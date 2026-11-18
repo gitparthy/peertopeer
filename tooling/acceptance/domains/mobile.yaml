@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "mobile",
+  "description": "Mobile is the managed product domain for Station entry, access, lifecycle, durable command recovery, social surfaces, and native iOS/Android quality.",
+  "capabilities": [
+    "acceptance-framework-self-consistency",
+    "mobile-station-access",
+    "mobile-runtime-lifecycle",
+    "mobile-command-recovery",
+    "mobile-secure-content-portable-core",
+    "mobile-secure-content-runtime",
+    "mobile-social-product",
+    "mobile-social-cross-platform-interoperability",
+    "mobile-native-quality",
+    "mobile-profile-resource-dependencies",
+    "release-mobile-ios-desktop-operation-analysis"
+  ],
+  "validation_gate_id": "mobile-domain-validation"
+}

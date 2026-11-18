@@ -1,0 +1,42 @@
+package model
+
+// Gender represents actor gender options
+type Gender string
+
+const (
+	GenderMale   Gender = "male"
+	GenderFemale Gender = "female"
+	GenderOther  Gender = "other"
+)
+
+const (
+	// Content types
+	ContentTypeActivityJSON     = "application/activity+json"
+	ContentTypeActivityJSONUTF8 = "application/activity+json; charset=utf-8"
+	ContentTypeJSON             = "application/json"
+	ContentTypeJSONUTF8         = "application/json; charset=utf-8"
+	ContentTypeProtobuf         = "application/protobuf"
+	ContentTypeXProtobuf        = "application/x-protobuf"
+	ContentTypeHTML             = "text/html"
+	ContentTypeJRD              = "application/jrd+json"
+	ContentTypeJRDUTF8          = "application/jrd+json; charset=utf-8"
+
+	// Accept headers
+	AcceptActivityJSON   = "application/activity+json"
+	AcceptActivityJSONLD = "application/activity+json, application/ld+json"
+	AcceptJRDJSON        = "application/jrd+json, application/json"
+	AcceptProtobuf       = "application/protobuf"
+	AcceptXProtobuf      = "application/x-protobuf"
+)
+
+// router constants
+const (
+	RouteNameActivityPub = "activitypub"
+	RouteNameManagement  = "management"
+	RouteNameWellKnown   = ".well-known"
+	RouteNameActor       = "actor"
+	RouteNamePeer        = "peer"
+	RouteNameMessage     = "message"
+	RouteNameMastodon    = "mastodon"
+	RouteNameSocial      = "social"
+)

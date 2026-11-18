@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "capabilities": [
+    {
+      "id": "federation-ledger-convergence",
+      "domain": "federation",
+      "direction": "acceptance_validates_product",
+      "features": ["federation-ledger"],
+      "required_gates": ["proto-build", "station-federation-unit"],
+      "synthetic_paths": [
+        "model/domain/federation/federation_ledger.proto",
+        "apps/station/app/subserver/federation/application/ledger_service.go"
+      ],
+      "evidence": {
+        "truth_sources": ["federation_ledger_events"],
+        "proven_by": ["proto-build", "station-federation-unit"],
+        "proven_scope": [
+          "ledger append preserves hash chain",
+          "ledger replay rebuilds materialized state"
+        ],
+        "unproven_scope": [
+          "multi-Station ledger convergence"
+        ]
+      }
+    },
+    {
+      "id": "federation-governance-truth",
+      "domain": "federation",
+      "direction": "acceptance_validates_product",
+      "features": ["federation-governance"],
+      "required_gates": ["station-federation-unit"],
+      "synthetic_paths": [
+        "apps/station/app/subserver/federation/handler.go",
+        "apps/station/app/subserver/dashboard/handler_federation.go",
+        "apps/station/app/subserver/dashboard/web/src/pages/FederationPage.tsx"
+      ],
+      "evidence": {
+        "truth_sources": ["federation_ledger_proposals", "federation_ledger_events"],
+        "proven_by": ["station-federation-unit"],
+        "proven_scope": [
+          "join proposals are accepted or rejected through governance flow",
+          "governance events replay into member and role projections",
+          "sequencer handover and recovery are verifiable"
+        ],
+        "unproven_scope": [
+          "cross-Station governance convergence",
+          "governance notification SSE complete user experience"
+        ]
+      }
+    },
+    {
+      "id": "federation-discovery-trust-boundary",
+      "domain": "federation",
+      "direction": "acceptance_validates_product",
+      "features": ["federation-discovery-network"],
+      "required_gates": ["station-federation-unit"],
+      "synthetic_paths": [
+        "model/domain/federation/federation_discovery.proto",
+        "apps/station/frame/core/plugin/native/federation/locator/publisher.go"
+      ],
+      "evidence": {
+        "truth_sources": ["signed discovery hint", "federation manifest", "ledger membership replay"],
+        "proven_by": ["station-federation-unit"],
+        "proven_scope": [
+          "signed hint can be published and looked up",
+          "network discovery verifies manifest genesis",
+          "discovery hint does not grant membership trust"
+        ],
+        "unproven_scope": [
+          "remote network discovery across multiple Stations",
+          "external ActivityPub interop boundary"
+        ]
+      }
+    },
+    {
+      "id": "federation-two-station-lifecycle",
+      "domain": "federation",
+      "direction": "acceptance_validates_product",
+      "features": ["federation-full-lifecycle"],
+      "required_gates": [
+        "station-federation-unit",
+        "station-access-federation-boundary-e2e",
+        "federation-two-station-lifecycle-e2e"
+      ],
+      "synthetic_paths": [
+        "apps/station/app/subserver/federation/handler.go",
+        "apps/station/app/subserver/federation/handler_governance.go",
+        "apps/station/app/subserver/federation/application/federation_service.go",
+        "apps/station/app/subserver/federation/application/ledger_service.go",
+        "apps/station/app/subserver/federation/handler_governance.go",
+        "apps/station/app/subserver/federation/remote_fetcher.go",
+        "apps/station/app/subserver/federation/subserver.go",
+        "apps/station/app/subserver/federation/sync_manager.go",
+        "apps/station/app/subserver/dashboard/handler_federation.go",
+        "apps/station/app/subserver/dashboard/web/src/pages/FederationPage.tsx",
+        "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+        "apps/desktop/src/runtimes/federationRuntime.ts",
+        "tooling/acceptance/gates/federation/two_station_lifecycle_e2e.py"
+      ],
+      "evidence": {
+        "truth_sources": [
+          "federation_ledger_events",
+          "federation_station_membership",
+          "federation_actor_role",
+          "station_role_assignment"
+        ],
+        "surfaces": [
+          "station-four Dashboard-authenticated Federation management",
+          "station-five-arm Dashboard-authenticated Federation management",
+          "macOS Native Find People Federation context"
+        ],
+        "proven_by": [
+          "station-federation-unit",
+          "station-access-federation-boundary-e2e",
+          "federation-two-station-lifecycle-e2e"
+        ],
+        "proven_scope": [
+          "create and cross-Station join",
+          "bilateral ledger and member convergence",
+          "non-owner leave and rejoin",
+          "restart replay",
+          "owner-only archive and ordinary-client context removal"
+        ],
+        "unproven_scope": [
+          "quorum policy",
+          "migration of Federation ledgers created before Station-key genesis binding",
+          "Station signing-key rotation and STATION_KEY_ROTATED replay",
+          "Mobile two-Station visual lifecycle journey",
+          "physical-device and non-macOS Desktop behavior"
+        ]
+      }
+    },
+    {
+      "id": "desktop-federation-context-surface",
+      "domain": "federation",
+      "direction": "acceptance_validates_product",
+      "features": ["desktop-federation-surfaces"],
+      "required_gates": [
+        "desktop-check",
+        "station-access-federation-boundary-e2e"
+      ],
+      "synthetic_paths": [
+        "apps/desktop/src/pages/login/StationSetupPanel.tsx",
+        "apps/desktop/src/pages/login/useStationRegistry.ts",
+        "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+        "apps/desktop/src-tauri/src/application/federation/mod.rs"
+      ],
+      "evidence": {
+        "truth_sources": ["StationRegistry", "Federation Plaza projection", "Federation catalog projection"],
+        "surfaces": ["desktop station picker", "find people modal"],
+        "proven_by": [
+          "desktop-check",
+          "station-access-federation-boundary-e2e"
+        ],
+        "proven_scope": [
+          "Native Desktop consumes one explicit Federation context for scoped search and resolve",
+          "Native Desktop creates Direct and Group conversations with the selected Federation context",
+          "Federation Catalog transport is statically constrained to direct typed protobuf decoding"
+        ],
+        "unproven_scope": [
+          "Linux and Windows native Federation context journeys"
+        ]
+      }
+    }
+  ]
+}

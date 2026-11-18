@@ -1,0 +1,345 @@
+// Package native provides a node implementation integrating transport, registry and server.
+package native
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+
+	"github.com/peers-labs/peers-touch/station/frame/core/client"
+	"github.com/peers-labs/peers-touch/station/frame/core/cmd"
+	"github.com/peers-labs/peers-touch/station/frame/core/facility/appdir"
+	"github.com/peers-labs/peers-touch/station/frame/core/logger"
+	"github.com/peers-labs/peers-touch/station/frame/core/node"
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"github.com/peers-labs/peers-touch/station/frame/core/peers/config"
+	"github.com/peers-labs/peers-touch/station/frame/core/registry"
+	"github.com/peers-labs/peers-touch/station/frame/core/server"
+	"github.com/peers-labs/peers-touch/station/frame/core/util/log"
+)
+
+var (
+	_ node.Node = (*native)(nil)
+)
+
+type native struct {
+	opts            *node.Options
+	kernel          *p2pKernel
+	nodeIncarnation string
+	cluster         *stationClusterAdmission
+	clusterAdmitted atomic.Bool
+	node.AbstractService
+}
+
+// Name returns the service name.
+func (s *native) Name() string {
+	return s.opts.Name
+}
+
+// Options returns the node options.
+func (s *native) Options() *node.Options {
+	return s.opts
+}
+
+// Client returns the node client.
+func (s *native) Client() client.Client {
+	return s.opts.Client
+}
+
+// Server returns the node server.
+func (s *native) Server() server.Server {
+	return s.opts.Server
+}
+
+// String returns the node identifier.
+func (s *native) String() string {
+	return "peers"
+}
+
+// Start runs pre-hooks, starts server, registers node and runs post-hooks.
+func (s *native) Start(ctx context.Context) error {
+	for _, fn := range s.opts.BeforeStart {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	if err := s.kernel.Start(ctx); err != nil {
+		return errors.Join(err, s.kernel.Close())
+	}
+	s.clusterAdmitted.Store(s.cluster == nil)
+
+	ready := make(chan interface{})
+	// Start server in a goroutine
+	go func() {
+		if err := s.opts.Server.Start(
+			ctx,
+			server.WithReadyChan(ready),
+			server.WithGlobalWrappers(s.clusterAdmissionWrapper),
+		); err != nil {
+			logger.Errorf(ctx, "server start failed: %v", err)
+			return
+		}
+	}()
+
+	// Wait for the server to be ready
+	select {
+	case info := <-ready:
+		logger.Infof(ctx, "server started: %v", info)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	if err := s.cluster.Admit(ctx); err != nil {
+		return errors.Join(
+			fmt.Errorf("Station cluster admission failed: %w", err),
+			s.opts.Server.Stop(ctx),
+			s.kernel.Close(),
+		)
+	}
+	s.clusterAdmitted.Store(true)
+
+	// register node
+	if err := s.opts.Registry.Register(ctx, s.toPeer()); err != nil {
+		return errors.Join(
+			err,
+			s.cluster.Stop(ctx),
+			s.opts.Server.Stop(ctx),
+			s.kernel.Close(),
+		)
+	}
+
+	// todo start achievement, but now it's blocked by Start
+	// so will never be called. it should be pass a exit signal
+	for _, fn := range s.opts.AfterStart {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+
+	logger.Infof(ctx, "peers' node started at %s", s.opts.Server.Options().Address)
+
+	s.Finish(s)
+	return nil
+}
+
+// Stop runs stop hooks, stops server, closes config and runs post-stop hooks.
+func (s *native) Stop(ctx context.Context) error {
+	var gerr error
+	s.clusterAdmitted.Store(false)
+
+	logger.Infof(ctx, "stop native peers' node. begin to execute before stop hooks")
+
+	for _, fn := range s.opts.BeforeStop {
+		if err := fn(); err != nil {
+			gerr = err
+		}
+	}
+
+	logger.Infof(ctx, "stop native peers' node. begin to execute stop hooks")
+
+	if err := s.cluster.Stop(ctx); err != nil {
+		gerr = errors.Join(gerr, err)
+	}
+	if err := s.opts.Server.Stop(ctx); err != nil {
+		gerr = errors.Join(gerr, err)
+	}
+	if err := s.kernel.Close(); err != nil {
+		gerr = errors.Join(gerr, err)
+	}
+
+	logger.Infof(ctx, "stop native peers' node. begin to execute config close")
+	if err := s.opts.Config.Close(); err != nil {
+		gerr = errors.Join(gerr, err)
+	}
+
+	logger.Infof(ctx, "stop native peers' node. begin to execute after stop hooks")
+	for _, fn := range s.opts.AfterStop {
+		if err := fn(); err != nil {
+			gerr = err
+		}
+	}
+
+	logger.Warnf(ctx, "stop native peers' native node stopped with error: %v", gerr)
+
+	return gerr
+}
+
+// Run starts and blocks on signals or context cancellation.
+func (s *native) Run() error {
+	ctx, cancel := context.WithCancel(s.opts.Ctx())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		return err
+	}
+
+	logger.Infof(ctx, "[%s] server started", s.Name())
+
+	ch := make(chan os.Signal, 1)
+	if s.opts.Signal {
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+	}
+
+	var clusterFailure <-chan error
+	if s.cluster != nil {
+		clusterFailure = s.cluster.Failure()
+	}
+	var runErr error
+	select {
+	// wait on kill signal
+	case <-ch:
+		logger.Warnf(ctx, "received signal, stopping")
+	case <-ctx.Done():
+		// todo, try to store canceled context data for logger
+		logger.Infof(context.Background(), "[%s] server stopped", s.Name())
+	case err := <-clusterFailure:
+		s.clusterAdmitted.Store(false)
+		runErr = fmt.Errorf(
+			"Station cluster readiness withdrawn: %w",
+			err,
+		)
+		logger.Errorf(ctx, "%v", runErr)
+	}
+
+	return errors.Join(runErr, s.Stop(ctx))
+}
+
+func (s *native) clusterAdmissionWrapper(
+	next server.EndpointHandler,
+) server.EndpointHandler {
+	return func(
+		ctx context.Context,
+		req server.Request,
+		resp server.Response,
+	) error {
+		if !s.clusterAdmitted.Load() {
+			resp.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = resp.Write([]byte("Station cluster admission is pending"))
+			return nil
+		}
+		return next(ctx, req, resp)
+	}
+}
+
+// todo, update to one node supports multiple peers
+// now there is a node for one peer, it's not graceful.
+// toPeer builds a peer registration for the node.
+func (s *native) toPeer() *registry.Registration {
+	registration := &registry.Registration{
+		ID:         s.opts.Id,
+		Name:       s.opts.Name,
+		Type:       registry.RegisterTypeNode,
+		Namespaces: []string{"native"},
+		Addresses:  []string{},
+		Metadata: map[string]interface{}{
+			"demo": "hello-world",
+		},
+	}
+
+	// the root of http entrance
+	if s.opts.Server != nil {
+		registration.Addresses = append(registration.Addresses, s.opts.Server.Options().Address)
+		registration.Metadata["server_address"] = s.opts.Server.Options().Address
+	}
+
+	return registration
+}
+
+// NewService constructs a native node service.
+// todo remove rootOptions, not graceful
+func NewService(rootOpts *option.Options, opts ...option.Option) node.Node {
+	defaultOpts := []option.Option{
+		// todo remove non-peers' code
+		node.RPC("peers"),
+		node.HandleSignal(true),
+		// print runtime info
+		node.BeforeInit(func(sOpts *node.Options) error {
+			// current working directory
+			wd, err := os.Getwd()
+			if err != nil {
+				log.Infof("failed to get working directory: %+v", err)
+			}
+			if wd != "" {
+				log.Infof("peers-touch-go's working directory is %s", wd)
+			}
+			return nil
+		}),
+		// load config
+		node.BeforeInit(func(sOpts *node.Options) error {
+			// cmd helps peers parse command options and reset the options that should work.
+			err := sOpts.Cmd.Init()
+			if err != nil {
+				log.Errorf("cmd init error: %s", err)
+				return err
+			}
+
+			err = config.LoadConfig(sOpts)
+			if err != nil {
+				log.Errorf("load config error: %s", err)
+				return err
+			}
+
+			return nil
+		}),
+		// Load Private Key & Public Key
+		node.BeforeInit(func(sOpts *node.Options) error {
+			return initKeys(sOpts)
+		}),
+		// parse config to options for components
+		node.BeforeInit(func(sOpts *node.Options) error {
+			err := config.SetOptions(sOpts)
+			if err != nil {
+				log.Errorf("init components' options error: %s", err)
+				return err
+			}
+
+			return nil
+		}),
+		node.BeforeInit(func(sOpts *node.Options) error {
+			report, err := appdir.ResolveReport("station")
+			if err != nil {
+				log.Errorf("resolve station storage report error: %s", err)
+				return err
+			}
+			if err = appdir.Ensure(report.Paths); err != nil {
+				log.Errorf("ensure station storage dirs error: %s", err)
+				return err
+			}
+			log.Infof("station storage profile=%s paths_file=%s", report.Profile, report.PathsFile)
+			kinds := []string{"config", "data", "cache", "logs", "runtime", "temp"}
+			for _, kind := range kinds {
+				log.Infof("station storage kind=%s path=%s source=%s", kind, report.Paths[kind], report.Sources[kind])
+			}
+			return nil
+		}),
+		// kernal components pre-initialization, this helps to set up the options for each component.
+		// so we can use the options by calling GetOptions() in each comp's directory.
+		// other comps is going to do...
+		client.WithInit(),
+		// set the default components
+		// see initComponents
+		// node.Store(plugin.StorePlugins["native"].New()),
+		// node.Server(plugin.ServerPlugins["native"].New()),
+		// node.Logger(plugin.LoggerPlugins["console"].New()),
+		//node.HandleSignal(true),
+	}
+
+	// make sure the custom options are applied last
+	// so that they can override the default options
+	defaultOpts = append(defaultOpts, opts...)
+
+	rootOpts.Apply(defaultOpts...)
+
+	s := &native{
+		opts: node.GetOptions(rootOpts),
+	}
+
+	// set CMD for loading config
+	s.opts.Cmd = cmd.NewCmd()
+
+	return s
+}

@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package domain.agent;
+
+option go_package = "github.com/peers-labs/peers-touch/station/app/subserver/agent/model";
+
+// ─── Agent Groups ────────────────────────────────────────────
+
+message AgentGroup {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  repeated string member_agent_ids = 4;
+  string orchestration_mode = 5; // "sequential" | "parallel" | "router"
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message CreateAgentGroupRequest {
+  string name = 1;
+  string description = 2;
+  string orchestration_mode = 3;
+}
+
+message CreateAgentGroupResponse {
+  AgentGroup group = 1;
+}
+
+message UpdateAgentGroupRequest {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string orchestration_mode = 4;
+  repeated string member_agent_ids = 5;
+}
+
+message UpdateAgentGroupResponse {
+  AgentGroup group = 1;
+}
+
+message DeleteAgentGroupRequest {
+  string id = 1;
+}
+
+message DeleteAgentGroupResponse {}
+
+message ListAgentGroupsRequest {}
+
+message ListAgentGroupsResponse {
+  repeated AgentGroup groups = 1;
+}
+
+// ─── Topic Comments ──────────────────────────────────────────
+
+message TopicComment {
+  reserved "author_id";
+
+  string id = 1;
+  string topic_key = 2;
+  string content = 3;
+  string created_at = 4;
+  string author_ptid = 5;
+}
+
+message CreateTopicCommentRequest {
+  string topic_key = 1;
+  string content = 2;
+}
+
+message CreateTopicCommentResponse {
+  TopicComment comment = 1;
+}
+
+message DeleteTopicCommentRequest {
+  string topic_key = 1;
+  string comment_id = 2;
+}
+
+message DeleteTopicCommentResponse {}
+
+message ListTopicCommentsRequest {
+  string topic_key = 1;
+}
+
+message ListTopicCommentsResponse {
+  repeated TopicComment comments = 1;
+}

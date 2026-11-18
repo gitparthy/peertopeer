@@ -1,0 +1,255 @@
+# Mobile Shell — 体验合同
+
+> **Status**: active
+> **Version**: v1.2
+> **Created**: 2026-08-27 | **Updated**: 2026-10-12
+> **Owner**: Mobile Product Team
+> **Module**: `apps/mobile/`
+
+---
+
+## 1. Journey Index
+
+| ID | Journey | Capabilities |
+|---|---|---|
+| MS-J01 | First Station entry | MS-C01, MS-C02, MS-C03 |
+| MS-J02 | Returning session restore | MS-C01, MS-C02, MS-C10 |
+| MS-J03 | Conversation work | MS-C04, MS-C05, MS-C06, MS-C12 |
+| MS-J04 | Contact and group work | MS-C04, MS-C07 |
+| MS-J05 | Moments participation | MS-C04, MS-C08 |
+| MS-J06 | Profile, settings, and Station change | MS-C04, MS-C09, MS-C10 |
+| MS-J07 | Interrupted work and degraded recovery | MS-C05, MS-C08, MS-C10, MS-C12, MS-C14 |
+| MS-J08 | Whole-product foreground walkthrough | MS-C01..MS-C10, MS-C14, MS-C15 |
+
+Single-call proof belongs to the original mixed call-resolution runtime:
+Mobile incoming/outgoing audio and video require real RTP progress on both
+clients, native media controls, ICE renegotiation, chat receiver readback while
+the call is active, and released tracks after hangup. Simulator startup retains
+the owned native app's redacted stdout/stderr as immutable run artifacts before
+Appium teardown and Simulator deletion, including entry failures before login.
+Diagnostics do not qualify an unavailable Station or replace a surface journey.
+The whole-product Gate and bound simulator provisioner use the same
+`simulator_native_output.ios_native_output_callbacks` capture owner, with
+run-owned temporary storage and cleanup after evidence capture.
+
+## 2. MS-J01 First Station Entry
+
+1. User opens Mobile without an active Station.
+2. System shows saved Stations and truthful checking/online/offline/unknown states.
+3. User selects or adds one Station.
+4. System performs Station handshake before exposing authentication.
+5. Station returns the current access gate.
+6. User completes Email login or GitHub/Google OAuth.
+7. System verifies callback/session with the selected Station.
+8. Remaining Station gates continue until access is granted.
+9. Critical session runtimes bootstrap and the Shell becomes visible.
+
+Recovery:
+
+- Invalid address stays on Station selection with field-level recovery.
+- Unreachable Station offers retry and Station change.
+- A saved URL presenting another Station identity shows a blocking trust state;
+  the user may go back or explicitly replace the saved Station.
+- Removing a Station requires confirmation, removes only its local registry
+  entry, and never silently deletes Station-owned data.
+- OAuth cancellation returns to the same access gate without losing Station context.
+- OAuth expiry/replay/provider mismatch preserves the Station and offers retry
+  or Email login without activating a session.
+- Gate denial never enters the Shell.
+
+## 3. MS-J02 Returning Session Restore
+
+1. User opens Mobile with a saved Station and secure session.
+2. System validates Station and session.
+3. Station resumes the access gate chain.
+4. If access remains granted, critical projections bootstrap and Shell opens.
+5. If revoked or expired, secure session is cleared and the current login gate appears.
+
+The user must never see stale account data from another Station or actor while
+the restore decision is pending.
+
+## 4. MS-J03 Conversation Work
+
+1. User opens Messages, selects the Chats top scope, and sees Station-backed friend and group conversation projections. The bottom destinations are Messages, Moments, and Me.
+2. Search filters the projected list without changing authoritative data.
+3. User opens a conversation; the detail surface hides the bottom tab bar.
+4. History loads while preserving the current scroll anchor.
+5. User sends text or attachment content and sees explicit pending/committed/failure state.
+6. Realtime events update messages, receipts, typing, reactions, pins, and mutations.
+7. Missing events are repaired by reconciliation.
+8. Back returns to the prior list context.
+9. Attachment upload, typing, search, delete, and conversation settings expose
+   their own waiting, success, failure, and recovery state.
+10. In a Direct conversation, the user starts or receives an audio/video call.
+11. The shell-level call surface preserves the conversation beneath it and
+    exposes outgoing, incoming, active, reconnecting, handled-on-another-device,
+    and ended states.
+12. Accept/reject, mute, camera toggle, reconnect, and hangup affect one call
+    identity; only the winning device may retain media resources.
+
+Message actions must preserve readable content and provide local recovery.
+Non-idempotent writes with unknown outcomes are never silently replayed.
+Conversation drafts survive tab changes and background/resume; process restart
+restores the latest safely persisted draft without presenting it as sent.
+Call setup or media failure ends visibly, releases resources, and never disables
+text messaging. A sibling device that loses resolution stops ringing and shows
+`handled_elsewhere`; it cannot establish a second media session.
+
+## 5. MS-J04 Contact And Group Work
+
+1. User opens the Contacts top scope within Messages and sees pending requests, friends, and groups. It has independent query, scroll and focus state; opening a profile or its conversation and returning preserves that scope.
+2. User searches local contacts or resolves a federated handle.
+3. User accepts/rejects a request or sends a new request.
+4. User opens a profile and may start a conversation or manage block state.
+5. User creates a group, selects initial members, and enters the resulting group.
+6. Authorized group roles manage membership and ownership through explicit,
+   confirmed actions.
+
+No-result local search, unresolved federated handle, duplicate request,
+permission denial, and remote Station unavailable are distinct states with a
+valid next action.
+
+## 6. MS-J05 Moments Participation
+
+1. User opens Moments and sees the latest Station projection.
+2. User paginates or refreshes without losing already visible content.
+3. User publishes text or images with visible audience.
+4. User reacts, comments, or replies and sees pending, committed, or failed state.
+5. Runtime events or reconciliation update affected feed/detail projections.
+
+An empty feed, filtered feed, unavailable feed, and policy-hidden feed are
+different visible states.
+Composer text, successful attachments, and audience survive tab change,
+background, submission failure, and process restart until publish or discard.
+Optimistic reaction/comment state rolls back to Station readback on rejection.
+
+## 7. MS-J06 Profile, Settings, And Station Change
+
+1. User opens Me and sees identity, Station, trust, and profile summary.
+2. User opens a settings detail; only that detail surface mounts.
+3. Actor Profile/privacy, Notification preferences, and Social blocked users
+   persist through their Station owners; personalization stays on the device
+   in the active actor's identity-scoped namespace and is hard-deleted on
+   logout, while device/install state remains local.
+4. User changes Station or logs out.
+5. System tears down session runtimes, clears actor-scoped projections,
+   personalization, and credentials, preserves the Station registry and other
+   L3 device state, and restarts the gate flow with OS defaults.
+
+Language, notification, privacy, storage, and blocked-user surfaces distinguish
+saved, unsaved, saving, permission-required, failed, and externally changed
+states. A save targets only the currently selected owner; Settings never
+attempts a cross-owner transaction. Leaving an unsaved detail requires save,
+discard, or stay. A stale revision preserves the draft and exposes reload,
+discard, or a new explicit save after reconciliation.
+
+## 8. MS-J07 Interrupted Work And Degraded Recovery
+
+1. User performs a write while connectivity or Station response becomes uncertain.
+2. The affected item shows queued, pending, unknown, retryable, or terminal
+   state without claiming success.
+3. The user may check status, keep editing a draft, or discard local tracking;
+   replay is offered only when Station proves no prior commit.
+4. Capacity exhaustion disables new writes with an explanation while read-only
+   projections remain available.
+5. Session revocation or Station identity mismatch closes writes immediately,
+   hides prior-scope projections, and presents re-authentication or Station
+   replacement.
+6. A device-local message flag is explicitly labeled as local to this device;
+   another device is not expected to show it.
+7. A suspended or partitioned call enters reconnecting, reconciles the
+   authoritative resolution before retaining media, and ends visibly if it
+   cannot recover.
+
+## 9. Platform Adaptation
+
+| Product behavior | Mobile contract |
+|---|---|
+| Primary navigation | Three bottom destinations: Messages, Moments, Me; horizontal page swipes follow that order without wrapping; Chats/Contacts top scopes within Messages, with same-frame visible feedback |
+| Native continuity | Visited views and headers persist across navigation; hidden work pauses; no full-page refresh/loading reset or post-paint scroll jump |
+| Detail navigation | Stack semantics; tab bar hidden for immersive detail |
+| Context actions | Bottom sheet or dedicated page |
+| Live call | Shell-owned full-screen overlay; Direct conversation remains the context owner |
+| Secure credentials | Tauri/native secure storage |
+| OAuth callback | Native deep link returns to the same Station/access attempt |
+| Foreground freshness | Event stream plus reconcile |
+| Background freshness | Push/wakeup marks stale; resume performs authoritative sync |
+| Large lists | Virtualized or bounded rendering with preserved anchors |
+| Accessibility | Screen-reader order, dynamic text, focus restoration, reduced motion, and labeled icon actions |
+
+Acceptance-build diagnostics use the shared UI overlay host. Debug opens a
+bounded bottom Drawer with a pinned 44px close control, a scrollable body,
+safe-area clearance, explicit close and outside/Escape dismissal. Closing
+restores the existing product tree and scroll position. The launcher stays
+above bottom navigation controls. Global touch handlers must not cancel rapid
+button activation; double-tap zoom prevention belongs to `touch-action:
+manipulation`, while the existing native gesture guard prevents pinch zoom.
+
+Primary page swipes use the shared `useMobileTabSwipe` arbitration and the same
+navigation/exit intent as bottom-tab taps. Vertical scrolling, taps, long presses,
+editable controls and nested horizontal scrollers retain their own gestures.
+An established horizontal pan is judged by direction and displacement, without
+a total-duration cutoff. A stationary hold before pan recognition remains the
+page's long-press action.
+Detail views, immersive media and open overlays do not switch primary modules.
+The gesture changes the retained active view without rebuilding it or moving
+the entire page during the drag; returning preserves scroll, draft and query.
+
+## 10. MS-J08 Whole-Product Foreground Walkthrough
+
+The reviewer uses a visible iOS Simulator and real application controls. The
+walkthrough starts at launch and visits every reachable surface one by one:
+
+1. Boot, Station selection, Station verification, login, access gates, and
+   runtime preparation.
+2. Chat list, Direct and Group details, search, composer, attachment/voice
+   controls, message actions, conversation settings, forwarding, and group
+   management.
+3. Contacts, requests, profile detail, Find People, Create Group, and their
+   no-result, duplicate, unavailable, permission, and destructive states.
+4. Moments feed, detail/comments, composer, media lifecycle, pagination, empty,
+   filtered, policy-hidden, unavailable, pending, and rollback states.
+5. Me and every Settings detail, including profile/privacy, notifications,
+   blocked users, identity-scoped personalization, device settings, storage,
+   language, Station change,
+   logout, dirty drafts, conflict, permission, unavailable, and failure states.
+6. Shared recovery surfaces for revocation, stale data, command capacity,
+   unknown outcome, draft restoration, and deferred module activation.
+
+At every step, a human must be able to identify the page, primary content,
+primary action, current scope, state meaning, and recovery path without
+interpreting internal identifiers. Text and controls must fit at supported
+viewport and text-size cells; the keyboard, safe area, tab bar, composer,
+sheet, modal, notice, and system status area must not obscure one another.
+
+Find People is a pushed detail page (`detail:find-people`), with a peers-ui
+navigation bar, top search field and explicit search scope above an independently
+scrolling results list. The bottom tab bar is hidden. Keyboard viewport changes
+resize the page through the shared visual-keyboard projection; they do not move
+search into a bottom sheet. Back returns to the original Messages pane.
+The software keyboard opens only when the user activates an editable input,
+including by hardware-keyboard navigation. Opening a page, revealing search,
+replying/editing, selecting an emoji, sending, or dismissing a modal must not
+activate an input. Navigation preserves drafts, queries and selection without
+restoring editable focus. Non-editable accessibility focus remains available.
+Mobile selects the shared `UIProvider inputFocus="explicit"` policy; modal
+entry focuses its reading container, with normal Tab navigation inside it.
+Station actor search is the default and remains available without Federation
+membership. Explicit Federation search and full remote handles use the selected
+real Federation context. Discovery grants no relationship authority: requests
+require an observed Federation, canonical actor identity and Home Station.
+Loading, no-result, failure/retry and duplicate/request states preserve the
+entered query; a scope change or page teardown invalidates stale replies.
+
+The walkthrough fails on any reachable surface that:
+
+- uses a raw PTID, Station URL, runtime ID, command ID, untranslated key, or
+  internal exception as primary user-facing copy when a friendly projection is
+  available;
+- presents a module failure as an app-wide blocking card while unrelated work
+  remains usable;
+- clips, overlaps, truncates without recovery, hides the active control, loses
+  navigation context, or lacks a usable next action;
+- differs materially from the confirmed Mobile prototype or UI Identity
+  without a recorded product decision; or
+- has not been opened and interacted with in the foreground runtime.

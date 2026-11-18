@@ -1,0 +1,124 @@
+mod attachment_transfer;
+mod device_identity_backup;
+mod direct_session;
+mod engine;
+mod group_genesis;
+mod lifecycle;
+mod membership_transition;
+mod mls_key_packages;
+mod mls_leave_intent;
+mod prekeys;
+pub(crate) mod private_content;
+mod recovery;
+mod search;
+mod store;
+mod transport;
+mod verification;
+
+pub(crate) fn actor_ref(ptid: &str) -> messaging_core::proto::actor::ActorRef {
+    messaging_core::proto::actor::ActorRef {
+        ptid: ptid.to_string(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn actor_device_ref(
+    ptid: &str,
+    device_id: &str,
+) -> messaging_core::proto::actor::ActorDeviceRef {
+    messaging_core::proto::actor::ActorDeviceRef {
+        actor: Some(actor_ref(ptid)),
+        device_id: device_id.to_string(),
+    }
+}
+
+pub(crate) fn actor_device_parts(
+    device: &messaging_core::proto::actor::ActorDeviceRef,
+) -> Option<(&str, &str)> {
+    let ptid = device.actor.as_ref()?.ptid.as_str();
+    if ptid.trim().is_empty() || device.device_id.trim().is_empty() {
+        return None;
+    }
+    Some((ptid, device.device_id.as_str()))
+}
+
+pub(crate) fn crypto_endpoint_from_actor_device_ref(
+    device: &messaging_core::proto::actor::ActorDeviceRef,
+) -> Option<crate::model::chat::CryptoEndpoint> {
+    let (ptid, device_id) = actor_device_parts(device)?;
+    Some(crate::model::chat::CryptoEndpoint {
+        ptid: ptid.to_string(),
+        device_id: device_id.to_string(),
+    })
+}
+
+pub(crate) fn crypto_endpoints_from_actor_device_refs(
+    devices: &[messaging_core::proto::actor::ActorDeviceRef],
+) -> Option<Vec<crate::model::chat::CryptoEndpoint>> {
+    devices
+        .iter()
+        .map(crypto_endpoint_from_actor_device_ref)
+        .collect()
+}
+
+pub use attachment_transfer::{
+    AttachmentRetryPolicy, AttachmentTransferControl, AttachmentTransferFailure,
+    AttachmentTransferProgress, AttachmentTransferRecord, AttachmentTransferTransport,
+    AttachmentTransferWorker, PreparedAttachmentUpload, StationAttachmentTransferTransport,
+    ATTACHMENT_TRANSFER_MEMORY_OVERHEAD,
+};
+pub use direct_session::{
+    DirectSessionBootstrapper, KeyBundleTransport, StationKeyBundleTransport,
+};
+pub(crate) use engine::now_unix_ms;
+pub use engine::{
+    EngineEndpoint, EngineRegistry, LocalAttachmentIntent, MessagingEngine,
+    MessagingProfileReadiness, MessagingProjectionChange, MessagingProjectionNotifier,
+    MetadataInteraction, PreparedGroupConversation, RetryMessageOutcome, SubmitMessageOutcome,
+};
+pub use group_genesis::StationGroupGenesisTransport;
+pub(crate) use lifecycle::hydrate_projections_from_station;
+pub use lifecycle::MessagingLifecycleWorker;
+pub use membership_transition::StationMembershipTransitionTransport;
+pub use messaging_core::codec::private_content::{
+    decode_message_private_content, encode_message_private_content,
+    validate_attachment_plaintext_metadata, validate_message_private_content,
+    MESSAGE_PRIVATE_CONTENT_FORMAT_VERSION,
+};
+pub use messaging_core::crypto::prekeys::PendingPreKeyBundle;
+pub use messaging_core::identity::{FreshDeviceEnrollment, INITIAL_ACTOR_IDENTITY_PROFILE_VERSION};
+pub use messaging_core::inbox::CommandResultProcessor;
+pub use mls_key_packages::StationMlsKeyPackageTransport;
+pub use mls_leave_intent::StationMlsLeaveIntentTransport;
+pub use prekeys::{PreKeyPublisher, PreKeyTransport, StationPreKeyTransport};
+pub use recovery::{
+    decode_recovery_revision, encode_recovery_revision, DecodedRecoveryRevision,
+    EncodedRecoveryRevision, MessagingRecoveryArchive, RecoveryAttachmentMetadata,
+    RecoveryAuthorityHead, RecoveryConversationProjection, RecoveryMessageProjection,
+    RecoveryMessageRedactionTombstone, RecoveryReconciliation, RecoveryRetentionFloor,
+    RecoveryTrustRecord,
+};
+pub use store::{
+    ActorReadReceiveCommit, AttachmentDownloadProjection, CommandResultDisposition,
+    CommandResultReceiveCommit, CommandStatusProjection, ConversationCommandCommit,
+    ConversationMemberProjection, ConversationMessagePage, ConversationMessageProjection,
+    ConversationMutation, ConversationMutationReceiveCommit, ConversationProjection,
+    ConversationStateReceiveCommit, ConversationSummaryProjection, DeliveryReceiptReceiveCommit,
+    DirectEditCommit, DirectReceiveCommit, DirectSendCommit, InteractionCommandCommit,
+    MemberAuthorityReceiveCommit, MessageProjection, MessageRetryDisposition, MessagingStore,
+    MlsReceiveCommit, MlsRetirementReceiveCommit, MlsSendCommit, MlsSenderTransitionReceiveCommit,
+    MlsTransitionReceiveCommit, PendingAttachmentUpload, PendingMembershipIntent,
+    PendingMessageDraft, PendingMlsTransitionState, PendingSenderProjection,
+    PublicEventReceiveCommit, ReceiveCommitResult, ServiceMessageRow, SupersededInteractionIntent,
+    ThreadCountProjection,
+};
+#[cfg(any(test, feature = "acceptance-webdriver"))]
+pub use transport::{
+    get_acceptance_command_transport_fault, set_acceptance_command_transport_fault,
+    AcceptanceCommandTransportFaultSnapshot,
+};
+pub use transport::{
+    StationCommandTransport, StationDeliveryReceiptTransport, StationDeviceTransport,
+    StationQueueTransport,
+};
+pub use verification::verify_device_event_delivery;

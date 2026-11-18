@@ -1,0 +1,166 @@
+---
+status: active
+owner: Client Platform Team
+updated: 2026-11-14
+review-cadence: quarterly
+next-review: 2027-02-14
+related:
+  - docs/client/common/ui-identity/patterns/optimistic-commit.md
+  - docs/client/common/ui-identity/accessibility.md
+---
+
+# UI Identity Interaction
+
+## 1. Purpose
+
+Interaction quality determines whether Peers Touch feels trustworthy.
+
+Every action must expose state ownership: what is pending, what changed, what failed, and whether the user can recover.
+
+## 2. State Ownership
+
+State belongs to the user intent before it belongs to a child element.
+
+Rules:
+
+- Posting state belongs to the composer surface.
+- Reaction state belongs to the reaction action group.
+- Comment submission state belongs to the reply composer.
+- Follow/block/moderation state belongs to the relationship or trust control.
+- Detail loading state belongs to the thread surface, not only the spinner.
+
+## 3. Interaction States
+
+These are component interaction states, not the Journey-visible `StateKind`
+taxonomy in `interaction-design-methodology.md`. A component state can refine a
+Journey-visible state but cannot replace or rename it.
+
+Every actionable component must define:
+
+- Normal.
+- Hover.
+- Focus.
+- Pressed.
+- Loading.
+- Disabled.
+- Success.
+- Error.
+- Recovering.
+- Offline or degraded when the action depends on network/runtime state.
+
+Minimum rule:
+
+- If the disabled state blocks a user task, the UI must explain the reason.
+
+## 4. Optimistic Updates
+
+Optimistic UI is allowed only when recovery is clear.
+
+Rules:
+
+- Reaction and lightweight local toggles may update optimistically.
+- Publish may show pending content only if failure can restore the draft.
+- Delete, block, moderation, and privacy-sensitive actions must confirm server success before removing critical context.
+- Station policy state must never be fabricated locally; show pending policy only as pending.
+- Immediate local preview with real progress and rollback (media uploads,
+  visible commits) follows one reusable contract:
+  [patterns/optimistic-commit.md](./patterns/optimistic-commit.md). Do not
+  restate its state machine, progress, or accessibility rules per surface.
+
+## 5. Feedback
+
+Feedback should be local first, global second.
+
+Rules:
+
+- Prefer inline pending/success/error near the affected surface.
+- Use toast for completion that does not require follow-up.
+- Use modal confirmation only for destructive, irreversible, or policy-changing actions.
+- Do not use global alerts for routine feed refresh or reaction changes.
+
+## 6. Recovery
+
+Every failed action must answer:
+
+- What failed?
+- Which object/action was affected?
+- Is the user's input preserved?
+- Can the user retry?
+- Is the failure local, runtime, station, network, permission, or policy?
+
+Rules:
+
+- Draft text must survive publish failure.
+- Reply text must survive comment failure.
+- A failed reaction must restore the previous count/state.
+- A failed moderation command must not imply the station is blocked.
+
+## 7. Accessibility
+
+Rules:
+
+- Keyboard users must be able to reach primary actions, secondary actions, tabs, menus, and composers.
+- Focus must return to the source control after popover/menu close.
+- Hover-only affordances need keyboard-visible alternatives.
+- Motion-sensitive users must still understand the state transition without animation.
+
+## 8. Covered UX Dimensions
+
+This interaction contract covers:
+
+- State ownership.
+- Interaction discoverability.
+- Feedback and recovery.
+- Trust and safety.
+- Accessibility.
+- Performance perception.
+
+Out of scope:
+
+- Concrete runtime event ownership.
+- Module-specific mutation rules, unless defined by module contracts.
+
+## 9. Silent Data Updates — 禁止显式刷新
+
+**全应用禁止以显式刷新呈现后台数据更新。** Follow the continuity of native
+applications such as WeChat: new data joins the current instance quietly and
+smoothly; the user keeps control of the surface.
+
+- Do not blank, clear, remount, hide/reveal or replace a painted page, card,
+  thread or list with a spinner/skeleton/empty state during revalidation.
+  Initial acquisition and an acquired empty result are distinct states.
+- Reconcile data by stable logical resource identity. Reuse unchanged entities,
+  rows and component instances; update changed fields and insert only new rows.
+  Preserve acquired pagination outside the refreshed range.
+- Preserve scroll anchor, selection, focused input, IME composition, drafts,
+  search results and explicit expansion/collapse choices. Background updates
+  must never reopen a thread the user collapsed or reapply default UI state.
+- Animate only newly arrived data in an already acquired visible instance.
+  Use short component-local arrival motion; never animate the whole page or
+  replay mount motion on returning to an alive surface. Retire arrival markers
+  and honor `prefers-reduced-motion`.
+- A late read started before a confirmed command must not erase a new item,
+  resurrect a deletion or roll back a confirmed reaction. Later authoritative
+  reads still apply real removals; silent updates are not indefinite caching.
+- Focus/scroll to an addressed item once per explicit navigation intent,
+  within its active surface. A timer or changed result count is not new intent.
+- Keep the existing Actor, Station, session and authorization boundaries.
+  Revocation or identity changes remove unavailable data immediately; retained
+  UI state must not cross those boundaries.
+
+Verify with repeated unchanged reads, acquired-empty reads, new arrivals,
+confirmed writes racing an older read, collapse plus revalidation, and return
+to an alive page. Observe node identity, focus/selection, draft, scroll anchor
+and the absence of blank/loading frames.
+
+## 10. AI Agent Checklist
+
+- [ ] Does each action have a named state owner?
+- [ ] Is loading local to the affected intent?
+- [ ] Does failure preserve user input?
+- [ ] Are sensitive trust/policy actions server-authoritative?
+- [ ] Does optimistic UI have rollback?
+- [ ] Can keyboard users complete the action path?
+- [ ] Are background updates silent, incremental and instance-preserving?
+- [ ] Do collapse, draft, focus and scroll survive revalidation?
+- [ ] Is motion limited to new arrivals and disabled for reduced motion?

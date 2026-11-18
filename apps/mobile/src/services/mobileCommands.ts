@@ -1,0 +1,1945 @@
+import {
+  create,
+  fromBinary,
+  toBinary,
+  type DescMessage,
+  type MessageShape,
+} from '@bufbuild/protobuf';
+import { invoke } from '@tauri-apps/api/core';
+import {
+  AttachmentAccessProjectionSchema,
+  type AttachmentAccessProjection,
+} from '../gen/proto/domain/chat/attachment_pb';
+
+import {
+  AcceptSocialFriendRequestResponseSchema,
+  BlockSocialActorResponseSchema,
+  RejectSocialFriendRequestResponseSchema,
+  SendSocialFriendRequestResponseSchema,
+  type AcceptSocialFriendRequestResponse,
+  type BlockSocialActorResponse,
+  type RejectSocialFriendRequestResponse,
+  type SendSocialFriendRequestResponse,
+  type UnblockSocialActorResponse,
+  UnblockSocialActorResponseSchema,
+} from '../gen/proto/domain/social/relationship_pb';
+import {
+  ImageAttachmentSchema,
+  type ImageAttachment,
+} from '../gen/proto/domain/social/post_pb';
+import {
+  ChatStorageConversationRequestSchema,
+  ChatStorageResultSchema,
+  ChatStorageRetentionRequestSchema,
+  ChatStorageSnapshotRequestSchema,
+  ChatStorageSnapshotSchema,
+  type ChatRetentionPreset,
+  type ChatStorageResult,
+  type ChatStorageSnapshot,
+} from '../gen/proto/domain/chat/storage_pb';
+import {
+  notifyReliabilityCommandChanged,
+  type CommandState,
+  type FriendRequestCommandProjection,
+  type SocialRelationshipCommandProjection,
+} from '../runtimes/commandRuntime';
+import {
+  mobileMutationScopeKey,
+  requireMobileMutationAdmission,
+  type MobileMutationDomain,
+} from '../runtimes/mutationAdmission';
+
+export async function setSecureStorageValue(key: string, value: string): Promise<void> {
+  await invoke('secure_storage_set', { key, value });
+}
+
+export async function getSecureStorageValue(key: string): Promise<string | null> {
+  return invoke<string | null>('secure_storage_get', { key });
+}
+
+export async function removeSecureStorageValue(key: string): Promise<void> {
+  await invoke('secure_storage_remove', { key });
+}
+
+export interface NativeMediaPickInput {
+  stationPeerId: string;
+  actorPtid: string;
+  sessionId: string;
+  requestId: string;
+  surfaceKind: 'chat_attachment' | 'moment_media' | 'profile_image';
+  capability: 'photo_library' | 'camera' | 'document';
+  deadlineMs: number;
+  acceptedMediaKinds: Array<'image' | 'video' | 'file'>;
+  maxItemCount: number;
+  maxTotalBytes: number;
+}
+
+export interface NativeStagedMediaHandle {
+  handle: string;
+  mediaKind: 'image' | 'video' | 'file';
+  mimeType: string;
+  byteLength: number;
+  sha256Base64: string;
+}
+
+export interface NativeMediaPickProjection {
+  requestId: string;
+  lifecycleGeneration: number;
+  outcome:
+    | 'selected'
+    | 'cancelled'
+    | 'permission_required'
+    | 'expired'
+    | 'failed';
+  items: NativeStagedMediaHandle[];
+  errorCode?: string;
+}
+
+export async function pickNativeMedia(
+  input: NativeMediaPickInput,
+): Promise<NativeMediaPickProjection> {
+  return invoke<NativeMediaPickProjection>('media_pick', { input });
+}
+
+export interface NativeMomentMediaInput {
+  stationPeerId: string;
+  actorPtid: string;
+  deviceId: string;
+  lifecycleGeneration: number;
+  sessionId: string;
+  handle: string;
+}
+
+function stagedMomentMediaCommandInput(input: NativeMomentMediaInput) {
+  return {
+    stationPeerId: input.stationPeerId,
+    actorPtid: input.actorPtid,
+    sessionId: input.sessionId,
+    handle: input.handle,
+  };
+}
+
+export async function uploadNativeMomentMedia(
+  input: NativeMomentMediaInput,
+): Promise<ImageAttachment> {
+  requireMobileMutationAdmission(
+    mobileMutationScopeKey(
+      input.stationPeerId,
+      input.actorPtid,
+      input.deviceId,
+      input.lifecycleGeneration,
+    ),
+    'moments',
+  );
+  const bytes = await invoke<number[]>('moment_media_upload', {
+    input: stagedMomentMediaCommandInput(input),
+  });
+  return fromBinary(ImageAttachmentSchema, Uint8Array.from(bytes));
+}
+
+export async function discardNativeMomentMedia(
+  input: NativeMomentMediaInput,
+): Promise<void> {
+  await invoke('moment_media_discard', {
+    input: stagedMomentMediaCommandInput(input),
+  });
+}
+
+const CROCKFORD_BASE32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+export function createNativeMediaRequestId(): string {
+  const random = globalThis.crypto.getRandomValues(new Uint8Array(10));
+  let time = BigInt(Date.now());
+  let encodedTime = '';
+  for (let index = 0; index < 10; index += 1) {
+    encodedTime = CROCKFORD_BASE32[Number(time & 31n)] + encodedTime;
+    time >>= 5n;
+  }
+  let entropy = 0n;
+  for (const byte of random) entropy = (entropy << 8n) | BigInt(byte);
+  let encodedEntropy = '';
+  for (let index = 0; index < 16; index += 1) {
+    encodedEntropy = CROCKFORD_BASE32[Number(entropy & 31n)] + encodedEntropy;
+    entropy >>= 5n;
+  }
+  return encodedTime + encodedEntropy;
+}
+
+export interface NativeProfileImagePreview {
+  assetUrl: string;
+  accessHandle: string;
+}
+export async function previewNativeProfileImage(input: NativeMomentMediaInput): Promise<NativeProfileImagePreview> {
+  return invoke('profile_image_preview', { input });
+}
+export async function uploadNativeProfileImage(input: NativeMomentMediaInput): Promise<string> {
+  requireMobileMutationAdmission(mobileMutationScopeKey(
+    input.stationPeerId, input.actorPtid, input.deviceId, input.lifecycleGeneration,
+  ), 'profile');
+  return invoke('profile_image_upload', { input });
+}
+export async function discardNativeProfileImage(input: NativeMomentMediaInput): Promise<void> {
+  await invoke('profile_image_discard', { input });
+}
+export async function releaseNativeProfileImagePreview(accessHandle: string): Promise<void> {
+  await invoke('profile_image_preview_release', { accessHandle });
+}
+
+export interface MessagingAccountInput {
+  stationPeerId: string;
+  actorPtid: string;
+}
+
+export interface MessagingMutationScopeInput extends MessagingAccountInput {
+  deviceId: string;
+  lifecycleGeneration: number;
+}
+
+export async function chatStorageSnapshot(
+  input: MessagingAccountInput & {
+    deviceId: string;
+    scopeRevision: string;
+  },
+): Promise<ChatStorageSnapshot> {
+  const request = create(ChatStorageSnapshotRequestSchema, {
+    scope: {
+      stationPeerId: input.stationPeerId,
+      actorPtid: input.actorPtid,
+      deviceId: input.deviceId,
+    },
+    scopeRevision: input.scopeRevision,
+  });
+  const response = await invoke<number[]>('chat_storage_snapshot', {
+    input: {
+      requestBytes: Array.from(toBinary(ChatStorageSnapshotRequestSchema, request)),
+    },
+  });
+  return fromBinary(ChatStorageSnapshotSchema, Uint8Array.from(response));
+}
+
+export async function chatStorageClearCache(
+  input: MessagingAccountInput & {
+    deviceId: string;
+    scopeRevision: string;
+  },
+): Promise<ChatStorageResult> {
+  const request = create(ChatStorageSnapshotRequestSchema, {
+    scope: {
+      stationPeerId: input.stationPeerId,
+      actorPtid: input.actorPtid,
+      deviceId: input.deviceId,
+    },
+    scopeRevision: input.scopeRevision,
+  });
+  const response = await invoke<number[]>('chat_storage_clear_cache', {
+    input: {
+      requestBytes: Array.from(toBinary(ChatStorageSnapshotRequestSchema, request)),
+    },
+  });
+  return fromBinary(ChatStorageResultSchema, Uint8Array.from(response));
+}
+
+export async function chatStorageClearConversation(
+  input: MessagingAccountInput & {
+    deviceId: string;
+    scopeRevision: string;
+    conversationId: string;
+  },
+): Promise<ChatStorageResult> {
+  const request = create(ChatStorageConversationRequestSchema, {
+    scope: {
+      stationPeerId: input.stationPeerId,
+      actorPtid: input.actorPtid,
+      deviceId: input.deviceId,
+    },
+    scopeRevision: input.scopeRevision,
+    conversationId: input.conversationId,
+  });
+  const response = await invoke<number[]>('chat_storage_clear_conversation', {
+    input: {
+      requestBytes: Array.from(toBinary(ChatStorageConversationRequestSchema, request)),
+    },
+  });
+  return fromBinary(ChatStorageResultSchema, Uint8Array.from(response));
+}
+
+export async function chatStorageSetRetention(
+  input: MessagingAccountInput & {
+    deviceId: string;
+    scopeRevision: string;
+    retentionPreset: ChatRetentionPreset;
+  },
+): Promise<ChatStorageResult> {
+  const request = create(ChatStorageRetentionRequestSchema, {
+    scope: {
+      stationPeerId: input.stationPeerId,
+      actorPtid: input.actorPtid,
+      deviceId: input.deviceId,
+    },
+    scopeRevision: input.scopeRevision,
+    retentionPreset: input.retentionPreset,
+  });
+  const response = await invoke<number[]>('chat_storage_set_retention', {
+    input: {
+      requestBytes: Array.from(toBinary(ChatStorageRetentionRequestSchema, request)),
+    },
+  });
+  return fromBinary(ChatStorageResultSchema, Uint8Array.from(response));
+}
+
+export interface MessagingConversationMutationInput extends MessagingMutationScopeInput {
+  admissionDomain?: Extract<MobileMutationDomain, 'social' | 'group'>;
+}
+
+export interface MessagingActivateInput extends MessagingMutationScopeInput {
+  sessionId: string;
+}
+
+export type MessagingIdentityRecoveryInput = MessagingActivateInput;
+
+export interface MessagingRuntimeStatus {
+  active: boolean;
+  profileId?: string;
+  stationPeerId?: string;
+  stationOrigin?: string;
+  actorPtid?: string;
+  deviceId?: string;
+  deviceEnrolled: boolean;
+  laneSequence: number;
+  consumerEpoch: number;
+  conversationCount: number;
+  activationGeneration: number;
+  workerPhase: 'running' | 'suspended' | 'stopping';
+}
+
+export type MobileCallSignalKind =
+  | 'OFFER'
+  | 'ANSWER'
+  | 'CANDIDATE'
+  | 'HANGUP'
+  | 'CALL_REQUEST'
+  | 'CALL_ACCEPT'
+  | 'CALL_REJECT'
+  | 'CALL_END'
+  | 'CALL_NO_ANSWER';
+
+export interface MessagingCallSignalInput extends MessagingAccountInput {
+  peerPtid: string;
+  sessionUlid: string;
+  kind: MobileCallSignalKind;
+}
+
+export interface MessagingConversationProjection {
+  conversationId: string;
+  authorityStationId: string;
+  federationId: string;
+  kind: number;
+  name: string;
+  description?: string;
+  ownerPtid: string;
+  memberPtids: string[];
+  members: MessagingMemberAuthorityMemberProjection[];
+  membershipEpoch: number;
+  mlsEpoch: number;
+  active: boolean;
+  updatedAtUnixMs: number;
+}
+
+export interface MessagingCreateDirectInput extends MessagingMutationScopeInput {
+  peerPtid: string;
+  /**
+   * Deprecated for Direct creation: the Station derives the scope (Local vs
+   * Federation) from the two actors' Home Stations. Retained as optional only
+   * so older acceptance call sites compile during the migration.
+   */
+  federationId?: string;
+}
+
+export interface MessagingCreateDirectResult {
+  conversationId: string;
+  commandId: string;
+  state: 'pending' | 'projected';
+}
+
+export interface MessagingCreateGroupInput extends MessagingMutationScopeInput {
+  conversationId: string;
+  name: string;
+  memberPtids: string[];
+  federationId: string;
+}
+
+export interface MessagingCreateGroupResult {
+  conversationId: string;
+  commandId: string;
+  state: 'pending' | 'projected' | 'failed';
+}
+
+export interface MessagingMembershipTransitionInput extends MessagingMutationScopeInput {
+  conversationId: string;
+  action: 'add_actor' | 'remove_actor' | 'add_device' | 'remove_device';
+  targetPtid: string;
+  targetDeviceId?: string;
+  role?: 'member' | 'admin' | 'owner';
+}
+
+export interface MessagingPendingConversationCommandResult {
+  commandId: string;
+  state: 'pending';
+}
+
+export interface MessagingMemberAuthorityMemberProjection {
+  ptid: string;
+  role: number;
+  homeStationPeerId: string;
+  muted: boolean;
+  mutedUntilUnixMs?: number;
+}
+
+export interface MessagingMemberAuthorityResult {
+  commandId: string;
+  conversationId: string;
+  ownerPtid?: string;
+  members?: MessagingMemberAuthorityMemberProjection[];
+  authoritySequence?: number;
+  authorityHash?: number[];
+  membershipEpoch?: number;
+  mlsEpoch?: number;
+  state: 'pending' | 'projected';
+}
+
+export interface MessagingUpdateMemberAuthorityInput extends MessagingMutationScopeInput {
+  conversationId: string;
+  targetPtid: string;
+  role?: 'member' | 'admin';
+  muted?: boolean;
+  mutedUntilUnixMs?: number;
+}
+
+export interface MessagingTransferOwnershipInput extends MessagingMutationScopeInput {
+  conversationId: string;
+  nextOwnerPtid: string;
+}
+
+export interface MessagingUpdateConversationInput extends MessagingMutationScopeInput {
+  conversationId: string;
+  name?: string;
+  description?: string;
+}
+
+export interface MessagingSubmitLeaveIntentInput extends MessagingMutationScopeInput {
+  conversationId: string;
+}
+
+export interface MessagingLeaveIntentSubmissionResult {
+  intentId: string;
+  state: 'pending';
+}
+
+export interface SocialFriendRequestSendInput extends MessagingMutationScopeInput {
+  receiverPtid: string;
+  receiverHomeStationPeerId: string;
+  federationId: string;
+  message?: string;
+}
+
+export interface SocialFriendRequestDecisionInput extends MessagingMutationScopeInput {
+  requestId: string;
+  senderPtid: string;
+  receiverPtid: string;
+  senderHomeStationPeerId: string;
+  receiverHomeStationPeerId: string;
+  federationId: string;
+}
+
+export interface ReliableFriendRequestResult<Response> {
+  commandId: string;
+  requestId: string;
+  payloadSha256: readonly number[];
+  state: CommandState;
+  response: Response | null;
+  checkpointReady: boolean;
+}
+
+export interface SocialRelationshipMutationInput extends MessagingMutationScopeInput {
+  targetPtid: string;
+  targetHomeStationPeerId: string;
+  observedRevision: number;
+}
+
+export interface ReliableRelationshipResult<Response> {
+  commandId: string;
+  targetPtid: string;
+  payloadSha256: readonly number[];
+  state: CommandState;
+  response: Response | null;
+  checkpointReady: boolean;
+}
+
+export interface MessagingAttachmentProjection {
+  attachmentId: string;
+  filename: string;
+  mimeType: string;
+  plaintextSize: number;
+  objectId?: string;
+  storageRef?: string;
+  ciphertextSize?: number;
+  availabilityState?: 'remote' | 'local';
+  contentKind: number;
+  durationMs: number;
+  voiceNote?: MessagingVoiceNoteMetadata;
+}
+
+export interface MessagingVoiceNoteMetadata {
+  durationMs: number;
+  codec: string;
+  waveform: number[];
+}
+
+export interface MessagingReactionProjection {
+  actorPtid: string;
+  reaction: string;
+  createdAtUnixMs: number;
+}
+
+export interface MessagingMessageProjection {
+  eventId?: string;
+  eventSequence?: number;
+  messageId: string;
+  senderPtid: string;
+  senderDeviceId: string;
+  plaintext: string;
+  attachments: MessagingAttachmentProjection[];
+  state:
+    | 'draft'
+    | 'pending'
+    | 'prepared'
+    | 'retry_wait'
+    | 'submitted'
+    | 'failed'
+    | 'terminal'
+    | 'accepted'
+    | 'delivered'
+    | 'read';
+  timestampUnixMs: number;
+  replyToMessageId?: string;
+  threadRootMessageId?: string;
+  editedText?: string;
+  editedAtUnixMs?: number;
+  retracted: boolean;
+  moderated: boolean;
+  moderationReasonCode?: string;
+  reactions: MessagingReactionProjection[];
+  pinnedByPtid?: string;
+  pinnedAtUnixMs?: number;
+  readByPtids: string[];
+}
+
+export interface MessagingPendingCommandResult {
+  commandId: string;
+  messageId: string;
+  attachmentIds: string[];
+  state: 'pending';
+}
+
+export interface MessagingConversationSummary {
+  lastMessage: MessagingMessageProjection | null;
+  unreadCount: number;
+}
+
+export type MessagingSubmitCommandResult =
+  | MessagingPendingCommandResult
+  | {
+    messageId: string;
+    attachmentIds: string[];
+    state: 'draft';
+  };
+
+export interface MessagingAttachmentStageProjection {
+  stageId: string;
+  filename: string;
+  mimeType: string;
+  plaintextSize: number;
+  contentKind: number;
+  durationMs: number;
+  voiceNote?: MessagingVoiceNoteMetadata;
+  completed: boolean;
+  maxChunkBytes: number;
+}
+
+export interface MessagingCommandStatusProjection {
+  commandId: string;
+  conversationId: string;
+  state:
+    | 'pending'
+    | 'retry_wait'
+    | 'submitted'
+    | 'failed'
+    | 'superseded'
+    | 'committed';
+  lastErrorCode: string;
+}
+
+export type MessagingMetadataInteraction =
+  | { kind: 'retract' }
+  | { kind: 'hideForActor' }
+  | { kind: 'moderate'; reasonCode: string }
+  | { kind: 'reaction'; reaction: string; remove: boolean }
+  | { kind: 'pin'; remove: boolean };
+
+export interface MessagingReconcileResult {
+  deviceEnrolled: boolean;
+  processed: number;
+  cursor: number;
+  laneHead: number;
+  consumerEpoch: number;
+  deliveryReceiptSubmitted: boolean;
+  commandState:
+    | 'idle'
+    | 'submitted'
+    | 'retry_scheduled'
+    | 'failed'
+    | 'stale_delivery_plan'
+    | 'stale_authority_plan';
+  commandId?: string;
+  nextAttemptAtUnixMs?: number;
+}
+
+export async function messagingActivate(
+  input: MessagingActivateInput,
+): Promise<MessagingRuntimeStatus> {
+  return invoke<MessagingRuntimeStatus>('messaging_activate', { input });
+}
+
+export async function messagingStatus(): Promise<MessagingRuntimeStatus> {
+  return invoke<MessagingRuntimeStatus>('messaging_status');
+}
+
+export interface MessagingRecoveryPreflightResult {
+  recoveryAvailable: boolean;
+}
+
+export async function messagingRecoveryPreflight(
+  input: MessagingIdentityRecoveryInput,
+): Promise<MessagingRecoveryPreflightResult> {
+  return invoke<MessagingRecoveryPreflightResult>(
+    'messaging_recovery_preflight',
+    { input },
+  );
+}
+
+export async function messagingRecoverIdentity(
+  input: MessagingIdentityRecoveryInput,
+): Promise<MessagingRuntimeStatus> {
+  return invoke<MessagingRuntimeStatus>(
+    'messaging_recover_identity_with_native_input',
+    { input },
+  );
+}
+
+export async function messagingCallSignalSeal(
+  input: MessagingCallSignalInput & { plaintext: string },
+): Promise<string> {
+  const result = await invoke<{ payloadBase64: string }>(
+    'messaging_call_signal_seal',
+    { input },
+  );
+  return result.payloadBase64;
+}
+
+export async function messagingCallSignalOpen(
+  input: MessagingCallSignalInput & { payload: number[] },
+): Promise<string> {
+  const result = await invoke<{ plaintext: string }>(
+    'messaging_call_signal_open',
+    { input },
+  );
+  return result.plaintext;
+}
+
+export type PrivateSocialActivationInput = MessagingMutationScopeInput;
+
+export interface PrivateSocialAccountInput extends MessagingMutationScopeInput {
+  activationGeneration: number;
+}
+
+export interface PrivateSocialNativeRecoveryInput extends PrivateSocialAccountInput {
+  postId: string;
+  recoveryEpoch?: number;
+}
+
+export type PrivateSocialAudience =
+  | { kind: 'FOLLOWERS' | 'FRIENDS' | 'SELF' }
+  | { kind: 'CIRCLE'; circleId: string }
+  | { kind: 'GROUP'; groupConversationId: string }
+  | { kind: 'CUSTOM_ALLOW'; actorPtids: string[] }
+  | {
+    kind: 'CUSTOM_DENY';
+    actorPtids: string[];
+    baseKind: 'FOLLOWERS' | 'PUBLIC';
+  };
+
+export interface PrivateSocialTextIntent {
+  draftId: string;
+  draftRevision: number;
+  text: string;
+  audience: PrivateSocialAudience;
+}
+
+export type PrivateMomentKind =
+  | 'TEXT'
+  | 'IMAGE'
+  | 'VIDEO'
+  | 'LINK'
+  | 'REPOST'
+  | 'LOCATION';
+
+export interface PrivateMomentMention {
+  actorPtid: string;
+  offset: number;
+  length: number;
+  display: string;
+}
+
+export interface PrivateMomentFileIntent {
+  handle: string;
+  attachmentId: string;
+  width?: number;
+  height?: number;
+  durationMs?: number;
+  altText?: string;
+}
+
+export interface PrivateSocialMomentIntent extends PrivateSocialTextIntent {
+  momentKind?: PrivateMomentKind;
+  mentions?: PrivateMomentMention[];
+  files?: PrivateMomentFileIntent[];
+  link?: {
+    url: string;
+    title: string;
+    description?: string;
+    imageUrl?: string;
+    siteName?: string;
+    faviconUrl?: string;
+  };
+  location?: {
+    name: string;
+    latitude: number;
+    longitude: number;
+    address?: string;
+    placeId?: string;
+  };
+  poll?: {
+    question: string;
+    options: string[];
+    minChoices: number;
+    maxChoices: number;
+    expiresAtSeconds: number;
+  };
+  repost?: { sourcePostId: string };
+}
+
+export type PrivateSocialPublishState =
+  | 'PREPARING'
+  | 'READY_PRIVATE'
+  | 'PUBLISHING'
+  | 'UNKNOWN_OUTCOME'
+  | 'PUBLISHED'
+  | 'PUBLISH_FAILED';
+
+export interface PrivateMomentProjection {
+  draftId: string;
+  draftRevision: number;
+  contentId: string;
+  generation: number;
+  audienceKind: PrivateSocialAudience['kind'];
+  state: PrivateSocialPublishState;
+  postId?: string;
+  text?: string;
+  errorCode?: number;
+}
+
+export type PrivateSocialReadState =
+  | 'RECOVERY_REQUIRED'
+  | 'RECOVERY_KEY_UNAVAILABLE'
+  | 'CONTENT_READY'
+  | 'AUTHENTICATION_REQUIRED'
+  | 'NOT_FOUND_OR_NOT_AUTHORIZED'
+  | 'INTEGRITY_FAILURE'
+  | 'DELETED_OR_REVOKED';
+
+export type PrivateMediaState =
+  | 'MEDIA_PLACEHOLDER'
+  | 'MEDIA_GRANT_PENDING'
+  | 'MEDIA_DOWNLOADING'
+  | 'MEDIA_DECRYPTING'
+  | 'MEDIA_READY'
+  | 'MEDIA_ACCESS_DENIED'
+  | 'MEDIA_INTEGRITY_FAILURE'
+  | 'MEDIA_OFFLINE_RETRYABLE';
+
+export interface PrivateMomentMediaProjection {
+  attachmentId: string;
+  objectId: string;
+  state: PrivateMediaState;
+  mimeType: string;
+  width: number;
+  height: number;
+  durationMs: number;
+  altText: string;
+  plaintextSha256?: string;
+  plaintextSize?: number;
+  localPath?: string;
+  errorCode?: string;
+}
+
+export type PrivateMomentReadContent =
+  | { kind: 'TEXT'; text: string }
+  | { kind: 'IMAGE'; text: string; media: PrivateMomentMediaProjection[] }
+  | { kind: 'VIDEO'; text: string; media: PrivateMomentMediaProjection[] }
+  | { kind: 'LINK'; text: string; url: string; title: string }
+  | {
+    kind: 'REPOST';
+    comment: string;
+    sourcePostId: string;
+    sourceAuthorPtid: string;
+    sourceKind: string;
+    sourceText: string;
+  }
+  | {
+    kind: 'LOCATION';
+    text: string;
+    name: string;
+    latitude: string;
+    longitude: string;
+    address: string;
+    media: PrivateMomentMediaProjection[];
+  };
+
+
+export type PrivateSocialReceiverAudience =
+  | 'FRIENDS'
+  | 'FOLLOWERS'
+  | 'CIRCLE'
+  | 'GROUP'
+  | 'SELF'
+  | 'CUSTOM_ALLOW'
+  | 'CUSTOM_DENY';
+
+export interface PrivateMomentReadProjection {
+  postId: string;
+  contentId: string;
+  generation: string;
+  authorPtid: string;
+  audienceKind: PrivateSocialReceiverAudience | 'UNKNOWN';
+  state: PrivateSocialReadState;
+  mentions?: PrivateMomentMention[];
+  reactions?: PrivateReactionSummaryProjection[];
+  reactionRevision?: string;
+  reactionsHydrated?: boolean;
+  content?: PrivateMomentReadContent;
+  errorCode?: string;
+  retryAfterSeconds?: number;
+  createdAtMillis?: number;
+  updatedAtMillis?: number;
+}
+
+export interface PrivateReactionSummaryProjection {
+  kind: number;
+  count: string;
+  reactedByViewer: boolean;
+}
+
+export type PrivateReactionCommandState =
+  | 'REACTION_PENDING'
+  | 'REACTION_RETRYING'
+  | 'REACTION_UNKNOWN_OUTCOME'
+  | 'REACTION_COMMITTED'
+  | 'REACTION_REJECTED';
+
+export interface PrivateReactionCommandProjection {
+  commandId: string;
+  postId: string;
+  commentId: string;
+  kind: number;
+  operation: 'REACT' | 'UNREACT';
+  state: PrivateReactionCommandState;
+  attemptCount: number;
+  projectionRevision: string;
+  errorCode?: string;
+  retryAfterSeconds?: number;
+  retryNotBeforeUnixMs?: number;
+}
+
+export interface PrivateReactionMutationResult {
+  command: PrivateReactionCommandProjection;
+  reactions: PrivateReactionSummaryProjection[];
+  projectionRevision: string;
+  exactReplay: boolean;
+}
+
+export type PrivateCommentState =
+  | 'COMMENT_EDITING'
+  | 'COMMENT_ENCRYPTING'
+  | 'COMMENT_SUBMITTING'
+  | 'COMMENT_POSTED'
+  | 'COMMENT_FAILED'
+  | 'COMMENT_RATE_LIMITED'
+  | 'COMMENT_PARENT_UNAVAILABLE';
+
+export interface PrivateCommentIntent {
+  draftId: string;
+  draftRevision: number;
+  postId: string;
+  replyToCommentId?: string;
+  text: string;
+  mentions?: PrivateMomentMention[];
+}
+
+export interface PrivateCommentDraftProjection extends PrivateCommentIntent {
+  replyToCommentId: string;
+  mentions: PrivateMomentMention[];
+  state: PrivateCommentState;
+  commentId?: string;
+  errorCode?: string;
+  retryAfterSeconds?: number;
+}
+
+export interface PrivateCommentProjection {
+  commentId: string;
+  contentId: string;
+  generation: string;
+  postId: string;
+  replyToCommentId: string;
+  authorPtid: string;
+  state: 'COMMENT_POSTED';
+  text?: string;
+  mentions: PrivateMomentMention[];
+  reactionsCount: number;
+  reactions?: PrivateReactionSummaryProjection[];
+  reactionRevision?: string;
+  reactionsHydrated?: boolean;
+  repliesCount: number;
+  createdAtMillis?: number;
+  updatedAtMillis?: number;
+}
+
+export interface PrivateCommentSubmitResult {
+  draft: PrivateCommentDraftProjection;
+  comment?: PrivateCommentProjection;
+}
+
+export interface PrivateCommentPage {
+  postId: string;
+  comments: PrivateCommentProjection[];
+  nextCursor: string;
+  hasMore: boolean;
+}
+
+export interface PrivateSocialNativeSnapshot {
+  publishProjections: PrivateMomentProjection[];
+  readProjections: PrivateMomentReadProjection[];
+  commentDrafts: PrivateCommentDraftProjection[];
+  comments: PrivateCommentProjection[];
+  reactionCommands: PrivateReactionCommandProjection[];
+}
+
+export interface PrivateSocialRuntimeStatus {
+  active: boolean;
+  profileId?: string;
+  stationPeerId?: string;
+  actorPtid?: string;
+  deviceId?: string;
+  activationGeneration: number;
+  reconciliationMode: 'on_demand';
+}
+
+export interface PrivateSocialReconciliationReport {
+  endpointPrekeysAvailable: number;
+  recoveryPrekeysAvailable: number | null;
+  submissionsProcessed: number;
+  submissionsUnknown: number;
+  submissionsTerminal: number;
+}
+
+export type PrivateSocialInvalidationReason =
+  | 'RESOURCE_DELETED'
+  | 'RELATIONSHIP_REVOKED'
+  | 'RECIPIENT_BLOCKED'
+  | 'DEVICE_REVOKED';
+
+export type PrivateSocialInvalidation =
+  | {
+      reason: 'RESOURCE_DELETED';
+      sourceCursor: string;
+      postId: string;
+    }
+  | {
+      reason: 'RELATIONSHIP_REVOKED' | 'RECIPIENT_BLOCKED';
+      sourceCursor: string;
+      authorPtid: string;
+    }
+  | {
+      reason: 'DEVICE_REVOKED';
+      sourceCursor: string;
+      entireScope: true;
+    };
+
+export interface PrivateSocialReconcileResult extends PrivateSocialReconciliationReport {
+  invalidatedReadProjections: PrivateMomentReadProjection[];
+}
+
+export async function privateSocialActivate(
+  input: PrivateSocialActivationInput,
+): Promise<PrivateSocialRuntimeStatus> {
+  return invoke<PrivateSocialRuntimeStatus>('social_private_activate', { input });
+}
+
+export async function privateSocialStatus(): Promise<PrivateSocialRuntimeStatus> {
+  return invoke<PrivateSocialRuntimeStatus>('social_private_status');
+}
+
+export async function privateSocialPrepareText(
+  input: PrivateSocialAccountInput & PrivateSocialTextIntent,
+): Promise<PrivateMomentProjection> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateMomentProjection>('social_private_prepare_text', { input });
+}
+
+export async function privateSocialSubmitText(
+  input: PrivateSocialAccountInput & {
+    draftId: string;
+    draftRevision: number;
+  },
+): Promise<PrivateMomentProjection> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateMomentProjection>('social_private_submit_text', { input });
+}
+
+export async function privateSocialPublish(
+  input: PrivateSocialAccountInput & PrivateSocialMomentIntent,
+): Promise<PrivateMomentProjection> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateMomentProjection>('social_private_publish', { input });
+}
+
+export async function privateSocialReadText(
+  input: PrivateSocialAccountInput & { postId: string },
+): Promise<PrivateMomentReadProjection> {
+  return invoke<PrivateMomentReadProjection>('social_private_read_text', { input });
+}
+
+export async function privateSocialRead(
+  input: PrivateSocialAccountInput & { postId: string },
+): Promise<PrivateMomentReadProjection> {
+  return invoke<PrivateMomentReadProjection>('social_private_read', { input });
+}
+
+export async function privateSocialOpenMedia(
+  input: PrivateSocialAccountInput & { postId: string; objectId: string },
+): Promise<PrivateMomentReadProjection> {
+  return invoke<PrivateMomentReadProjection>('social_private_open_media', { input });
+}
+
+export async function privateSocialRecoverWithNativeInput(
+  input: PrivateSocialNativeRecoveryInput,
+): Promise<PrivateMomentReadProjection> {
+  return invoke<PrivateMomentReadProjection>(
+    'social_private_recover_with_native_input',
+    { input },
+  );
+}
+
+export async function privateSocialCommentSubmit(
+  input: PrivateSocialAccountInput & PrivateCommentIntent,
+): Promise<PrivateCommentSubmitResult> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateCommentSubmitResult>('social_private_comment_submit', { input });
+}
+
+export async function privateSocialComments(
+  input: PrivateSocialAccountInput & {
+    postId: string;
+    cursor?: string;
+    limit?: number;
+    anchorCommentId?: string;
+  },
+): Promise<PrivateCommentPage> {
+  return invoke<PrivateCommentPage>('social_private_comments', { input });
+}
+
+export async function privateSocialReact(
+  input: PrivateSocialAccountInput & { postId: string; commentId?: string; kind: number },
+): Promise<PrivateReactionMutationResult> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateReactionMutationResult>('social_private_react', {
+    input: {
+      ...privateSocialReactionScope(input),
+      postId: input.postId,
+      commentId: input.commentId ?? '',
+      kind: input.kind,
+    },
+  });
+}
+
+export async function privateSocialUnreact(
+  input: PrivateSocialAccountInput & { postId: string; commentId?: string; kind: number },
+): Promise<PrivateReactionMutationResult> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateReactionMutationResult>('social_private_unreact', {
+    input: {
+      ...privateSocialReactionScope(input),
+      postId: input.postId,
+      commentId: input.commentId ?? '',
+      kind: input.kind,
+    },
+  });
+}
+
+export async function privateSocialReactionRetry(
+  input: PrivateSocialAccountInput & { commandId: string },
+): Promise<PrivateReactionMutationResult> {
+  requirePrivateSocialMutation(input);
+  return invoke<PrivateReactionMutationResult>('social_private_reaction_retry', {
+    input: {
+      ...privateSocialReactionScope(input),
+      commandId: input.commandId,
+    },
+  });
+}
+
+function privateSocialReactionScope(input: PrivateSocialAccountInput) {
+  return {
+    stationPeerId: input.stationPeerId,
+    actorPtid: input.actorPtid,
+    activationGeneration: input.activationGeneration,
+  };
+}
+
+export async function privateSocialReconcile(
+  input: PrivateSocialAccountInput & {
+    invalidations?: readonly PrivateSocialInvalidation[];
+  },
+): Promise<PrivateSocialReconcileResult> {
+  return invoke<PrivateSocialReconcileResult>('social_private_reconcile', { input });
+}
+
+export async function privateSocialSnapshot(
+  input: PrivateSocialAccountInput,
+): Promise<PrivateSocialNativeSnapshot> {
+  return invoke<PrivateSocialNativeSnapshot>('social_private_snapshot', { input });
+}
+
+export async function privateSocialTeardown(
+  input: PrivateSocialAccountInput,
+): Promise<PrivateSocialRuntimeStatus> {
+  return invoke<PrivateSocialRuntimeStatus>('social_private_teardown', { input });
+}
+
+export async function socialFriendRequestSend(
+  input: SocialFriendRequestSendInput,
+): Promise<ReliableFriendRequestResult<SendSocialFriendRequestResponse>> {
+  requireMessagingMutation(input, 'social');
+  const projection = await invoke<FriendRequestCommandProjection>(
+    'social_friend_request_send',
+    { input },
+  );
+  notifyFriendRequestRecoveryIfNeeded(projection);
+  return decodeReliableFriendRequestResult(
+    projection,
+    SendSocialFriendRequestResponseSchema,
+  );
+}
+
+export async function socialFriendRequestAccept(
+  input: SocialFriendRequestDecisionInput,
+): Promise<ReliableFriendRequestResult<AcceptSocialFriendRequestResponse>> {
+  requireMessagingMutation(input, 'social');
+  const projection = await invoke<FriendRequestCommandProjection>(
+    'social_friend_request_accept',
+    { input },
+  );
+  notifyFriendRequestRecoveryIfNeeded(projection);
+  return decodeReliableFriendRequestResult(
+    projection,
+    AcceptSocialFriendRequestResponseSchema,
+  );
+}
+
+export async function socialFriendRequestReject(
+  input: SocialFriendRequestDecisionInput,
+): Promise<ReliableFriendRequestResult<RejectSocialFriendRequestResponse>> {
+  requireMessagingMutation(input, 'social');
+  const projection = await invoke<FriendRequestCommandProjection>(
+    'social_friend_request_reject',
+    { input },
+  );
+  notifyFriendRequestRecoveryIfNeeded(projection);
+  return decodeReliableFriendRequestResult(
+    projection,
+    RejectSocialFriendRequestResponseSchema,
+  );
+}
+
+function notifyFriendRequestRecoveryIfNeeded(
+  projection: FriendRequestCommandProjection,
+): void {
+  if (!projection.checkpointReady) notifyReliabilityCommandChanged();
+}
+
+function decodeReliableFriendRequestResult<Desc extends DescMessage>(
+  projection: FriendRequestCommandProjection,
+  schema: Desc,
+): ReliableFriendRequestResult<MessageShape<Desc>> {
+  return {
+    commandId: projection.commandId,
+    requestId: projection.requestId,
+    payloadSha256: projection.payloadSha256,
+    state: projection.state,
+    response: projection.responseBytes
+      ? fromBinary(schema, Uint8Array.from(projection.responseBytes))
+      : null,
+    checkpointReady: projection.checkpointReady,
+  };
+}
+
+export async function socialRelationshipBlock(
+  input: SocialRelationshipMutationInput,
+): Promise<ReliableRelationshipResult<BlockSocialActorResponse>> {
+  requireMessagingMutation(input, 'social');
+  const projection = await invoke<SocialRelationshipCommandProjection>(
+    'social_relationship_block',
+    { input },
+  );
+  notifyReliabilityCommandChanged();
+  return decodeReliableRelationshipResult(
+    projection,
+    BlockSocialActorResponseSchema,
+  );
+}
+
+export async function socialRelationshipUnblock(
+  input: SocialRelationshipMutationInput,
+): Promise<ReliableRelationshipResult<UnblockSocialActorResponse>> {
+  requireMessagingMutation(input, 'social');
+  const projection = await invoke<SocialRelationshipCommandProjection>(
+    'social_relationship_unblock',
+    { input },
+  );
+  notifyReliabilityCommandChanged();
+  return decodeReliableRelationshipResult(
+    projection,
+    UnblockSocialActorResponseSchema,
+  );
+}
+
+function decodeReliableRelationshipResult<Desc extends DescMessage>(
+  projection: SocialRelationshipCommandProjection,
+  schema: Desc,
+): ReliableRelationshipResult<MessageShape<Desc>> {
+  return {
+    commandId: projection.commandId,
+    targetPtid: projection.targetPtid,
+    payloadSha256: projection.payloadSha256,
+    state: projection.state,
+    response: projection.responseBytes
+      ? fromBinary(schema, Uint8Array.from(projection.responseBytes))
+      : null,
+    checkpointReady: projection.checkpointReady,
+  };
+}
+
+export async function messagingCreateDirect(
+  input: MessagingCreateDirectInput,
+): Promise<MessagingCreateDirectResult> {
+  requireMessagingMutation(input, 'social');
+  // Scope (Local vs Federation) is derived server-side from the two actors'
+  // Home Stations, so federationId is intentionally omitted. The account
+  // mutation scope is still required by the Tauri command to route the command
+  // to the active account-scoped engine.
+  return invoke<MessagingCreateDirectResult>('messaging_create_direct', {
+    input: {
+      stationPeerId: input.stationPeerId,
+      actorPtid: input.actorPtid,
+      deviceId: input.deviceId,
+      lifecycleGeneration: input.lifecycleGeneration,
+      peerPtid: input.peerPtid,
+    },
+  });
+}
+
+export async function messagingCreateGroup(
+  input: MessagingCreateGroupInput,
+): Promise<MessagingCreateGroupResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingCreateGroupResult>('messaging_create_group', { input });
+}
+
+export async function messagingMembershipTransition(
+  input: MessagingMembershipTransitionInput,
+): Promise<MessagingPendingConversationCommandResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingPendingConversationCommandResult>(
+    'messaging_membership_transition',
+    { input },
+  );
+}
+
+export async function messagingUpdateConversation(
+  input: MessagingUpdateConversationInput,
+): Promise<MessagingPendingConversationCommandResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingPendingConversationCommandResult>(
+    'messaging_update_conversation',
+    { input },
+  );
+}
+
+export async function messagingDissolveConversation(
+  input: MessagingMutationScopeInput & { conversationId: string },
+): Promise<MessagingPendingConversationCommandResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingPendingConversationCommandResult>(
+    'messaging_dissolve_conversation',
+    { input },
+  );
+}
+
+export async function messagingUpdateMemberAuthority(
+  input: MessagingUpdateMemberAuthorityInput,
+): Promise<MessagingMemberAuthorityResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingMemberAuthorityResult>(
+    'messaging_update_member_authority',
+    { input },
+  );
+}
+
+export async function messagingTransferOwnership(
+  input: MessagingTransferOwnershipInput,
+): Promise<MessagingMemberAuthorityResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingMemberAuthorityResult>(
+    'messaging_transfer_ownership',
+    { input },
+  );
+}
+
+export async function messagingSubmitLeaveIntent(
+  input: MessagingSubmitLeaveIntentInput,
+): Promise<MessagingLeaveIntentSubmissionResult> {
+  requireMessagingMutation(input, 'group');
+  return invoke<MessagingLeaveIntentSubmissionResult>(
+    'messaging_submit_leave_intent',
+    { input },
+  );
+}
+
+export async function messagingListConversations(
+  input: MessagingAccountInput,
+): Promise<MessagingConversationProjection[]> {
+  return invoke<MessagingConversationProjection[]>('messaging_list_conversations', { input });
+}
+
+export async function messagingListMessages(
+  input: MessagingAccountInput & { conversationId: string },
+): Promise<MessagingMessageProjection[]> {
+  return invoke<MessagingMessageProjection[]>('messaging_list_messages', { input });
+}
+
+export async function messagingConversationSummary(
+  input: MessagingAccountInput & { conversationId: string },
+): Promise<MessagingConversationSummary> {
+  return invoke<MessagingConversationSummary>('messaging_conversation_summary', { input });
+}
+
+export async function messagingListThreadMessages(
+  input: MessagingAccountInput & { conversationId: string; threadRootMessageId: string },
+): Promise<MessagingMessageProjection[]> {
+  return invoke<MessagingMessageProjection[]>('messaging_list_thread_messages', { input });
+}
+
+export async function messagingStageAttachment(
+  input: MessagingAccountInput & {
+    conversationId: string;
+    file: File;
+    voiceNote?: MessagingVoiceNoteMetadata;
+  },
+): Promise<MessagingAttachmentStageProjection> {
+  const stage = await invoke<MessagingAttachmentStageProjection>(
+    'messaging_attachment_stage_begin',
+    {
+      input: {
+        stationPeerId: input.stationPeerId,
+        actorPtid: input.actorPtid,
+        conversationId: input.conversationId,
+        filename: input.file.name,
+        mimeType: input.file.type || 'application/octet-stream',
+        plaintextSize: input.file.size,
+        voiceNote: input.voiceNote,
+      },
+    },
+  );
+  try {
+    let offset = 0;
+    while (offset < input.file.size) {
+      const end = Math.min(offset + stage.maxChunkBytes, input.file.size);
+      const bytes = Array.from(new Uint8Array(await input.file.slice(offset, end).arrayBuffer()));
+      await invoke<MessagingAttachmentStageProjection>('messaging_attachment_stage_write', {
+        input: {
+          stationPeerId: input.stationPeerId,
+          actorPtid: input.actorPtid,
+          stageId: stage.stageId,
+          offset,
+          bytes,
+        },
+      });
+      offset = end;
+    }
+    return await invoke<MessagingAttachmentStageProjection>('messaging_attachment_stage_complete', {
+      input: {
+        stationPeerId: input.stationPeerId,
+        actorPtid: input.actorPtid,
+        stageId: stage.stageId,
+      },
+    });
+  } catch (error) {
+    await messagingDiscardAttachmentStage({
+      stationPeerId: input.stationPeerId,
+      actorPtid: input.actorPtid,
+      stageId: stage.stageId,
+    });
+    throw error;
+  }
+}
+
+export async function messagingDiscardAttachmentStage(
+  input: MessagingAccountInput & { stageId: string },
+): Promise<void> {
+  await invoke('messaging_attachment_stage_discard', { input });
+}
+
+export async function messagingRestoreAttachmentStage(
+  input: MessagingAccountInput & { stageId: string },
+): Promise<{
+  stage: MessagingAttachmentStageProjection;
+  assetUrl: string;
+  accessHandle: string;
+}> {
+  return invoke('messaging_attachment_stage_restore', { input });
+}
+
+export async function messagingRecoverAttachmentComposer(
+  input: MessagingAccountInput & { conversationId: string; stageIds: readonly string[] },
+): Promise<{
+  stages: MessagingAttachmentStageProjection[];
+  adoptedMessage: {
+    messageId: string;
+    plaintext: string;
+    replyToMessageId: string;
+    threadRootMessageId: string;
+    attachmentIds: string[];
+  } | null;
+}> {
+  return invoke('messaging_attachment_composer_recover', { input });
+}
+
+export async function messagingReleaseAttachmentStagePreview(
+  input: MessagingAccountInput & { handle: string },
+): Promise<void> {
+  await invoke('messaging_attachment_stage_preview_release', { input });
+}
+
+export async function messagingSendMessage(
+  input: MessagingConversationMutationInput & {
+    conversationId: string;
+    plaintext: string;
+    replyToMessageId?: string;
+    threadRootMessageId?: string;
+    attachmentStageIds?: string[];
+  },
+): Promise<MessagingSubmitCommandResult> {
+  requireMessagingMutation(input, input.admissionDomain);
+  const { admissionDomain: _admissionDomain, ...commandInput } = input;
+  return invoke<MessagingSubmitCommandResult>(
+    'messaging_send_message',
+    { input: commandInput },
+  );
+}
+
+export async function messagingForwardMessage(
+  input: MessagingConversationMutationInput & {
+    sourceConversationId: string;
+    sourceMessageId: string;
+    destinationConversationId: string;
+  },
+): Promise<MessagingSubmitCommandResult> {
+  requireMessagingMutation(input, input.admissionDomain);
+  const { admissionDomain: _admissionDomain, ...commandInput } = input;
+  return invoke<MessagingSubmitCommandResult>(
+    'messaging_forward_message',
+    { input: commandInput },
+  );
+}
+
+export async function messagingAttachmentAccess(
+  input: MessagingAccountInput & { attachmentId: string },
+): Promise<AttachmentAccessProjection> {
+  const bytes = await invoke<number[]>('messaging_attachment_access', { input: { ...input, startDownload: true } });
+  return fromBinary(AttachmentAccessProjectionSchema, new Uint8Array(bytes));
+}
+
+export async function messagingCancelAttachment(
+  input: MessagingAccountInput & { attachmentId: string },
+): Promise<void> {
+  await invoke('messaging_cancel_attachment', { input });
+}
+
+export async function messagingSubmitEdit(
+  input: MessagingConversationMutationInput & {
+    conversationId: string;
+    messageId: string;
+    plaintext: string;
+  },
+): Promise<MessagingPendingCommandResult> {
+  requireMessagingMutation(input, input.admissionDomain);
+  const { admissionDomain: _admissionDomain, ...commandInput } = input;
+  return invoke<MessagingPendingCommandResult>(
+    'messaging_submit_edit',
+    { input: commandInput },
+  );
+}
+
+export async function messagingSubmitMetadataInteraction(
+  input: MessagingConversationMutationInput & {
+    conversationId: string;
+    messageId: string;
+    interaction: MessagingMetadataInteraction;
+  },
+): Promise<MessagingPendingCommandResult> {
+  requireMessagingMutation(input, input.admissionDomain);
+  const { admissionDomain: _admissionDomain, ...commandInput } = input;
+  return invoke<MessagingPendingCommandResult>(
+    'messaging_submit_metadata_interaction',
+    { input: commandInput },
+  );
+}
+
+export async function messagingSubmitReadCursor(
+  input: MessagingConversationMutationInput & {
+    conversationId: string;
+    lastReadSequence: number;
+  },
+): Promise<{ submitted: boolean }> {
+  requireMessagingMutation(input, input.admissionDomain);
+  const { admissionDomain: _admissionDomain, ...commandInput } = input;
+  return invoke<{ submitted: boolean }>(
+    'messaging_submit_read_cursor',
+    { input: commandInput },
+  );
+}
+
+export async function messagingSubmitTyping(
+  input: MessagingConversationMutationInput & {
+    conversationId: string;
+    isTyping: boolean;
+  },
+): Promise<{ submitted: boolean }> {
+  requireMessagingMutation(input, input.admissionDomain);
+  const { admissionDomain: _admissionDomain, ...commandInput } = input;
+  return invoke<{ submitted: boolean }>(
+    'messaging_submit_typing',
+    { input: commandInput },
+  );
+}
+
+function requireMessagingMutation(
+  input: MessagingMutationScopeInput,
+  domain?: MobileMutationDomain,
+): void {
+  requireMobileMutationAdmission(
+    mobileMutationScopeKey(
+      input.stationPeerId,
+      input.actorPtid,
+      input.deviceId,
+      input.lifecycleGeneration,
+    ),
+    domain,
+  );
+}
+
+function requirePrivateSocialMutation(input: PrivateSocialAccountInput): void {
+  requireMessagingMutation(input, 'social');
+}
+
+export async function messagingCommandStatus(
+  input: MessagingAccountInput & { commandId: string },
+): Promise<MessagingCommandStatusProjection> {
+  return invoke<MessagingCommandStatusProjection>('messaging_command_status', { input });
+}
+
+export async function messagingReconcile(
+  input: MessagingAccountInput,
+): Promise<MessagingReconcileResult> {
+  return invoke<MessagingReconcileResult>('messaging_reconcile', { input });
+}
+
+export async function messagingDeactivate(
+  input: MessagingAccountInput,
+): Promise<MessagingRuntimeStatus> {
+  return invoke<MessagingRuntimeStatus>('messaging_deactivate', { input });
+}
+
+export interface VerifiedStationIdentity {
+  stationPeerId: string;
+  nodePeerId: string;
+  authorizationEpoch: number;
+  canonicalOrigin: string;
+  capabilities: string[];
+  verifiedAt: number;
+  routeId?: string;
+  routeType?: StationRouteType;
+}
+
+export type StationRouteType = 'direct' | 'relay';
+
+export interface NativeStationRouteCandidate {
+  stationPeerId: string;
+  nodePeerId: string;
+  stationRootPublicKey: number[];
+  nodeAuthorizationDigest: number[];
+  authorizationEpoch: number;
+  routeId: string;
+  routeType: StationRouteType;
+  transport: 'libp2p_http_v1';
+  endpointOrigin: string;
+  relayPeerId?: string;
+  routeGeneration: number;
+  innerTlsSpkiSha256?: number[];
+  addresses: string[];
+  attestationBytes?: number[];
+  attestationExpiresAtUnixMs?: number;
+  sourceRef: string;
+}
+
+export interface StationEndpointDiscovery {
+  role: 'direct_station' | 'relay';
+  endpointPeerId: string;
+  canonicalOrigin: string;
+  routes: NativeStationRouteCandidate[];
+}
+
+export interface StationRouteBindingProjection {
+  stationPeerId: string;
+  routeId: string;
+  routeType: StationRouteType;
+  endpointOrigin: string;
+  relayPeerId?: string;
+  routeGeneration: number;
+  routeRevision: number;
+  transportOrigin: string;
+}
+
+export interface StationRouteRefreshProjection {
+  binding: StationRouteBindingProjection;
+  route: NativeStationRouteCandidate;
+}
+
+export type XConfigFreshness = 'current' | 'stale' | 'embedded' | 'unavailable';
+
+export interface XConfigSuggestion {
+  seedId: string;
+  kind: 'relay' | 'direct_station';
+  displayName: string;
+  canonicalOrigin: string;
+  regions: string[];
+  freshness: Exclude<XConfigFreshness, 'unavailable'>;
+  actionable: boolean;
+  sourceSequence: number;
+}
+
+export interface XConfigRelease {
+  releaseId: string;
+  version: string;
+  manifestUrl: string;
+  manifestSha256Hex: string;
+  releaseSigningKeyId: string;
+  releaseNotesUrl: string;
+}
+
+export interface XConfigProjection {
+  channel: string;
+  sequence?: number;
+  expiresAtUnixMs?: number;
+  freshness: XConfigFreshness;
+  suggestions: XConfigSuggestion[];
+  release?: XConfigRelease;
+  refreshing: boolean;
+  activeOrigin?: string;
+  lastRefreshAttemptAtUnixMs?: number;
+  nextRefreshAtUnixMs?: number;
+  lastRefreshError?: string;
+}
+
+export async function discoverStationEndpoint(
+  input: string,
+): Promise<StationEndpointDiscovery> {
+  return invoke<StationEndpointDiscovery>('station_endpoint_discover', { input });
+}
+
+export async function activateStationRouteBinding(input: {
+  stationPeerId: string;
+  routeId: string;
+  routeRevision: number;
+}): Promise<StationRouteBindingProjection> {
+  return invoke<StationRouteBindingProjection>('station_route_activate', { input });
+}
+
+export async function restoreStationRouteBinding(input: {
+  stationPeerId: string;
+  routeId: string;
+  routeGeneration: number;
+  routeRevision: number;
+  sourceRef: string;
+  endpointOrigin: string;
+}): Promise<StationRouteRefreshProjection> {
+  return invoke<StationRouteRefreshProjection>('station_route_restore', { input });
+}
+
+export async function removeStationRouteBinding(input: {
+  stationPeerId: string;
+  routeId: string;
+  sourceRef: string;
+}): Promise<void> {
+  await invoke<void>('station_route_remove', { input });
+}
+
+export async function readStationRouteBinding(): Promise<StationRouteBindingProjection | null> {
+  return invoke<StationRouteBindingProjection | null>('station_route_snapshot');
+}
+
+export async function refreshStationRouteBinding(input: {
+  stationPeerId: string;
+  routeId: string;
+  routeRevision: number;
+}): Promise<StationRouteRefreshProjection> {
+  return invoke('station_route_refresh', { input });
+}
+
+export async function fetchActiveStationIdentity(): Promise<VerifiedStationIdentity> {
+  return invoke<VerifiedStationIdentity>('station_identity_fetch');
+}
+
+export async function readXConfigProjection(): Promise<XConfigProjection> {
+  return invoke<XConfigProjection>('x_config_projection');
+}
+
+export async function refreshXConfigProjection(
+  force = false,
+): Promise<XConfigProjection> {
+  return invoke<XConfigProjection>('x_config_refresh', { force });
+}
+
+export async function discoverXConfigSuggestion(
+  seedId: string,
+): Promise<StationEndpointDiscovery> {
+  return invoke<StationEndpointDiscovery>('x_config_discover_suggestion', { seedId });
+}
+
+export type MobileOAuthProvider = 'github' | 'google';
+
+export type OAuthPublicPhase =
+  | 'idle'
+  | 'starting'
+  | 'awaiting_provider'
+  | 'callback_received'
+  | 'exchanging'
+  | 'following_gate'
+  | 'credential_delivery'
+  | 'active_session'
+  | 'cancelled'
+  | 'expired'
+  | 'failed';
+
+export interface OAuthStartInput {
+  stationOrigin: string;
+  stationPeerId: string;
+  accessAttemptId: string;
+  gateId: string;
+  provider: MobileOAuthProvider;
+}
+
+export interface OAuthScopeInput {
+  stationOrigin: string;
+  stationPeerId: string;
+}
+
+export interface OAuthProviderInfo {
+  id: string;
+  enabled: boolean;
+  status: string;
+  hasCredentials: boolean;
+}
+
+export interface OAuthCandidateProjection {
+  candidateId: string;
+  actorPtid: string;
+  accessAttemptId: string;
+  stationPeerId: string;
+  decisionRevision: number;
+  issuedAtUnixMs?: number;
+  expiresAtUnixMs?: number;
+}
+
+export interface OAuthGateActionProjection {
+  actionId: string;
+  actionType: string;
+  submitAction: string;
+  schemaRevision: number;
+  schemaDigest: string;
+}
+
+export interface OAuthGateProjection {
+  gateId: string;
+  gateType: string;
+  state: string;
+  title: string;
+  description: string;
+  blockingReason: string;
+  submitAction: string;
+  inputSchemaJson: string;
+  alternativeActions: OAuthGateActionProjection[];
+  actionId: string;
+  schemaRevision: number;
+  schemaDigest: string;
+}
+
+export interface OAuthAccessDecisionProjection {
+  state: string;
+  attemptId: string;
+  currentGateId: string;
+  gates: OAuthGateProjection[];
+  actorPtid?: string;
+  accessGrantId: string;
+  expiresAtUnixMs?: number;
+  message: string;
+}
+
+export interface OAuthSessionProjection {
+  sessionId: string;
+  actorPtid: string;
+  deviceId: string;
+  lifecycleGeneration: number;
+  expiresAt: string;
+}
+
+export interface OAuthPublicProjection {
+  phase: OAuthPublicPhase;
+  stationPeerId?: string;
+  provider?: string;
+  accessAttemptId?: string;
+  gateId?: string;
+  expiresAtUnixMs?: number;
+  result?: string;
+  errorCode?: string;
+  candidate?: OAuthCandidateProjection;
+  accessDecision?: OAuthAccessDecisionProjection;
+  session?: OAuthSessionProjection;
+}
+
+export interface NativeAccessStartInput {
+  stationOrigin: string;
+  stationPeerId: string;
+  locale?: string;
+  sessionId?: string;
+}
+
+export interface NativeAccessDecisionInput {
+  stationOrigin: string;
+  stationPeerId: string;
+  attemptId: string;
+}
+
+export type NativeGenericScalar =
+  | { kind: 'string'; value: string }
+  | { kind: 'boolean'; value: boolean }
+  | { kind: 'integer'; value: number }
+  | { kind: 'number'; value: number };
+
+export interface NativeGenericFieldValue {
+  fieldName: string;
+  value: NativeGenericScalar;
+}
+
+export type NativeAccessGateInput =
+  | { kind: 'login'; email: string; password: string }
+  | { kind: 'invite_code'; inviteCode: string }
+  | { kind: 'session_restore'; sessionId: string }
+  | { kind: 'device_trust'; attestationHandle: string }
+  | { kind: 'generic'; fields: NativeGenericFieldValue[] };
+
+export interface NativeAccessSubmitInput extends NativeAccessDecisionInput {
+  gateId: string;
+  gateType: number;
+  actionId: string;
+  schemaRevision: number;
+  schemaDigest: string;
+  submissionId: string;
+  input: NativeAccessGateInput;
+}
+
+export interface NativeAccessProjection {
+  decision: OAuthAccessDecisionProjection;
+  stationLabel?: string;
+  session?: OAuthSessionProjection;
+}
+
+export async function accessStart(
+  input: NativeAccessStartInput,
+): Promise<NativeAccessProjection> {
+  return invoke<NativeAccessProjection>('access_start', { input });
+}
+
+export async function accessDecision(
+  input: NativeAccessDecisionInput,
+): Promise<NativeAccessProjection> {
+  return invoke<NativeAccessProjection>('access_decision', { input });
+}
+
+export async function accessSubmit(
+  input: NativeAccessSubmitInput,
+): Promise<NativeAccessProjection> {
+  return invoke<NativeAccessProjection>('access_submit', { input });
+}
+
+export async function accessCancel(
+  input: NativeAccessDecisionInput,
+): Promise<boolean> {
+  return invoke<boolean>('access_cancel', { input });
+}
+
+export async function oauthStart(input: OAuthStartInput): Promise<OAuthPublicProjection> {
+  return invoke<OAuthPublicProjection>('oauth_start', { input });
+}
+
+export async function oauthProviders(input: OAuthScopeInput): Promise<OAuthProviderInfo[]> {
+  return invoke<OAuthProviderInfo[]>('oauth_providers', { input });
+}
+
+export async function oauthStatus(input: OAuthScopeInput): Promise<OAuthPublicProjection> {
+  return invoke<OAuthPublicProjection>('oauth_status', { input });
+}
+
+export async function oauthCancel(input: OAuthScopeInput): Promise<OAuthPublicProjection> {
+  return invoke<OAuthPublicProjection>('oauth_cancel', { input });
+}
+
+export async function oauthRestore(input: OAuthScopeInput): Promise<OAuthPublicProjection> {
+  return invoke<OAuthPublicProjection>('oauth_restore', { input });
+}
+
+export async function oauthRetryBrowser(): Promise<OAuthPublicProjection> {
+  return invoke<OAuthPublicProjection>('oauth_retry_browser');
+}
+
+export async function oauthProjection(): Promise<OAuthPublicProjection> {
+  return invoke<OAuthPublicProjection>('oauth_projection');
+}

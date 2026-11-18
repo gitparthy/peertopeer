@@ -1,0 +1,189 @@
+import type { FriendChatSession } from './socialProjection';
+import type { Conversation, ConversationMember } from '../gen/proto/domain/chat/conversation_pb';
+import { ConversationKind, ConversationStatus, MemberRole, MemberStatus } from '../gen/proto/domain/chat/conversation_pb';
+import type { Timestamp } from '@bufbuild/protobuf/wkt';
+import {
+  clientWireEnumNumber,
+  clientWireNumber,
+  clientWireRecord,
+  clientWireString,
+  clientWireTimestampIso,
+} from '@peers-touch/client-chat-core';
+
+export interface FriendRequestData {
+  id: string;
+  senderPtid: string;
+  receiverPtid: string;
+  federationId: string;
+  senderHomeStationPeerId: string;
+  receiverHomeStationPeerId: string;
+  status: number;
+  message: string;
+  createdAt: string;
+  respondedAt: string;
+  senderDisplayName: string;
+  senderAvatar: string;
+  receiverDisplayName: string;
+  receiverAvatar: string;
+}
+
+const recordFromUnknown = clientWireRecord;
+const stringValue = clientWireString;
+const numberValue = clientWireNumber;
+const timestampString = clientWireTimestampIso;
+const enumValue = clientWireEnumNumber;
+
+export function normalizeFriendChatSession(raw: unknown): FriendChatSession {
+  const record = recordFromUnknown(raw);
+  const session = record as Partial<FriendChatSession>;
+  return {
+    ...(session as FriendChatSession),
+    participantAPtid: stringValue(session.participantAPtid, record.participant_a_ptid),
+    participantBPtid: stringValue(session.participantBPtid, record.participant_b_ptid),
+    participantADisplayName: stringValue(session.participantADisplayName, record.participant_a_display_name),
+    participantAAvatar: stringValue(session.participantAAvatar, record.participant_a_avatar),
+    participantBDisplayName: stringValue(session.participantBDisplayName, record.participant_b_display_name),
+    participantBAvatar: stringValue(session.participantBAvatar, record.participant_b_avatar),
+  };
+}
+
+export function normalizeFriendRequests(raw: unknown): FriendRequestData[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeFriendRequestData);
+}
+
+export function friendRequestProfileDids(
+  requests: FriendRequestData[],
+  currentUserPtid: string | null,
+): string[] {
+  const ownDid = currentUserPtid?.trim() || '';
+  const dids = new Set<string>();
+  for (const request of requests) {
+    for (const candidate of [request.senderPtid, request.receiverPtid]) {
+      const did = candidate.trim();
+      if (did && did !== ownDid) dids.add(did);
+    }
+  }
+  return [...dids];
+}
+
+export function normalizeFriendRequestData(raw: unknown): FriendRequestData {
+  const record = recordFromUnknown(raw);
+  return {
+    id: stringValue(record.requestId, record.request_id),
+    senderPtid: actorPtid(record.sender),
+    receiverPtid: actorPtid(record.receiver),
+    federationId: stringValue(record.federationId, record.federation_id),
+    senderHomeStationPeerId: stringValue(
+      record.senderHomeStationPeerId,
+      record.sender_home_station_peer_id,
+    ),
+    receiverHomeStationPeerId: stringValue(
+      record.receiverHomeStationPeerId,
+      record.receiver_home_station_peer_id,
+    ),
+    status: numberValue(record.state),
+    message: stringValue(record.message),
+    createdAt: timestampString(record.createdAt, record.created_at),
+    respondedAt: timestampString(record.respondedAt, record.responded_at),
+    senderDisplayName: stringValue(record.senderDisplayName, record.sender_display_name),
+    senderAvatar: stringValue(record.senderAvatar, record.sender_avatar),
+    receiverDisplayName: stringValue(record.receiverDisplayName, record.receiver_display_name),
+    receiverAvatar: stringValue(record.receiverAvatar, record.receiver_avatar),
+  };
+}
+
+function actorPtid(value: unknown): string {
+  const actor = recordFromUnknown(value);
+  return stringValue(actor.ptid);
+}
+
+const CONVERSATION_KIND_MAP: Record<string, number> = {
+  CONVERSATION_KIND_UNSPECIFIED: ConversationKind.UNSPECIFIED,
+  CONVERSATION_KIND_DIRECT: ConversationKind.DIRECT,
+  CONVERSATION_KIND_GROUP: ConversationKind.GROUP,
+};
+
+const CONVERSATION_STATUS_MAP: Record<string, number> = {
+  CONVERSATION_STATUS_UNSPECIFIED: ConversationStatus.UNSPECIFIED,
+  CONVERSATION_STATUS_ACTIVE: ConversationStatus.ACTIVE,
+  CONVERSATION_STATUS_DISSOLVED: ConversationStatus.DISSOLVED,
+  CONVERSATION_STATUS_DEGRADED_READ_ONLY: ConversationStatus.DEGRADED_READ_ONLY,
+  CONVERSATION_STATUS_ORPHANED_READ_ONLY: ConversationStatus.ORPHANED_READ_ONLY,
+};
+
+const MEMBER_ROLE_MAP: Record<string, number> = {
+  MEMBER_ROLE_UNSPECIFIED: MemberRole.UNSPECIFIED,
+  MEMBER_ROLE_MEMBER: MemberRole.MEMBER,
+  MEMBER_ROLE_ADMIN: MemberRole.ADMIN,
+  MEMBER_ROLE_OWNER: MemberRole.OWNER,
+};
+
+const MEMBER_STATUS_MAP: Record<string, number> = {
+  MEMBER_STATUS_UNSPECIFIED: MemberStatus.UNSPECIFIED,
+  MEMBER_STATUS_ACTIVE: MemberStatus.ACTIVE,
+  MEMBER_STATUS_LEFT: MemberStatus.LEFT,
+  MEMBER_STATUS_REMOVED: MemberStatus.REMOVED,
+};
+
+function normalizeTimestamp(value: unknown): Timestamp | undefined {
+  if (!value) return undefined;
+  if (typeof value === 'object' && value !== null && 'seconds' in value) {
+    return value as Timestamp;
+  }
+  if (typeof value === 'string') {
+    const ms = Date.parse(value);
+    if (Number.isFinite(ms)) {
+      return { seconds: BigInt(Math.floor(ms / 1000)), nanos: (ms % 1000) * 1_000_000, $typeName: 'google.protobuf.Timestamp' } as Timestamp;
+    }
+  }
+  return undefined;
+}
+
+export function normalizeConversation(raw: unknown): Conversation {
+  const r = recordFromUnknown(raw);
+  return {
+    $typeName: 'peers_touch.model.chat.v1.Conversation',
+    conversationId: stringValue(r.conversationId, r.conversation_id),
+    kind: enumValue(r.kind, CONVERSATION_KIND_MAP) as ConversationKind,
+    authorityStationPeerId: stringValue(r.authorityStationPeerId, r.authority_station_peer_id),
+    membershipEpoch: BigInt(numberValue(r.membershipEpoch ?? r.membership_epoch)),
+    mlsEpoch: BigInt(numberValue(r.mlsEpoch ?? r.mls_epoch)),
+    federationId: stringValue(r.federationId, r.federation_id),
+    authorityEpoch: BigInt(numberValue(r.authorityEpoch ?? r.authority_epoch)),
+    status: enumValue(r.status, CONVERSATION_STATUS_MAP) as ConversationStatus,
+    createdAt: normalizeTimestamp(r.createdAt ?? r.created_at),
+    updatedAt: normalizeTimestamp(r.updatedAt ?? r.updated_at),
+    name: stringValue(r.name),
+    description: stringValue(r.description),
+    maxMembers: numberValue(r.maxMembers ?? r.max_members),
+    avatarCid: stringValue(r.avatarCid, r.avatar_cid),
+    ownerPtid: stringValue(r.ownerPtid, r.owner_ptid),
+  } as Conversation;
+}
+
+export function normalizeConversations(raw: unknown): Conversation[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeConversation);
+}
+
+export function normalizeConversationMember(raw: unknown): ConversationMember {
+  const r = recordFromUnknown(raw);
+  return {
+    $typeName: 'peers_touch.model.chat.v1.ConversationMember',
+    conversationId: stringValue(r.conversationId, r.conversation_id),
+    ptid: stringValue(r.ptid),
+    role: enumValue(r.role, MEMBER_ROLE_MAP) as MemberRole,
+    memberStatus: enumValue(r.memberStatus ?? r.member_status, MEMBER_STATUS_MAP) as MemberStatus,
+    actorHomeStationPeerId: stringValue(r.actorHomeStationPeerId, r.actor_home_station_peer_id),
+    actorHomeStationDomain: stringValue(r.actorHomeStationDomain, r.actor_home_station_domain),
+    nickname: stringValue(r.nickname),
+    muted: Boolean(r.muted),
+    joinedAt: normalizeTimestamp(r.joinedAt ?? r.joined_at),
+  } as ConversationMember;
+}
+
+export function normalizeConversationMembers(raw: unknown): ConversationMember[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeConversationMember);
+}

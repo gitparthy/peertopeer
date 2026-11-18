@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tooling.acceptance.core.suite_runtime import (
+    RuntimeReuseContract,
+    SuiteRuntimeAction,
+    SuiteRuntimeLedger,
+)
+
+
+SCRIPT = Path(__file__).with_name("acceptance-pipeline-audit.py")
+SPEC = importlib.util.spec_from_file_location(
+    "acceptance_pipeline_audit",
+    SCRIPT,
+)
+assert SPEC is not None and SPEC.loader is not None
+AUDIT = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(AUDIT)
+
+
+def runtime_reuse() -> dict[str, object]:
+    return {
+        "scope": "suite",
+        "entryCheckId": "suite-functional",
+        "scenarioIds": ["publish", "receive"],
+        "maxProvisioningRuns": 1,
+        "maxClientLaunches": 2,
+        "minWarmReuseRate": 0.5,
+        "requireAttachOnlyScenarios": True,
+        "requireReceiverVisibleProof": True,
+        "allowClientReplacement": False,
+    }
+
+
+def write_plan(
+    root: Path,
+    *,
+    include_contract: bool = True,
+    heading: str = "Plan Package",
+) -> Path:
+    plan_dir = root / "plan"
+    task_dir = plan_dir / "tasks"
+    task_dir.mkdir(parents=True)
+    task = {
+        "kind": "peers-touch-task-slice",
+        "planId": "AUDIT-TEST",
+        "taskId": "T1",
+        "workstreamId": "T1",
+        "title": "Audit suite",
+        "workClass": "product-behavior",
+        "completionClass": "functional",
+        "executionMode": "build",
+        "closureId": "audit-suite",
+        "journeyId": "audit-suite",
+        "runtimeClass": "native-desktop",
+        "writeSet": ["tooling/acceptance"],
+        "readSet": [],
+        "budgets": {
+            "focusedCheckSeconds": 60,
+            "functionalRunSeconds": 120,
+            "cleanupSeconds": 30,
+        },
+        "checks": [
+            {
+                "id": "suite-source",
+                "command": "check-suite",
+                "verificationClass": "SOURCE_CHECK",
+            },
+            {
+                "id": "suite-functional",
+                "command": "run-suite",
+                "verificationClass": "FUNCTIONAL_CHECK",
+            }
+        ],
+        "doneWhen": ["suite passes"],
+        "failureBehavior": ["fail closed"],
+        "updatedAt": "2026-09-29T00:00:00.000Z",
+    }
+    if include_contract:
+        task["runtimeReuse"] = runtime_reuse()
+    (task_dir / "T1.md").write_text(
+        "\n".join(
+            (
+                "# T1",
+                "",
+                "## Task Slice",
+                "",
+                "```json",
+                json.dumps(task),
+                "```",
+                "",
+                "## Current Snapshot",
+                "",
+                "- Test fixture.",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    manifest = {
+        "kind": (
+            "peers-touch-plan-version"
+            if heading == "Plan Version"
+            else "peers-touch-plan-package"
+        ),
+        "planId": "AUDIT-TEST",
+        "tasks": [
+            {
+                "id": "T1",
+                "workstreamId": "T1",
+                "path": "tasks/T1.md",
+                "dependsOn": [],
+            }
+        ],
+    }
+    if heading == "Plan Version":
+        manifest.update(
+            {
+                "versionId": "audit-test-v1",
+                "createdAt": "2026-10-15T00:00:00.000Z",
+                "workClass": "infrastructure",
+                "architecture": {
+                    "sources": ["docs/README.md"],
+                    "decisions": ["TEST-D01"],
+                },
+                "scope": {
+                    "sourceClaims": [
+                        {
+                            "pathPrefix": "tooling",
+                            "mode": "exclusive-write",
+                        }
+                    ],
+                    "nonGoals": [],
+                },
+                "authorization": {
+                    "checkpoint": {
+                        "localCommit": "allowed",
+                        "amend": "denied",
+                    },
+                    "delivery": {
+                        "push": "denied",
+                        "pullRequest": "denied",
+                    },
+                    "runtime": {
+                        "deployProfiles": [],
+                        "destructiveResetScopes": [],
+                    },
+                    "history": {"rewrite": "denied"},
+                },
+            }
+        )
+    plan_path = plan_dir / "plan.md"
+    plan_lines = [
+        "# Audit Test",
+        "",
+    ]
+    if heading == "Plan Version":
+        plan_lines.extend(
+            (
+                "> **Plan ID**: AUDIT-TEST",
+                "> **Version ID**: audit-test-v1",
+                "> **Created**: 2026-10-15T00:00:00.000Z",
+                "",
+            )
+        )
+    plan_lines.extend(
+        (
+            f"## {heading}",
+            "",
+            "```json",
+            json.dumps(manifest),
+            "```",
+            "",
+        )
+    )
+    if heading == "Plan Version":
+        plan_lines.extend(
+            (
+                "## Acceptance Execution",
+                "",
+                "```json",
+                json.dumps(
+                    {
+                        "closures": {"audit-suite": []},
+                        "completion": [],
+                        "full": [],
+                    }
+                ),
+                "```",
+                "",
+            )
+        )
+    plan_path.write_text(
+        "\n".join(plan_lines),
+        encoding="utf-8",
+    )
+    return plan_path
+
+
+def valid_report() -> dict[str, object]:
+    contract = RuntimeReuseContract.from_dict(runtime_reuse())
+    ledger = SuiteRuntimeLedger(
+        contract,
+        suite_runtime_id="audit-suite",
+        source_digest="a" * 40,
+        fixture_epoch="epoch-1",
+    )
+    ledger.record(
+        SuiteRuntimeAction.PROVISION,
+        resource_id="runtime",
+    )
+    for actor in ("alice", "bob"):
+        ledger.record(
+            SuiteRuntimeAction.CLIENT_LAUNCH,
+            resource_id=actor,
+        )
+    for scenario_id in contract.scenario_ids:
+        ledger.record(
+            SuiteRuntimeAction.SCENARIO_START,
+            scenario_id=scenario_id,
+        )
+        ledger.record(
+            SuiteRuntimeAction.UI_ACTION,
+            scenario_id=scenario_id,
+        )
+        ledger.record(
+            SuiteRuntimeAction.RECEIVER_ASSERTION,
+            scenario_id=scenario_id,
+        )
+        ledger.record(
+            SuiteRuntimeAction.SCENARIO_END,
+            scenario_id=scenario_id,
+        )
+    ledger.record(SuiteRuntimeAction.CLEANUP_COMPLETE)
+    return ledger.require_valid()
+
+
+class AcceptancePipelineAuditTests(unittest.TestCase):
+    def test_canonical_plan_version_heading_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            plan_path = write_plan(
+                Path(temp_dir),
+                heading="Plan Version",
+            )
+            result = AUDIT.audit_pipeline(
+                plan_path=plan_path,
+                task_ids=("T1",),
+            )
+
+        self.assertEqual(result["result"], "PASS")
+
+    def test_plan_version_rejects_incomplete_canonical_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            plan_path = write_plan(
+                Path(temp_dir),
+                heading="Plan Version",
+            )
+            text = plan_path.read_text(encoding="utf-8")
+            matches = AUDIT.MANIFEST_BLOCK_PATTERN.findall(text)
+            self.assertEqual(len(matches), 1)
+            encoded = matches[0][1]
+            manifest = json.loads(encoded)
+            del manifest["architecture"]
+            plan_path.write_text(
+                text.replace(encoded, json.dumps(manifest)),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                AUDIT.PipelineAuditError,
+                "canonical validation",
+            ):
+                AUDIT.audit_pipeline(
+                    plan_path=plan_path,
+                    task_ids=("T1",),
+                )
+
+    def test_current_stable_plan_heading_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = write_plan(
+                Path(temp_dir),
+                heading="Plan",
+            )
+            result = AUDIT.audit_pipeline(
+                plan_path=plan_path,
+                task_ids=("T1",),
+            )
+
+        self.assertEqual(result["result"], "PASS")
+
+    def test_plan_version_heading_rejects_legacy_manifest_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = write_plan(
+                Path(temp_dir),
+                heading="Plan Version",
+            )
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8").replace(
+                    "peers-touch-plan-version",
+                    "peers-touch-plan-package",
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                AUDIT.PipelineAuditError,
+                "peers-touch-plan-version kind",
+            ):
+                AUDIT.audit_pipeline(
+                    plan_path=plan_path,
+                    task_ids=("T1",),
+                )
+
+    def test_multiple_supported_manifest_blocks_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = write_plan(Path(temp_dir))
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8")
+                + "\n## Plan Version\n\n```json\n{}\n```\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                AUDIT.PipelineAuditError,
+                "exactly one matching JSON block",
+            ):
+                AUDIT.audit_pipeline(
+                    plan_path=plan_path,
+                    task_ids=("T1",),
+                )
+
+    def test_plan_contract_passes_without_claiming_runtime_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = write_plan(Path(temp_dir))
+            result = AUDIT.audit_pipeline(
+                plan_path=plan_path,
+                task_ids=("T1",),
+            )
+
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(result["proofState"], "NOT_RUN")
+        self.assertEqual(
+            result["taskResults"][0]["runtimeProofState"],
+            "NOT_RUN",
+        )
+
+    def test_missing_contract_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = write_plan(
+                Path(temp_dir),
+                include_contract=False,
+            )
+            result = AUDIT.audit_pipeline(
+                plan_path=plan_path,
+                task_ids=("T1",),
+            )
+
+        self.assertEqual(result["result"], "FAIL")
+        self.assertEqual(
+            result["findings"][0]["code"],
+            "RUNTIME_REUSE_CONTRACT_MISSING",
+        )
+
+    def test_implicit_audit_rejects_plan_without_reuse_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = write_plan(
+                Path(temp_dir),
+                include_contract=False,
+            )
+            with self.assertRaisesRegex(
+                AUDIT.PipelineAuditError,
+                "no runtimeReuse Task",
+            ):
+                AUDIT.audit_pipeline(
+                    plan_path=plan_path,
+                    task_ids=(),
+                )
+
+    def test_valid_runtime_report_is_supporting_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = write_plan(root)
+            report_path = root / "suite-report.json"
+            report_path.write_text(
+                json.dumps(valid_report()),
+                encoding="utf-8",
+            )
+            result = AUDIT.audit_pipeline(
+                plan_path=plan_path,
+                task_ids=("T1",),
+                runtime_reports=(report_path,),
+            )
+
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(result["proofState"], "SUPPORTING")
+        self.assertEqual(
+            result["runtimeReports"][0]["result"],
+            "PASS",
+        )
+
+    def test_mutated_runtime_report_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = write_plan(root)
+            report = valid_report()
+            report["metrics"]["clientLaunches"] = 99
+            report_path = root / "suite-report.json"
+            report_path.write_text(
+                json.dumps(report),
+                encoding="utf-8",
+            )
+            result = AUDIT.audit_pipeline(
+                plan_path=plan_path,
+                task_ids=("T1",),
+                runtime_reports=(report_path,),
+            )
+
+        self.assertEqual(result["result"], "FAIL")
+        self.assertEqual(
+            result["findings"][0]["code"],
+            "SUITE_RUNTIME_REPORT_DIGEST_MISMATCH",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

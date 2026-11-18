@@ -1,0 +1,351 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/domain"
+)
+
+func TestExecutorStreamsResponseAndReceivesCompleteConversation(t *testing.T) {
+	root := t.TempDir()
+	promptPath := filepath.Join(root, "prompt.txt")
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+cat > "$1"
+printf '%s\n' '{"type":"delta","content":"hello "}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"world"}}'
+printf '%s\n' '{"type":"done"}'
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+
+	var deltas []string
+	result, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID:      "actor-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Provider:       "test-cli",
+		Model:          "default",
+		Command:        []string{commandPath, promptPath},
+		SystemPrompt:   "system contract",
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "first question"},
+			{Role: domain.MessageRoleAssistant, Content: "first answer"},
+			{Role: domain.MessageRoleUser, Content: "follow up"},
+		},
+	}, func(_ context.Context, delta Delta) error {
+		if delta.Type == "text" {
+			deltas = append(deltas, delta.Content)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.Content != "hello world" || !result.Streamed {
+		t.Fatalf("Execute() result = %+v", result)
+	}
+	if strings.Join(deltas, "") != "hello world" {
+		t.Fatalf("streamed deltas = %#v", deltas)
+	}
+	prompt, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	for _, expected := range []string{
+		"# System\nsystem contract",
+		"## user\nfirst question",
+		"## assistant\nfirst answer",
+		"## user\nfollow up",
+	} {
+		if !strings.Contains(string(prompt), expected) {
+			t.Fatalf("prompt does not contain %q: %s", expected, prompt)
+		}
+	}
+}
+
+func TestExecutorAppliesStructuredStartupArgsEnvironmentAndTimeout(t *testing.T) {
+	root := t.TempDir()
+	argsPath := filepath.Join(root, "args.txt")
+	envPath := filepath.Join(root, "environment.txt")
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+printf '%s\n' "$@" > "$PEERS_TEST_ARGS_PATH"
+printf '%s' "$PEERS_TEST_MODE" > "$PEERS_TEST_ENV_PATH"
+cat >/dev/null
+printf '%s\n' '{"type":"done","content":"configured"}'
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+
+	result, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{commandPath, "-"},
+		StartupArgs: []string{
+			"--mode",
+			"fast",
+		},
+		Environment: map[string]string{
+			"PEERS_TEST_ARGS_PATH": argsPath,
+			"PEERS_TEST_ENV_PATH":  envPath,
+			"PEERS_TEST_MODE":      "review",
+		},
+		Timeout:  time.Second,
+		Messages: []domain.Message{{Role: domain.MessageRoleUser, Content: "hello"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.Content != "configured" {
+		t.Fatalf("Execute() content = %q", result.Content)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read arguments: %v", err)
+	}
+	if string(args) != "--mode\nfast\n-\n" {
+		t.Fatalf("structured arguments = %q", args)
+	}
+	environment, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read environment: %v", err)
+	}
+	if string(environment) != "review" {
+		t.Fatalf("configured environment = %q", environment)
+	}
+}
+
+func TestExecutorBindsSelectedModelAndCredentialToAdapterInvocation(t *testing.T) {
+	root := t.TempDir()
+	argsPath, credentialPath := filepath.Join(root, "args"), filepath.Join(root, "credential")
+	command := writeExecutable(t, root, "codex", `#!/bin/sh
+printf '%s\n' "$@" > "$PEERS_TEST_ARGS_PATH"
+printf '%s' "${CODEX_API_KEY:-}" > "$PEERS_TEST_CREDENTIAL_PATH"
+cat >/dev/null
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"selected"}}' '{"type":"turn.completed"}'
+`)
+	t.Setenv("CODEX_API_KEY", "inherited-station-key")
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+	request := &ExecuteRequest{ActorPTID: "actor-1", Provider: "codex-cli",
+		Command: []string{command, "exec", "--json", "-"}, Model: "chosen-model", Effort: "high",
+		Environment: map[string]string{"PEERS_TEST_ARGS_PATH": argsPath, "PEERS_TEST_CREDENTIAL_PATH": credentialPath},
+		Credentials: map[string]string{"CODEX_API_KEY": "owner-bound-test-key"}}
+	result, err := executor.Execute(context.Background(), request, nil)
+	if err != nil || result.Content != "selected" {
+		t.Fatalf("adapter invocation = %+v %v", result, err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--model\nchosen-model\n-c\nmodel_reasoning_effort=\"high\"\n") ||
+		!strings.Contains(string(args), "model_providers.station.env_key=\"CODEX_API_KEY\"") ||
+		!strings.Contains(string(args), "model_providers.station.wire_api=\"responses\"") ||
+		!strings.HasSuffix(string(args), "\n-\n") || strings.Contains(string(args), "owner-bound-test-key") {
+		t.Fatalf("selected model did not reach adapter arguments: %q", args)
+	}
+	credential, err := os.ReadFile(credentialPath)
+	if err != nil || string(credential) != "owner-bound-test-key" {
+		t.Fatal("adapter did not use its explicit owner credential")
+	}
+	request.StartupArgs = []string{"--model", "bypass-model"}
+	if _, err := executor.Execute(context.Background(), request, nil); !IsFailureKind(err, FailureInvalidCommand) {
+		t.Fatalf("startup model override was accepted: %v", err)
+	}
+}
+
+func TestExecutorReturnsTypedMissingBinary(t *testing.T) {
+	executor := NewExecutor(&WorkspaceManager{BaseDir: t.TempDir()})
+	_, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{"peers-touch-cli-that-does-not-exist"},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if !IsFailureKind(err, FailureBinaryMissing) {
+		t.Fatalf("Execute() error = %v, want binary_missing", err)
+	}
+	if strings.Contains(err.Error(), t.TempDir()) {
+		t.Fatalf("typed error leaked a host path: %v", err)
+	}
+}
+
+func TestExecutorReturnsTypedExitWithoutStderrLeak(t *testing.T) {
+	root := t.TempDir()
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+cat >/dev/null
+printf '%s\n' 'secret-provider-detail' >&2
+exit 7
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+	_, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{commandPath},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if !IsFailureKind(err, FailureExit) {
+		t.Fatalf("Execute() error = %v, want execution_failed", err)
+	}
+	if strings.Contains(err.Error(), "secret-provider-detail") ||
+		strings.Contains(err.Error(), root) {
+		t.Fatalf("typed error leaked provider stderr or a host path: %v", err)
+	}
+}
+
+func TestExecutorReturnsTypedStreamFailure(t *testing.T) {
+	root := t.TempDir()
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"turn.failed","error":{"message":"expired credential"}}'
+exit 1
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+	_, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{commandPath},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if !IsFailureKind(err, FailureExit) {
+		t.Fatalf("Execute() error = %v, want execution_failed", err)
+	}
+	if strings.Contains(err.Error(), "expired credential") {
+		t.Fatalf("typed error leaked CLI failure details: %v", err)
+	}
+}
+
+func TestExecutorReturnsTypedTimeout(t *testing.T) {
+	root := t.TempDir()
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+sleep 5
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+	executor.Timeout = 20 * time.Millisecond
+	_, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{commandPath},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if !IsFailureKind(err, FailureTimeout) {
+		t.Fatalf("Execute() error = %v, want timeout", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Execute() error = %v, want deadline cause", err)
+	}
+}
+
+func TestExecutorDoesNotExposeStationSecrets(t *testing.T) {
+	root := t.TempDir()
+	envPath := filepath.Join(root, "environment.txt")
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+cat >/dev/null
+env > "$1"
+printf '%s\n' '{"type":"done","content":"safe"}'
+`)
+	t.Setenv("PEERS_AUTH_SECRET", "must-not-reach-cli")
+	t.Setenv("PEERS_DB_DSN", "must-not-reach-cli")
+	t.Setenv("HOME", root)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+
+	_, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID:      "actor-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Command:        []string{commandPath, envPath},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	environment, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read child environment: %v", err)
+	}
+	value := string(environment)
+	stateRoot, err := executor.WorkspaceManager.StateRoot("actor-1", adapterName(commandPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"PEERS_AUTH_SECRET=", "PEERS_DB_DSN="} {
+		if strings.Contains(value, forbidden) {
+			t.Fatalf("child environment contains %s", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"HOME=" + filepath.Join(stateRoot, "home") + "\n",
+		"PEERS_TOUCH_AGENT_ID=agent-1",
+		"PEERS_TOUCH_CONVERSATION_ID=conversation-1",
+	} {
+		if !strings.Contains(value, required) {
+			t.Fatalf("child environment does not contain %q: %s", required, value)
+		}
+	}
+}
+
+func TestExecutorBoundsTotalStdout(t *testing.T) {
+	root := t.TempDir()
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+cat >/dev/null
+i=0
+while [ "$i" -lt 3000 ]; do
+  printf '%01024d\n' 0
+  i=$((i + 1))
+done
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+
+	_, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{commandPath},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if !IsFailureKind(err, FailureOutput) {
+		t.Fatalf("Execute() error = %v, want output_failed", err)
+	}
+}
+
+func TestExecutorDrainsOutputAfterTerminalEvent(t *testing.T) {
+	root := t.TempDir()
+	commandPath := writeExecutable(t, root, "provider", `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"done","content":"complete"}'
+dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\000' x
+`)
+	executor := NewExecutor(&WorkspaceManager{BaseDir: filepath.Join(root, "workspaces")})
+	executor.Timeout = 2 * time.Second
+
+	result, err := executor.Execute(context.Background(), &ExecuteRequest{
+		ActorPTID: "actor-1",
+		Command:   []string{commandPath},
+		Messages: []domain.Message{
+			{Role: domain.MessageRoleUser, Content: "hello"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.Content != "complete" {
+		t.Fatalf("Execute() content = %q, want complete", result.Content)
+	}
+}
+
+func writeExecutable(t *testing.T, root, name, content string) string {
+	t.Helper()
+	path := filepath.Join(root, name)
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write executable: %v", err)
+	}
+	return path
+}

@@ -1,0 +1,338 @@
+providers:
+  - id: ark
+    name: ByteDance Ark
+    description: ByteDance Ark AI platform
+    enabled: true
+    builtin: true
+    show_checker: false
+    show_api_key: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://www.volcengine.com/product/ark
+    api_key_url: https://console.volcengine.com/ark
+    default_base_url: https://ark.cn-beijing.volces.com/api/v3
+    models:
+      - id: ep-20260623145021-n4xdm
+        display_name: Doubao Seed 2.1 Pro (Ark endpoint)
+        type: chat
+        enabled: true
+        context_window: 256000
+        thinking_control: ark
+        capabilities: [text-input, text-output, streaming, reasoning, structured-output, native-tools, parallel-tools]
+      - id: doubao-pro-256k
+        display_name: Doubao Pro
+        type: chat
+        enabled: true
+        context_window: 256000
+        capabilities: [text-input, text-output, streaming, structured-output, native-tools, parallel-tools]
+      - id: doubao-embedding
+        display_name: Doubao Embedding
+        type: embedding
+        enabled: true
+        context_window: 8192
+  - id: openai
+    name: OpenAI
+    description: GPT models from OpenAI
+    enabled: true
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://openai.com
+    api_key_url: https://platform.openai.com/api-keys
+    default_base_url: https://api.openai.com/v1
+    models:
+      - id: gpt-4o
+        display_name: GPT-4o
+        type: chat
+        enabled: true
+        context_window: 128000
+        capabilities: [text-input, text-output, streaming, structured-output, native-tools, parallel-tools]
+      - id: gpt-4o-mini
+        display_name: GPT-4o Mini
+        type: chat
+        enabled: true
+        context_window: 128000
+        capabilities: [text-input, text-output, streaming, structured-output, native-tools, parallel-tools]
+  - id: anthropic
+    name: Anthropic
+    description: Claude models from Anthropic
+    enabled: true
+    builtin: true
+    show_checker: true
+    protocol: anthropic
+    discovery: anthropic-models
+    home_url: https://www.anthropic.com
+    api_key_url: https://console.anthropic.com/settings/keys
+    default_base_url: https://api.anthropic.com
+    models:
+      - id: claude-sonnet-4-20250514
+        display_name: Claude Sonnet 4
+        type: chat
+        enabled: true
+        context_window: 200000
+        capabilities: [text-input, text-output, streaming, prompt-cache]
+  - id: google
+    name: Google
+    description: Gemini models from Google
+    enabled: true
+    builtin: true
+    show_checker: true
+    protocol: gemini
+    discovery: gemini-models
+    home_url: https://ai.google.dev
+    api_key_url: https://aistudio.google.com/apikey
+    default_base_url: https://generativelanguage.googleapis.com/v1beta
+    models:
+      - id: gemini-2.0-flash
+        display_name: Gemini 2.0 Flash
+        type: chat
+        enabled: true
+        context_window: 1048576
+        capabilities: [text-input, text-output]
+  - id: deepseek
+    name: DeepSeek
+    description: DeepSeek models
+    enabled: true
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://deepseek.com
+    api_key_url: https://platform.deepseek.com/api_keys
+    default_base_url: https://api.deepseek.com/v1
+    models:
+      - id: deepseek-chat
+        display_name: DeepSeek Chat
+        type: chat
+        enabled: true
+        context_window: 128000
+        capabilities: [text-input, text-output, streaming, structured-output, native-tools]
+  - id: ollama
+    name: Ollama
+    description: Run open-source models locally
+    enabled: true
+    builtin: true
+    show_checker: true
+    show_api_key: false
+    protocol: ollama
+    discovery: ollama-tags
+    home_url: https://ollama.com
+    api_key_url: ""
+    default_base_url: http://localhost:11434
+    models: []
+  - id: openrouter
+    name: OpenRouter
+    description: Unified routing for multiple LLM providers
+    enabled: false
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://openrouter.ai
+    api_key_url: https://openrouter.ai/keys
+    default_base_url: https://openrouter.ai/api/v1
+    models:
+      - id: openai/gpt-4o-mini
+        display_name: GPT-4o Mini (OpenRouter)
+        type: chat
+        enabled: true
+        context_window: 128000
+        capabilities: [text-input, text-output, streaming, structured-output, native-tools, parallel-tools]
+  - id: mistral
+    name: Mistral
+    description: Mistral AI models
+    enabled: false
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://mistral.ai
+    api_key_url: https://console.mistral.ai/api-keys
+    default_base_url: https://api.mistral.ai/v1
+    models:
+      - id: mistral-large-latest
+        display_name: Mistral Large
+        type: chat
+        enabled: true
+        context_window: 131072
+        capabilities: [text-input, text-output, streaming, structured-output, native-tools]
+  - id: groq
+    name: Groq
+    description: Groq low-latency inference platform
+    enabled: false
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://groq.com
+    api_key_url: https://console.groq.com/keys
+    default_base_url: https://api.groq.com/openai/v1
+    models:
+      - id: llama-3.3-70b-versatile
+        display_name: Llama 3.3 70B
+        type: chat
+        enabled: true
+        context_window: 131072
+        capabilities: [text-input, text-output, streaming, native-tools, parallel-tools]
+  - id: together
+    name: Together
+    description: Together AI model hosting
+    enabled: false
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://www.together.ai
+    api_key_url: https://api.together.xyz/settings/api-keys
+    default_base_url: https://api.together.xyz/v1
+    models:
+      - id: meta-llama/Llama-3.1-70B-Instruct-Turbo
+        display_name: Llama 3.1 70B Turbo
+        type: chat
+        enabled: true
+        context_window: 131072
+        capabilities: [text-input, text-output, streaming, native-tools, parallel-tools]
+  - id: cohere
+    name: Cohere
+    description: Cohere language models
+    enabled: false
+    builtin: true
+    show_checker: true
+    protocol: openai-compatible
+    discovery: openai-models
+    home_url: https://cohere.com
+    api_key_url: https://dashboard.cohere.com/api-keys
+    default_base_url: https://api.cohere.com/compatibility/v1
+    models:
+      - id: command-r-plus
+        display_name: Command R+
+        type: chat
+        enabled: true
+        context_window: 128000
+        capabilities: [text-input, text-output, streaming, native-tools]
+  - id: external-agent
+    name: External Agent
+    description: Stateful session runtime managed by the Station
+    enabled: true
+    builtin: true
+    show_checker: false
+    show_api_key: false
+    protocol: session-cli-v1
+    discovery: environment
+    home_url: ""
+    api_key_url: ""
+    default_base_url: ""
+    runtime_kind: external-agent
+    models:
+      - id: default
+        display_name: Default
+        type: chat
+        enabled: true
+        context_window: 200000
+        capabilities: [text-input, text-output, streaming, external-resume]
+  - id: codex-cli
+    name: Codex CLI
+    description: Local Codex CLI adapter running in the Agent workspace
+    enabled: true
+    builtin: true
+    show_checker: false
+    show_api_key: true
+    protocol: cli
+    discovery: static
+    home_url: https://developers.openai.com/codex
+    api_key_url: https://platform.openai.com/api-keys
+    default_base_url: ""
+    runtime_kind: cli
+    credential_env_key: CODEX_API_KEY
+    backend_protocols: [responses]
+    cli_argv: [codex, exec, --json, --skip-git-repo-check, "-"]
+    default_model: default
+    default_timeout_seconds: 120
+    workspace_policy: isolated-agent-workspace
+    configurable: [default-model, startup-args, environment, timeout]
+    adapter_capabilities: [streaming]
+    models:
+      - id: default
+        display_name: Default
+        type: chat
+        enabled: true
+        context_window: 200000
+        capabilities: [text-input, text-output, streaming]
+  - id: cursor-cli
+    name: Cursor CLI
+    description: Local Cursor Agent CLI adapter running in the Agent workspace
+    enabled: true
+    builtin: true
+    show_checker: false
+    show_api_key: true
+    protocol: cli
+    discovery: static
+    home_url: https://cursor.com
+    api_key_url: https://cursor.com/dashboard/cloud-agents
+    default_base_url: ""
+    runtime_kind: cli
+    credential_env_key: CURSOR_API_KEY
+    cli_argv: [cursor-agent, --print, --output-format, text, --trust]
+    model_catalog_argv: [cursor-agent, --list-models]
+    default_model: default
+    default_timeout_seconds: 120
+    workspace_policy: isolated-agent-workspace
+    configurable: [default-model, startup-args, environment, timeout]
+    adapter_capabilities: [streaming]
+    models: []
+  - id: claude-cli
+    name: Claude CLI
+    description: Local Claude CLI adapter running in the Agent workspace
+    enabled: true
+    builtin: true
+    show_checker: false
+    show_api_key: true
+    protocol: cli
+    discovery: static
+    home_url: https://www.anthropic.com/claude-code
+    api_key_url: https://platform.claude.com/settings/keys
+    default_base_url: ""
+    runtime_kind: cli
+    credential_env_key: ANTHROPIC_API_KEY
+    backend_protocols: [anthropic]
+    cli_argv: [claude, -p]
+    default_model: default
+    default_timeout_seconds: 120
+    workspace_policy: isolated-agent-workspace
+    configurable: [default-model, startup-args, environment, timeout]
+    adapter_capabilities: [streaming]
+    models:
+      - id: default
+        display_name: Default
+        type: chat
+        enabled: true
+        context_window: 200000
+        capabilities: [text-input, text-output]
+  - id: trae-cli
+    name: TRAE CLI
+    description: Local TRAE CLI adapter running in the Agent workspace
+    enabled: true
+    builtin: true
+    show_checker: false
+    show_api_key: false
+    protocol: cli
+    discovery: static
+    home_url: https://www.trae.ai
+    api_key_url: ""
+    default_base_url: ""
+    runtime_kind: cli
+    cli_argv: [traecli, --json, exec, --skip-git-repo-check, "-"]
+    model_catalog_argv: [traecli, debug, models]
+    default_model: default
+    default_timeout_seconds: 120
+    workspace_policy: isolated-agent-workspace
+    configurable: [default-model, startup-args, environment, timeout]
+    adapter_capabilities: [streaming, reasoning, image-input]
+    models:
+      - id: default
+        display_name: Default
+        type: chat
+        enabled: true
+        context_window: 200000
+        capabilities: [text-input, text-output, streaming]

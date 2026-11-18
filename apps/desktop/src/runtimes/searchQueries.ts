@@ -1,0 +1,664 @@
+import { keepPreviousData, QueryClient, QueryObserver, type QueryObserverResult } from '@tanstack/query-core';
+import { SearchErrorCode, SearchKind, SourceState, type ResultItem, type SearchReadState, type SearchResponse } from '../gen/proto/domain/search/search_pb';
+import { RustCommandException } from '../services/desktop_api';
+import {
+  captureSearchIdentity, concealChangedSearchSources, resourceIdentity, searchService,
+  searchResponseCurrent, searchResponseDeadline, searchRowKey, sourceStateIdentity,
+  subscribeSearchFrames,
+} from '../services/search';
+import { useSearchStore, type SearchContentFilter, type SearchMode, type SearchTraversal } from '../store/search';
+import {
+  isSameProgressiveItem, mergeProgressiveFrame, retainTransientlyUnavailableSources,
+} from './searchFrames';
+import { structuralEqual } from '../utils/structuralEqual';
+
+const MAX_FRAMES = 32;
+const MAX_ITEMS = 640;
+const MAX_VISIBLE_ITEMS = 200;
+const MAX_TRAVERSAL_PAGES = 32;
+const TRAVERSAL_DEADLINE_MS = 5_000;
+const STALLED_SEARCH_DELAY = 200;
+type ContentMode = Exclude<SearchMode, 'functions'>;
+interface Frame {
+  query: string; mode: ContentMode; filter: SearchContentFilter;
+  response: SearchResponse; traversal: SearchTraversal;
+}
+const client = new QueryClient({ defaultOptions: { queries: {
+  retry: false, gcTime: 60_000, refetchOnWindowFocus: false, refetchOnReconnect: false,
+  structuralSharing: false,
+} } });
+let observer: QueryObserver<Frame> | null = null;
+let unsubscribe: (() => void) | null = null;
+let active: { cancel: () => void } | null = null;
+let ownerState: SearchReadState | null = null;
+let stateFlight: Promise<SearchReadState> | null = null;
+let epoch = 0;
+let activeLocale = 'en';
+let stalledTimer: ReturnType<typeof setTimeout> | null = null;
+let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/// One in-flight first-page FIND. Progressive frames are its side channel;
+/// the fused final frame settles `finalPromise`. Activating a progressive row
+/// waits for this promise instead of issuing a second query.
+interface ActiveFlight {
+  id: string;
+  query: string;
+  mode: ContentMode;
+  filter: SearchContentFilter;
+  finalPromise: Promise<SearchResponse>;
+  resolveFinal: (response: SearchResponse) => void;
+  rejectFinal: (error: unknown) => void;
+  settled: boolean;
+}
+let flight: ActiveFlight | null = null;
+let frameUnlisten: (() => void) | null = null;
+
+export function activeFlightDraft(): { query: string; filter: SearchContentFilter } | null {
+  return flight ? { query: flight.query, filter: flight.filter } : null;
+}
+
+/// When `item` belongs to the current progressive observation, await the same
+/// request's final frame and return that item's authoritative final version.
+/// Never sends another query. Returns null when there is nothing to wait for.
+export async function progressiveFinalItem(item: ResultItem): Promise<ResultItem | null> {
+  const current = flight;
+  if (!current || current.mode !== 'submit') return null;
+  const progressive = useSearchStore.getState().progressive;
+  if (!progressive
+    || useSearchStore.getState().progressiveRequestId !== current.id
+    || !progressive.items.some(observed => isSameProgressiveItem(observed, item))) {
+    return null;
+  }
+  try {
+    const response = await current.finalPromise;
+    return response.items.find(final => isSameProgressiveItem(final, item)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function deadline(response: SearchResponse): number {
+  return searchResponseDeadline(response);
+}
+
+function valid(response: SearchResponse): boolean {
+  return !!ownerState && searchResponseCurrent(response, ownerState);
+}
+
+function reusable(response: SearchResponse): boolean {
+  return valid(response) && !response.sources.some(source => source.noStore)
+    && response.coverage.every(source => source.state === SourceState.READY);
+}
+
+function kinds(filter: SearchContentFilter): SearchKind[] {
+  switch (filter) {
+    case 'messages': return [SearchKind.MESSAGE, SearchKind.CONVERSATION];
+    case 'attachments': return [SearchKind.MESSAGE];
+    case 'social': return [SearchKind.SOCIAL_POST, SearchKind.SOCIAL_COMMENT];
+    default: return [];
+  }
+}
+
+export function searchErrorKey(error: unknown): string {
+  const code = error instanceof RustCommandException ? error.details?.search_error_code : undefined;
+  switch (code) {
+    case SearchErrorCode.CURSOR_EXPIRED: return 'search.error.cursorExpired';
+    case SearchErrorCode.RESOURCE_UNAVAILABLE: return 'search.error.resourceUnavailable';
+    case SearchErrorCode.SOURCE_CHANGED: return 'search.error.sourceChanged';
+    case SearchErrorCode.SOURCE_TIMEOUT: return 'search.error.timeout';
+    case SearchErrorCode.INVALID_QUERY: return 'search.error.invalidQuery';
+    default: return 'search.error.unavailable';
+  }
+}
+
+function hide(): void {
+  if (expiryTimer !== null) clearTimeout(expiryTimer);
+  expiryTimer = null;
+  useSearchStore.setState({
+    response: null, displayedQuery: '', displayedMode: 'suggest',
+    progressive: null, progressiveRequestId: null, progressiveSources: [],
+  });
+}
+
+function failFlight(error: unknown): void {
+  if (flight && !flight.settled) {
+    flight.settled = true;
+    flight.rejectFinal(error instanceof Error ? error : new Error('search_cancelled'));
+  }
+  flight = null;
+}
+
+function clearProgressiveObservation(): void {
+  useSearchStore.setState({
+    progressive: null, progressiveRequestId: null, progressiveSources: [],
+  });
+}
+
+async function attachFrameListener(current: () => boolean): Promise<void> {
+  frameUnlisten?.();
+  frameUnlisten = null;
+  try {
+    frameUnlisten = await subscribeSearchFrames(decoded => {
+      const activeFlight = flight;
+      if (!activeFlight || decoded.requestId !== activeFlight.id || !current()) return;
+      const view = useSearchStore.getState();
+      if (view.progressiveRequestId && view.progressiveRequestId !== activeFlight.id) return;
+      // Background refresh of the SAME intent must keep the qualified frame
+      // until the final fused frame arrives. A per-source progressive frame
+      // (public rows while private is still in flight or transiently failed)
+      // would otherwise temporarily erase qualified rows and move the anchor.
+      // Progressive delivery stays live for first-load intents with no
+      // committed frame.
+      const committed = view.response;
+      if (committed && committed.items.length > 0
+        && view.displayedQuery === activeFlight.query
+        && view.displayedMode === 'submit' && view.displayedFilter === activeFlight.filter) {
+        return;
+      }
+      const previous = view.progressiveRequestId === activeFlight.id ? view.progressive : null;
+      const merged = mergeProgressiveFrame(
+        previous, decoded.response, decoded.sourceId, view.progressiveSources,
+      );
+      useSearchStore.setState({
+        progressive: merged.response,
+        progressiveRequestId: activeFlight.id,
+        progressiveSources: merged.deliveredSources,
+      });
+    });
+  } catch {
+    // No native event channel (or closed window): FIND still completes via
+    // the command response; progressive delivery is advisory.
+    frameUnlisten = null;
+  }
+}
+
+export function stopSearchQuery(): void {
+  active?.cancel();
+  active = null;
+  unsubscribe?.(); unsubscribe = null;
+  client.removeQueries({ predicate: query => {
+    const frame = query.state.data as Frame | undefined;
+    return query.getObserversCount() === 0 && !!frame?.response.sources.some(source => source.noStore);
+  } });
+  if (stalledTimer !== null) clearTimeout(stalledTimer);
+  stalledTimer = null;
+  frameUnlisten?.(); frameUnlisten = null;
+  failFlight(new Error('search_cancelled'));
+  clearProgressiveObservation();
+  // Removing the last subscriber consumes Query's AbortSignal and cancels native IPC.
+  useSearchStore.setState({ stalled: false });
+}
+
+export function clearSearchQueries(): void {
+  epoch++;
+  stopSearchQuery();
+  observer?.destroy(); observer = null;
+  client.clear();
+  ownerState = null;
+  stateFlight = null;
+  reconcileInFlight = null;
+  useSearchStore.setState({ traversal: null, selectedKey: null, scrollTop: 0 });
+  hide();
+}
+
+function presentationPosition(keys: string[], previousKeys: string[]) {
+  const view = useSearchStore.getState();
+  const stable = keys.length >= previousKeys.length
+    && previousKeys.every((key, index) => key === keys[index]);
+  return {
+    selectedKey: view.selectedKey && keys.includes(view.selectedKey) ? view.selectedKey : null,
+    scrollTop: stable ? view.scrollTop : 0,
+  };
+}
+
+function conceal(response: SearchResponse | null): void {
+  // Temporary loss of read authority is not a qualified empty-page observation.
+  useSearchStore.setState({ response });
+}
+
+export function invalidateSearchSources(sourceIds: readonly string[]): boolean {
+  const affected = new Set(sourceIds);
+  const view = useSearchStore.getState();
+  const response = view.response;
+  // A pending new intent has no qualified source vector yet. Keep that case
+  // conservative; a continuation retains its current response's dependencies.
+  const queryAffected = !response?.sources.length
+    || view.displayedQuery !== view.query.trim() || view.displayedMode !== view.mode
+    || view.displayedFilter !== view.contentFilter
+    || response.sources.some(source => affected.has(source.sourceId));
+  client.removeQueries({ predicate: query => {
+    const frame = query.state.data as Frame | undefined;
+    return frame ? frame.response.sources.some(source => affected.has(source.sourceId)) : queryAffected;
+  } });
+  if (!queryAffected) return false;
+  epoch++;
+  stopSearchQuery();
+  observer?.destroy(); observer = null;
+  ownerState = null;
+  stateFlight = null;
+  if (response) conceal({
+    ...response, items: response.items.filter(item => !affected.has(item.sourceId)),
+    nextCursor: '', hasMore: false,
+    coverage: response.coverage.map(source => affected.has(source.sourceId)
+      ? { ...source, state: SourceState.PARTIAL, detailKey: 'search.coverage.partial' } : source),
+  });
+  return true;
+}
+
+async function readState(): Promise<SearchReadState> {
+  if (stateFlight) return stateFlight;
+  const capturedEpoch = epoch;
+  const identity = captureSearchIdentity();
+  if (!identity) throw new Error('search.error.unavailable');
+  let timer!: ReturnType<typeof setTimeout>;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new RustCommandException('search', {
+      code: 'CONFLICT', message: 'search read-state timeout',
+      details: { search_error_code: SearchErrorCode.SOURCE_TIMEOUT },
+    })), TRAVERSAL_DEADLINE_MS);
+  });
+  const promise = Promise.race([searchService.readState(), expired]).then(state => {
+    if (capturedEpoch !== epoch || captureSearchIdentity() !== identity) {
+      throw new Error('search_scope_changed');
+    }
+    if (ownerState && sourceStateIdentity(ownerState) !== sourceStateIdentity(state)) {
+      client.removeQueries({ predicate: query => query.getObserversCount() === 0 });
+      const response = useSearchStore.getState().response;
+      if (response) conceal(concealChangedSearchSources(response, state));
+    }
+    ownerState = state;
+    return state;
+  }).finally(() => {
+    clearTimeout(timer);
+    if (stateFlight === promise) stateFlight = null;
+  });
+  stateFlight = promise;
+  return promise;
+}
+
+function budgetCache(): void {
+  const queries = client.getQueryCache().findAll().sort((a, b) =>
+    b.getObserversCount() - a.getObserversCount() || b.state.dataUpdatedAt - a.state.dataUpdatedAt);
+  let items = 0;
+  let frames = 0;
+  for (const query of queries) {
+    const frame = query.state.data as Frame | undefined;
+    if (!frame) continue;
+    if (query.getObserversCount() === 0 && (
+      !reusable(frame.response)
+      || frames + 1 > MAX_FRAMES || items + frame.response.items.length > MAX_ITEMS
+    )) client.getQueryCache().remove(query);
+    else { items += frame.response.items.length; frames++; }
+  }
+}
+
+function publish(frame: Frame): void {
+  const previous = useSearchStore.getState();
+  const context = previous.traversal;
+  const changed = !context || context.identity !== frame.traversal.identity
+    || context.query !== frame.query || context.mode !== frame.mode
+    || context.filter !== frame.filter || context.locale !== frame.traversal.locale;
+  const sameContext = !changed && previous.response;
+  const retained = sameContext && previous.response
+    ? retainTransientlyUnavailableSources(
+      previous.response, frame.response, item => searchRowKey(item.resource),
+    )
+    : frame.response;
+  const rowKeys = retained.items.map(item => searchRowKey(item.resource));
+  // Keys preserve selection; only complete render equality permits retaining
+  // row references. Every qualified response still installs its issued scope,
+  // cursor and lease so result activation uses the current owner metadata.
+  const previousItems = new Map(previous.response?.items.map(item => [
+    searchRowKey(item.resource), item,
+  ]));
+  const response = changed ? retained : {
+    ...retained,
+    items: retained.items.map(item => {
+      const existing = previousItems.get(searchRowKey(item.resource));
+      return existing && structuralEqual(existing, item) ? existing : item;
+    }),
+  };
+  useSearchStore.setState({
+    response, displayedQuery: frame.query, displayedMode: frame.mode,
+    displayedFilter: frame.filter,
+    traversal: { ...frame.traversal, rowKeys },
+    progressive: null, progressiveRequestId: null, progressiveSources: [],
+    ...(changed ? { selectedKey: null, scrollTop: 0 }
+      : presentationPosition(rowKeys, context.rowKeys)),
+  });
+  if (expiryTimer !== null) clearTimeout(expiryTimer);
+  expiryTimer = null;
+  // Owner-checked no-store frames have no time-based replay: no expiry timer.
+  // Revisions and invalidations arrive through their own subscriptions; a new
+  // user intent starts a fresh FIND directly.
+  if (hasExpiringLease(response)) {
+    expiryTimer = setTimeout(() => {
+      // Lease expiry only requires a fresh owner confirmation; it is not a
+      // revocation. Keep the qualified frame on screen and re-read in the
+      // background.
+      if (useSearchStore.getState().open) void reconcileSearchQuery(activeLocale);
+    }, Math.max(0, deadline(frame.response) - Date.now()));
+  }
+}
+
+export async function runSearchQuery(locale: string, refresh = false, more = false): Promise<void> {
+  if (useSearchStore.getState().opening) return;
+  stopSearchQuery();
+  activeLocale = locale;
+  const view = useSearchStore.getState();
+  if (!view.open || view.mode === 'functions' || (!view.query.trim() && view.mode === 'submit')) return;
+  const identity = captureSearchIdentity();
+  const query = view.query.trim();
+  const mode = view.mode;
+  const context = view.traversal;
+  const sameTraversal = !!context && context.identity === identity && context.query === query
+    && context.mode === mode && context.filter === view.contentFilter && context.locale === locale;
+  const freshTraversal = !more && sameTraversal && context.noStore && mode === 'submit';
+  const ordinal = more ? (sameTraversal ? context.ordinal : 0) + 1
+    : freshTraversal ? context.ordinal : 0;
+  const cursor = more ? view.response?.nextCursor ?? '' : '';
+  if (more && (!cursor || view.displayedQuery !== query || view.displayedMode !== mode
+    || view.displayedFilter !== view.contentFilter)) return;
+  if (ordinal >= MAX_TRAVERSAL_PAGES) {
+    useSearchStore.setState({ status: 'error', errorKey: 'search.error.cursorExpired' });
+    return;
+  }
+  let id: string | null = null;
+  // A first-page FIND owns a request-scoped progressive flight: native source
+  // frames feed the side channel, and the command response settles the final
+  // promise. Suggestions, continuations and refreshes have no flight.
+  const progressiveFlight = !more && mode === 'submit';
+  let activeFlight: ActiveFlight | null = null;
+  if (progressiveFlight) {
+    let resolveFinal!: (response: SearchResponse) => void;
+    let rejectFinal!: (error: unknown) => void;
+    const finalPromise = new Promise<SearchResponse>((resolve, reject) => {
+      resolveFinal = resolve;
+      rejectFinal = reject;
+    });
+    // Cancellation rejections are routine (new intent supersedes the flight);
+    // only callers that asked to await progressive rows observe them.
+    finalPromise.catch(() => {});
+    activeFlight = {
+      id: crypto.randomUUID(), query, mode, filter: view.contentFilter,
+      finalPromise, resolveFinal, rejectFinal, settled: false,
+    };
+    id = activeFlight.id;
+    flight = activeFlight;
+  }
+  const settleFlight = (response: SearchResponse): void => {
+    if (activeFlight && !activeFlight.settled) {
+      activeFlight.settled = true;
+      activeFlight.resolveFinal(response);
+    }
+    if (flight === activeFlight) flight = null;
+  };
+  const failActiveFlight = (error: unknown): void => {
+    if (activeFlight && !activeFlight.settled) {
+      activeFlight.settled = true;
+      activeFlight.rejectFinal(error instanceof Error ? error : new Error('search_cancelled'));
+    }
+    if (flight === activeFlight) flight = null;
+  };
+  let timedOut = false;
+  const until = Date.now() + TRAVERSAL_DEADLINE_MS;
+  const cancelNative = () => { if (id) void searchService.cancel(id).catch(() => {}); };
+  let rejectDeadline!: (error: unknown) => void;
+  const expired = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
+  void expired.catch(() => {});
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    cancelNative();
+    rejectDeadline(new RustCommandException('search', {
+      code: 'CONFLICT', message: 'search traversal timeout',
+      details: { search_error_code: SearchErrorCode.SOURCE_TIMEOUT },
+    }));
+  }, TRAVERSAL_DEADLINE_MS);
+  const token = { cancel: () => {
+    clearTimeout(timeout);
+    cancelNative();
+    rejectDeadline(new Error('search_cancelled'));
+  } };
+  active = token;
+  const current = () => active === token && !!identity && captureSearchIdentity() === identity
+    && useSearchStore.getState().open && !useSearchStore.getState().opening;
+  useSearchStore.setState({ status: 'loading', errorKey: null });
+  stalledTimer = setTimeout(() => {
+    if (current()) useSearchStore.setState({ stalled: true });
+  }, STALLED_SEARCH_DELAY);
+  try {
+    await Promise.race([readState(), expired]);
+    if (!current()) return;
+    if (view.response && !valid(view.response)) {
+      conceal(concealChangedSearchSources(view.response, ownerState!));
+    }
+    const queryKey = [epoch, sourceStateIdentity(ownerState!), mode, view.contentFilter, query, locale,
+      freshTraversal ? `fresh:${ordinal}` : cursor];
+    const baseKey = [...queryKey.slice(0, -1), ''];
+    const cached = client.getQueryData<Frame>(queryKey);
+    if (cached && !reusable(cached.response)) {
+      client.removeQueries({ queryKey, exact: true });
+    }
+    const options = {
+      queryKey, enabled: false,
+      placeholderData: (previous: Frame | undefined) =>
+        previous && reusable(previous.response) ? keepPreviousData(previous) : undefined,
+      staleTime: (entry: { state: { data: unknown; dataUpdatedAt: number } }) => {
+        const data = entry.state.data as Frame | undefined;
+        return data && reusable(data.response)
+          ? Math.max(0, deadline(data.response) - entry.state.dataUpdatedAt) : 0;
+      },
+      queryFn: async ({ signal }: { signal: AbortSignal }): Promise<Frame> => {
+        signal.addEventListener('abort', cancelNative, { once: true });
+        const failure = (code: SearchErrorCode): never => {
+          throw new RustCommandException('search', {
+            code: 'CONFLICT', message: 'search traversal failed', details: { search_error_code: code },
+          });
+        };
+        const read = async (nextCursor: string, force: boolean, requestId?: string): Promise<SearchResponse> => {
+          if (timedOut || Date.now() >= until) failure(SearchErrorCode.SOURCE_TIMEOUT);
+          if (signal.aborted || !current()) throw new Error('search_cancelled');
+          id = requestId ?? crypto.randomUUID();
+          const response = await Promise.race([expired, mode === 'suggest'
+            ? searchService.suggest(query, id, kinds(view.contentFilter), view.contentFilter === 'attachments')
+            : searchService.submit(query, id, locale, nextCursor, force, kinds(view.contentFilter), view.contentFilter === 'attachments')]);
+          await Promise.race([readState(), expired]);
+          if (signal.aborted || !current()) throw new Error('search_cancelled');
+          if (timedOut || Date.now() >= until) failure(SearchErrorCode.SOURCE_TIMEOUT);
+          if (!valid(response)) failure(SearchErrorCode.SOURCE_CHANGED);
+          return response;
+        };
+        try {
+          let response = await read(cursor, refresh || freshTraversal, activeFlight?.id);
+          // Only freshly issued continuations are consumed; intermediate no-store
+          // pages never enter Query storage or the visible projection.
+          for (let page = 0; freshTraversal && page < ordinal; page++) {
+            if (!response.hasMore || !response.nextCursor) failure(SearchErrorCode.SOURCE_CHANGED);
+            response = await read(response.nextCursor, false);
+          }
+          if (more && view.response && !valid(view.response)) failure(SearchErrorCode.SOURCE_CHANGED);
+          const frame = (value: SearchResponse): Frame => ({
+            query, mode, filter: view.contentFilter, response: value,
+            traversal: {
+              identity, query, mode, filter: view.contentFilter, locale, ordinal,
+              noStore: value.sources.some(source => source.noStore),
+              rowKeys: value.items.map(item => searchRowKey(item.resource)),
+            },
+          });
+          if (ordinal + 1 >= MAX_TRAVERSAL_PAGES) response = { ...response, hasMore: false, nextCursor: '' };
+          if (!more || !view.response || response.sources.some(source => source.noStore)) {
+            settleFlight(response);
+            return frame(response);
+          }
+          const seen = new Set(view.response.items.map(item => resourceIdentity(item.resource)));
+          const combined = {
+            ...response,
+            items: [...view.response.items, ...response.items.filter(item => !seen.has(resourceIdentity(item.resource)))]
+              .slice(0, MAX_VISIBLE_ITEMS),
+            expiresAtUnixMs: response.expiresAtUnixMs < view.response.expiresAtUnixMs
+              ? response.expiresAtUnixMs : view.response.expiresAtUnixMs,
+          };
+          if (combined.items.length >= MAX_VISIBLE_ITEMS) combined.hasMore = false;
+          settleFlight(combined);
+          return frame(combined);
+        } catch (error) {
+          failActiveFlight(error);
+          throw error;
+        } finally {
+          clearTimeout(timeout);
+          signal.removeEventListener('abort', cancelNative);
+        }
+      },
+    };
+    if (observer) observer.setOptions(options);
+    else observer = new QueryObserver<Frame>(client, options);
+    const project = (result: QueryObserverResult<Frame>) => {
+      if (!current()) return;
+      if (result.data && valid(result.data.response)) publish(result.data);
+      if (!current()) return;
+      if (!result.isFetching && !result.isPlaceholderData && result.status !== 'pending') {
+        clearTimeout(timeout);
+        if (stalledTimer !== null) clearTimeout(stalledTimer);
+        stalledTimer = null;
+        if (result.isError) {
+          // Terminal failure of the fused frame: any partial observation is
+          // no longer copyable or openable. Intent cancellation already
+          // cleared it in stopSearchQuery before the rejection is observed.
+          clearProgressiveObservation();
+          failFlight(result.error);
+        }
+        useSearchStore.setState({
+          status: result.isError ? 'error' : 'ready', stalled: false,
+          errorKey: result.isError ? searchErrorKey(result.error) : null,
+        });
+        if (!current()) return;
+        if (result.isError && freshTraversal) hide();
+        if (more && result.isSuccess && result.data && reusable(result.data.response)) client.setQueryData(baseKey, result.data);
+        if (result.isSuccess && result.data?.traversal.noStore) {
+          unsubscribe?.(); unsubscribe = null;
+          observer?.destroy(); observer = null;
+          client.removeQueries({ queryKey, exact: true });
+        }
+        budgetCache();
+      }
+    };
+    unsubscribe = observer.subscribe(project);
+    // An explicit native read-state check always precedes Query cache admission.
+    const saved = client.getQueryData<Frame>(queryKey);
+    if (!refresh && saved && reusable(saved.response)) {
+      settleFlight(saved.response);
+      project(observer.getCurrentResult());
+    } else {
+      // Register the request-scoped native channel before invoking FIND so a
+      // fast source frame cannot overtake subscription.
+      if (activeFlight) await attachFrameListener(current);
+      if (!current()) {
+        failActiveFlight(new Error('search_cancelled'));
+        return;
+      }
+      void observer.refetch();
+    }
+  } catch (error) {
+    if (!current()) return;
+    clearTimeout(timeout);
+    if (stalledTimer !== null) clearTimeout(stalledTimer);
+    stalledTimer = null;
+    // A failed background refresh never erases an already qualified frame:
+    // lease-driven re-reads confirm content, they do not revoke it. Only a
+    // first-load failure with nothing qualified falls back to the empty/error
+    // surface.
+    const hasQualifiedFrame = (useSearchStore.getState().response?.items.length ?? 0) > 0;
+    if (!hasQualifiedFrame) hide();
+    // A superseding flight reports plain cancellation; with the qualified
+    // frame retained this is not a user-visible failure.
+    const cancelled = error instanceof Error && error.message === 'search_cancelled';
+    useSearchStore.setState(cancelled && hasQualifiedFrame
+      ? { status: 'ready', stalled: false, errorKey: null }
+      : { status: 'error', stalled: false, errorKey: searchErrorKey(error) });
+  }
+}
+
+/**
+ * Event/lease-driven reconciliation. A no-store FIND is NOT replayed on a
+ * timer: a re-read needs a reason — an outstanding load, no qualified
+ * response, a source revision/scope change observed in read-state, or an
+ * expired response lease/session window. Invalidations arrive through their
+ * own event subscription and cancel/conceal immediately.
+ */
+// Coalesce concurrent reconciliation requests. Open completion, focus and
+// visibility edges can all fire within milliseconds after returning to
+// Search; running each as a separate cancelling FIND produced overlapping
+// flights whose aborts surfaced as transient source-unavailable frames.
+// Callers in the same burst share the one read that was actually needed.
+let reconcileInFlight: Promise<void> | null = null;
+
+export async function reconcileSearchQuery(locale: string): Promise<void> {
+  if (reconcileInFlight) {
+    await reconcileInFlight.catch(() => {});
+    return;
+  }
+  const flight = reconcileSearchQueryOnce(locale).finally(() => {
+    if (reconcileInFlight === flight) reconcileInFlight = null;
+  });
+  reconcileInFlight = flight;
+  await flight.catch(() => {});
+}
+
+async function reconcileSearchQueryOnce(locale: string): Promise<void> {
+  const view = useSearchStore.getState();
+  if (!view.open || view.opening || view.mode === 'functions') return;
+  if (view.status === 'loading') {
+    await runSearchQuery(locale);
+    return;
+  }
+  const capturedEpoch = epoch;
+  try {
+    await readState();
+    let latest = useSearchStore.getState();
+    if (capturedEpoch !== epoch || !latest.open || latest.opening) return;
+    if (latest.response && !valid(latest.response)) {
+      conceal(concealChangedSearchSources(latest.response, ownerState!));
+      latest = useSearchStore.getState();
+    }
+    if (capturedEpoch !== epoch || !latest.open || latest.opening) return;
+    if (shouldReread(latest.status, latest.response)) await runSearchQuery(locale);
+  } catch {
+    if (capturedEpoch === epoch && !useSearchStore.getState().opening) {
+      hide();
+      useSearchStore.setState({ status: 'error', stalled: false, errorKey: 'search.error.unavailable' });
+    }
+  }
+}
+
+/**
+ * Whether time alone is a reason to re-read this frame.
+ *
+ * no-store sources with owner-check-required rows (device.social /
+ * station.social.public) are confirmed at Open time, never by a timer:
+ * replay arrives only from owner revision/scope changes, invalidations or a
+ * new user intent. Stored sources (device.messaging) and rows carrying a
+ * bounded lease still expire on schedule. Treating an owner-checked no-store
+ * frame as expiring produced a self-cancelling FIND storm every lease window.
+ */
+function hasExpiringLease(response: SearchResponse): boolean {
+  if (response.sources.some(source => !source.noStore)) return true;
+  return response.items.some(item =>
+    item.readValidity ? !item.readValidity.ownerCheckRequired : true);
+}
+
+function shouldReread(
+  status: SearchStateStatus,
+  response: SearchResponse | null,
+): boolean {
+  if (!response) return true;
+  // The Runtime marks an original-owner invalidation idle after concealing
+  // its rows. A pinned remote owner may report no monotonic revision, so its
+  // unchanged read-state cannot qualify that concealed frame as completed.
+  if (status === 'idle') return true;
+  if (status === 'error') return true;
+  if (hasExpiringLease(response) && searchResponseDeadline(response) <= Date.now()) return true;
+  if (ownerState && !searchResponseCurrent(response, ownerState)) return true;
+  return false;
+}
+
+type SearchStateStatus = 'idle' | 'loading' | 'ready' | 'error';

@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+import base64
+import json
+import re
+from collections.abc import Mapping
+from typing import Any, Callable
+from urllib.parse import quote, quote_plus
+
+
+REDACTED = "[REDACTED]"
+_SAFE_REFERENCE_SUFFIXES = (
+    "_ref",
+    "_refs",
+    "_reference",
+    "_references",
+)
+# A digest is a non-reversible hash by construction, never a raw credential.
+# Keys such as storage_key_digest or password_digest contain a sensitive token
+# only by name; their values cannot be reversed into the secret and are safe to
+# retain in evidence, matching the host_key_sha256 / idempotency_key_hash rules.
+_SAFE_DIGEST_SUFFIXES = ("_digest",)
+_SAFE_EXACT_KEYS = frozenset(
+    {
+        "cache_tokens",
+        "cleanup_fencing_token",
+        "context_tokens",
+        "error_key",
+        "fence_token",
+        "fencing_token",
+        "has_token_accounting",
+        "host_key_sha256",
+        "idempotency_key_hash",
+        "input_tokens",
+        "locale_key",
+        "max_input_tokens",
+        "max_output_tokens",
+        "output_tokens",
+        "process_port_secret_canary",
+        "public_key",
+        "public_keys",
+        "reasoning_tokens",
+        "resource_key",
+        "runtime_tuple_key",
+        "scenario_key",
+        "secret_leak_count",
+        "token_accounting_present",
+        "token_usage",
+        "tool_definition_tokens",
+    }
+)
+_SENSITIVE_KEY_TOKENS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "bearer",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "dsn",
+        "jwt",
+        "key",
+        "keys",
+        "mnemonic",
+        "nonce",
+        "otp",
+        "passphrase",
+        "passwd",
+        "password",
+        "passwords",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "totp",
+    }
+)
+_SENSITIVE_KEY_PHRASES = tuple(
+    sorted(
+        {
+            "api_key",
+            "auth_code",
+            "callback_code",
+            "code_verifier",
+            "connection_string",
+            "database_url",
+            "mfa_code",
+            "oauth_code",
+            "recovery_code",
+            "seed_phrase",
+            *(
+                f"{qualifier}_key"
+                for qualifier in (
+                    "access",
+                    "client",
+                    "encryption",
+                    "private",
+                    "refresh",
+                    "secret",
+                    "session",
+                    "signing",
+                )
+            ),
+            *(
+                f"{qualifier}_token"
+                for qualifier in (
+                    "access",
+                    "auth",
+                    "id",
+                    "oauth",
+                    "refresh",
+                    "session",
+                )
+            ),
+            *(
+                f"{qualifier}_secret"
+                for qualifier in ("client", "signing", "webhook")
+            ),
+        }
+    )
+)
+_SENSITIVE_ASSIGNMENT_FIELDS = tuple(
+    sorted(_SENSITIVE_KEY_TOKENS | frozenset(_SENSITIVE_KEY_PHRASES))
+)
+
+
+def _field_pattern(name: str) -> str:
+    separator = r"(?:[._\-\s]|%2d|%2e|%5f)*"
+    return separator.join(re.escape(part) for part in name.split("_"))
+
+
+_SENSITIVE_FIELD_PATTERN = "|".join(
+    _field_pattern(name)
+    for name in sorted(_SENSITIVE_ASSIGNMENT_FIELDS, key=len, reverse=True)
+)
+# Assignment redaction splits sensitive field names into two classes so the
+# generic text pattern cannot flag non-secret framework attributes in DOM
+# evidence:
+#  * compound names (api_key, client_secret, ...) are enumerated phrases and
+#    matched across their full . _ - space spelling, so api-key / api.key stay
+#    sensitive even when embedded in a larger token;
+#  * bare single-word fields (key, token, secret, ...) match only as standalone
+#    fields. A bare token that merely tails a larger hyphen/dot identifier
+#    (data-group-key, rc-util-key, config.token) is a framework or data
+#    attribute carrying an opaque UI identifier, not a credential.
+_SENSITIVE_COMPOUND_FIELD_PATTERN = "|".join(
+    _field_pattern(name)
+    for name in sorted(
+        (name for name in _SENSITIVE_ASSIGNMENT_FIELDS if "_" in name),
+        key=len,
+        reverse=True,
+    )
+)
+_SENSITIVE_BARE_FIELD_PATTERN = "|".join(
+    _field_pattern(name)
+    for name in sorted(
+        (name for name in _SENSITIVE_ASSIGNMENT_FIELDS if "_" not in name),
+        key=len,
+        reverse=True,
+    )
+)
+_REDACTED_VALUE_PATTERN = re.escape(REDACTED)
+# A bare "key" URL query parameter is the object-storage object identifier by
+# convention (S3/OSS/GCS: GET /file?key=YYYY/MM/DD/<id><ext>), i.e. a resource
+# path rather than a credential; object access is authorized separately via a
+# signature or auth header. Keep it out of URL query redaction while compound
+# names such as api_key/access_key and every other sensitive parameter remain
+# covered.
+_SAFE_URL_QUERY_FIELDS = frozenset({"key"})
+_URL_QUERY_FIELD_PATTERN = "|".join(
+    _field_pattern(name)
+    for name in sorted(
+        {
+            *_SENSITIVE_ASSIGNMENT_FIELDS,
+            "code",
+            "sig",
+            "signature",
+            "state",
+            "x_amz_credential",
+            "x_amz_security_token",
+            "x_amz_signature",
+        }
+        - _SAFE_URL_QUERY_FIELDS,
+        key=len,
+        reverse=True,
+    )
+)
+_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)(?P<prefix>"
+    rf"(?<![\w])[\"']?(?:{_SENSITIVE_COMPOUND_FIELD_PATTERN})[\"']?\s*[:=]\s*"
+    # Bare fields never own URL query/fragment parameters: ? &# introduce a
+    # query string that _URL_QUERY_SECRET handles, so assignment matching must
+    # not re-flag an exempt object-storage key there.
+    rf"|(?<![\w.?&#-])[\"']?(?:{_SENSITIVE_BARE_FIELD_PATTERN})[\"']?\s*[:=]\s*"
+    rf")"
+    rf"(?P<value>{_REDACTED_VALUE_PATTERN}|"
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s}\]]+)"
+)
+_SENSITIVE_COMMAND_FLAG = re.compile(
+    rf"(?i)(?P<prefix>(?<![\w])--?(?:{_SENSITIVE_FIELD_PATTERN})\s+)"
+    rf"(?P<value>{_REDACTED_VALUE_PATTERN}|"
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s}\]]+)"
+)
+# Whitespace-separated line assignments (netrc/shell "name value" with no
+# separator) are only safe for unambiguous credential keepers. Bare dictionary
+# words such as auth/key/token/secret/cookie/bearer legitimately begin prose and
+# CSS comment lines (e.g. "auth card. Only a failure card ..."), so they are
+# excluded from this loose line form. Their structured forms remain fully
+# covered: "key=..."/"token: ..." by _SENSITIVE_ASSIGNMENT, query parameters by
+# _URL_QUERY_SECRET, and authorization/cookie/bearer headers by their dedicated
+# header patterns.
+_LINE_ASSIGNMENT_PROSE_PRONE_TOKENS = frozenset(
+    {
+        "auth",
+        "bearer",
+        "cookie",
+        "cookies",
+        "key",
+        "keys",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+    }
+)
+_LINE_ASSIGNMENT_FIELDS = tuple(
+    sorted(
+        set(_SENSITIVE_KEY_PHRASES)
+        | (_SENSITIVE_KEY_TOKENS - _LINE_ASSIGNMENT_PROSE_PRONE_TOKENS),
+        key=len,
+        reverse=True,
+    )
+)
+_SENSITIVE_LINE_FIELD_PATTERN = "|".join(
+    _field_pattern(name) for name in _LINE_ASSIGNMENT_FIELDS
+)
+_SENSITIVE_LINE_ASSIGNMENT = re.compile(
+    rf"(?im)(?P<prefix>^\s*(?:{_SENSITIVE_LINE_FIELD_PATTERN})\s+)"
+    rf"(?P<value>{_REDACTED_VALUE_PATTERN}|"
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n]+)"
+)
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?im)(\b(?:proxy[-_\s]?authorization|authorization)\s*[:=]\s*)[^\r\n]+"
+)
+_COOKIE_HEADER = re.compile(
+    r"(?im)(\b(?:set-cookie|cookie)\s*[:=]\s*)[^\r\n]+"
+)
+_BEARER_TOKEN = re.compile(r"(?i)(\bbearer\s+)[^\s,;}\]]+")
+_URI_CREDENTIAL = re.compile(
+    r"(?i)(\b[a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]+)(?=@)"
+)
+_URL_QUERY_SECRET = re.compile(
+    rf"(?i)([?&#](?:{_URL_QUERY_FIELD_PATTERN})=)[^&#\s]+"
+)
+_PRIVATE_KEY = re.compile(
+    r"-----BEGIN [^-]*PRIVATE KEY-----.*?"
+    r"(?:-----END [^-]*PRIVATE KEY-----|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_KNOWN_SECRET_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"glpat-[A-Za-z0-9_-]{20,}|"
+    r"GOCSPX-[A-Za-z0-9_-]{20,}|"
+    r"npm_[A-Za-z0-9]{20,}|"
+    r"pypi-[A-Za-z0-9_-]{20,}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"AIza[0-9A-Za-z_-]{35}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"sk-[A-Za-z0-9_-]{20,}|"
+    r"sk_(?:live|test)_[A-Za-z0-9]{16,}|"
+    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r")(?![A-Za-z0-9])"
+)
+
+
+def _camel_to_snake(name: str) -> str:
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
+
+def is_sensitive_key(key: object) -> bool:
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        _camel_to_snake(str(key).strip()),
+    ).strip("_")
+    if normalized in _SAFE_EXACT_KEYS:
+        return False
+    if normalized.endswith(_SAFE_REFERENCE_SUFFIXES):
+        return False
+    if normalized.endswith(_SAFE_DIGEST_SUFFIXES):
+        return False
+    tokens = frozenset(filter(None, normalized.split("_")))
+    if tokens & _SENSITIVE_KEY_TOKENS:
+        return True
+    padded = f"_{normalized}_"
+    compact = normalized.replace("_", "")
+    return any(
+        f"_{phrase}_" in padded or compact == phrase.replace("_", "")
+        for phrase in _SENSITIVE_KEY_PHRASES
+    )
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        replacement = f"{value[0]}{REDACTED}{value[-1]}"
+    else:
+        replacement = REDACTED
+    return f"{match.group('prefix')}{replacement}"
+
+
+def redact_text(text: str) -> str:
+    redacted = _PRIVATE_KEY.sub(REDACTED, text)
+    redacted = _AUTHORIZATION_HEADER.sub(rf"\1{REDACTED}", redacted)
+    redacted = _COOKIE_HEADER.sub(rf"\1{REDACTED}", redacted)
+    redacted = _BEARER_TOKEN.sub(rf"\1{REDACTED}", redacted)
+    redacted = _URI_CREDENTIAL.sub(rf"\1{REDACTED}", redacted)
+    redacted = _URL_QUERY_SECRET.sub(rf"\1{REDACTED}", redacted)
+    redacted = _KNOWN_SECRET_TOKEN.sub(REDACTED, redacted)
+    redacted = _SENSITIVE_COMMAND_FLAG.sub(_redact_assignment, redacted)
+    redacted = _SENSITIVE_LINE_ASSIGNMENT.sub(_redact_assignment, redacted)
+    return _SENSITIVE_ASSIGNMENT.sub(_redact_assignment, redacted)
+
+
+def redact_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            redact_text(str(key)): (
+                item
+                if is_sensitive_key(key) and isinstance(item, bool)
+                else REDACTED
+                if is_sensitive_key(key)
+                else redact_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return REDACTED
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return redact_text(str(value))
+
+
+def _secret_representations(secret_values: tuple[str, ...]) -> tuple[str, ...]:
+    representations: set[str] = set()
+    for secret in secret_values:
+        if len(secret) < 4:
+            continue
+        encoded = secret.encode("utf-8")
+        percent_encoded = quote(secret, safe="")
+        plus_encoded = quote_plus(secret, safe="")
+        representations.update(
+            {
+                secret,
+                percent_encoded,
+                plus_encoded,
+                re.sub(
+                    r"%[0-9A-F]{2}",
+                    lambda match: match.group(0).lower(),
+                    percent_encoded,
+                ),
+                re.sub(
+                    r"%[0-9A-F]{2}",
+                    lambda match: match.group(0).lower(),
+                    plus_encoded,
+                ),
+                quote(percent_encoded, safe=""),
+                quote(plus_encoded, safe=""),
+                json.dumps(secret, ensure_ascii=True)[1:-1],
+                json.dumps(secret, ensure_ascii=True)[1:-1].replace("/", r"\/"),
+                base64.b64encode(encoded).decode("ascii"),
+                base64.urlsafe_b64encode(encoded).decode("ascii"),
+                base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
+            }
+        )
+    representations.discard("")
+    representations.discard(REDACTED)
+    return tuple(sorted(representations, key=len, reverse=True))
+
+
+def secret_text_redactor(secret_values: tuple[str, ...]) -> Callable[[str], str]:
+    representations = _secret_representations(secret_values)
+
+    def text(value: str) -> str:
+        result = redact_text(value)
+        for representation in representations:
+            result = result.replace(representation, REDACTED)
+        return result
+
+    return text
+
+
+def redact_text_with_values(text: str, secret_values: tuple[str, ...]) -> str:
+    return secret_text_redactor(secret_values)(text)
+
+
+def redact_value_with_values(
+    value: Any,
+    secret_values: tuple[str, ...],
+    *,
+    serialized_metadata: bool = False,
+) -> Any:
+    text = secret_text_redactor(secret_values)
+
+    def visit(item: Any, *, public_metadata: bool = False) -> Any:
+        if isinstance(item, Mapping):
+            if (
+                serialized_metadata and not public_metadata
+                and type(item) is dict
+                and item.get("artifactKind") == "acceptance-execution-graph"
+            ):
+                from .execution_graph import ExecutionGraph
+                from .execution_budget import ExecutionBudgetError
+
+                try:
+                    ExecutionGraph(item)
+                except ExecutionBudgetError:
+                    pass
+                else:
+                    public_metadata = True
+            return {
+                text(str(key)): (
+                    child if not public_metadata and is_sensitive_key(key) and isinstance(child, bool)
+                    else REDACTED if not public_metadata and is_sensitive_key(key)
+                    else visit(child, public_metadata=public_metadata)
+                )
+                for key, child in item.items()
+            }
+        if isinstance(item, (list, tuple)):
+            return [visit(child, public_metadata=public_metadata) for child in item]
+        if isinstance(item, str):
+            return text(item)
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            return REDACTED
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return text(str(item))
+
+    return visit(value)
+
+
+def redact_artifact_bytes(
+    value: bytes,
+    secret_values: tuple[str, ...] = (),
+) -> tuple[bytes, bool]:
+    explicit_secrets = tuple(
+        representation.encode("utf-8")
+        for representation in _secret_representations(secret_values)
+    )
+    explicit_leak = any(secret in value for secret in explicit_secrets)
+    try:
+        original = value.decode("utf-8")
+    except UnicodeDecodeError:
+        if explicit_leak:
+            return f"{REDACTED}\n".encode("utf-8"), True
+        return value, False
+
+    try:
+        structured = json.loads(original)
+    except json.JSONDecodeError:
+        structured = None
+    else:
+        redacted_val = redact_value_with_values(
+            structured, secret_values, serialized_metadata=True,
+        )
+        if redacted_val != structured:
+            encoded = (
+                json.dumps(redacted_val, indent=2, sort_keys=True, default=str)
+                + "\n"
+            ).encode("utf-8")
+            return encoded, True
+        return value, False
+
+    redacted = redact_text_with_values(original, secret_values)
+    encoded = redacted.encode("utf-8")
+    return encoded, encoded != value

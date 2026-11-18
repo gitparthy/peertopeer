@@ -1,0 +1,669 @@
+#[cfg(feature = "acceptance-webdriver")]
+use crate::contracts::StubPayload;
+use crate::contracts::{
+    AccessDecisionInput, AccessDecisionPayload, AccessSubmitInviteInput, AccessSubmitLoginInput,
+    AuthSessionPayload, AuthValidateTokenInput,
+};
+use crate::domain::identity::{ActiveSession, ActorRef};
+use crate::error::{AppResult, ErrorCode};
+use crate::infrastructure::identity_event::{self, IdentityChangeReason, IdentityChangedPayload};
+use crate::infrastructure::session_revocation::SESSION_KICKED_EVENT;
+use crate::state::AppState;
+#[cfg(feature = "acceptance-webdriver")]
+use serde::Deserialize;
+#[cfg(feature = "acceptance-webdriver")]
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State, Window};
+
+use crate::application::auth::service as auth_service;
+
+pub(super) fn secure_content_session_replaced(
+    previous: Option<&ActiveSession>,
+    account_id: &str,
+    actor_ptid: &str,
+    token: &str,
+) -> bool {
+    previous.is_some_and(|session| {
+        session.account_id != account_id || session.actor.ptid != actor_ptid || session.jwt != token
+    })
+}
+
+/// Bind the freshly-authenticated identity to the originating window so
+/// every subsequent command issued from that window resolves to the
+/// correct actor — even when other windows host a different actor.
+fn bind_window_session(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    window: &Window,
+    payload: &AuthSessionPayload,
+) -> Result<(), String> {
+    let previous_window_session = state.sessions.get(window.label());
+    let actor_ptid = payload
+        .actor_ptid
+        .as_deref()
+        .filter(|ptid| ptid.starts_with("ptid:"))
+        .ok_or_else(|| "authenticated response missing canonical actor_ptid".to_string())?
+        .to_string();
+    let token = payload
+        .session_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "authenticated response missing session token".to_string())?
+        .to_string();
+    let actor = ActorRef::new_person(actor_ptid.clone());
+    let account_id =
+        crate::infrastructure::auth_identity::find_account_id_by_actor_ptid(&actor_ptid)
+            .ok_or_else(|| "authenticated actor has no local account".to_string())?;
+    let replaces_window_session = secure_content_session_replaced(
+        previous_window_session.as_ref(),
+        &account_id,
+        &actor_ptid,
+        &token,
+    );
+    let takes_over_actor =
+        state.sessions.snapshot_all().iter().any(|session| {
+            session.window_label != window.label() && session.actor.ptid == actor_ptid
+        });
+    if replaces_window_session || takes_over_actor {
+        state
+            .secure_content
+            .teardown_actor_with_source(&actor_ptid, "auth-bind:replace-or-takeover")?;
+    }
+    if let Err(error) =
+        auth_service::activate_messaging_profile(state, &account_id, &actor_ptid, &token)
+    {
+        tracing::warn!(
+            account_id = %account_id,
+            actor_ptid = %actor_ptid,
+            error = %error,
+            "window session retained while messaging profile activation awaits retry"
+        );
+    }
+    let kicked =
+        state
+            .sessions
+            .bind_exclusive(ActiveSession::new(window.label(), account_id, actor, token));
+    for session in kicked {
+        let payload = serde_json::json!({
+            "reason": "takeover",
+            "actor_ptid": session.actor.ptid,
+        });
+        if let Err(error) = app.emit_to(&session.window_label, SESSION_KICKED_EVENT, &payload) {
+            tracing::warn!(window = %session.window_label, error = %error, "auth: failed to emit local session kick");
+        }
+    }
+    Ok(())
+}
+
+fn broadcast_identity(
+    app: &AppHandle,
+    reason: IdentityChangeReason,
+    payload: &AppResult<AuthSessionPayload>,
+) {
+    if !payload.ok {
+        return;
+    }
+    let data = match &payload.data {
+        Some(data) => data,
+        None => return,
+    };
+    identity_event::emit(
+        app,
+        IdentityChangedPayload {
+            reason,
+            actor_ptid: data.actor_ptid.clone(),
+            login_method: data.login_method.clone(),
+        },
+    );
+}
+
+fn bind_after(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    window: &Window,
+    mut result: AppResult<AuthSessionPayload>,
+) -> AppResult<AuthSessionPayload> {
+    let _transition = match state.identity_transition.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                "Failed to coordinate identity transition",
+                None,
+            )
+        }
+    };
+    if !result.ok {
+        if is_session_revoked(&result) {
+            let result_actor = result.data.as_ref().and_then(|d| d.actor_ptid.clone());
+            let window_actor = state
+                .sessions
+                .get(window.label())
+                .map(|session| session.actor.ptid.clone());
+            tracing::warn!(
+                result_actor = result_actor.as_deref().unwrap_or("-"),
+                window_actor = window_actor.as_deref().unwrap_or("-"),
+                "auth response revoked: detaching window session (bind_after)"
+            );
+            if let Err(error) = unbind_for_logout(state, window) {
+                return secure_content_teardown_failure(error);
+            }
+        }
+        return result;
+    }
+    if let Some(data) = &mut result.data {
+        if let Err(error) = bind_window_session(state, app, window, data) {
+            return AppResult::fail(crate::error::ErrorCode::Unauthorized, error, None);
+        }
+        data.session_activation_id = state.sessions.get(window.label()).map(|session| session.activation_id);
+    }
+    result
+}
+
+fn is_session_revoked(result: &AppResult<AuthSessionPayload>) -> bool {
+    result
+        .error
+        .as_ref()
+        .and_then(|error| error.details.as_ref())
+        .and_then(|details| details.get("code"))
+        .and_then(serde_json::Value::as_str)
+        == Some("session_revoked")
+}
+
+fn unbind_for_logout(state: &Arc<AppState>, window: &Window) -> Result<(), String> {
+    if let Some(session) = state.sessions.unbind(window.label()) {
+        let teardown = state
+            .secure_content
+            .teardown_actor_with_source(&session.actor.ptid, "logout");
+        state.event_streams.stop(&session.actor.ptid)?;
+        teardown?;
+    }
+    Ok(())
+}
+
+fn run_logout_transition(
+    detach_native_authority: impl FnOnce() -> Result<(), String>,
+    cleanup: impl FnOnce() -> AppResult<AuthSessionPayload>,
+    broadcast: impl FnOnce(),
+) -> AppResult<AuthSessionPayload> {
+    let detach_error = detach_native_authority().err();
+    let result = cleanup();
+    broadcast();
+    if let Some(error) = detach_error {
+        return secure_content_teardown_failure(error);
+    }
+    result
+}
+
+fn secure_content_teardown_failure(error: String) -> AppResult<AuthSessionPayload> {
+    AppResult::fail(
+        ErrorCode::InternalError,
+        "Failed to complete Secure Content teardown",
+        Some(serde_json::json!({
+            "command": "auth_logout",
+            "reason": "secure_content_teardown_failed",
+            "failures": [{
+                "operation": "secure_content_teardown",
+                "message": error,
+            }],
+        })),
+    )
+}
+
+/// Open an interactive access attempt and return the Station's initial gate
+/// decision. This is a pre-login step in the gate chain — no session is
+/// produced, so no window binding or identity broadcast is performed.
+#[tauri::command]
+pub fn access_start(state: State<'_, Arc<AppState>>) -> AppResult<AccessDecisionPayload> {
+    auth_service::access_start(&state.station)
+}
+
+/// Redeem a self-service invite code against a live attempt and return the
+/// re-evaluated decision. Advances the chain toward the login gate; never
+/// produces a session on its own.
+#[tauri::command]
+pub fn access_submit_invite_code(
+    input: AccessSubmitInviteInput,
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<AccessDecisionPayload> {
+    auth_service::access_submit_invite_code(&state.station, input)
+}
+
+#[tauri::command]
+pub fn access_decision(
+    input: AccessDecisionInput,
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<AccessDecisionPayload> {
+    auth_service::access_decision(&state.station, input)
+}
+
+#[tauri::command]
+pub fn access_cancel(
+    input: AccessDecisionInput,
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<AccessDecisionPayload> {
+    auth_service::access_cancel(&state.station, input)
+}
+
+/// Submit the login credential gate for a live attempt. On grant this lands
+/// the full desktop session, window binding, and identity broadcast.
+#[tauri::command]
+pub fn access_submit_login(
+    input: AccessSubmitLoginInput,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    window: Window,
+) -> AppResult<AuthSessionPayload> {
+    let result = bind_after(
+        state.inner(),
+        &app,
+        &window,
+        auth_service::access_submit_login(&state.station, input, state.inner()),
+    );
+    broadcast_identity(&app, IdentityChangeReason::Login, &result);
+    result
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ScopedLogoutInput {
+    /// The exact native window activation whose binding failed.
+    pub expected_actor_ptid: String,
+    pub expected_session_activation_id: String,
+}
+
+fn scoped_logout_matches(current: &ActiveSession, scope: &ScopedLogoutInput) -> bool {
+    current.actor.ptid == scope.expected_actor_ptid &&
+        current.activation_id == scope.expected_session_activation_id
+}
+
+#[tauri::command]
+pub fn auth_logout(
+    input: Option<ScopedLogoutInput>,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    window: Window,
+) -> AppResult<AuthSessionPayload> {
+    let _transition = match state.identity_transition.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                "Failed to coordinate identity transition",
+                None,
+            )
+        }
+    };
+    // A binding-rollback logout is scoped to the login attempt that failed.
+    // Under rapid account switching a late/stale rollback can arrive after a
+    // newer unlock already rebound the window, including to the same actor; tearing that
+    // session down would destroy the live Secure Content runtime for the
+    // current identity. Skip the destructive transition and report success so
+    // the superseding session survives.
+    if let Some(scope) = input.as_ref() {
+        let current = state.sessions.get(window.label());
+        if current.as_ref().is_none_or(|current| !scoped_logout_matches(current, scope)) {
+            tracing::info!(
+                expected_actor_ptid = %scope.expected_actor_ptid,
+                "scoped logout skipped: window session was superseded"
+            );
+            return AppResult::success(AuthSessionPayload {
+                command: "auth_logout".to_string(),
+                status: "session_superseded".to_string(),
+                actor_ptid: current.as_ref().map(|session| session.actor.ptid.clone()),
+                session_activation_id: current.map(|session| session.activation_id),
+                session_token: None,
+                name: None,
+                email: None,
+                avatar_url: None,
+                avatar_local_path: None,
+                login_method: None,
+            });
+        }
+    }
+    run_logout_transition(
+        || unbind_for_logout(state.inner(), &window),
+        || auth_service::auth_logout(state.inner()),
+        || {
+            identity_event::emit(
+                &app,
+                IdentityChangedPayload {
+                    reason: IdentityChangeReason::Logout,
+                    actor_ptid: None,
+                    login_method: None,
+                },
+            );
+        },
+    )
+}
+
+#[cfg(feature = "acceptance-webdriver")]
+#[derive(Debug, Deserialize)]
+pub struct AcceptanceLogoutWindowSessionInput {
+    pub expected_actor_ptid: String,
+}
+
+#[cfg(feature = "acceptance-webdriver")]
+#[tauri::command]
+pub fn acceptance_logout_window_session(
+    input: AcceptanceLogoutWindowSessionInput,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    window: Window,
+) -> AppResult<AuthSessionPayload> {
+    let Some(session) = state.sessions.get(window.label()) else {
+        return AppResult::fail(
+            ErrorCode::Unauthorized,
+            "Window has no committed session",
+            Some(serde_json::json!({
+                "command": "acceptance_logout_window_session",
+                "reason": "window_session_missing"
+            })),
+        );
+    };
+    let expected_actor_ptid = input.expected_actor_ptid.trim();
+    if !expected_actor_ptid.starts_with("ptid:") {
+        return AppResult::fail(
+            ErrorCode::InvalidArgument,
+            "acceptance.chat.expectedActorPtidInvalid",
+            Some(serde_json::json!({
+                "command": "acceptance_logout_window_session",
+                "reason": "expected_actor_ptid_invalid"
+            })),
+        );
+    }
+    if expected_actor_ptid != session.actor.ptid {
+        return AppResult::fail(
+            ErrorCode::Forbidden,
+            "acceptance.chat.windowActorMismatch",
+            Some(serde_json::json!({
+                "command": "acceptance_logout_window_session",
+                "reason": "window_actor_mismatch"
+            })),
+        );
+    }
+    auth_logout(None, state, app, window)
+}
+
+#[cfg(feature = "acceptance-webdriver")]
+#[tauri::command]
+pub fn acceptance_window_session_identity(
+    state: State<'_, Arc<AppState>>,
+    window: Window,
+) -> AppResult<StubPayload> {
+    let Some(session) = state.sessions.get(window.label()) else {
+        return AppResult::fail(
+            ErrorCode::Unauthorized,
+            "Window has no committed session",
+            Some(serde_json::json!({
+                "command": "acceptance_window_session_identity",
+                "reason": "window_session_missing"
+            })),
+        );
+    };
+    let session_id = match crate::secure_content::adapter::jwt_session_id(&session.jwt) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return AppResult::fail(
+                ErrorCode::Unauthorized,
+                "Window session has no canonical session identity",
+                Some(serde_json::json!({
+                    "command": "acceptance_window_session_identity",
+                    "reason": "jwt_session_id_invalid",
+                    "cause": error,
+                })),
+            )
+        }
+    };
+    AppResult::success(StubPayload {
+        command: "acceptance_window_session_identity".to_string(),
+        status: serde_json::json!({
+            "actor_ptid": session.actor.ptid,
+            "account_scope_sha256": hex::encode(Sha256::digest(session.account_id.as_bytes())),
+            "session_id_sha256": hex::encode(Sha256::digest(session_id.as_bytes())),
+            "session_binding_sha256": hex::encode(Sha256::digest(session.jwt.as_bytes())),
+        })
+        .to_string(),
+    })
+}
+
+#[cfg(feature = "acceptance-webdriver")]
+#[tauri::command]
+pub fn acceptance_session_persistence_state() -> AppResult<StubPayload> {
+    let identity = match crate::infrastructure::auth_identity::read_state() {
+        Ok(identity) => identity,
+        Err(error) => {
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                "Failed to inspect persisted session identity",
+                Some(serde_json::json!({
+                    "command": "acceptance_session_persistence_state",
+                    "reason": "identity_state_unavailable",
+                    "cause": error,
+                })),
+            )
+        }
+    };
+    let active_account_id = identity.active_account_id.clone();
+    let active_account = active_account_id.as_deref().and_then(|account_id| {
+        identity
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+    });
+    let requires_pin = active_account_id
+        .as_deref()
+        .is_some_and(crate::infrastructure::session_vault::account_requires_pin);
+    let persisted = active_account_id.as_deref().and_then(|account_id| {
+        crate::infrastructure::session_vault::load_raw_session_for_account(account_id, None)
+            .ok()
+            .flatten()
+    });
+    AppResult::success(StubPayload {
+        command: "acceptance_session_persistence_state".to_string(),
+        status: serde_json::json!({
+            "activeAccountPresent": active_account.is_some(),
+            "accountHasSessionMetadata": active_account
+                .is_some_and(|account| account.has_session),
+            "accountRequiresPin": requires_pin,
+            "rawSessionPresent": persisted.is_some(),
+            "rawSessionActorMatches": persisted.as_ref().is_some_and(|session| {
+                active_account
+                    .is_some_and(|account| account.actor_ptid == session.actor_ptid)
+            }),
+            "rawSessionSource": persisted.as_ref().map(|session| match session.source {
+                crate::infrastructure::session_store::SessionSource::Password => "password",
+                crate::infrastructure::session_store::SessionSource::OauthBridge => "oauth_bridge",
+            }),
+        })
+        .to_string(),
+    })
+}
+
+#[tauri::command]
+pub fn auth_restore_session(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    window: Window,
+) -> AppResult<AuthSessionPayload> {
+    bind_after(
+        state.inner(),
+        &app,
+        &window,
+        auth_service::auth_restore_session(state.station.client(), state.inner()),
+    )
+}
+
+#[tauri::command]
+pub fn auth_validate_token(
+    mut input: AuthValidateTokenInput,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    window: Window,
+) -> AppResult<AuthSessionPayload> {
+    if input
+        .token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        input.token =
+            crate::application::session_resolver::token_for_window(state.inner(), &window);
+    }
+    bind_after(
+        state.inner(),
+        &app,
+        &window,
+        auth_service::auth_validate_token(state.station.client(), input, state.inner()),
+    )
+}
+
+/// Load a PTID-scoped Station JWT persisted during OAuth callback.
+#[tauri::command]
+pub fn ensure_station_session(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    window: Window,
+) -> AppResult<AuthSessionPayload> {
+    let result = bind_after(
+        state.inner(),
+        &app,
+        &window,
+        auth_service::ensure_station_session(state.station.client(), state.inner()),
+    );
+    broadcast_identity(&app, IdentityChangeReason::OauthBridge, &result);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_session_revoked, run_logout_transition, scoped_logout_matches,
+        secure_content_session_replaced, ScopedLogoutInput};
+    use crate::contracts::AuthSessionPayload;
+    use crate::domain::identity::{ActiveSession, ActorRef};
+    use crate::error::{AppResult, ErrorCode};
+    use std::cell::RefCell;
+
+    #[test]
+    fn binding_rollback_rejects_superseding_same_actor_activation() {
+        let original = ActiveSession::new("main", "account-1", ActorRef::new_person("ptid:alice"), "token");
+        let scope = ScopedLogoutInput {
+            expected_actor_ptid: original.actor.ptid.clone(),
+            expected_session_activation_id: original.activation_id.clone(),
+        };
+        assert!(scoped_logout_matches(&original, &scope));
+        let replacement = ActiveSession::new("main", "account-1", ActorRef::new_person("ptid:alice"), "token");
+        assert!(!scoped_logout_matches(&replacement, &scope));
+        let different_actor = ActiveSession::new("main", "account-2", ActorRef::new_person("ptid:bob"), "token");
+        assert!(!scoped_logout_matches(&different_actor, &scope));
+        assert!(serde_json::from_value::<ScopedLogoutInput>(
+            serde_json::json!({"expected_actor_ptid": "ptid:alice"})
+        ).is_err());
+    }
+
+    #[test]
+    fn recognizes_only_typed_session_revocation() {
+        let revoked = AppResult::<AuthSessionPayload>::fail(
+            ErrorCode::Unauthorized,
+            "session revoked",
+            Some(serde_json::json!({ "code": "session_revoked" })),
+        );
+        let unrelated = AppResult::<AuthSessionPayload>::fail(
+            ErrorCode::Unauthorized,
+            "authentication required",
+            None,
+        );
+
+        assert!(is_session_revoked(&revoked));
+        assert!(!is_session_revoked(&unrelated));
+    }
+
+    #[test]
+    fn same_actor_token_replacement_tears_down_secure_content_authority() {
+        let previous = ActiveSession::new(
+            "main",
+            "account-1",
+            ActorRef::new_person("ptid:alice"),
+            "old-token",
+        );
+
+        assert!(secure_content_session_replaced(
+            Some(&previous),
+            "account-1",
+            "ptid:alice",
+            "new-token",
+        ));
+        assert!(!secure_content_session_replaced(
+            Some(&previous),
+            "account-1",
+            "ptid:alice",
+            "old-token",
+        ));
+    }
+
+    #[test]
+    fn logout_detaches_and_broadcasts_before_returning_cleanup_failure() {
+        let order = RefCell::new(Vec::new());
+        let result = run_logout_transition(
+            || {
+                order.borrow_mut().push("detach");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("cleanup");
+                AppResult::fail(
+                    ErrorCode::InternalError,
+                    "cleanup failed",
+                    Some(serde_json::json!({ "reason": "logout_cleanup_failed" })),
+                )
+            },
+            || order.borrow_mut().push("broadcast"),
+        );
+
+        assert_eq!(*order.borrow(), vec!["detach", "cleanup", "broadcast"]);
+        assert!(!result.ok);
+        assert_eq!(
+            result
+                .error
+                .and_then(|error| error.details)
+                .and_then(|details| details["reason"].as_str().map(str::to_string)),
+            Some("logout_cleanup_failed".to_string())
+        );
+    }
+
+    #[test]
+    fn logout_surfaces_secure_content_teardown_failure_after_cleanup() {
+        let order = RefCell::new(Vec::new());
+        let result = run_logout_transition(
+            || {
+                order.borrow_mut().push("detach");
+                Err("request drain timed out".to_string())
+            },
+            || {
+                order.borrow_mut().push("cleanup");
+                AppResult::success(AuthSessionPayload {
+                    command: "auth_logout".to_string(),
+                    status: "logged_out".to_string(),
+                    actor_ptid: None,
+                    session_activation_id: None,
+                    session_token: None,
+                    name: None,
+                    email: None,
+                    avatar_url: None,
+                    avatar_local_path: None,
+                    login_method: None,
+                })
+            },
+            || order.borrow_mut().push("broadcast"),
+        );
+
+        assert_eq!(*order.borrow(), vec!["detach", "cleanup", "broadcast"]);
+        assert!(!result.ok);
+        assert_eq!(
+            result
+                .error
+                .and_then(|error| error.details)
+                .and_then(|details| details["reason"].as_str().map(str::to_string)),
+            Some("secure_content_teardown_failed".to_string())
+        );
+    }
+}

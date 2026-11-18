@@ -1,0 +1,200 @@
+package server
+
+import (
+	"context"
+	"time"
+
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"github.com/peers-labs/peers-touch/station/frame/core/transport"
+)
+
+const DefaultRequestReadTimeout = 3 * time.Minute
+
+// region server options
+// serverOptionsKey is the context key for server options.
+type serverOptionsKey struct{}
+
+// ClusterReadinessProbe verifies one enabled owner's shared runtime backing.
+// Stateful owners should prefer implementing ClusterReadiness on the
+// Subserver itself when the check depends on initialized private state.
+type ClusterReadinessProbe func(context.Context) (string, error)
+
+var (
+	wrapper = option.NewWrapper[Options](serverOptionsKey{}, func(options *option.Options) *Options {
+		o := &Options{
+			Options:                options,
+			SubServers:             map[string]subServerNewFunctions{},
+			SubserverInstances:     map[string]Subserver{},
+			ClusterReadinessProbes: map[string]ClusterReadinessProbe{},
+		}
+
+		return o
+	})
+)
+
+// Options holds configuration for the server.
+type Options struct {
+	*option.Options
+
+	Address  string            `pconf:"address"` // Server address
+	Timeout  int               `pconf:"timeout"` // Server timeout
+	Metadata map[string]string `pconf:"metadata"`
+	// Handlers is a list of handlers that injected to the server
+	// usually, it's used for the initialization of the server
+	// if you want to add handlers after the server is initialized,
+	// you can use the server.Handler interface
+	Handlers []Handler
+	// store the new function for each subserver
+	// key: subserver name
+	// value: new function for the subserver
+	SubServers map[string]subServerNewFunctions
+
+	// ReadyChan is a channel that will be closed when the server is ready
+	// it's used to signal the main process that the server is ready
+	ReadyChan chan interface{}
+
+	Transport transport.Transport
+
+	// GlobalWrappers are wrappers that will be applied to all handlers automatically
+	// These wrappers are applied before handler-specific wrappers
+	GlobalWrappers []Wrapper
+
+	// SubserverInstances holds instances keyed by their registration name.
+	// Populated by BaseServer.init() after each subserver is created and initialised,
+	// so that any subserver (e.g. dashboard) can discover its siblings at Start time.
+	SubserverInstances map[string]Subserver
+
+	// ClusterReadinessProbes holds explicit composition-root declarations for
+	// enabled owners whose readiness does not depend on private subserver state.
+	ClusterReadinessProbes map[string]ClusterReadinessProbe
+}
+
+// WithAddress sets the server address.
+func WithAddress(address string) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.Address = address
+	})
+}
+
+// WithTimeout sets the server timeout.
+func WithTimeout(timeout int) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.Timeout = timeout
+	})
+}
+
+// RequestReadTimeout returns the configured full-request read deadline, using
+// a bounded default when no explicit server timeout is configured.
+func RequestReadTimeout(timeoutSeconds int) time.Duration {
+	if timeoutSeconds > 0 {
+		return time.Duration(timeoutSeconds) * time.Second
+	}
+	return DefaultRequestReadTimeout
+}
+
+// WithMetadata associates metadata with the server.
+func WithMetadata(md map[string]string) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.Metadata = md
+	})
+}
+
+// WithMetadataEntry appends one composition-root runtime fact without
+// replacing configured server metadata.
+func WithMetadataEntry(key, value string) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		if opts.Metadata == nil {
+			opts.Metadata = make(map[string]string)
+		}
+		opts.Metadata[key] = value
+	})
+}
+
+// WithGlobalWrappers sets global wrappers that will be applied to all handlers.
+func WithGlobalWrappers(wrappers ...Wrapper) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.GlobalWrappers = append(opts.GlobalWrappers, wrappers...)
+	})
+}
+
+// WithHandlers adds handlers to the server options.
+func WithHandlers(handlers ...Handler) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.Handlers = append(opts.Handlers, handlers...)
+	})
+}
+
+// WithRouters converts routers to handlers and adds them to the server.
+// Each handler's path will be prefixed with the router's name
+func WithRouters(routers ...Routers) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		for _, router := range routers {
+			routerName := router.Name()
+			handlers := router.Handlers()
+
+			// Create new handlers with router name prefixed to path
+			for _, handler := range handlers {
+				var prefixedPath string
+				if routerName == "" {
+					// If router name is empty, use original path without prefix
+					prefixedPath = handler.Path()
+				} else {
+					// Otherwise, prefix with router name
+					prefixedPath = "/" + routerName + handler.Path()
+				}
+				prefixedHandler := NewHandler(
+					handler.Name(),
+					prefixedPath,
+					handler.Method(),
+					handler.Type(),
+					handler.Handler(),
+					handler.Wrappers()...,
+				)
+				opts.Handlers = append(opts.Handlers, prefixedHandler)
+			}
+		}
+	})
+}
+
+// WithSubServer adds a subserver to the server.
+func WithSubServer(name string, newFunc func(opts ...option.Option) Subserver, subServerOptions ...option.Option) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.SubServers[name] = subServerNewFunctions{
+			exec:    newFunc,
+			options: subServerOptions,
+		}
+	})
+}
+
+// WithClusterReadinessProbe declares the shared backing contract for one
+// registered subserver. Cluster admission still fails closed when an enabled
+// owner has neither this declaration nor an owner-implemented readiness probe.
+func WithClusterReadinessProbe(
+	name string,
+	probe ClusterReadinessProbe,
+) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.ClusterReadinessProbes[name] = probe
+	})
+}
+
+// WithReadyChan sets the readiness channel.
+func WithReadyChan(c chan interface{}) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.ReadyChan = c
+	})
+}
+
+// WithTransport injects a transport into server options.
+func WithTransport(t transport.Transport) option.Option {
+	return wrapper.Wrap(func(opts *Options) {
+		opts.Transport = t
+	})
+}
+
+// endregion
+
+// GetOptions retrieves typed server options from the global option context.
+func GetOptions() *Options {
+	return option.GetOptions().Ctx().Value(serverOptionsKey{}).(*Options)
+}

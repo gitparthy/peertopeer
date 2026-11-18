@@ -1,0 +1,2178 @@
+{
+  "kind": "peers-touch-architecture-module-registry",
+  "schemaVersion": 5,
+  "taxonomyIndexes": [
+    "docs/architecture/domains/README.md",
+    "docs/architecture/domains/applets/README.md",
+    "docs/architecture/domains/chat/README.md",
+    "docs/architecture/domains/chat/calling/README.md",
+    "docs/architecture/domains/identity/README.md",
+    "docs/architecture/domains/social/README.md",
+    "docs/architecture/engineering/README.md",
+    "docs/architecture/platform/README.md",
+    "docs/architecture/platform/client/README.md",
+    "docs/architecture/platform/client/desktop/README.md",
+    "docs/architecture/platform/contracts/README.md",
+    "docs/architecture/platform/runtime/README.md",
+    "docs/architecture/platform/station/README.md",
+    "docs/architecture/shared/README.md",
+    "docs/architecture/shared/communication/README.md",
+    "docs/architecture/shared/security/README.md"
+  ],
+  "documentCollections": [
+    "docs/architecture/domains/agent/modules",
+    "docs/architecture/domains/agent/task-workbench",
+    "docs/architecture/domains/identity/device-login-approval",
+    "docs/architecture/domains/applets/atelier",
+    "docs/architecture/domains/chat/calling/prototype",
+    "docs/architecture/domains/chat/encryption",
+    "docs/architecture/domains/chat/lifecycle",
+    "docs/architecture/domains/chat/messaging",
+    "docs/architecture/domains/social/access",
+    "docs/architecture/domains/social/core",
+    "docs/architecture/domains/social/federation",
+    "docs/architecture/domains/social/runtime",
+    "docs/architecture/engineering/api-governance",
+    "docs/architecture/engineering/prototypes",
+    "docs/architecture/engineering/quality",
+    "docs/architecture/engineering/toolchain",
+    "docs/architecture/platform/applet-runtime",
+    "docs/architecture/platform/client/cross-client-runtime",
+    "docs/architecture/platform/client/frontend-runtime",
+    "docs/architecture/platform/client/mobile",
+    "docs/architecture/platform/runtime/node-connectivity/relay-attachment",
+    "docs/architecture/domains/federation",
+    "docs/architecture/shared/i18n",
+    "docs/architecture/domains/notification",
+    "docs/architecture/shared/security/secure-content"
+  ],
+  "modules": [
+    {
+      "id": "chat-group-calling",
+      "root": "docs/architecture/domains/chat/calling/group",
+      "status": "active",
+      "owner": "Chat Product Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": ["README.md", "design.md", "decisions.md", "data-model.md", "module-layout.md", "integration.md"],
+      "decisionIds": ["GC-D01", "GC-D02", "GC-D03", "GC-D04", "GC-D05"],
+      "governedPaths": [
+        "docs/architecture/domains/chat/calling/group",
+        "model/domain/realtime/group_call.proto",
+        "apps/station/app/subserver/groupcall",
+        "packages/client-chat-core/src/group-call",
+        "packages/client-chat-core/src/mediaReservation.ts",
+        "apps/desktop/src/modules/groupCall",
+        "apps/mobile/src/features/call/groupCallRuntime.ts"
+      ],
+      "capabilities": [
+        {
+          "id": "chat.group.live-media",
+          "owner": "chat.groupcall",
+          "contractRoots": ["model/domain/realtime/group_call.proto", "packages/client-chat-core/src/group-call"],
+          "consumers": ["apps/desktop/src/modules/groupCall", "apps/mobile/src/features/call", "apps/station/app/subserver/groupcall"],
+          "allowedDependencies": ["chat.conversation", "identity.actor", "identity.session", "federation.runtime", "livekit-client", "livekit.server-sdk"],
+          "evidenceGates": ["CHAT-G14", "chat-lifecycle-group-live-e2e"],
+          "reuseLayer": "shared-ts-core"
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "acceptance",
+      "root": "docs/architecture/engineering/acceptance",
+      "status": "active",
+      "owner": "Architecture Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "D-01",
+        "D-02",
+        "D-04",
+        "D-05",
+        "D-06",
+        "D-07",
+        "D-08",
+        "D-09",
+        "D-10",
+        "D-11",
+        "D-12",
+        "D-13",
+        "D-14",
+        "D-15",
+        "D-16",
+        "D-17",
+        "D-18",
+        "D-19",
+        "D-20",
+        "D-21",
+        "D-22",
+        "D-23"
+      ],
+      "governedPaths": [
+        "docs/architecture/engineering/acceptance",
+        "tooling/acceptance/core",
+        "tooling/acceptance/tests",
+        "tooling/acceptance/drivers/native/base.py",
+        "tooling/acceptance/drivers/native/macos.py",
+        "tooling/acceptance/drivers/native/macos_ax.py",
+        "tooling/acceptance/drivers/native/macos_operator.py",
+        "tooling/acceptance/drivers/native/runtime.py",
+        "tooling/acceptance/provisioners/native_desktop_macos.py",
+        "tooling/scripts/acceptance-run.py",
+        "tooling/scripts/acceptance-plan.py",
+        "tooling/scripts/acceptance-validate.py",
+        "tooling/scripts/acceptance-report.py",
+        "tooling/scripts/acceptance-gap-detect.py"
+      ],
+      "capabilities": [
+        {
+          "id": "acceptance.core.execution",
+          "owner": "acceptance.infra",
+          "contractRoots": [
+            "tooling/acceptance/core",
+            "docs/architecture/engineering/acceptance"
+          ],
+          "consumers": [
+            "tooling/scripts/acceptance-run.py",
+            "tooling/scripts/acceptance-plan.py",
+            "tooling/scripts/acceptance-report.py",
+            "tooling/scripts/acceptance-gap-detect.py"
+          ],
+          "allowedDependencies": [
+            "python.stdlib",
+            "python.yaml"
+          ],
+          "evidenceGates": [
+            "acceptance-plan-self",
+            "acceptance-infra-validation",
+            "acceptance-workflow-contract",
+            "acceptance-runtime-provisioning-self"
+          ]
+        },
+        {
+          "id": "acceptance.native.operator-observation",
+          "owner": "acceptance.native-driver",
+          "contractRoots": [
+            "tooling/acceptance/drivers/native/base.py",
+            "tooling/acceptance/drivers/native/macos.py",
+            "tooling/acceptance/drivers/native/macos_ax.py",
+            "tooling/acceptance/drivers/native/macos_operator.py"
+          ],
+          "consumers": [
+            "tooling/acceptance/provisioners/native_desktop_macos.py",
+            "tooling/acceptance/drivers/native/runtime.py",
+            "tooling/acceptance/gates/chat/native_file_picker.py"
+          ],
+          "allowedDependencies": [
+            "python.stdlib",
+            "acceptance.core.execution",
+            "macos.AppKit",
+            "macos.ApplicationServices",
+            "macos.CoreFoundation",
+            "macos.CoreGraphics"
+          ],
+          "evidenceGates": [
+            "acceptance-infra-validation",
+            "acceptance-runtime-provisioning-self"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": [
+        {
+          "path": "tooling/acceptance/capabilities/core.yaml",
+          "capabilityIds": [
+            "acceptance-framework-self-consistency"
+          ],
+          "gate": "acceptance-infra-validation"
+        }
+      ]
+    },
+    {
+      "id": "search",
+      "root": "docs/architecture/domains/search",
+      "status": "active",
+      "owner": "Search / Client / Station",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "D-01",
+        "D-02",
+        "D-03",
+        "D-04",
+        "D-05",
+        "D-06",
+        "D-07",
+        "D-12",
+        "D-13",
+        "D-16",
+        "D-17",
+        "D-19",
+        "D-20"
+      ],
+      "governedPaths": [
+        "docs/architecture/domains/search",
+        "model/domain/search",
+        "apps/desktop/src-tauri/src/application/search",
+        "apps/desktop/src-tauri/src/interface/tauri_commands/search.rs",
+        "apps/mobile/src-tauri/src/runtime/search.rs",
+        "apps/mobile/src-tauri/src/commands/search.rs"
+      ],
+      "capabilities": [
+        {
+          "id": "search.device.find",
+          "owner": "search",
+          "contractRoots": [
+            "model/domain/search/search.proto"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/src/application/search",
+            "apps/desktop/src-tauri/src/interface/tauri_commands/search.rs",
+            "apps/mobile/src-tauri/src/runtime/search.rs",
+            "apps/mobile/src-tauri/src/commands/search.rs"
+          ],
+          "allowedDependencies": [
+            "client.search.portable-core"
+          ],
+          "evidenceGates": [
+            "CCR-G02",
+            "CCR-G09"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "architecture-module-governance",
+      "root": "docs/architecture/engineering/architecture-governance",
+      "status": "active",
+      "owner": "Architecture Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": false,
+        "persistence": false,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "AMG-D01",
+        "AMG-D02",
+        "AMG-D03",
+        "AMG-D04",
+        "AMG-D05",
+        "AMG-D06",
+        "AMG-D07"
+      ],
+      "governedPaths": [
+        "docs/architecture/engineering/architecture-governance",
+        "docs/global/architecture-document-standard.md",
+        "docs/knowledge/invariants/owner-rooted-workflow-binding.md",
+        "tooling/acceptance/gates.yaml",
+        "tooling/plugins/pt-ew-plugin",
+        "tooling/scripts/agent-integration-audit-test.py",
+        "tooling/scripts/agent-integration-audit.py",
+        "tooling/scripts/agent-integration-control.py",
+        "tooling/scripts/architecture",
+        "tooling/scripts/local-dev/workflow-host-adapters.mjs",
+        "tooling/scripts/local-dev/workflow-host-adapters.test.mjs",
+        "tooling/scripts/local-dev/workflow-kernel.mjs",
+        "tooling/scripts/local-dev/workflow-kernel.test.mjs",
+        "tooling/scripts/plan/plan-package.mjs",
+        "tooling/scripts/plan/planctl.test.mjs",
+        "tooling/scripts/review/knowledge-match.sh",
+        "tooling/scripts/review/skill-check.sh",
+        "tooling/skills/pt-architecture-design-methodology",
+        "tooling/skills/pt-github-review",
+        "tooling/skills/pt-plan-and-document"
+      ],
+      "capabilities": [
+        {
+          "id": "architecture.module.validate",
+          "owner": "architecture.governance",
+          "contractRoots": [
+            "docs/architecture/engineering/architecture-governance",
+            "tooling/scripts/architecture"
+          ],
+          "consumers": [
+            "tooling/plugins/pt-ew-plugin/scripts/hook-entry.mjs",
+            "tooling/scripts/local-dev/workflow-kernel.mjs",
+            "tooling/scripts/plan/plan-package.mjs",
+            "tooling/scripts/review/knowledge-match.sh"
+          ],
+          "allowedDependencies": [
+            "node.child_process",
+            "node.crypto",
+            "node.fs",
+            "node.path",
+            "python.yaml"
+          ],
+          "evidenceGates": [
+            "architecture-module-governance"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "release-distribution",
+      "root": "docs/architecture/engineering/release-distribution",
+      "status": "active",
+      "owner": "Architecture Team",
+      "characteristics": {
+        "protocol": false,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "RD-D01",
+        "RD-D02",
+        "RD-D03",
+        "RD-D04",
+        "RD-D05",
+        "RD-D06",
+        "RD-D07",
+        "RD-D08",
+        "RD-D09",
+        "RD-D10",
+        "RD-D11",
+        "RD-D12",
+        "RD-D13",
+        "RD-D14",
+        "RD-D15"
+      ],
+      "governedPaths": [
+        ".github/workflows/release.yml",
+        "docs/architecture/engineering/release-distribution",
+        "tooling/distribution/.env.example",
+        "tooling/distribution/README.md",
+        "tooling/distribution/docker-compose.yml",
+        "tooling/distribution/install.sh",
+        "tooling/distribution/install.test.sh",
+        "tooling/distribution/installation_state.py",
+        "tooling/distribution/installation_state_test.py",
+        "tooling/distribution/installer.py",
+        "tooling/distribution/installer_test.py",
+        "tooling/distribution/release-asset-server.mjs",
+        "tooling/distribution/release-asset-server.test.mjs",
+        "tooling/distribution/release-assets.mjs",
+        "tooling/distribution/release-assets.test.mjs",
+        "tooling/distribution/release-evidence-check.mjs",
+        "tooling/distribution/release-evidence-check.test.mjs",
+        "tooling/distribution/release-lifecycle.mjs",
+        "tooling/distribution/release-lifecycle.test.mjs",
+        "tooling/distribution/release-suite.mjs",
+        "tooling/distribution/release-version-check.mjs",
+        "tooling/distribution/release-version-check.test.mjs",
+        "tooling/distribution/release-workflow.test.mjs"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "development-workflow",
+      "root": "docs/architecture/engineering/development-workflow",
+      "status": "active",
+      "owner": "Platform Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "DWF-D02",
+        "DWF-D03",
+        "DWF-D04",
+        "DWF-D06",
+        "DWF-D07",
+        "DWF-D08",
+        "DWF-D09",
+        "DWF-D10",
+        "DWF-D12",
+        "DWF-D14",
+        "DWF-D17",
+        "DWF-D20",
+        "DWF-D21",
+        "DWF-D22",
+        "DWF-D23",
+        "DWF-D25",
+        "DWF-D39",
+        "DWF-D40",
+        "DWF-D46",
+        "DWF-D47",
+        "DWF-D48"
+      ],
+      "governedPaths": [
+        "docs/architecture/engineering/development-workflow",
+        "docs/global/workflow.md",
+        "tooling/scripts/README.md",
+        "tooling/scripts/local-dev/completion-review.mjs",
+        "tooling/scripts/local-dev/completion-review.test.mjs",
+        "tooling/scripts/local-dev/development-close.mjs",
+        "tooling/scripts/local-dev/development-close.test.mjs",
+        "tooling/scripts/local-dev/development-flow-residue.mjs",
+        "tooling/scripts/local-dev/development-flow-residue.test.mjs",
+        "tooling/scripts/local-dev/development-flow.integration.test.mjs",
+        "tooling/scripts/local-dev/dev-work.mjs",
+        "tooling/scripts/local-dev/dev-work.test.mjs",
+        "tooling/scripts/local-dev/task-progress-store.mjs",
+        "tooling/scripts/local-dev/workflow-doctor.mjs",
+        "tooling/scripts/local-dev/workflow-doctor.test.mjs",
+        "tooling/scripts/local-dev/workflow-snapshot.mjs",
+        "tooling/scripts/local-dev/workflow-snapshot.test.mjs",
+        "tooling/scripts/local-dev/workflow-state-inspector.mjs",
+        "tooling/scripts/local-dev/workflow-state-inspector.test.mjs",
+        "tooling/scripts/local-dev/workspace-lifecycle-lock.mjs",
+        "tooling/scripts/local-dev/workspace-lifecycle-lock.test.mjs",
+        "tooling/scripts/local-dev/worktree-observation-store.mjs",
+        "tooling/scripts/local-dev/worktree-observation-store.test.mjs",
+        "tooling/scripts/local-dev/worktree-observe.mjs",
+        "tooling/scripts/plan/planctl.mjs",
+        "tooling/skills/pt-acceptance-gap-detector",
+        "tooling/skills/pt-agent-development",
+        "tooling/skills/pt-architecture-execution-methodology",
+        "tooling/skills/pt-completion-auditor",
+        "tooling/skills/pt-context-anchor",
+        "tooling/skills/pt-dev-runtime-handoff",
+        "tooling/skills/pt-dev-workflow",
+        "tooling/skills/pt-execution-plan-guardian",
+        "tooling/skills/pt-goal-orchestrator"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "agent",
+      "root": "docs/architecture/domains/agent",
+      "status": "active",
+      "owner": "Peers-Touch Agent Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "MCA-D14",
+        "MCA-D15",
+        "MCA-D16A",
+        "MCA-D17",
+        "MCA-D18",
+        "MCA-D20",
+        "MCA-D22",
+        "MCA-D23",
+        "WE-D01",
+        "WE-D02",
+        "WE-D03",
+        "WE-D04",
+        "WE-D05",
+        "WE-D06",
+        "WE-D07",
+        "WE-D08"
+      ],
+      "governedPaths": [
+        "apps/desktop/src-tauri/src/application/agent_turn",
+        "apps/desktop/src-tauri/src/application/desktop_executor_worker",
+        "apps/desktop/src-tauri/src/application/mcp",
+        "apps/station/app/subserver/agent",
+        "docs/architecture/domains/agent",
+        "model/domain/agent",
+        "packages/agent-catalog",
+        "tooling/acceptance/gates/agent"
+      ],
+      "capabilities": [
+        {
+          "id": "agent.chat.minimum-usable",
+          "owner": "agent.station",
+          "contractRoots": [
+            "apps/station/app/subserver/agent",
+            "model/domain/agent"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/src/application/agent_turn",
+            "apps/desktop/src-tauri/src/application/mcp"
+          ],
+          "allowedDependencies": [
+            "desktop.application.agent_turn",
+            "desktop.application.mcp",
+            "model.domain.agent",
+            "station.agent"
+          ],
+          "evidenceGates": [
+            "agent-minimum-usable-chat-native-e2e"
+          ]
+        },
+        {
+          "id": "agent.mcp.dual-runtime",
+          "owner": "agent.station",
+          "contractRoots": [
+            "apps/station/app/subserver/agent",
+            "model/domain/agent"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/src/application/desktop_executor_worker",
+            "apps/desktop/src-tauri/src/application/mcp"
+          ],
+          "allowedDependencies": [
+            "desktop.application.mcp",
+            "model.domain.agent",
+            "station.agent"
+          ],
+          "evidenceGates": [
+            "agent-v2-mcp-lifecycle-e2e"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "bot",
+      "root": "docs/architecture/domains/bot",
+      "status": "active",
+      "owner": "Peers-Touch Bot Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "BOT-D01",
+        "BOT-D02",
+        "BOT-D03",
+        "BOT-D04",
+        "BOT-D05"
+      ],
+      "governedPaths": [
+        "apps/desktop/src-tauri/src/interface/tauri_commands/bot.rs",
+        "apps/desktop/src/components/settings/BotsSettings.tsx",
+        "apps/desktop/src/modules/bots.ts",
+        "apps/station/app/subserver/bot",
+        "docs/architecture/domains/bot",
+        "model/domain/bot"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "local-dev-control-plane",
+      "root": "docs/architecture/engineering/local-dev",
+      "status": "active",
+      "owner": "Platform Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "LDCP-D01",
+        "LDCP-D02",
+        "LDCP-D03",
+        "LDCP-D04",
+        "LDCP-D05",
+        "LDCP-D06",
+        "LDCP-D07",
+        "LDCP-D08",
+        "LDCP-D13",
+        "LDCP-D16",
+        "LDCP-D17",
+        "LDCP-D19",
+        "LDCP-D21",
+        "LDCP-D22",
+        "LDCP-D23",
+        "LDCP-D25",
+        "LDCP-D26",
+        "LDCP-D27"
+      ],
+      "governedPaths": [
+        "docs/architecture/engineering/local-dev",
+        "tooling/make/local-dev.mk",
+        "tooling/scripts/lib/machine-dev-paths.mjs",
+        "tooling/scripts/lib/machine-dev-paths.test.mjs",
+        "tooling/scripts/local-dev/config.sh",
+        "tooling/scripts/local-dev/desktop-dev.sh",
+        "tooling/scripts/local-dev/env.sh",
+        "tooling/scripts/local-dev/git-workspace.mjs",
+        "tooling/scripts/local-dev/machine-dev-lease.py",
+        "tooling/scripts/local-dev/machine-dev-registry.mjs",
+        "tooling/scripts/local-dev/machine-dev-resource-contract.mjs",
+        "tooling/scripts/local-dev/machine-dev-primitives.mjs",
+        "tooling/scripts/local-dev/machine-dev-resource-store.mjs",
+        "tooling/scripts/local-dev/machine-dev-ios-provider.mjs",
+        "tooling/scripts/local-dev/machine-dev-resources.test.mjs",
+        "tooling/scripts/local-dev/machine-dev-resource-overwrite.test.mjs",
+        "tooling/scripts/local-dev/machine-dev-resource-lock.test.mjs",
+        "tooling/scripts/local-dev/machine-dev-mobile-entry.test.mjs",
+        "tooling/scripts/local-dev/fixtures/resource-owner.mjs",
+        "tooling/scripts/local-dev/fixtures/resource-native-boundary.mjs",
+        "tooling/acceptance/provisioners/mobile_ios_resources.py",
+        "tooling/acceptance/provisioners/profile_ios_fixture.py",
+        "tooling/acceptance/gates/mobile/resource_dependencies_e2e.py",
+        "tooling/acceptance/gates/mobile/resource_dependencies_functional.py",
+        "tooling/scripts/local-dev/machine-dev.mjs",
+        "tooling/scripts/local-dev/machine-dev.test.mjs",
+        "tooling/scripts/local-dev/mobile-ios-sim.sh",
+        "tooling/scripts/local-dev/profile.sh",
+        "tooling/scripts/local-dev/redact-env.sh",
+        "tooling/scripts/local-dev/relay-check.sh",
+        "tooling/scripts/local-dev/relay-dev.sh",
+        "tooling/scripts/local-dev/relay-logs.sh",
+        "tooling/scripts/local-dev/relay-status.sh",
+        "tooling/scripts/local-dev/restart.sh",
+        "tooling/scripts/local-dev/station-check.sh",
+        "tooling/scripts/local-dev/station-dev.sh",
+        "tooling/scripts/local-dev/station-logs.sh",
+        "tooling/scripts/local-dev/station-status.sh",
+        "tooling/scripts/local-dev/status.sh",
+        "tooling/scripts/local-dev/stop.sh"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "oauth-login-broker",
+      "root": "docs/architecture/domains/identity/oauth-login-broker",
+      "status": "active",
+      "owner": "Identity and Access",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "OLB-D01",
+        "OLB-D02",
+        "OLB-D03",
+        "OLB-D04",
+        "OLB-D05",
+        "OLB-D06",
+        "OLB-D07",
+        "OLB-D08",
+        "OLB-D09",
+        "OLB-D10",
+        "OLB-D11",
+        "OLB-D12",
+        "OLB-D13",
+        "OLB-D14",
+        "OLB-D15",
+        "OLB-D16",
+        "OLB-D17",
+        "OLB-D18"
+      ],
+      "governedPaths": [
+        "apps/oauth2-client",
+        "docs/architecture/domains/identity/oauth-login-broker"
+      ],
+      "capabilities": [
+        {
+          "id": "oauth.login.broker",
+          "owner": "oauth.login-broker",
+          "contractRoots": [
+            "apps/oauth2-client/internal/domain/oauth",
+            "docs/architecture/domains/identity/oauth-login-broker"
+          ],
+          "consumers": [
+            "apps/oauth2-client/api",
+            "apps/oauth2-client/cmd/server"
+          ],
+          "allowedDependencies": [
+            "github.rest",
+            "go.crypto",
+            "oauth.provider"
+          ],
+          "evidenceGates": [
+            "oauth-login-broker-contract"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "station-access-lifecycle",
+      "root": "docs/architecture/platform/station/access",
+      "status": "active",
+      "owner": "Identity and Access",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "SAL-D01",
+        "SAL-D02",
+        "SAL-D03",
+        "SAL-D04",
+        "SAL-D06",
+        "SAL-D07",
+        "SAL-D08",
+        "SAL-D12",
+        "SAL-D14",
+        "SAL-D15"
+      ],
+      "governedPaths": [
+        "apps/desktop/src/pages/login/StationSwitcher.tsx",
+        "apps/desktop/src-tauri/src/application/station_binding",
+        "apps/desktop/src-tauri/src/infrastructure/station_registry.rs",
+        "apps/desktop/src/services/desktop_api.ts",
+        "apps/desktop/src-tauri/src/application/auth",
+        "apps/desktop/src-tauri/src/application/federation",
+        "apps/desktop/src-tauri/src/interface/tauri_commands/auth.rs",
+        "apps/desktop/src-tauri/src/interface/tauri_commands/federation.rs",
+        "apps/mobile/src/features/station",
+        "apps/mobile/src/services/gateways/gatewayTypes.ts",
+        "apps/mobile/src/services/gateways/profileGateway.ts",
+        "apps/mobile/src/services/mobileCommands.ts",
+        "apps/mobile/src/services/stationTransport.ts",
+        "apps/mobile/src-tauri/src/commands/oauth.rs",
+        "apps/mobile/src-tauri/src/runtime/oauth",
+        "apps/mobile/src-tauri/src/runtime/station_transport",
+        "apps/station/app/main.go",
+        "apps/station/frame/core/plugin/native/node",
+        "apps/station/frame/peers.go",
+        "apps/station/frame/touch",
+        "docs/architecture/platform/station/access",
+        "model/domain/access_gate",
+        "model/domain/peer",
+        "tooling/acceptance/gates/station_access"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": [
+        {
+          "path": "docs/architecture/engineering/api-governance/station-api-capabilities.yaml",
+          "capabilityIds": [
+            "station.identity.verify",
+            "access.gate.start",
+            "access.gate.submit",
+            "access.gate.decision",
+            "access.gate.cancel"
+          ],
+          "gate": "station-api-ownership"
+        }
+      ]
+    },
+    {
+      "id": "node-connectivity",
+      "root": "docs/architecture/platform/runtime/node-connectivity",
+      "status": "active",
+      "owner": "Architecture Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "NCP-D01",
+        "NCP-D02",
+        "NCP-D03",
+        "NCP-D04",
+        "NCP-D05",
+        "NCP-D06",
+        "NCP-D07",
+        "NCP-D08",
+        "NCP-D09",
+        "NCP-D10",
+        "NCP-D11",
+        "NCP-D12",
+        "NCP-D13",
+        "NCP-D14",
+        "NCP-D15",
+        "NCP-D16",
+        "NCP-D17",
+        "NCP-D18",
+        "NCP-D19",
+        "NCP-D20",
+        "NCP-D21",
+        "NCP-D22",
+        "NCP-D23",
+        "NCP-D24"
+      ],
+      "governedPaths": [
+        "apps/station/frame/core/federation",
+        "apps/station/frame/core/plugin/native/relay",
+        "apps/station/frame/core/plugin/native/subserver/relay",
+        "apps/station/frame/core/plugin/native/transport",
+        "apps/station/frame/core/plugin/native/registry",
+        "apps/station/frame/core/plugin/native/subserver/bootstrap",
+        "apps/station/frame/core/runtime/role",
+        "apps/desktop/src-tauri/src/application/station_runtime",
+        "apps/desktop/src-tauri/src/infrastructure/station",
+        "apps/mobile/src-tauri/src/runtime/station_route.rs",
+        "docs/architecture/platform/runtime/node-connectivity",
+        "packages/station-libp2p-http"
+      ],
+      "capabilities": [
+        {
+          "id": "relay.control.enrollment",
+          "owner": "node.connectivity",
+          "contractRoots": [
+            "apps/station/frame/core/plugin/native/subserver/relay/domain",
+            "apps/station/frame/core/plugin/native/subserver/relay/application",
+            "docs/architecture/platform/runtime/node-connectivity"
+          ],
+          "consumers": [
+            "apps/station/frame/core/plugin/native/relay/station_control.go"
+          ],
+          "allowedDependencies": [
+            "model.domain.peer",
+            "station.logical-identity",
+            "station.node-authorization"
+          ],
+          "evidenceGates": [
+            "NCP-G07",
+            "relay-role-security-contract"
+          ]
+        },
+        {
+          "id": "relay.transport.circuit",
+          "owner": "node.connectivity",
+          "contractRoots": [
+            "apps/station/frame/core/plugin/native/transport/securehttp",
+            "packages/station-libp2p-http",
+            "docs/architecture/platform/runtime/node-connectivity"
+          ],
+          "consumers": [
+            "apps/station/frame/core/federation",
+            "apps/desktop/src-tauri/src/infrastructure/station",
+            "apps/mobile/src-tauri/src/runtime/station_route.rs",
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "model.domain.peer",
+            "station.canonical-router",
+            "tls.1.3",
+            "libp2p.circuit-v2",
+            "http2"
+          ],
+          "evidenceGates": [
+            "NCP-G02",
+            "NCP-G03",
+            "NCP-G07",
+            "NCP-G08"
+          ],
+          "reuseLayer": "portable-rust-core"
+        },
+        {
+          "id": "station.connectivity.node-authorization",
+          "owner": "node.connectivity",
+          "contractRoots": [
+            "docs/architecture/platform/runtime/node-connectivity"
+          ],
+          "consumers": [
+            "apps/station/frame/core/plugin/native/subserver/bootstrap",
+            "apps/station/frame/core/plugin/native/transport",
+            "apps/station/frame/core/plugin/native/registry"
+          ],
+          "allowedDependencies": [
+            "model.domain.peer",
+            "station.logical-identity",
+            "station.canonical-router"
+          ],
+          "evidenceGates": [
+            "NCP-G01",
+            "NCP-G08"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "x-config",
+      "root": "docs/architecture/platform/client/control-plane",
+      "status": "active",
+      "owner": "Client Platform",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "CCP-D02",
+        "CCP-D03",
+        "CCP-D04",
+        "CCP-D05",
+        "CCP-D06",
+        "CCP-D09",
+        "CCP-D11",
+        "XCFG-D01",
+        "XCFG-D03",
+        "XCFG-D04",
+        "XCFG-D05",
+        "XCFG-D06"
+      ],
+      "governedPaths": [
+        "apps/x-config",
+        "apps/desktop/src-tauri/src/application/x_config",
+        "apps/desktop/src-tauri/src/interface/tauri_commands/x_config.rs",
+        "apps/desktop/src/runtimes/xConfigRuntime.ts",
+        "apps/desktop/src/services/xConfig.ts",
+        "apps/mobile/src-tauri/src/runtime/x_config.rs",
+        "docs/architecture/platform/client/control-plane",
+        "model/domain/x_config",
+        "packages/x-config-core",
+        "packages/prototypes/control/x-config",
+        "tooling/acceptance/gates/x_config",
+        "tooling/distribution/channels.json"
+      ],
+      "capabilities": [
+        {
+          "id": "x.config.operator",
+          "owner": "x.config",
+          "contractRoots": [
+            "apps/x-config/internal/domain/operator",
+            "docs/architecture/platform/client/control-plane"
+          ],
+          "consumers": [
+            "apps/x-config/internal/interfaces/http"
+          ],
+          "allowedDependencies": [
+            "oauth.login.broker",
+            "go.crypto",
+            "sqlite.transaction"
+          ],
+          "evidenceGates": [
+            "x-config-operator-login-contract",
+            "x-config-home-operator-login-e2e"
+          ]
+        },
+        {
+          "id": "x.config.snapshot",
+          "owner": "x.config",
+          "contractRoots": [
+            "model/domain/x_config",
+            "packages/x-config-core"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/src/application/x_config",
+            "apps/mobile/src-tauri/src/runtime/x_config.rs",
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "reuseLayer": "portable-rust-core",
+          "allowedDependencies": [
+            "station.connectivity.node-authorization",
+            "go.crypto"
+          ],
+          "evidenceGates": [
+            "x-config-snapshot-core-contract",
+            "x-config-desktop-adapter-contract",
+            "x-config-mobile-adapter-contract"
+          ]
+        },
+        {
+          "id": "x.config.publication",
+          "owner": "x.config",
+          "contractRoots": [
+            "apps/x-config/internal/application/admin",
+            "apps/x-config/internal/infrastructure/catalogrepo",
+            "apps/x-config/internal/publication",
+            "apps/x-config/cmd/server",
+            "docs/architecture/platform/client/control-plane"
+          ],
+          "consumers": [
+            "apps/x-config/internal/interfaces/http",
+            "apps/desktop/src-tauri/src/application/x_config",
+            "apps/mobile/src-tauri/src/runtime/x_config.rs",
+            "tooling/acceptance/gates/x_config"
+          ],
+          "allowedDependencies": [
+            "github.rest",
+            "go.crypto",
+            "home.http"
+          ],
+          "evidenceGates": [
+            "x-config-snapshot-publication-contract",
+            "x-config-home-publication-e2e"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "chat-storage-governance",
+      "root": "docs/architecture/domains/chat/storage-governance",
+      "status": "active",
+      "owner": "Device Messaging Engine",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "CSG-D01",
+        "CSG-D02",
+        "CSG-D03",
+        "CSG-D04",
+        "CSG-D05",
+        "CSG-D06",
+        "CSG-D07",
+        "CSG-D08",
+        "CSG-D09"
+      ],
+      "governedPaths": [
+        "apps/desktop/src/components/settings/ChatStorageSettings.tsx",
+        "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+        "apps/mobile/src/pages/settings/SettingsSections.tsx",
+        "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+        "apps/mobile/src-tauri/src/messaging/adapter.rs",
+        "apps/mobile/src-tauri/src/messaging/commands.rs",
+        "apps/mobile/src-tauri/src/messaging/engine.rs",
+        "docs/architecture/domains/chat/storage-governance",
+        "model/domain/chat/storage.proto",
+        "packages/client-chat-core/src/storageBatch.ts",
+        "packages/messaging-core/src/storage_governance",
+        "tooling/acceptance/gates/chat/storage_batch_desktop_runner.py",
+        "tooling/acceptance/gates/chat/storage_governance_contract_test.py",
+        "tooling/acceptance/gates/chat/storage_governance_e2e.py",
+        "tooling/acceptance/gates/chat/storage_governance_runner.py",
+        "tooling/acceptance/gates/chat/storage_redaction_recovery_e2e.py",
+        "tooling/acceptance/gates/chat/storage_redaction_recovery_runner.py",
+        "tooling/acceptance/gates/mobile/simulator_social_e2e.py"
+      ],
+      "capabilities": [
+        {
+          "id": "chat.storage.device-governance",
+          "owner": "device.messaging.engine",
+          "contractRoots": [
+            "model/domain/chat/storage.proto",
+            "packages/messaging-core/src/storage_governance"
+          ],
+          "consumers": [
+            "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+            "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+            "packages/client-chat-core/src/storageBatch.ts"
+          ],
+          "allowedDependencies": [
+            "bufbuild.protobuf",
+            "client-chat-core",
+            "messaging-core",
+            "tauri"
+          ],
+          "evidenceGates": [
+            "chat-storage-governance-aggregate-e2e",
+            "chat-storage-batch-clear-aggregate-e2e"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "api-ownership",
+      "root": "docs/architecture/engineering/api-governance",
+      "status": "active",
+      "owner": "Architecture Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": false,
+        "persistence": false,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": false,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "AO-D01",
+        "AO-D02",
+        "AO-D03",
+        "AO-D04",
+        "AO-D05",
+        "AO-D06",
+        "AO-D07",
+        "AO-D10",
+        "AO-D10A"
+      ],
+      "governedPaths": [
+        "docs/architecture/engineering/api-governance"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "cross-station-social",
+      "root": "docs/architecture/domains/social/cross-station",
+      "status": "active",
+      "owner": "Social / Federation",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": false,
+        "moduleLayout": false,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "CSS-D01",
+        "CSS-D02",
+        "CSS-D03",
+        "CSS-D04",
+        "CSS-D05",
+        "CSS-D06",
+        "CSS-D07",
+        "CSS-D08",
+        "CSS-D09",
+        "CSS-D10",
+        "CSS-D11"
+      ],
+      "governedPaths": [
+        "docs/architecture/domains/social/cross-station"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "cross-client-runtime",
+      "root": "docs/architecture/platform/client/cross-client-runtime",
+      "status": "active",
+      "owner": "Client Platform Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": false,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "CCR-D01",
+        "CCR-D02",
+        "CCR-D03",
+        "CCR-D04",
+        "CCR-D05",
+        "CCR-D06",
+        "CCR-D07",
+        "CCR-D08",
+        "CCR-D09",
+        "CCR-D10",
+        "CCR-D11",
+        "CCR-D12",
+        "CCR-D13"
+      ],
+      "governedPaths": [
+        "docs/architecture/platform/client/cross-client-runtime",
+        "pnpm-workspace.yaml",
+        "apps/desktop/package.json",
+        "apps/mobile/package.json",
+        "apps/desktop/src-tauri/Cargo.toml",
+        "apps/mobile/src-tauri/Cargo.toml",
+        "apps/desktop/src/components/chat/chatPresentationPolicy.ts",
+        "apps/mobile/src/pages/chat/chatPresentationPolicy.ts",
+        "packages/client-chat-core/package.json",
+        "packages/client-chat-core/src/chatStorageProjection.ts",
+        "packages/client-chat-core/src/wireCodec.ts",
+        "packages/client-media-security/package.json",
+        "packages/client-media-security/src/index.ts",
+        "packages/client-storage/package.json",
+        "packages/client-storage/src/index.ts",
+        "packages/messaging-core/Cargo.toml",
+        "packages/messaging-native-filesystem/Cargo.toml",
+        "packages/secure-content-core/Cargo.toml",
+        "packages/station-trust/Cargo.toml",
+        "packages/search-core/Cargo.toml"
+      ],
+      "capabilities": [
+        {
+          "id": "client.reuse.admission",
+          "owner": "client.platform",
+          "contractRoots": [
+            "docs/architecture/platform/client/cross-client-runtime"
+          ],
+          "consumers": [
+            "apps/desktop/package.json",
+            "apps/mobile/package.json",
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "architecture.module.validate",
+            "cargo.manifest",
+            "pnpm.workspace"
+          ],
+          "evidenceGates": [
+            "CCR-G09",
+            "CCR-G10",
+            "CCR-G11",
+            "CCR-G12"
+          ]
+        },
+        {
+          "id": "client.runtime.portability",
+          "owner": "client.platform",
+          "contractRoots": [
+            "docs/architecture/platform/client/cross-client-runtime"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "model.contracts",
+            "station.business",
+            "frontend-runtime",
+            "mobile-shell",
+            "messaging-platform",
+            "secure-content"
+          ],
+          "evidenceGates": [
+            "CCR-G01",
+            "CCR-G02",
+            "CCR-G03",
+            "CCR-G04",
+            "CCR-G05",
+            "CCR-G06",
+            "CCR-G07",
+            "CCR-G08",
+            "unified-client-android-host-e2e",
+            "unified-client-ios-host-e2e",
+            "unified-client-architecture-aggregate"
+          ]
+        },
+        {
+          "id": "client.chat.headless",
+          "owner": "client.chat.core",
+          "contractRoots": [
+            "packages/client-chat-core/package.json",
+            "packages/client-chat-core/src/chatStorageProjection.ts",
+            "packages/client-chat-core/src/wireCodec.ts"
+          ],
+          "consumers": [
+            "apps/desktop/package.json",
+            "apps/mobile/package.json"
+          ],
+          "allowedDependencies": [
+            "client.storage.headless",
+            "model.contracts"
+          ],
+          "evidenceGates": [
+            "CCR-G09",
+            "client-chat-core-contract",
+            "unified-client-shared-semantics"
+          ],
+          "reuseLayer": "shared-ts-core"
+        },
+        {
+          "id": "client.chat.presentation.desktop",
+          "owner": "client.desktop.presentation",
+          "contractRoots": [
+            "apps/desktop/src/components/chat/chatPresentationPolicy.ts"
+          ],
+          "consumers": [
+            "apps/desktop/src/components/chat/ChatComposer.tsx",
+            "apps/desktop/src/components/chat/ChatMessageArea.tsx",
+            "apps/desktop/src/components/chat/ChatThreadPanel.tsx"
+          ],
+          "allowedDependencies": [
+            "client.chat.headless"
+          ],
+          "evidenceGates": [
+            "CCR-G11",
+            "unified-client-shared-semantics"
+          ],
+          "reuseLayer": "presentation-policy"
+        },
+        {
+          "id": "client.chat.presentation.mobile",
+          "owner": "client.mobile.presentation",
+          "contractRoots": [
+            "apps/mobile/src/pages/chat/chatPresentationPolicy.ts"
+          ],
+          "consumers": [
+            "apps/mobile/src/pages/ChatPage.tsx"
+          ],
+          "allowedDependencies": [
+            "client.chat.headless"
+          ],
+          "evidenceGates": [
+            "CCR-G05",
+            "CCR-G11",
+            "unified-client-shared-semantics"
+          ],
+          "reuseLayer": "presentation-policy"
+        },
+        {
+          "id": "client.media-security.headless",
+          "owner": "client.media.security",
+          "contractRoots": [
+            "packages/client-media-security/package.json",
+            "packages/client-media-security/src/index.ts"
+          ],
+          "consumers": [
+            "apps/desktop/package.json",
+            "apps/mobile/package.json"
+          ],
+          "allowedDependencies": [
+            "model.contracts",
+            "web.crypto"
+          ],
+          "evidenceGates": [
+            "CCR-G09",
+            "client-media-security-contract",
+            "unified-client-shared-semantics"
+          ],
+          "reuseLayer": "shared-ts-core"
+        },
+        {
+          "id": "client.storage.headless",
+          "owner": "client.storage",
+          "contractRoots": [
+            "packages/client-storage/package.json",
+            "packages/client-storage/src/index.ts"
+          ],
+          "consumers": [
+            "apps/desktop/package.json",
+            "apps/mobile/package.json"
+          ],
+          "allowedDependencies": [
+            "web.storage"
+          ],
+          "evidenceGates": [
+            "CCR-G09",
+            "client-storage-contract",
+            "unified-client-shared-semantics"
+          ],
+          "reuseLayer": "shared-ts-core"
+        },
+        {
+          "id": "client.messaging.portable-core",
+          "owner": "messaging.platform",
+          "contractRoots": [
+            "packages/messaging-core/Cargo.toml"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "model.contracts",
+            "secure-content-core",
+            "openmls"
+          ],
+          "evidenceGates": [
+            "CCR-G02",
+            "CCR-G09",
+            "messaging-platform-contract",
+            "unified-client-messaging-core-contract",
+            "unified-client-messaging-e2e",
+            "messaging-owner-hard-cut-zero"
+          ],
+          "reuseLayer": "portable-rust-core"
+        },
+        {
+          "id": "client.messaging.native-filesystem",
+          "owner": "messaging.platform",
+          "contractRoots": [
+            "packages/messaging-native-filesystem/Cargo.toml"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "client.messaging.portable-core",
+            "client.secure-content.portable-core",
+            "rustix"
+          ],
+          "evidenceGates": [
+            "CCR-G03",
+            "CCR-G09",
+            "messaging-owner-hard-cut-zero"
+          ],
+          "reuseLayer": "platform-adapter"
+        },
+        {
+          "id": "client.secure-content.portable-core",
+          "owner": "secure-content",
+          "contractRoots": [
+            "packages/secure-content-core/Cargo.toml"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "model.contracts",
+            "rust.crypto"
+          ],
+          "evidenceGates": [
+            "CCR-G02",
+            "CCR-G09",
+            "secure-content-portable-core",
+            "unified-client-secure-content-e2e",
+            "secure-content-owner-hard-cut-zero"
+          ],
+          "reuseLayer": "portable-rust-core"
+        },
+        {
+          "id": "client.station-trust.portable-core",
+          "owner": "station.access",
+          "contractRoots": [
+            "packages/station-trust/Cargo.toml"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "model.domain.peer",
+            "libp2p.identity"
+          ],
+          "evidenceGates": [
+            "CCR-G02",
+            "CCR-G09",
+            "station-identity-contract"
+          ],
+          "reuseLayer": "portable-rust-core"
+        },
+        {
+          "id": "client.search.portable-core",
+          "owner": "search",
+          "contractRoots": [
+            "packages/search-core/Cargo.toml"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml",
+            "packages/messaging-core/Cargo.toml"
+          ],
+          "allowedDependencies": [],
+          "evidenceGates": [
+            "CCR-G02",
+            "CCR-G09"
+          ],
+          "reuseLayer": "portable-rust-core"
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "mobile-social-parity",
+      "root": "docs/architecture/platform/client/mobile/social-parity",
+      "status": "active",
+      "owner": "Mobile / Social / Client Architecture",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "MPS-D01",
+        "MPS-D02",
+        "MPS-D03",
+        "MPS-D04",
+        "MPS-D05",
+        "MPS-D06",
+        "MPS-D07",
+        "MPS-D08",
+        "MPS-D09",
+        "MPS-D10",
+        "MPS-D11",
+        "MPS-D12",
+        "MPS-D13"
+      ],
+      "governedPaths": [
+        "apps/mobile/src/features/social",
+        "apps/mobile/src/pages/MomentsPage.tsx",
+        "apps/mobile/src/pages/moments",
+        "apps/mobile/src/runtimes/momentsProjectionDescriptor.ts",
+        "apps/mobile/src/runtimes/privateMomentsRuntime.ts",
+        "apps/mobile/src-tauri/plugins/secure-input",
+        "apps/mobile/src-tauri/src/platform/secure_input.rs",
+        "apps/mobile/src-tauri/src/social",
+        "docs/architecture/platform/client/mobile/social-parity"
+      ],
+      "capabilities": [
+        {
+          "id": "mobile.social.native-parity",
+          "owner": "mobile.social.runtime",
+          "contractRoots": [
+            "docs/architecture/platform/client/mobile/social-parity"
+          ],
+          "consumers": [
+            "apps/mobile/src/features/social",
+            "apps/mobile/src/pages/MomentsPage.tsx",
+            "apps/mobile/src/pages/moments",
+            "apps/mobile/src/runtimes/momentsProjectionDescriptor.ts",
+            "apps/mobile/src/runtimes/privateMomentsRuntime.ts",
+            "apps/mobile/src-tauri/plugins/secure-input",
+            "apps/mobile/src-tauri/src/platform/secure_input.rs",
+            "apps/mobile/src-tauri/src/social"
+          ],
+          "allowedDependencies": [
+            "mobile.lifecycle",
+            "mobile.navigation",
+            "mobile.reliability",
+            "secure-content",
+            "social.station",
+            "federation.delivery"
+          ],
+          "evidenceGates": [
+            "mobile-social-ios-native",
+            "mobile-social-android-native",
+            "mobile-social-cross-platform"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "secure-content",
+      "root": "docs/architecture/shared/security/secure-content",
+      "status": "active",
+      "owner": "Architecture Team",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "SC-D01",
+        "SC-D02",
+        "SC-D03",
+        "SC-D04",
+        "SC-D05",
+        "SC-D06",
+        "SC-D07",
+        "SC-D08",
+        "SC-D09",
+        "SC-D10",
+        "SC-D11",
+        "SC-D12",
+        "SC-D13",
+        "SC-D14",
+        "SC-D15",
+        "SC-D16",
+        "SC-D17",
+        "SC-D18",
+        "SC-D19",
+        "SC-D20",
+        "SC-D21",
+        "SC-D22",
+        "SC-D23",
+        "SC-D24",
+        "SC-D25",
+        "SC-D26",
+        "SC-D27",
+        "SC-D28",
+        "SC-D29",
+        "SC-D30",
+        "SC-D31",
+        "SC-D32",
+        "SC-D33"
+      ],
+      "governedPaths": [
+        "docs/architecture/shared/security/secure-content"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "ui-system",
+      "root": "docs/architecture/platform/client/ui-system",
+      "status": "active",
+      "owner": "Client Platform / UI System",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": false,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "UI-D01",
+        "UI-D02",
+        "UI-D03",
+        "UI-D04"
+      ],
+      "governedPaths": [
+        "docs/architecture/platform/client/ui-system",
+        "packages/ui"
+      ],
+      "capabilities": [
+        {
+          "id": "client.ui.system",
+          "owner": "ui.system",
+          "reuseLayer": "shared-ui-primitive",
+          "contractRoots": [
+            "docs/architecture/platform/client/ui-system",
+            "packages/ui/contracts",
+            "packages/ui/web"
+          ],
+          "consumers": [
+            "apps/desktop/package.json",
+            "apps/mobile/package.json",
+            "apps/desktop/src",
+            "apps/mobile/src",
+            "packages/prototypes"
+          ],
+          "allowedDependencies": [
+            "react",
+            "react-dom",
+            "web.platform"
+          ],
+          "evidenceGates": [
+            "UI-GATE-BOUNDARY",
+            "UI-GATE-SPECIMEN",
+            "UI-GATE-JOURNEY"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "mobile-scan-login",
+      "root": "docs/architecture/domains/identity/mobile-scan-login",
+      "status": "active",
+      "owner": "Identity and Access",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "MSL-D01",
+        "MSL-D02",
+        "MSL-D03",
+        "MSL-D04",
+        "MSL-D05",
+        "MSL-D06",
+        "MSL-D07"
+      ],
+      "governedPaths": [
+        "model/domain/auth/device_link.proto",
+        "apps/station/app/subserver/device_link",
+        "apps/desktop/src-tauri/src/application/device_link",
+        "apps/mobile/src-tauri/src/runtime/device_link",
+        "packages/device-link-core",
+        "docs/architecture/domains/identity/mobile-scan-login"
+      ],
+      "capabilities": [
+        {
+          "id": "identity.device-link.authorize",
+          "owner": "identity.device-link",
+          "contractRoots": [
+            "model/domain/auth/device_link.proto",
+            "packages/device-link-core"
+          ],
+          "consumers": [
+            "apps/station/app/main.go",
+            "packages/device-link-core/src",
+            "apps/desktop/src-tauri/src/application/device_link",
+            "apps/mobile/src-tauri/src/runtime/device_link"
+          ],
+          "allowedDependencies": [
+            "shared-schema",
+            "node-connectivity",
+            "station.access",
+            "actor.session",
+            "actor.identity"
+          ],
+          "evidenceGates": [
+            "MSL-A01",
+            "MSL-A02",
+            "MSL-A03",
+            "MSL-A04",
+            "MSL-A05",
+            "MSL-A06",
+            "MSL-A07",
+            "MSL-A08",
+            "MSL-A09"
+          ]
+        },
+        {
+          "id": "client.device-link.portable-core",
+          "owner": "identity.device-link",
+          "contractRoots": [
+            "packages/device-link-core/Cargo.toml"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "shared.schema",
+            "station.access",
+            "model.domain.auth"
+          ],
+          "evidenceGates": [
+            "MSL-A01",
+            "MSL-A02",
+            "MSL-A03",
+            "MSL-A07"
+          ],
+          "reuseLayer": "portable-rust-core"
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "experience-design",
+      "root": "docs/architecture/engineering/experience-design",
+      "status": "active",
+      "owner": "Developer Experience / Product Design",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": true,
+        "persistence": false,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "EDX-D01",
+        "EDX-D02",
+        "EDX-D03",
+        "EDX-D04",
+        "EDX-D05",
+        "EDX-D06",
+        "EDX-D07",
+        "EDX-D08",
+        "EDX-RK-D01",
+        "EDX-RK-D02",
+        "EDX-RK-D03",
+        "EDX-RK-D04",
+        "EDX-RK-D05",
+        "EDX-RK-D06",
+        "EDX-RK-D07",
+        "EDX-RK-D08",
+        "CER-D01",
+        "CER-D02",
+        "CER-D03",
+        "CER-D04",
+        "CER-D05",
+        "CER-D06",
+        "CER-D07"
+      ],
+      "governedPaths": [
+        "docs/architecture/engineering/experience-design",
+        "docs/client/common/interaction-design-methodology.md",
+        "docs/client/common/ui-identity/grammar-bindings.json",
+        "tooling/scripts/experience-design",
+        "tooling/skills/pt-product-design-methodology",
+        "tooling/skills/pt-prototype-design",
+        "tooling/skills/pt-quality-check"
+      ],
+      "capabilities": [
+        {
+          "id": "experience.design.evaluate",
+          "owner": "experience.design",
+          "contractRoots": [
+            "docs/architecture/engineering/experience-design",
+            "docs/client/common/interaction-design-methodology.md",
+            "docs/client/common/ui-identity/grammar-bindings.json",
+            "tooling/scripts/experience-design"
+          ],
+          "consumers": [
+            "tooling/skills/pt-product-design-methodology/SKILL.md",
+            "tooling/skills/pt-prototype-design/SKILL.md",
+            "tooling/skills/pt-quality-check/SKILL.md"
+          ],
+          "allowedDependencies": [
+            "node.crypto",
+            "node.fs",
+            "node.path",
+            "node.url"
+          ],
+          "evidenceGates": [
+            "experience-design-control-plane"
+          ]
+        },
+        {
+          "id": "experience.design.compare",
+          "owner": "experience.design",
+          "contractRoots": [
+            "docs/architecture/engineering/experience-design/comparative-experience-review.md",
+            "docs/architecture/engineering/experience-design/data-model.md",
+            "docs/client/common/interaction-design-methodology.md",
+            "tooling/scripts/experience-design"
+          ],
+          "consumers": [
+            "tooling/skills/pt-product-design-methodology/SKILL.md",
+            "tooling/skills/pt-prototype-design/SKILL.md",
+            "tooling/skills/pt-quality-check/SKILL.md"
+          ],
+          "allowedDependencies": [
+            "node.crypto",
+            "node.fs",
+            "node.os",
+            "node.path",
+            "node.url"
+          ],
+          "evidenceGates": [
+            "experience-design-control-plane"
+          ]
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "shared-schema",
+      "root": "docs/architecture/shared/schema",
+      "status": "active",
+      "owner": "Shared Client Interaction",
+      "characteristics": {
+        "protocol": true,
+        "stateMachine": false,
+        "persistence": false,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "SCH-D01",
+        "SCH-D02",
+        "SCH-D03",
+        "SCH-D04"
+      ],
+      "governedPaths": [
+        "model/domain/schema",
+        "packages/schema-core",
+        "packages/schema",
+        "docs/architecture/shared/schema"
+      ],
+      "capabilities": [
+        {
+          "id": "client.schema.link",
+          "owner": "shared.schema",
+          "contractRoots": [
+            "model/domain/schema",
+            "packages/schema-core"
+          ],
+          "consumers": [
+            "apps/desktop/src-tauri/Cargo.toml",
+            "apps/mobile/src-tauri/Cargo.toml"
+          ],
+          "allowedDependencies": [
+            "model.domain",
+            "station-trust"
+          ],
+          "evidenceGates": [
+            "schema-link-vectors",
+            "MSL-A07"
+          ],
+          "reuseLayer": "portable-rust-core"
+        },
+        {
+          "id": "client.schema.qr",
+          "owner": "shared.schema",
+          "contractRoots": [
+            "packages/schema"
+          ],
+          "consumers": [
+            "apps/desktop/package.json",
+            "apps/mobile/package.json"
+          ],
+          "allowedDependencies": [
+            "model.domain",
+            "qrcode-generator",
+            "react"
+          ],
+          "evidenceGates": [
+            "schema-independent-decoder",
+            "schema-browser-renderer",
+            "MSL-A07"
+          ],
+          "reuseLayer": "shared-ts-core"
+        }
+      ],
+      "externalCapabilityRegistries": []
+    },
+    {
+      "id": "runtime-secrets",
+      "root": "docs/architecture/platform/runtime/runtime-secrets",
+      "status": "active",
+      "owner": "Platform Team",
+      "characteristics": {
+        "protocol": false,
+        "stateMachine": false,
+        "persistence": true,
+        "ownership": true,
+        "moduleLayout": true,
+        "crossRuntime": true,
+        "integration": true
+      },
+      "requiredDocuments": [
+        "README.md",
+        "design.md",
+        "decisions.md",
+        "data-model.md",
+        "module-layout.md",
+        "integration.md"
+      ],
+      "decisionIds": [
+        "RS-D01",
+        "RS-D02",
+        "RS-D03",
+        "RS-D04",
+        "RS-D05",
+        "RS-D06",
+        "RS-D07",
+        "RS-D08",
+        "RS-D09"
+      ],
+      "governedPaths": [
+        "docs/architecture/platform/runtime/runtime-secrets",
+        "tooling/scripts/deploy/secret-edit.sh",
+        "tooling/scripts/deploy/secret-reconcile.sh",
+        "tooling/scripts/deploy/deploy.sh",
+        "tooling/docker/entrypoint.sh",
+        "tooling/make/deploy.mk",
+        "apps/station/app/subserver/oauth/plugin.go"
+      ],
+      "capabilities": [],
+      "externalCapabilityRegistries": []
+    }
+  ],
+  "reuseDivergences": []
+}

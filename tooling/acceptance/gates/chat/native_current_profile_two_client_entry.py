@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+import os
+
+from tooling.acceptance.core import AcceptanceGate, GateError
+from tooling.acceptance.core.launch_context import EphemeralGateClient
+from tooling.acceptance.drivers.native import resolve_native_desktop_runtime
+from tooling.acceptance.gates.chat.native_two_client_runner import (
+    CURRENT_PROFILE_GATE_ID,
+    NativeTwoClientGate,
+    runtime_manifest,
+)
+
+
+class NativeCurrentProfileTwoClientEntrypoint(NativeTwoClientGate):
+    """Run the Direct two-client journey on the installed active profile."""
+
+    gate_id = CURRENT_PROFILE_GATE_ID
+
+    def prove_additional_journey_assertions(self) -> None:
+        from tooling.acceptance.gates.chat.drawer_layout import prove_drawer_layout
+        self.step("layout.drawer", lambda: prove_drawer_layout(self), "bob")
+
+    def __init__(self) -> None:
+        cell_id = os.environ.get("PT_ACCEPTANCE_RUNTIME_CELL", "").strip()
+        if cell_id != "desktop-macos-native":
+            raise GateError(
+                "current-profile Native Chat requires desktop-macos-native"
+            )
+        manifest, actor_manifest = runtime_manifest(self.gate_id)
+        source = manifest.get("source")
+        source_commit = str(
+            source.get("commit") if isinstance(source, dict) else ""
+        )
+        if not source_commit:
+            raise GateError("runtime manifest source commit is required")
+        runtime_binding = resolve_native_desktop_runtime(
+            cell_id,
+            gate_id=self.gate_id,
+            source_commit=source_commit,
+        )
+        runtime_binding.set_runtime_manifest(manifest)
+        login_client = EphemeralGateClient.from_environment()
+        if login_client is None:
+            raise GateError("Current-profile accounts require their runtime login capability")
+        super().__init__(
+            manifest=manifest,
+            actor_manifest=actor_manifest,
+            runtime_binding=runtime_binding,
+            gate_id=self.gate_id,
+            allow_existing_fixture=True,
+            account_login_client=login_client,
+        )
+
+
+def main() -> int:
+    gate: AcceptanceGate = NativeCurrentProfileTwoClientEntrypoint()
+    try:
+        result = gate.execute()
+    finally:
+        if gate.account_login_client is not None:
+            gate.account_login_client.close()
+    if result:
+        return result
+    from tooling.acceptance.gates.chat.native_current_profile_two_client_e2e import main as validate
+    return validate()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

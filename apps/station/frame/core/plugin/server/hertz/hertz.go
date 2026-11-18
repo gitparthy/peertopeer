@@ -1,0 +1,482 @@
+package hertz
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/cloudwego/hertz/pkg/app/middlewares/server/recovery"
+	hz "github.com/cloudwego/hertz/pkg/app/server"
+	"github.com/cloudwego/hertz/pkg/common/hlog"
+	"github.com/cloudwego/hertz/pkg/protocol/http1/resp"
+	"github.com/google/uuid"
+	log "github.com/peers-labs/peers-touch/station/frame/core/logger"
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"github.com/peers-labs/peers-touch/station/frame/core/server"
+)
+
+// hertzRouterURL implements server.RouterURL for hertz endpoints
+type hertzRouterURL struct {
+	name string
+	url  string
+}
+
+// Name returns route name.
+func (h hertzRouterURL) Name() string { return h.name }
+
+// SubPath returns route subpath.
+func (h hertzRouterURL) SubPath() string { return h.url }
+
+// Server implements server.Server using CloudWeGo Hertz.
+type Server struct {
+	*server.BaseServer
+
+	hertz *hz.Hertz
+
+	lock    sync.RWMutex
+	started bool
+}
+
+// NewServer constructs a Hertz server.
+func NewServer(opts ...option.Option) *Server {
+	s := &Server{
+		BaseServer: server.NewServer(opts...),
+	}
+
+	return s
+}
+
+// Init initializes base server and Hertz engine.
+func (s *Server) Init(opts ...option.Option) error {
+	err := s.BaseServer.Init(opts...)
+	if err != nil {
+		return err
+	}
+
+	s.Options().Apply(opts...)
+
+	// Configure Hertz to use our custom logger via adapter
+	// This ensures all internal Hertz logs follow our logging format and rules
+	hlog.SetLogger(NewHertzLogger())
+	// Note: We don't call hlog.SetLevel here because it would re-initialize
+	// our DefaultLogger and override the log level from config
+
+	s.hertz = newHertzEngine(
+		s.Options().Address,
+		server.RequestReadTimeout(s.Options().Timeout),
+	)
+	return nil
+}
+
+func newHertzEngine(address string, readTimeout time.Duration) *hz.Hertz {
+	return hz.New(
+		hz.WithHostPorts(address),
+		hz.WithStreamBody(true),
+		hz.WithReadTimeout(readTimeout),
+	)
+}
+
+// Handle registers a handler on the Hertz engine.
+func (s *Server) Handle(h server.Handler) error {
+	// Convert EndpointHandler to Hertz handler
+	endpointHandler := h.Handler()
+
+	// Apply wrappers
+	for _, wrapper := range h.Wrappers() {
+		endpointHandler = wrapper(endpointHandler)
+	}
+
+	// Create Hertz handler from EndpointHandler
+	hertzHandler := func(c context.Context, ctx *app.RequestContext) {
+		req := &hertzRequest{ctx: ctx}
+		resp := &hertzResponse{ctx: ctx}
+		_ = endpointHandler(c, req, resp)
+	}
+
+	switch h.Method() {
+	case server.POST:
+		s.hertz.POST(h.Path(), hertzHandler)
+	case server.GET:
+		s.hertz.GET(h.Path(), hertzHandler)
+	case server.PUT:
+		s.hertz.PUT(h.Path(), hertzHandler)
+	case server.DELETE:
+		s.hertz.DELETE(h.Path(), hertzHandler)
+	case server.PATCH:
+		s.hertz.PATCH(h.Path(), hertzHandler)
+	default:
+		s.hertz.Any(h.Path(), hertzHandler)
+	}
+
+	return nil
+}
+
+// Start starts base server and spins Hertz.
+func (s *Server) Start(ctx context.Context, opts ...option.Option) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.started {
+		log.Errorf(ctx, "server already started!")
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	s.Options().Apply(opts...)
+	err := s.BaseServer.Start()
+	if err != nil {
+		log.Errorf(ctx, "warmup baseServer error: %v", err)
+		cancel()
+		return err
+	}
+
+	// recovery middleware
+	s.hertz.Use(recovery.Recovery())
+
+	// CORS middleware for WebView clients. Mobile Tauri pages run from
+	// tauri.localhost and must preflight authenticated Station APIs.
+	s.hertz.Use(CORSMiddleware())
+
+	// request logger middleware
+	s.hertz.Use(RequestLoggerMiddleware())
+
+	s.hertz.OnShutdown = append(s.hertz.OnShutdown, func(hertzCtx context.Context) {
+		log.Infof(hertzCtx, "shutdown hertz")
+		cancel()
+	})
+
+	for _, handler := range s.Options().Handlers {
+		// Capture handler in closure to avoid loop variable issues
+		h := handler
+		endpointHandler := h.Handler()
+
+		// Apply endpoint-level wrappers first
+		allWrappers := append(s.Options().GlobalWrappers, h.Wrappers()...)
+		for _, wrapper := range allWrappers {
+			endpointHandler = wrapper(endpointHandler)
+		}
+
+		// Capture the final endpoint handler
+		finalEndpointHandler := endpointHandler
+
+		// Create a Hertz handler that wraps the EndpointHandler
+		hertzHandler := func(c context.Context, ctx *app.RequestContext) {
+			// Create request/response adapters that can provide Hertz context
+			req := &hertzRequestWithContext{ctx: ctx}
+			resp := &hertzResponse{ctx: ctx}
+
+			// Call the endpoint handler
+			if err := finalEndpointHandler(c, req, resp); err != nil {
+				log.Errorf(c, "handler error: %v", err)
+				ctx.SetStatusCode(http.StatusInternalServerError)
+			}
+		}
+
+		// Register handler directly with Hertz router
+		switch h.Method() {
+		case server.POST:
+			s.hertz.POST(h.Path(), hertzHandler)
+		case server.GET:
+			s.hertz.GET(h.Path(), hertzHandler)
+		case server.PUT:
+			s.hertz.PUT(h.Path(), hertzHandler)
+		case server.DELETE:
+			s.hertz.DELETE(h.Path(), hertzHandler)
+		case server.PATCH:
+			s.hertz.PATCH(h.Path(), hertzHandler)
+		case server.OPTIONS:
+			s.hertz.OPTIONS(h.Path(), hertzHandler)
+		default:
+			s.hertz.Any(h.Path(), hertzHandler)
+		}
+	}
+
+	go s.hertz.Spin()
+	select {
+	// wait for server to start
+	// TODO maybe need a better way to wait for server to start
+	case <-time.After(time.Second * 3):
+	}
+	if s.Options().ReadyChan != nil {
+		s.Options().ReadyChan <- struct {
+			Msg string
+		}{
+			Msg: "ready",
+		}
+	}
+
+	s.started = true
+	return nil
+}
+
+// CORSMiddleware allows browser/WebView clients to call authenticated Station APIs.
+func CORSMiddleware() app.HandlerFunc {
+	return func(c context.Context, ctx *app.RequestContext) {
+		origin := string(ctx.GetHeader("Origin"))
+		if origin != "" {
+			ctx.Header("Access-Control-Allow-Origin", origin)
+			ctx.Header("Access-Control-Allow-Credentials", "true")
+			ctx.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			ctx.Header(
+				"Access-Control-Allow-Headers",
+				"Accept, Content-Type, Authorization, X-Device-ID, Last-Event-ID",
+			)
+			ctx.Header("Access-Control-Max-Age", "600")
+		}
+
+		if string(ctx.Method()) == string(server.OPTIONS) {
+			ctx.SetStatusCode(http.StatusNoContent)
+			ctx.Abort()
+			return
+		}
+
+		ctx.Next(c)
+	}
+}
+
+// Stop shuts down base server and Hertz engine.
+func (s *Server) Stop(ctx context.Context) error {
+	// Add fresh shutdown context with longer timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First stop base server components
+	if err := s.BaseServer.Stop(shutdownCtx); err != nil {
+		return err
+	}
+
+	// Then stop Hertz server with proper error handling
+	if err := s.hertz.Engine.Close(); err != nil {
+		return fmt.Errorf("hertz engine close error: %w", err)
+	}
+
+	// Wait for server to actually stop with new context
+	select {
+	case <-shutdownCtx.Done():
+		if errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("server shutdown timed out after 5s")
+		}
+		return nil
+	}
+}
+
+// Name returns the server identifier.
+func (s *Server) Name() string {
+	return "hertz"
+}
+
+// responseWriter implements http.ResponseWriter for Hertz
+// responseWriter translates Hertz responses to http.ResponseWriter.
+type responseWriter struct {
+	ctx *app.RequestContext
+}
+
+// Header returns response header map.
+func (w *responseWriter) Header() http.Header {
+	// Convert Hertz headers to http.Header
+	h := make(http.Header)
+	w.ctx.Response.Header.VisitAll(func(key, value []byte) {
+		h.Add(string(key), string(value))
+	})
+	return h
+}
+
+// Write writes response bytes.
+func (w *responseWriter) Write(data []byte) (int, error) {
+	w.ctx.Write(data)
+	return len(data), nil
+}
+
+// WriteHeader sets HTTP status code.
+func (w *responseWriter) WriteHeader(statusCode int) {
+	w.ctx.SetStatusCode(statusCode)
+}
+
+func RequestLoggerMiddleware() app.HandlerFunc {
+	return func(ctx context.Context, c *app.RequestContext) {
+		requestID := string(c.Request.Header.Peek("X-Request-ID"))
+		if requestID == "" {
+			requestID = uuid.New().String()
+		}
+
+		ctx = log.WithRequestID(ctx, requestID)
+		c.Response.Header.Set("X-Request-ID", requestID)
+
+		start := time.Now()
+		method := string(c.Method())
+		path := requestLogPath(c)
+
+		log.Infof(ctx, "[HTTP] → %s %s", method, path)
+
+		c.Next(ctx)
+
+		latency := time.Since(start)
+		statusCode := c.Response.StatusCode()
+
+		log.Infof(ctx, "[HTTP] ← %s %s %d %s", method, path, statusCode, latency)
+	}
+}
+
+func requestLogPath(c *app.RequestContext) string {
+	if path := c.FullPath(); path != "" {
+		return path
+	}
+	return string(c.Path())
+}
+
+// hertzRequest adapts Hertz RequestContext to server.Request
+type hertzRequest struct {
+	ctx *app.RequestContext
+}
+
+func (r *hertzRequest) Context() context.Context {
+	return context.Background()
+}
+
+func (r *hertzRequest) Header() map[string]string {
+	h := make(map[string]string)
+	r.ctx.Request.Header.VisitAll(func(key, value []byte) {
+		h[string(key)] = string(value)
+	})
+	return h
+}
+
+func (r *hertzRequest) Method() server.Method {
+	return server.Method(r.ctx.Method())
+}
+
+func (r *hertzRequest) Path() string {
+	// Include query string in path for proper URL handling
+	path := string(r.ctx.Path())
+	if qs := r.ctx.URI().QueryString(); len(qs) > 0 {
+		return path + "?" + string(qs)
+	}
+	return path
+}
+
+func (r *hertzRequest) Body() []byte {
+	return r.ctx.Request.Body()
+}
+
+func (r *hertzRequest) BodyStream() io.Reader {
+	if r.ctx.Request.IsBodyStream() {
+		return r.ctx.Request.BodyStream()
+	}
+	return bytes.NewReader(r.ctx.Request.Body())
+}
+
+// GetHertzContext returns the underlying Hertz RequestContext.
+func (r *hertzRequest) GetHertzContext() interface{} {
+	return r.ctx
+}
+
+// hertzRequestWithContext adapts Hertz RequestContext to server.Request
+// and implements hertzContextGetter to provide access to the underlying Hertz context
+type hertzRequestWithContext struct {
+	ctx *app.RequestContext
+}
+
+func (r *hertzRequestWithContext) Context() context.Context {
+	return context.Background()
+}
+
+func (r *hertzRequestWithContext) Header() map[string]string {
+	h := make(map[string]string)
+	r.ctx.Request.Header.VisitAll(func(key, value []byte) {
+		h[string(key)] = string(value)
+	})
+	return h
+}
+
+func (r *hertzRequestWithContext) Method() server.Method {
+	return server.Method(r.ctx.Method())
+}
+
+func (r *hertzRequestWithContext) Path() string {
+	// Include query string in path for proper URL handling
+	path := string(r.ctx.Path())
+	if qs := r.ctx.URI().QueryString(); len(qs) > 0 {
+		return path + "?" + string(qs)
+	}
+	return path
+}
+
+func (r *hertzRequestWithContext) Body() []byte {
+	return r.ctx.Request.Body()
+}
+
+func (r *hertzRequestWithContext) BodyStream() io.Reader {
+	if r.ctx.Request.IsBodyStream() {
+		return r.ctx.Request.BodyStream()
+	}
+	return bytes.NewReader(r.ctx.Request.Body())
+}
+
+// GetHertzContext returns the underlying Hertz RequestContext
+// This implements the hertzContextGetter interface used by HertzHandlerFunc
+func (r *hertzRequestWithContext) GetHertzContext() interface{} {
+	return r.ctx
+}
+
+// hertzResponse adapts Hertz RequestContext to server.Response
+type hertzResponse struct {
+	ctx       *app.RequestContext
+	streaming bool
+}
+
+func (r *hertzResponse) Header() map[string]string {
+	h := make(map[string]string)
+	r.ctx.Response.Header.VisitAll(func(key, value []byte) {
+		h[string(key)] = string(value)
+	})
+	return h
+}
+
+func (r *hertzResponse) SetHeader(key, value string) {
+	r.ctx.Response.Header.Set(key, value)
+}
+
+func (r *hertzResponse) Write(b []byte) (int, error) {
+	r.prepareStreaming()
+	return r.ctx.Write(b)
+}
+
+func (r *hertzResponse) SetBodyStream(
+	reader io.ReadCloser,
+	size int64,
+) error {
+	if size < 0 || int64(int(size)) != size {
+		return fmt.Errorf("hertz response stream size %d is invalid", size)
+	}
+	r.ctx.SetBodyStream(reader, int(size))
+	r.streaming = true
+	return nil
+}
+
+func (r *hertzResponse) prepareStreaming() {
+	if r.streaming || string(r.ctx.Response.Header.ContentType()) != "text/event-stream" {
+		return
+	}
+	r.ctx.Response.Header.Set("Transfer-Encoding", "chunked")
+	r.ctx.SetStatusCode(http.StatusOK)
+	r.ctx.Response.HijackWriter(resp.NewChunkedBodyWriter(&r.ctx.Response, r.ctx.GetWriter()))
+	r.streaming = true
+}
+
+func (r *hertzResponse) Flush() error {
+	r.prepareStreaming()
+	return r.ctx.Flush()
+}
+
+func (r *hertzResponse) WriteHeader(statusCode int) {
+	r.ctx.SetStatusCode(statusCode)
+}
+
+func (r *hertzResponse) Status() int {
+	return r.ctx.Response.StatusCode()
+}

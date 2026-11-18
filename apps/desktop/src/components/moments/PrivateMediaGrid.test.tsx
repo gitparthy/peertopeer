@@ -1,0 +1,188 @@
+import { readFileSync } from 'node:fs';
+import type { ReactNode } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { UIProvider } from '@peers-touch/ui';
+import { expect, it, vi } from 'vitest';
+
+import { PrivateMediaGrid } from './PrivateMediaGrid';
+import { normalizePrivateMomentProjection } from '../../services/privateMomentsNative';
+import {
+  registerPrivateMediaLocalPreviews,
+  releasePrivateMediaLocalPreviews,
+} from '../../services/privateMediaLocalPreview';
+
+const render = (children: ReactNode) => renderToStaticMarkup(<UIProvider>{children}</UIProvider>);
+
+vi.mock('@tauri-apps/api/core', () => ({
+  convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}`,
+  invoke: vi.fn(),
+}));
+
+vi.mock('lucide-react', () => ({
+  ImageIcon: () => <span data-icon="image" />,
+  LockKeyhole: () => <span data-icon="lock" />,
+  RefreshCcw: () => <span data-icon="retry" />,
+  ShieldAlert: () => <span data-icon="shield" />,
+  WifiOff: () => <span data-icon="offline" />,
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => ({
+      'moments.private.action.retry': 'Try again',
+      'moments.private.media.ready.alt': 'Private attachment',
+      'moments.private.media.remoteRetryable': 'Source temporarily unavailable',
+    })[key] ?? key,
+  }),
+}));
+
+it('renders remote private image from home station', () => {
+  const projection = normalizePrivateMomentProjection({
+    post_id: 'post-image',
+    content_id: 'post-image',
+    generation: '7',
+    author_ptid: 'ptid:author',
+    audience_kind: 'FRIENDS',
+    state: 'CONTENT_READY',
+    content: {
+      kind: 'IMAGE',
+      text: 'remote private image',
+      media: [{
+        object_id: 'object-image',
+        state: 'MEDIA_READY',
+        access_path: 'HOME_STATION_REMOTE_PEER_STREAM',
+        retryable: false,
+        render_url: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        plaintext_sha256: 'a'.repeat(64),
+        plaintext_size: 128,
+        mime_type: 'image/jpeg',
+      }],
+    },
+  });
+  expect(projection.content?.kind).toBe('IMAGE');
+  if (projection.content?.kind !== 'IMAGE') return;
+  const html = render(
+    <PrivateMediaGrid
+      media={projection.content.media}
+      postId="test-post"
+      onOpen={vi.fn()}
+    />,
+  );
+
+  expect(html).toContain('data-private-media-access-path="HOME_STATION_REMOTE_PEER_STREAM"');
+  expect(html).toContain(
+    'src="private-media://localhost/01ARZ3NDEKTSV4RRFFQ69G5FAV"',
+  );
+  expect(html).not.toContain('station-source');
+  expect(html).not.toContain('https://');
+});
+
+it('renders remote private video retry state without direct remote URL', () => {
+  const projection = normalizePrivateMomentProjection({
+    post_id: 'post-video',
+    content_id: 'post-video',
+    generation: '7',
+    author_ptid: 'ptid:author',
+    audience_kind: 'FRIENDS',
+    state: 'CONTENT_READY',
+    content: {
+      kind: 'VIDEO',
+      text: 'remote private video',
+      media: [{
+        object_id: 'object-video',
+        state: 'MEDIA_OFFLINE_RETRYABLE',
+        access_path: 'HOME_STATION_REMOTE_PEER_STREAM',
+        retryable: true,
+        mime_type: 'video/mp4',
+        error_code: 'MEDIA_DEPENDENCY_UNAVAILABLE',
+      }],
+    },
+  });
+  expect(projection.content?.kind).toBe('VIDEO');
+  if (projection.content?.kind !== 'VIDEO') return;
+  const html = render(
+    <PrivateMediaGrid
+      media={projection.content.media}
+      postId="test-post"
+      onOpen={vi.fn()}
+    />,
+  );
+
+  expect(html).toContain('data-private-media-state="MEDIA_OFFLINE_RETRYABLE"');
+  expect(html).toContain('data-private-media-retryable="true"');
+  expect(html).toContain('Source temporarily unavailable');
+  expect(html).toContain('Try again');
+  expect(html).not.toContain('<video');
+  expect(html).not.toContain('station-source');
+  expect(html).not.toContain('http://');
+  expect(html).not.toContain('https://');
+});
+
+it('never embeds the publisher local file in server markup during the grant gap', () => {
+  // Session-scoped local previews are a client-render-only paint. The SSR
+  // snapshot must stay empty so picked file URLs never leak into static HTML.
+  registerPrivateMediaLocalPreviews('post-pending', [
+    { src: 'asset://localhost/picked.jpg', isVideo: false },
+  ]);
+  const projection = normalizePrivateMomentProjection({
+    post_id: 'post-pending',
+    content_id: 'post-pending',
+    generation: '11',
+    author_ptid: 'ptid:author',
+    audience_kind: 'SELF',
+    state: 'CONTENT_READY',
+    content: {
+      kind: 'IMAGE',
+      text: 'own pending post',
+      media: [{
+        object_id: 'object-pending',
+        state: 'MEDIA_GRANT_PENDING',
+        access_path: 'HOME_STATION_LOCAL_OBJECT',
+        retryable: false,
+      }],
+    },
+  });
+  if (projection.content?.kind !== 'IMAGE') throw new Error('expected IMAGE content');
+  const html = render(
+    <PrivateMediaGrid
+      media={projection.content.media}
+      postId="post-pending"
+      onOpen={vi.fn()}
+    />,
+  );
+
+  expect(html).toContain('data-private-media-state="MEDIA_GRANT_PENDING"');
+  expect(html).not.toContain('asset://localhost/picked.jpg');
+  expect(html).not.toContain('data-private-media-local="true"');
+  releasePrivateMediaLocalPreviews('post-pending');
+});
+
+it('localizes the remote private media retry state', () => {
+  const load = (relativePath: string) => JSON.parse(
+    readFileSync(new URL(relativePath, import.meta.url), 'utf8'),
+  ) as Record<string, string>;
+  const en = load('../../../../../packages/locales/en/moments.json');
+  const zh = load('../../../../../packages/locales/zh-CN/moments.json');
+
+  expect(en['moments.private.media.remoteRetryable'])
+    .toBe('Source temporarily unavailable');
+  expect(zh['moments.private.media.remoteRetryable']).toBe('来源暂时不可用');
+});
+
+it('renders available video through the shared player and removes revoked media', () => {
+  const item = {
+    objectId: 'private-video', state: 'MEDIA_READY' as const,
+    accessPath: 'HOME_STATION_REMOTE_PEER_STREAM' as const, retryable: false,
+    mimeType: 'video/mp4', renderUrl: 'private-media://localhost/window-grant',
+  };
+  const ready = render(<PrivateMediaGrid postId="private-video-post" media={[item]} onOpen={vi.fn()} />);
+  expect(ready).toContain('class="pt-media-player');
+  expect(ready).toContain('src="private-media://localhost/window-grant"');
+  const revoked = render(<PrivateMediaGrid
+    postId="private-video-post"
+    media={[{ ...item, state: 'MEDIA_ACCESS_DENIED', renderUrl: undefined }]} onOpen={vi.fn()} />);
+  expect(revoked).toContain('data-private-media-state="MEDIA_ACCESS_DENIED"');
+  expect(revoked).not.toContain('<video');
+  expect(revoked).not.toContain('<img');
+  expect(revoked).not.toContain('window-grant');
+});

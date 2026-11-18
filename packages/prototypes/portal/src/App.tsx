@@ -1,0 +1,800 @@
+import { useEffect, useRef, useState, type ComponentType, type CSSProperties, type KeyboardEvent, type ReactElement } from 'react';
+import { Archive, CloudCog, Layers, Maximize2, Minimize2, Monitor, PanelsTopLeft, Smartphone } from 'lucide-react';
+import { LOCAL_PROTOTYPES } from './registry/localManifests';
+import { WORKTREE_TARGETS } from './registry/worktrees';
+import type { PrototypeManifest, PrototypeSite, PrototypeWorktreeTarget } from './registry/types';
+import './responsive.css';
+
+const DEFAULT_SITE: PrototypeSite = normalizeSite(
+  new URLSearchParams(window.location.search).get('site') ?? import.meta.env.VITE_PROTOTYPE_SITE,
+);
+
+const SITE_META: Record<PrototypeSite, { title: string; subtitle: string; icon: ReactElement }> = {
+  desktop: {
+    title: 'Desktop Prototypes',
+    subtitle: 'Desktop App / desktop-web / applet container experiences',
+    icon: <Monitor size={18} />,
+  },
+  mobile: {
+    title: 'Mobile Prototypes',
+    subtitle: 'Mobile pages, flows, components, and cross-device UX',
+    icon: <Smartphone size={18} />,
+  },
+  dashboard: {
+    title: 'Station Dashboard Prototypes',
+    subtitle: 'Station admin, operations, and dashboard experiences',
+    icon: <PanelsTopLeft size={18} />,
+  },
+  control: {
+    title: 'Cloud Control Prototypes',
+    subtitle: 'Bootstrap catalog, releases, publication, and recovery',
+    icon: <CloudCog size={18} />,
+  },
+  'frontend-eles': {
+    title: 'Frontend Eles',
+    subtitle: '元素与组件全集 · 先基础，再高级，最后逐项交互',
+    icon: <Layers size={18} />,
+  },
+};
+
+// The current prototype system is the self-training Frontend Eles surface;
+// the legacy standalone desktop/mobile prototype sites stay available in the
+// collapsed Archive group for traceability, not as implementation authority.
+const PRIMARY_SITES: PrototypeSite[] = ['frontend-eles', 'dashboard', 'control'];
+const ARCHIVE_SITES: PrototypeSite[] = ['desktop', 'mobile'];
+
+function normalizeSite(value: unknown): PrototypeSite {
+  return value === 'mobile' || value === 'dashboard' || value === 'control' || value === 'desktop' || value === 'frontend-eles'
+    ? value
+    : 'frontend-eles';
+}
+
+export function PrototypePortal() {
+  const [site, setSite] = useState<PrototypeSite>(DEFAULT_SITE);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [targetId, setTargetId] = useState(WORKTREE_TARGETS[0]?.id ?? 'current');
+  const [selectedPrototypeId, setSelectedPrototypeId] = useState<string | null>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const meta = SITE_META[site];
+  const visible = LOCAL_PROTOTYPES.filter((prototype) => prototype.site === site);
+  const entryPrototypes = visible.filter(isEntryPrototype);
+  const target = WORKTREE_TARGETS.find((item) => item.id === targetId) ?? WORKTREE_TARGETS[0];
+  const servingTarget = WORKTREE_TARGETS[0];
+  const localTarget = target.id === 'current';
+  const selectedPrototype =
+    entryPrototypes.find((prototype) => prototype.id === selectedPrototypeId) ??
+    entryPrototypes.find((prototype) => prototype.status === 'pending-review' && prototype.kind !== 'shell') ??
+    entryPrototypes[0] ??
+    null;
+
+  useEffect(() => {
+    if (entryPrototypes.length === 0) {
+      setSelectedPrototypeId(null);
+      return;
+    }
+
+    if (!selectedPrototypeId || !entryPrototypes.some((prototype) => prototype.id === selectedPrototypeId)) {
+      setSelectedPrototypeId(entryPrototypes[0].id);
+    }
+  }, [entryPrototypes, selectedPrototypeId]);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape' && !event.defaultPrevented) setFullscreen(false);
+    };
+    document.body.classList.add('prototype-preview-fullscreen-open');
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.classList.remove('prototype-preview-fullscreen-open');
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [fullscreen]);
+
+  useEffect(() => {
+    setFullscreen(false);
+  }, [site, targetId]);
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('site') === site) return;
+    url.searchParams.set('site', site);
+    window.history.replaceState(null, '', url);
+  }, [site]);
+
+  // Deep links (or old bookmarks) into an archived site expand the archive so
+  // the selected entry is visible instead of looking unselected.
+  useEffect(() => {
+    if (ARCHIVE_SITES.includes(site)) setArchiveOpen(true);
+  }, [site]);
+
+  return (
+    <div className="prototype-portal" style={styles.page}>
+      <header
+        className="prototype-portal-header"
+        style={styles.header}
+        inert={fullscreen ? true : undefined}
+        aria-hidden={fullscreen || undefined}
+      >
+        <div style={styles.brand}>Peers Touch Prototype Portal</div>
+        <div className="prototype-portal-controls" style={styles.headerControls}>
+          <label className="prototype-portal-target" style={styles.targetPicker}>
+            <span>Worktree</span>
+            <select value={target.id} onChange={(event) => setTargetId(event.target.value)} style={styles.select}>
+              {WORKTREE_TARGETS.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label} / {item.branch}
+                </option>
+              ))}
+            </select>
+          </label>
+          <CurrentWorktreeBadge target={servingTarget} />
+        </div>
+      </header>
+
+      <main className="prototype-portal-main" style={styles.main}>
+        <aside
+          className="prototype-portal-sidebar"
+          style={styles.sidebar}
+          inert={fullscreen ? true : undefined}
+          aria-hidden={fullscreen || undefined}
+        >
+          {PRIMARY_SITES.map((key) => {
+            const item = SITE_META[key];
+            const active = key === site;
+            return (
+              <button
+                key={key}
+                type="button"
+                style={{ ...styles.siteItem, ...(active ? styles.siteItemActive : null), cursor: 'pointer' }}
+                aria-pressed={active}
+                onClick={() => setSite(key)}
+              >
+                {item.icon}
+                <div>
+                  <div style={styles.siteTitle}>{key}</div>
+                  <div style={styles.siteSubtitle}>{item.title}</div>
+                </div>
+              </button>
+            );
+          })}
+
+          <div className="prototype-portal-archive" style={styles.archiveGroup}>
+            <button
+              type="button"
+              aria-expanded={archiveOpen}
+              style={styles.archiveToggle}
+              onClick={() => setArchiveOpen((open) => !open)}
+            >
+              <Archive size={15} />
+              <span>归档 Archive</span>
+              <span style={styles.archiveChevron}>{archiveOpen ? '▾' : '▸'}</span>
+            </button>
+            {archiveOpen
+              ? ARCHIVE_SITES.map((key) => {
+                  const item = SITE_META[key];
+                  const active = key === site;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      style={{ ...styles.siteItem, ...styles.archiveItem, ...(active ? styles.siteItemActive : null), cursor: 'pointer' }}
+                      aria-pressed={active}
+                      onClick={() => setSite(key)}
+                    >
+                      {item.icon}
+                      <div>
+                        <div style={styles.siteTitle}>{key}</div>
+                        <div style={styles.siteSubtitle}>{item.title}</div>
+                      </div>
+                    </button>
+                  );
+                })
+              : null}
+          </div>
+        </aside>
+
+        <section className="prototype-portal-content" style={styles.content}>
+          <div
+            className="prototype-portal-heading"
+            style={styles.hero}
+            inert={fullscreen ? true : undefined}
+            aria-hidden={fullscreen || undefined}
+          >
+            <div>
+              <h1 style={styles.h1}>{meta.title}</h1>
+              <p style={styles.p}>{meta.subtitle}</p>
+            </div>
+            <div style={styles.command}>make run-prototype</div>
+          </div>
+
+          {localTarget ? (
+            <div
+              style={styles.grid}
+              inert={fullscreen ? true : undefined}
+              aria-hidden={fullscreen || undefined}
+            >
+              {entryPrototypes.length > 0 ? (
+                entryPrototypes.map((prototype) => (
+                  <PrototypeCard
+                    key={prototype.id}
+                    prototype={prototype}
+                    selected={prototype.id === selectedPrototype?.id}
+                    onSelect={() => setSelectedPrototypeId(prototype.id)}
+                  />
+                ))
+              ) : (
+                <div style={styles.empty}>
+                  <strong>No prototypes registered for {site} yet.</strong>
+                  <span>Add a prototype manifest under packages/prototypes/&lt;id&gt;/ and keep it under the correct first-level site.</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div inert={fullscreen ? true : undefined} aria-hidden={fullscreen || undefined}>
+              <RemoteTargetCard target={target} site={site} />
+            </div>
+          )}
+
+          {localTarget ? (
+            selectedPrototype ? (
+              <PrototypePreview
+                prototype={selectedPrototype}
+                fullscreen={fullscreen}
+                onFullscreenChange={setFullscreen}
+              />
+            ) : null
+          ) : (
+            <RemoteWorktreePreview
+              target={target}
+              site={site}
+              fullscreen={fullscreen}
+              onFullscreenChange={setFullscreen}
+            />
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
+
+function isEntryPrototype(prototype: PrototypeManifest): boolean {
+  if (prototype.hidden) return false;
+  if (prototype.site !== 'desktop') return true;
+  if (prototype.kind === 'applet') return false;
+  return prototype.kind === 'shell' || prototype.module !== 'applet-runtime';
+}
+
+function CurrentWorktreeBadge({ target }: { target: PrototypeWorktreeTarget }) {
+  return (
+    <div className="prototype-portal-worktree" style={styles.worktreeBadge}>
+      <div style={styles.worktreeBadgeTitle}>Serving worktree</div>
+      <div style={styles.worktreeBadgeBranch}>{target.branch}</div>
+      <div style={styles.worktreeBadgePath} title={target.worktreePath}>
+        {compactPath(target.worktreePath)}
+      </div>
+    </div>
+  );
+}
+
+function RemoteTargetCard({ target, site }: { target: PrototypeWorktreeTarget; site: PrototypeSite }) {
+  const url = target.sites[site];
+
+  return (
+    <article style={styles.remoteCard}>
+      <div style={styles.cardTop}>
+        <span style={styles.cardTitle}>{target.label}</span>
+        <span style={styles.status}>remote</span>
+      </div>
+      <p style={styles.cardText}>
+        Branch `{target.branch}` is rendered from its own running prototype service. Portal uses iframe preview for remote worktrees and never imports their source.
+      </p>
+      <div style={styles.targetMeta}>
+        <span>worktree: {target.worktreePath}</span>
+        <span>{site}: {url ?? 'not configured'}</span>
+      </div>
+    </article>
+  );
+}
+
+function RemoteWorktreePreview({
+  target,
+  site,
+  fullscreen,
+  onFullscreenChange,
+}: {
+  target: PrototypeWorktreeTarget;
+  site: PrototypeSite;
+  fullscreen: boolean;
+  onFullscreenChange: (value: boolean) => void;
+}) {
+  const url = target.sites[site];
+
+  return (
+    <PreviewFrame
+      label={`${target.label} / ${target.branch}`}
+      fullscreen={fullscreen}
+      onFullscreenChange={onFullscreenChange}
+      remote
+    >
+      {url ? (
+        <iframe title={`${target.label} ${site}`} src={url} style={styles.iframe} />
+      ) : (
+        <div style={styles.previewPlaceholder}>
+          No remote URL configured for {site}. Add it to VITE_PROTOTYPE_WORKTREES.
+        </div>
+      )}
+    </PreviewFrame>
+  );
+}
+
+function PreviewFrame({
+  label,
+  fullscreen,
+  onFullscreenChange,
+  remote = false,
+  children,
+}: {
+  label: string;
+  fullscreen: boolean;
+  onFullscreenChange: (value: boolean) => void;
+  remote?: boolean;
+  children: ReactElement;
+}) {
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const previousFullscreen = useRef(fullscreen);
+
+  useEffect(() => {
+    if (previousFullscreen.current && !fullscreen) {
+      window.requestAnimationFrame(() => toggleRef.current?.focus());
+    }
+    previousFullscreen.current = fullscreen;
+  }, [fullscreen]);
+
+  const toggle = () => onFullscreenChange(!fullscreen);
+
+  return (
+    <section
+      className={`prototype-portal-preview${fullscreen ? ' is-fullscreen' : ''}`}
+      style={styles.preview}
+      aria-label={`${label} 预览`}
+      role={fullscreen ? 'dialog' : undefined}
+      aria-modal={fullscreen || undefined}
+    >
+      <div style={styles.previewHeader}>
+        <div className="prototype-portal-preview-title">
+          <span>{remote ? 'Remote Preview' : 'Live Preview'}</span>
+          <span style={styles.previewMeta}>{label}</span>
+        </div>
+        <button
+          ref={toggleRef}
+          type="button"
+          className="prototype-portal-fullscreen-button"
+          aria-label={fullscreen ? '退出全屏预览' : '全屏预览'}
+          title={fullscreen ? '退出全屏预览（Esc）' : '全屏预览'}
+          onClick={toggle}
+        >
+          {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+          <span>{fullscreen ? '退出全屏' : '全屏查看'}</span>
+        </button>
+      </div>
+      <div
+        className={`prototype-portal-preview-body${remote ? ' is-remote' : ' is-local'}`}
+        style={remote ? styles.previewBody : styles.localPreviewBody}
+      >
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function PrototypePreview({
+  prototype,
+  fullscreen,
+  onFullscreenChange,
+}: {
+  prototype: PrototypeManifest;
+  fullscreen: boolean;
+  onFullscreenChange: (value: boolean) => void;
+}) {
+  const [Preview, setPreview] = useState<ComponentType | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreview(null);
+    setError(null);
+
+    prototype.entry()
+      .then((module) => {
+        const exportName = prototype.previewExport ?? 'default';
+        const candidate = module[exportName] ?? module.default;
+        if (typeof candidate !== 'function') {
+          throw new Error(`Missing preview export: ${exportName}`);
+        }
+        if (!cancelled) {
+          setPreview(() => candidate as ComponentType);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [prototype]);
+
+  return (
+    <PreviewFrame
+      label={prototype.title}
+      fullscreen={fullscreen}
+      onFullscreenChange={onFullscreenChange}
+    >
+      {Preview ? (
+        <Preview />
+      ) : (
+        <div style={styles.previewPlaceholder}>
+          {error ? `Preview unavailable: ${error}` : `Loading ${prototype.title}...`}
+        </div>
+      )}
+    </PreviewFrame>
+  );
+}
+
+function PrototypeCard({
+  prototype,
+  selected,
+  onSelect,
+}: {
+  prototype: PrototypeManifest;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    onSelect();
+  };
+
+  return (
+    <article
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      onClick={onSelect}
+      onKeyDown={handleKeyDown}
+      style={{ ...styles.card, ...(selected ? styles.cardSelected : null) }}
+    >
+      <div style={styles.cardTop}>
+        <span style={styles.cardTitle}>{prototype.title}</span>
+        <span style={styles.status}>{prototype.status}</span>
+      </div>
+      <p style={styles.cardText}>{prototype.description}</p>
+      <div style={styles.cardMeta}>
+        <span>{prototype.kind}</span>
+        <span>module: {prototype.module}</span>
+        <span>{prototype.path}</span>
+        {prototype.docs ? <span>{prototype.docs}</span> : null}
+      </div>
+    </article>
+  );
+}
+
+function compactPath(path: string): string {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length <= 4) {
+    return path;
+  }
+  return `.../${parts.slice(-4).join('/')}`;
+}
+
+const styles: Record<string, CSSProperties> = {
+  page: {
+    minHeight: '100vh',
+    background: '#f6f7fb',
+    color: '#1f2329',
+    fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  },
+  header: {
+    height: 56,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '0 20px',
+    background: '#ffffff',
+    borderBottom: '1px solid #e5e7eb',
+  },
+  brand: {
+    fontSize: 15,
+    fontWeight: 700,
+  },
+  headerControls: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  targetPicker: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    color: '#64748b',
+    fontSize: 12,
+    fontWeight: 600,
+  },
+  select: {
+    height: 30,
+    borderRadius: 8,
+    border: '1px solid #cbd5e1',
+    background: '#ffffff',
+    color: '#334155',
+    padding: '0 8px',
+    fontSize: 12,
+  },
+  main: {
+    display: 'flex',
+    minHeight: 'calc(100vh - 56px)',
+  },
+  sidebar: {
+    width: 260,
+    padding: 16,
+    background: '#ffffff',
+    borderRight: '1px solid #e5e7eb',
+  },
+  siteItem: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 12px',
+    border: 0,
+    borderRadius: 10,
+    background: 'transparent',
+    color: '#4b5563',
+    marginBottom: 8,
+    textAlign: 'left',
+  },
+  siteItemActive: {
+    background: '#eef2ff',
+    color: '#312e81',
+  },
+  archiveGroup: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTop: '1px solid #e5e7eb',
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  archiveToggle: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '6px 12px',
+    marginBottom: 4,
+    border: 0,
+    borderRadius: 8,
+    background: 'transparent',
+    color: '#8a9096',
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
+    cursor: 'pointer',
+    textAlign: 'left',
+  },
+  archiveChevron: {
+    marginLeft: 'auto',
+    fontSize: 10,
+  },
+  archiveItem: {
+    opacity: 0.72,
+  },
+  siteTitle: {
+    fontSize: 13,
+    fontWeight: 700,
+  },
+  siteSubtitle: {
+    fontSize: 11,
+    color: '#6b7280',
+    marginTop: 2,
+  },
+  content: {
+    flex: 1,
+    padding: 20,
+    minWidth: 0,
+  },
+  hero: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    background: '#ffffff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+  },
+  h1: {
+    margin: 0,
+    fontSize: 24,
+  },
+  p: {
+    margin: '8px 0 0',
+    color: '#6b7280',
+    fontSize: 13,
+  },
+  command: {
+    padding: '6px 10px',
+    borderRadius: 8,
+    background: '#111827',
+    color: '#ffffff',
+    fontSize: 12,
+    fontFamily: 'monospace',
+  },
+  worktreeBadge: {
+    display: 'grid',
+    gap: 4,
+    minWidth: 280,
+    padding: '10px 12px',
+    borderRadius: 12,
+    background: '#f8fafc',
+    border: '1px solid #e2e8f0',
+    textAlign: 'right',
+  },
+  worktreeBadgeTitle: {
+    color: '#64748b',
+    fontSize: 11,
+    fontWeight: 700,
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+  },
+  worktreeBadgeBranch: {
+    color: '#1e293b',
+    fontSize: 13,
+    fontWeight: 800,
+  },
+  worktreeBadgePath: {
+    color: '#475569',
+    fontFamily: 'monospace',
+    fontSize: 11,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    minWidth: 0,
+  },
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+    gap: 12,
+    marginBottom: 16,
+  },
+  card: {
+    background: '#ffffff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 14,
+    padding: 14,
+    cursor: 'pointer',
+    outline: 'none',
+  },
+  cardSelected: {
+    border: '1px solid #7c6ee6',
+    boxShadow: '0 0 0 3px rgba(124, 110, 230, 0.12)',
+  },
+  cardTop: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  cardTitle: {
+    fontSize: 14,
+    fontWeight: 700,
+  },
+  status: {
+    fontSize: 11,
+    color: '#2563eb',
+    background: '#dbeafe',
+    borderRadius: 999,
+    padding: '2px 8px',
+  },
+  cardText: {
+    fontSize: 12,
+    color: '#4b5563',
+    lineHeight: '18px',
+    minHeight: 36,
+  },
+  cardMeta: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 4,
+    color: '#6b7280',
+    fontSize: 11,
+  },
+  empty: {
+    gridColumn: '1 / -1',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    padding: 18,
+    background: '#ffffff',
+    border: '1px dashed #cbd5e1',
+    borderRadius: 14,
+    color: '#475569',
+    fontSize: 13,
+  },
+  remoteCard: {
+    background: '#ffffff',
+    border: '1px solid #dbeafe',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+  },
+  targetMeta: {
+    display: 'grid',
+    gap: 4,
+    color: '#475569',
+    fontSize: 11,
+    fontFamily: 'monospace',
+  },
+  preview: {
+    background: '#ffffff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  previewHeader: {
+    height: 44,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '0 14px',
+    borderBottom: '1px solid #e5e7eb',
+    fontSize: 13,
+    fontWeight: 700,
+  },
+  previewMeta: {
+    color: '#6b7280',
+    fontSize: 11,
+    fontWeight: 500,
+  },
+  previewBody: {
+    height: 720,
+    minHeight: 0,
+    // Vertical only: product surfaces own their minimum widths and clip
+    // rather than grow a horizontal UA scrollbar. The quiet scrollbar
+    // grammar itself lives in responsive.css (pseudo-elements cannot be
+    // inlined).
+    overflowX: 'hidden',
+    overflowY: 'auto',
+  },
+  // Definite-height clipping host, mirroring the remote iframe preview
+  // (previewBody height:720 + overflow:auto). Full-screen app prototypes
+  // (e.g. DesktopShell) use height:100% plus internal scroll surfaces, so
+  // they need a definite ancestor: without one the whole height chain
+  // collapses to content size, bottom-pinned chrome (rail notifications /
+  // settings) detaches and the surface grows past the preview, clipping its
+  // bottom. Document-style prototypes still scroll inside this host.
+  localPreviewBody: {
+    height: 780,
+    minHeight: 0,
+    overflowX: 'hidden',
+    overflowY: 'auto',
+  },
+  previewPlaceholder: {
+    height: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    color: '#64748b',
+    fontSize: 13,
+  },
+  iframe: {
+    width: '100%',
+    height: '100%',
+    border: 0,
+    display: 'block',
+    background: '#ffffff',
+  },
+};

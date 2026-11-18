@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en" spellcheck="false">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Peers Touch Desktop</title>
+    <style id="pt-boot-style">
+      /* North-star boot: a neutral paper canvas with a quiet wordmark and
+         loading ring so a stalled wake/boot reads as "loading" instead of a
+         dead white window. The failure card replaces it only if the bundle
+         cannot start. Mirrors the .ds-boot grammar in northstar.css. */
+      #pt-boot-fallback {
+        position: fixed; inset: 0; z-index: 99999;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        gap: 16px;
+        background: #f4f5f4;
+        transition: opacity 0.4s ease;
+        font-family: Manrope, -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC', sans-serif;
+      }
+      #pt-boot-fallback[data-hidden] {
+        opacity: 0; pointer-events: none;
+      }
+      #pt-boot-wordmark {
+        font-size: 20px; font-weight: 650; letter-spacing: -0.01em;
+        color: #171a1c;
+      }
+      #pt-boot-ring {
+        width: 26px; height: 26px; border-radius: 50%;
+        border: 3px solid rgba(22,26,24,0.12);
+        border-top-color: #2f6a50;
+        animation: pt-boot-spin 0.8s linear infinite;
+      }
+      @keyframes pt-boot-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        #pt-boot-ring { animation-duration: 1.6s; }
+      }
+      #pt-boot-error {
+        display: none; max-width: 420px; text-align: center;
+        padding: 28px 32px;
+        background: rgba(255,255,255,0.72);
+        border: 1px solid rgba(22,26,24,0.10);
+        border-radius: 14px;
+        box-shadow: 0 10px 30px -18px rgba(20,24,22,0.28);
+        backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+        color: #171a1c;
+        font-family: Manrope, -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC', sans-serif;
+      }
+      #pt-boot-error h3 { margin: 12px 0 8px; font-size: 17px; font-weight: 650; color: #171a1c; }
+      #pt-boot-error p { font-size: 13px; color: #5d6368; line-height: 1.5; margin: 0 0 16px; }
+      #pt-boot-error button {
+        padding: 9px 22px; font-size: 13px; font-weight: 600; cursor: pointer;
+        border: none; border-radius: 10px; color: #fff; background: #1a1d20;
+      }
+      #pt-boot-error button:hover { background: #2b2f33; }
+      #pt-boot-error details { margin-top: 16px; font-size: 11px; color: #8a9096; text-align: left; }
+      #pt-boot-error pre {
+        padding: 8px; border-radius: 8px; background: rgba(22,26,24,0.05);
+        overflow: auto; max-height: 120px; font-size: 10px; color: #c0392f;
+        white-space: pre-wrap; word-break: break-all;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- Boot Fallback: visible loading surface until React mounts; error card if JS fails -->
+    <div id="pt-boot-fallback">
+      <div id="pt-boot-loading">
+        <span id="pt-boot-wordmark">Peers</span>
+        <span id="pt-boot-ring" role="status" aria-label="Loading"></span>
+      </div>
+      <div id="pt-boot-error">
+        <div style="font-size:36px">⚠️</div>
+        <h3>Failed to start</h3>
+        <p id="pt-boot-error-msg">The application bundle could not be loaded. This usually means the frontend was not built correctly.</p>
+        <button onclick="location.reload()">Reload</button>
+        <details>
+          <summary>Diagnostics</summary>
+          <pre id="pt-boot-diag"></pre>
+        </details>
+      </div>
+    </div>
+
+    <script>
+      // Boot diagnostics — independent of the React bundle
+      (function() {
+        var BOOT_TIMEOUT_MS = 30000;
+        var bootLog = [];
+        var startTime = Date.now();
+
+        function logBoot(msg) {
+          var ts = Date.now() - startTime;
+          var entry = '[' + ts + 'ms] ' + msg;
+          bootLog.push(entry);
+          try { console.log('[pt-boot] ' + entry); } catch(e) {}
+          try {
+            var invoke = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
+            if (typeof invoke === 'function') {
+              Promise.resolve(invoke('frontend_log', {
+                input: {
+                  level: msg.indexOf('ERROR') >= 0 || msg.indexOf('TIMEOUT') >= 0 ? 'error' : 'info',
+                  tag: 'boot-raw',
+                  message: entry
+                }
+              })).catch(function() {});
+            }
+          } catch(e) {}
+        }
+
+        logBoot('boot script started');
+
+        var moduleScripts = document.querySelectorAll('script[type="module"]');
+        logBoot('module scripts found: ' + moduleScripts.length);
+
+        // Catch ALL uncaught errors (JS runtime errors, not just resource loads)
+        window.addEventListener('error', function(e) {
+          if (e.target && (e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) {
+            var resource = e.target.src || e.target.href;
+            logBoot('RESOURCE LOAD ERROR: ' + resource);
+            showBootError('A required resource failed to load:\n' + resource);
+          } else if (e.message) {
+            logBoot('JS ERROR: ' + e.message + ' at ' + (e.filename || '?') + ':' + (e.lineno || '?'));
+            showBootError('JavaScript error:\n' + e.message + '\n' + (e.filename || '') + ':' + (e.lineno || ''));
+          }
+        }, true);
+
+        // Catch unhandled promise rejections (module import failures, async errors)
+        window.addEventListener('unhandledrejection', function(e) {
+          var reason = e.reason;
+          var msg = (reason && reason.message) ? reason.message : String(reason);
+          logBoot('UNHANDLED REJECTION: ' + msg);
+          showBootError('Unhandled error:\n' + msg + (reason && reason.stack ? '\n' + reason.stack : ''));
+        });
+
+        var bootTimer = setTimeout(function() {
+          var root = document.getElementById('root');
+          if (root && root.childNodes.length === 0) {
+            logBoot('TIMEOUT: React did not mount within ' + BOOT_TIMEOUT_MS + 'ms');
+            showBootError(
+              'The app did not start within ' + (BOOT_TIMEOUT_MS / 1000) + 's.\n' +
+              'Check that Station and the Rust BFF gateway are running.\n\n' +
+              'Try: make desktop'
+            );
+          }
+        }, BOOT_TIMEOUT_MS);
+
+        window.__PT_BOOT_READY__ = function() {
+          logBoot('React app mounted — dismissing boot fallback');
+          clearTimeout(bootTimer);
+          var fallback = document.getElementById('pt-boot-fallback');
+          if (fallback) {
+            fallback.setAttribute('data-hidden', '');
+            setTimeout(function() { fallback.remove(); }, 500);
+          }
+        };
+
+        // Progress hooks retained for diagnostics; the silent boot paints no status.
+        window.__PT_BOOT_STATUS__ = function(text) {
+          logBoot('status: ' + text);
+        };
+
+        window.__PT_BOOT_ERROR__ = showBootError;
+        function showBootError(detail) {
+          logBoot('showBootError: ' + detail);
+          var loading = document.getElementById('pt-boot-loading');
+          var errorBox = document.getElementById('pt-boot-error');
+          var diagPre = document.getElementById('pt-boot-diag');
+          if (loading) loading.style.display = 'none';
+          if (errorBox) errorBox.style.display = 'block';
+          if (diagPre) diagPre.textContent = bootLog.join('\n') + '\n\n' + (detail || '');
+        }
+      })();
+    </script>
+
+    <script type="module">
+      // Canary: verify ES module execution works in this WebView
+      if (typeof window.__PT_BOOT_STATUS__ === 'function') {
+        window.__PT_BOOT_STATUS__('Module runtime OK, loading app…');
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

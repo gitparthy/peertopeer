@@ -1,0 +1,956 @@
+/**
+ * peers-touch Desktop — shell prototype.
+ *
+ * Faithful web-stack mock of the real desktop chrome (apps/desktop):
+ *   - global SideNav (LobeUI `<SideNav>` form): avatar + topActions
+ *     (Search / Chat / Agent / Moments) + bottomActions
+ *     (notifications / settings)
+ *   - a content area that swaps pages by `page` (kernel-style pages render
+ *     a lightweight placeholder; applets render their own surface)
+ *   - command palette (Cmd/Ctrl + K), also opened from Settings
+ *
+ * Applets remain runtime surfaces, but the generic launcher and applet
+ * instances do not inject entries into the global rail.
+ *
+ * This prototype exists to show that container relationship; the page bodies
+ * other than atelier are intentionally thin placeholders.
+ *
+ * Standalone web prototype: no real store / kernel / tauri, mock-data only.
+ */
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import {
+  Search,
+  MessageCircle,
+  Bot,
+  Blocks,
+  Bell,
+  Settings,
+  Plus,
+  PanelRightOpen,
+  UserRoundCog,
+  Sparkles,
+  Globe,
+  Wrench,
+  ChevronRight,
+  Image as ImageIcon,
+  type LucideIcon,
+} from 'lucide-react';
+import { Button } from '@peers-touch/ui';
+import { AtelierPage } from '@peers-touch/prototype-desktop-atelier';
+import { AppletWorkspacePage } from '../../features/applet-workspace/src/AppletWorkspacePrototype';
+import { SocialChatPage } from '../../features/social-chat/src/pages/SocialChatPage';
+import { Page as AgentFeaturePage } from '../../features/agent/src/Page';
+import { AgentChatPage } from './AgentChatPage';
+import { SettingsPage } from './Settings';
+import { INITIAL_NOTIFICATIONS, NotificationPanel, type NotifItem } from './Notifications';
+import { ProfilePopover } from './ProfilePopover';
+import { T } from './theme';
+import { ToastHost } from '../../shared/Toast';
+import { ModernChatReview } from '../../features/modern-chat-agent/src/ModernChatReview';
+import { V2ProductReview } from '../../features/modern-chat-agent/src/V2ProductReview';
+import { TaskWorkbench } from './workbench/Workbench';
+import { OAuthLoginPrototype } from './OAuthLoginPrototype';
+import { SearchOverlay } from './search/SearchOverlay';
+import { toast } from '../../shared/Toast';
+import { ModelServiceConsumerWireflow, ModelServiceWireflowTheme } from '../../../shared/ModelServiceWireflow';
+import { isModelWireflow } from '../../../shared/modelServiceWireflowState';
+
+/** An installed applet (mirrors RuntimeAppletInfo.manifest + status). */
+interface AppletInfo {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  /** lucide icon + gradient for the card chip */
+  icon: LucideIcon;
+  gradient: string;
+  capabilities: string[];
+  /** active = entered at least once this session (mock) */
+  status: 'active' | 'inactive';
+  /** the applet surface; atelier renders the real prototype */
+  render: () => React.ReactNode;
+}
+
+const APPLETS: AppletInfo[] = [
+  {
+    id: 'atelier',
+    name: 'Atelier',
+    version: '0.1.0',
+    author: 'Peers-Touch',
+    description: '个人 Agent 工作台：多 Agent 协作、协商引擎、共识与裁决，把大项目当工程系统推进到完成。',
+    icon: Sparkles,
+    gradient: 'linear-gradient(135deg, #8b5cf6, #6d28d9)',
+    capabilities: ['agents', 'ai', 'skills', 'tasks'],
+    status: 'active',
+    render: () => <AtelierPage />,
+  },
+  {
+    id: 'web-explorer',
+    name: 'Web Explorer',
+    version: '0.0.3',
+    author: 'Peers-Touch',
+    description: '联网检索与网页摘要 applet（容器演示用占位，未细化）。',
+    icon: Globe,
+    gradient: 'linear-gradient(135deg, #0ea5e9, #2563eb)',
+    capabilities: ['search', 'network'],
+    status: 'inactive',
+    render: () => <AppletPlaceholder name="Web Explorer" />,
+  },
+  {
+    id: 'toolbox',
+    name: 'Toolbox',
+    version: '0.0.1',
+    author: 'Peers-Touch',
+    description: '本地工具集 applet（容器演示用占位，未细化）。',
+    icon: Wrench,
+    gradient: 'linear-gradient(135deg, #10b981, #059669)',
+    capabilities: ['tools', 'file'],
+    status: 'inactive',
+    render: () => <AppletPlaceholder name="Toolbox" />,
+  },
+];
+
+/** Kernel-style top nav entries — placeholders. */
+const NAV_ITEMS: { id: string; icon: LucideIcon; title: string }[] = [
+  { id: 'search', icon: Search, title: '搜索' },
+  { id: 'chat', icon: MessageCircle, title: '聊天' },
+  { id: 'agent', icon: Bot, title: 'Agent' },
+  { id: 'moments', icon: ImageIcon, title: '动态' },
+];
+
+const COMMANDS: { id: string; label: string; desc: string; shortcut: string; target: string }[] = [
+  { id: 'search', label: '搜索', desc: '全局搜索', shortcut: '⌘K', target: 'search' },
+  { id: 'chat', label: '聊天', desc: '打开 Social Chat', shortcut: '⌘⇧C', target: 'chat' },
+  { id: 'agent', label: 'Agent', desc: '打开 Agent', shortcut: '⌘J', target: 'agent' },
+  { id: 'moments', label: '动态', desc: '打开 Social', shortcut: '⌘⇧M', target: 'moments' },
+  { id: 'settings', label: '设置', desc: '打开设置', shortcut: '⌘,', target: 'settings' },
+];
+
+/** A single ActionIcon button in the rail (mirrors LobeUI `<ActionIcon>`). */
+function RailIcon({
+  icon: Icon,
+  active,
+  title,
+  badge,
+  onClick,
+  buttonRef,
+}: {
+  icon: LucideIcon;
+  active?: boolean;
+  title: string;
+  badge?: number;
+  onClick: (pointer: boolean) => void;
+  buttonRef?: RefObject<HTMLButtonElement | null>;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      title={title}
+      aria-label={title}
+      aria-pressed={active}
+      onClick={(event) => onClick(event.detail > 0)}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        position: 'relative',
+        width: 40,
+        height: 40,
+        border: 0,
+        padding: 0,
+        borderRadius: 8,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        cursor: 'pointer',
+        color: active ? T.primary : T.textSecondary,
+        backgroundColor: active ? T.primaryWash : hover ? T.fillQuaternary : 'transparent',
+      }}
+    >
+      <Icon size={20} />
+      {badge && badge > 0 ? (
+        <span
+          aria-label={`${badge} unread`}
+          style={{
+            position: 'absolute', top: 4, right: 4, minWidth: 15, height: 15,
+            padding: '0 4px', borderRadius: 8, boxSizing: 'border-box',
+            background: T.danger, color: T.white, fontSize: 9, fontWeight: 700,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            lineHeight: 1, border: `2px solid ${T.navBg}`,
+          }}
+        >
+          {badge > 99 ? '99+' : badge}
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
+/** Global side navigation — LobeUI `<SideNav>` form (avatar / top / bottom). */
+function SideNav({
+  page,
+  onNavigate,
+  notifOpen,
+  unreadCount,
+  onToggleNotifications,
+  notificationButtonRef,
+  searchOpen,
+  profileOpen,
+  profileButtonRef,
+  onToggleProfile,
+}: {
+  page: string;
+  onNavigate: (p: string) => void;
+  notifOpen: boolean;
+  searchOpen?: boolean;
+  unreadCount: number;
+  onToggleNotifications: (pointer: boolean) => void;
+  notificationButtonRef: RefObject<HTMLButtonElement | null>;
+  profileOpen: boolean;
+  profileButtonRef: RefObject<HTMLButtonElement | null>;
+  onToggleProfile: (pointer: boolean) => void;
+}) {
+  return (
+    <div
+      style={{
+        width: 60,
+        flexShrink: 0,
+        height: '100%',
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        padding: '12px 0',
+        backgroundColor: T.navBg,
+        borderRight: `1px solid ${T.border}`,
+      }}
+    >
+      {/* avatar — opens the profile popover */}
+      <Button
+        ref={profileButtonRef}
+        actionId="shell.profile.open"
+        data-shell-profile-button
+        aria-label="我的资料"
+        aria-haspopup="dialog"
+        aria-expanded={profileOpen}
+        title="我的资料"
+        emphasis="quiet"
+        onActivate={() => onToggleProfile(true)}
+        style={{
+          width: 36,
+          height: 36,
+          minHeight: 36,
+          borderRadius: 8,
+          marginBottom: 16,
+          padding: 0,
+          border: 'none',
+          background: `linear-gradient(135deg, ${T.primary}, #9a8df0)`,
+          color: T.white,
+          fontWeight: 'bold',
+          fontSize: 15,
+        }}
+      >
+        P
+      </Button>
+
+      {/* topActions */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {NAV_ITEMS.map((n) => (
+          <RailIcon
+            key={n.id}
+            icon={n.icon}
+            title={n.title}
+            active={n.id === 'search' ? !!searchOpen : page === n.id || (n.id === 'agent' && page.startsWith('agent'))}
+            onClick={() => onNavigate(n.id)}
+          />
+        ))}
+      </div>
+
+      {/* spacer */}
+      <div style={{ flex: 1 }} />
+
+      {/* bottomActions */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <RailIcon
+          buttonRef={notificationButtonRef}
+          icon={Bell}
+          title="通知"
+          active={notifOpen}
+          badge={unreadCount}
+          onClick={onToggleNotifications}
+        />
+        <RailIcon icon={Settings} title="设置" active={page === 'settings'} onClick={() => onNavigate('settings')} />
+      </div>
+    </div>
+  );
+}
+
+/** Thin placeholder for kernel-owned pages we don't prototype in detail. */
+function PagePlaceholder({ page }: { page: string }) {
+  const meta: Record<string, { title: string; desc: string; icon: LucideIcon }> = {
+    search: { title: '搜索', desc: '全局搜索页（peers-touch 容器壳页，原型未细化）', icon: Search },
+    chat: { title: '聊天', desc: '社交聊天页（含 Chat / Contacts 与会话内 stream call）', icon: MessageCircle },
+    moments: { title: '动态', desc: 'Social 动态页', icon: ImageIcon },
+    settings: { title: '设置', desc: '设置页（peers-touch 容器壳页，原型未细化）', icon: Settings },
+  };
+  const m = meta[page] ?? { title: page, desc: '占位页', icon: Blocks };
+  const Icon = m.icon;
+  return (
+    <div
+      style={{
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: T.textTertiary,
+        backgroundColor: T.bg,
+        gap: 12,
+      }}
+    >
+      <Icon size={40} color={T.textQuaternary} />
+      <div style={{ fontSize: 17, fontWeight: 'bold', color: T.textSecondary }}>{m.title}</div>
+      <div style={{ fontSize: 13, maxWidth: 360, textAlign: 'center' }}>{m.desc}</div>
+    </div>
+  );
+}
+
+/** Placeholder surface for applets we don't prototype (web-explorer / toolbox). */
+function AppletPlaceholder({ name }: { name: string }) {
+  return (
+    <div
+      style={{
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: T.textTertiary,
+        backgroundColor: T.bg,
+        gap: 12,
+      }}
+    >
+      <Blocks size={40} color={T.textQuaternary} />
+      <div style={{ fontSize: 17, fontWeight: 'bold', color: T.textSecondary }}>{name}</div>
+      <div style={{ fontSize: 13, maxWidth: 360, textAlign: 'center' }}>
+        该 applet 仅用于演示「Applets 列表 → 进入 applet」的容器关系，内容未细化。
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Applets center (`page === 'applets'`) — card grid of installed applets.
+ * Mirrors the real desktop AppletsPage: click "Open" → enter `applet:<id>`.
+ */
+function AppletsCenter({ onOpen }: { onOpen: (id: string) => void }) {
+  return (
+    <div style={{ height: '100%', overflow: 'auto', backgroundColor: T.bg }}>
+      {/* PageHeader */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          padding: '22px 40px 18px',
+          borderBottom: `1px solid ${T.borderSoft}`,
+        }}
+      >
+        <div
+          style={{
+            width: 38,
+            height: 38,
+            borderRadius: 10,
+            background: T.primaryWash,
+            color: T.primary,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <Blocks size={20} />
+        </div>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: T.text }}>Applets</div>
+          <div style={{ fontSize: 13, color: T.textTertiary }}>
+            已安装的 applet。点「打开」进入对应工作面。
+          </div>
+        </div>
+      </div>
+
+      {/* card grid */}
+      <div
+        style={{
+          padding: '28px 40px 48px',
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
+          gap: 20,
+          alignContent: 'start',
+        }}
+      >
+        {APPLETS.filter((a) => a.id !== 'atelier').map((a) => (
+          <AppletCard key={a.id} applet={a} onOpen={() => onOpen(a.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** A single applet card in the applets center. */
+function AppletCard({ applet, onOpen }: { applet: AppletInfo; onOpen: () => void }) {
+  const [hover, setHover] = useState(false);
+  const isActive = applet.status === 'active';
+  const Icon = applet.icon;
+  return (
+    <div
+      onClick={onOpen}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        borderRadius: 16,
+        border: `1px solid ${hover ? T.primary : isActive ? T.primaryWash : T.border}`,
+        background: T.white,
+        overflow: 'hidden',
+        cursor: 'pointer',
+        transition: 'all 0.2s ease',
+        transform: hover ? 'translateY(-2px)' : 'none',
+        boxShadow: hover ? '0 4px 24px rgba(107,91,214,0.12)' : 'none',
+      }}
+    >
+      {/* top accent */}
+      <div style={{ height: 3, background: isActive ? applet.gradient : T.border }} />
+      <div style={{ padding: '20px 20px 16px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+        {/* row 1: icon + name + status */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div
+            style={{
+              width: 52,
+              height: 52,
+              borderRadius: 14,
+              background: applet.gradient,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+              opacity: isActive ? 1 : 0.6,
+            }}
+          >
+            <Icon size={26} color={T.white} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: T.text }}>{applet.name}</span>
+              <span style={{ fontSize: 11, color: T.textTertiary }}>v{applet.version}</span>
+              <span
+                style={{
+                  fontSize: 11,
+                  color: isActive ? '#10b981' : T.textQuaternary,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4,
+                }}
+              >
+                <span
+                  style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: '50%',
+                    background: isActive ? '#10b981' : T.textQuaternary,
+                  }}
+                />
+                {isActive ? '已启用' : '未启用'}
+              </span>
+            </div>
+            <div style={{ fontSize: 12, color: T.textTertiary, marginTop: 2 }}>by {applet.author}</div>
+          </div>
+        </div>
+
+        {/* row 2: description */}
+        <div
+          style={{
+            fontSize: 13,
+            lineHeight: 1.6,
+            color: T.textSecondary,
+            display: '-webkit-box',
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+          }}
+        >
+          {applet.description}
+        </div>
+
+        {/* row 3: capabilities */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {applet.capabilities.map((c) => (
+            <span
+              key={c}
+              style={{
+                fontSize: 11,
+                lineHeight: '20px',
+                padding: '0 8px',
+                borderRadius: 6,
+                background: T.fillQuaternary,
+                color: T.textSecondary,
+                border: `1px solid ${T.borderSoft}`,
+              }}
+            >
+              {c}
+            </span>
+          ))}
+        </div>
+
+        {/* footer: open */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'flex-end',
+            gap: 4,
+            paddingTop: 4,
+            color: hover ? T.primary : T.textTertiary,
+            fontSize: 13,
+            fontWeight: 600,
+          }}
+        >
+          打开
+          <ChevronRight size={16} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Command palette (Cmd/Ctrl + Shift + P) — antd Modal form mocked in CSS. */
+function CommandPalette({
+  open,
+  onClose,
+  onRun,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onRun: (target: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return COMMANDS;
+    return COMMANDS.filter((c) => `${c.label} ${c.desc} ${c.shortcut}`.toLowerCase().includes(q));
+  }, [query]);
+
+  if (!open) return null;
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 100,
+        backgroundColor: 'rgba(0,0,0,0.25)',
+        display: 'flex',
+        alignItems: 'flex-start',
+        justifyContent: 'center',
+        paddingTop: '12vh',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: 520,
+          maxWidth: '90vw',
+          backgroundColor: T.bg,
+          borderRadius: 14,
+          boxShadow: '0 12px 48px rgba(0,0,0,0.18)',
+          padding: 16,
+        }}
+      >
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="输入命令…"
+          style={{
+            width: '100%',
+            boxSizing: 'border-box',
+            border: `1px solid ${T.border}`,
+            borderRadius: 10,
+            padding: '10px 12px',
+            fontSize: 14,
+            outline: 'none',
+            marginBottom: 12,
+          }}
+        />
+        <div style={{ display: 'grid', gap: 6 }}>
+          {filtered.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => onRun(c.target)}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '24px 1fr auto',
+                alignItems: 'center',
+                gap: 10,
+                padding: '10px 12px',
+                borderRadius: 10,
+                border: `1px solid ${T.borderSoft}`,
+                background: 'transparent',
+                textAlign: 'left',
+                cursor: 'pointer',
+              }}
+            >
+              <span style={{ color: T.textTertiary }}>
+                {c.id === 'atelier' ? <Blocks size={16} /> : c.id === 'agent' ? <UserRoundCog size={16} /> : c.id === 'chat' ? <PanelRightOpen size={16} /> : c.id === 'search' ? <Search size={16} /> : <Settings size={16} />}
+              </span>
+              <span style={{ minWidth: 0 }}>
+                <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: T.text }}>{c.label}</span>
+                <span style={{ display: 'block', fontSize: 12, color: T.textTertiary }}>{c.desc}</span>
+              </span>
+              <kbd
+                style={{
+                  padding: '2px 6px',
+                  borderRadius: 6,
+                  border: `1px solid ${T.border}`,
+                  background: T.fillQuaternary,
+                  color: T.textSecondary,
+                  fontSize: 11,
+                }}
+              >
+                {c.shortcut}
+              </kbd>
+            </button>
+          ))}
+          {filtered.length === 0 ? (
+            <div style={{ padding: 12, fontSize: 13, color: T.textTertiary, textAlign: 'center' }}>无匹配命令</div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Optional overrides so sibling prototypes can reuse this container shell as a
+ * host and mount their own block into a kernel page, instead of building a
+ * parallel chrome. This mirrors how atelier is reused via `workspace:*`:
+ *   - `pages` maps a kernel page id (e.g. `chat`) to a full-bleed renderer;
+ *     unmapped ids fall back to the thin `PagePlaceholder`.
+ *   - `initialPage` selects the landing surface.
+ */
+export interface DesktopShellProps {
+  pages?: Record<string, () => React.ReactNode>;
+  initialPage?: string;
+}
+
+type AgentSurfaceId = 'agent' | 'agent-atelier';
+
+function availableShellPage(page: string): string {
+  return page === 'agent-atelier' || page === 'applet:atelier' ? 'agent' : page;
+}
+
+function getAgentSurfaceId(page: string): AgentSurfaceId | null {
+  if (page === 'agent' || page === 'agent-profile') return 'agent';
+  if (page === 'agent-atelier') return 'agent-atelier';
+  return null;
+}
+
+export function DesktopShell({ pages, initialPage }: DesktopShellProps = {}) {
+  // page mirrors the real router: public shell ids plus hidden applet runtime
+  // routes (`applets` and `applet:<id>`). The visible shell lands on Search.
+  const modernChatState = typeof window === 'undefined'
+    ? ''
+    : new URLSearchParams(window.location.search).get('state') ?? '';
+  const showModernChatReview = modernChatState.startsWith('modern-');
+  const showV2ProductReview = modernChatState.startsWith('v2-');
+  const showAuthPrototype = modernChatState.startsWith('auth-oauth-');
+  const showAgentChatReview = modernChatState === 'agent-chat';
+  const showTaskWorkbench = modernChatState === 'task-workbench';
+  const requestedSurface = typeof window === 'undefined'
+    ? ''
+    : new URLSearchParams(window.location.search).get('surface') ?? '';
+  const defaultPage = isModelWireflow()
+    ? (requestedSurface === 'agent' ? 'agent' : 'settings')
+    : showModernChatReview || showV2ProductReview || showAgentChatReview || showTaskWorkbench
+    ? 'agent'
+    : initialPage ?? (requestedSurface === 'search' ? 'search-placeholder' : 'chat');
+  const [page, setPage] = useState(availableShellPage(defaultPage === 'search-placeholder' ? 'chat' : defaultPage));
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  // Search 是按需唤起的覆盖层，不是页面（S-01：Chat 默认落点）。
+  const [searchOpen, setSearchOpen] = useState(requestedSurface === 'search');
+  const [notificationView, setNotificationView] = useState<'closed' | 'preview' | 'all'>('closed');
+  const notificationButtonRef = useRef<HTMLButtonElement>(null);
+  // Whether the current preview was opened by pointer (mouse/touch); pointer
+  // openers keep focus on the bell, keyboard openers move focus into the panel.
+  const notificationPointerOpen = useRef(false);
+  const notifOpen = notificationView !== 'closed';
+  const notificationViewRef = useRef(notificationView);
+  notificationViewRef.current = notificationView;
+  const [notifications, setNotifications] = useState<NotifItem[]>(INITIAL_NOTIFICATIONS);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const profileButtonRef = useRef<HTMLButtonElement>(null);
+  const [authPrototypeComplete, setAuthPrototypeComplete] = useState(false);
+  const unreadCount = notifications.filter((n) => !n.read).length;
+  const [visitedAgentSurfaces, setVisitedAgentSurfaces] = useState<Set<AgentSurfaceId>>(() => {
+    const initialSurface = getAgentSurfaceId(availableShellPage(defaultPage));
+    return initialSurface ? new Set([initialSurface]) : new Set();
+  });
+
+  const navigate = (requestedPage: string) => {
+    const p = availableShellPage(requestedPage);
+    // 搜索是覆盖层而不是路由页：点击搜索图标只唤起 Search，保留当前页面。
+    if (p === 'search') {
+      setProfileOpen(false);
+      setSearchOpen(true);
+      return;
+    }
+    const surface = getAgentSurfaceId(p);
+    if (surface) {
+      setVisitedAgentSurfaces((current) => {
+        if (current.has(surface)) return current;
+        const next = new Set(current);
+        next.add(surface);
+        return next;
+      });
+    }
+    setNotificationView('closed');
+    setProfileOpen(false);
+    setPage(p);
+  };
+
+  const openNotification = (item: NotifItem) => {
+    setNotifications((prev) => prev.map((n) => (n.id === item.id ? { ...n, read: true } : n)));
+    setNotificationView('closed');
+    if (item.targetPage) navigate(item.targetPage);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        // ⌘K 是 Search 门户快捷键（S-02）；通用命令面板仍可从设置入口打开。
+        setSearchOpen((v) => !v);
+      } else if (e.key === 'Escape') {
+        setPaletteOpen(false);
+        setSearchOpen(false);
+        setProfileOpen(false);
+        if (notificationViewRef.current !== 'closed') {
+          setNotificationView('closed');
+          // Restore the bell after the dialog's own close/focus teardown.
+          window.setTimeout(() => notificationButtonRef.current?.focus(), 0);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  if (showAuthPrototype && !authPrototypeComplete) {
+    return <OAuthLoginPrototype onComplete={() => setAuthPrototypeComplete(true)} />;
+  }
+
+  const applet = page.startsWith('applet:')
+    ? APPLETS.find((a) => `applet:${a.id}` === page)
+    : undefined;
+
+  // Resolve the content body: applet surface > injected kernel page > built-in
+  // prototype page > thin placeholder. Injected pages let a sibling prototype
+  // mount its own block into a real kernel page without re-building the chrome.
+  let body: React.ReactNode;
+  if (applet) {
+    body = applet.render();
+  } else if (pages && pages[page]) {
+    body = pages[page]!();
+  } else if (page === 'applets') {
+    body = <AppletWorkspacePage />;
+  } else if (page === 'chat') {
+    body = <SocialChatPage />;
+  } else if (page === 'agent') {
+    body = (
+      <AgentChatPage
+        profileOpen={false}
+        onOpenProfile={() => navigate('agent-profile')}
+        onCloseProfile={() => navigate('agent')}
+      />
+    );
+  } else if (page === 'agent-profile') {
+    body = (
+      <AgentChatPage
+        profileOpen
+        onOpenProfile={() => navigate('agent-profile')}
+        onCloseProfile={() => navigate('agent')}
+      />
+    );
+  } else if (page === 'settings') {
+    body = <SettingsPage onOpenCommandPalette={() => setPaletteOpen(true)} onStartModelChat={() => navigate('agent')} />;
+  } else {
+    body = <PagePlaceholder page={page} />;
+  }
+
+  return (
+    <div style={{ width: '100%', height: '100%', minHeight: 0, overflow: 'hidden', display: 'flex', position: 'relative', backgroundColor: T.bg }}>
+      <SideNav
+        page={page}
+        onNavigate={navigate}
+        notifOpen={notifOpen}
+        unreadCount={unreadCount}
+        searchOpen={searchOpen}
+        notificationButtonRef={notificationButtonRef}
+        profileOpen={profileOpen}
+        profileButtonRef={profileButtonRef}
+        onToggleProfile={(pointer) => {
+          setProfileOpen((v) => !v);
+          // Pointer openers leave no :focus-visible ring on the avatar.
+          if (pointer) requestAnimationFrame(() => profileButtonRef.current?.blur());
+        }}
+        onToggleNotifications={(pointer) => {
+          setNotificationView((v) => {
+            if (v === 'closed') {
+              notificationPointerOpen.current = pointer;
+              return 'preview';
+            }
+            return 'closed';
+          });
+          // A pointer click on an already keyboard-focused element keeps the
+          // :focus-visible ring in Chromium; pointer-openers leave the bell
+          // without a visible ring.
+          if (pointer) requestAnimationFrame(() => notificationButtonRef.current?.blur());
+        }}
+      />
+      {notifOpen ? (
+          <NotificationPanel
+            mode={notificationView === 'all' ? 'all' : 'preview'}
+            anchorRef={notificationButtonRef}
+            keyboardAutoFocus={!notificationPointerOpen.current}
+            onShowAll={() => setNotificationView('all')}
+            onClose={() => setNotificationView('closed')}
+            // Defer past the dialog's own trigger-focus restoration, which
+            // targets an element that has already unmounted.
+            onRestoreFocus={() => window.setTimeout(
+              () => notificationButtonRef.current?.focus(), 0)}
+            items={notifications}
+            onMarkAllRead={() => setNotifications((prev) => prev.map((n) => ({ ...n, read: true })))}
+            onOpenItem={openNotification}
+            onDismiss={(id) => setNotifications((prev) => prev.filter((n) => n.id !== id))}
+            onInviteDecision={(id, accept) => setNotifications((prev) => prev.map((n) =>
+              n.id === id
+                ? { ...n, read: true, pending: false, body: accept ? 'Invite accepted — group added to your chats.' : 'Invite declined.' }
+                : n,
+            ))}
+          />
+      ) : null}
+      {profileOpen ? (
+        <ProfilePopover
+          anchorRef={profileButtonRef}
+          onClose={() => setProfileOpen(false)}
+          onManageAccount={() => navigate('settings')}
+        />
+      ) : null}
+      <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: 'relative', overflow: 'hidden' }}>
+        {visitedAgentSurfaces.size > 0 && (
+          <div
+            data-testid="desktop-agent-module-host"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              minHeight: 0,
+              display: page.startsWith('agent') ? 'flex' : 'none',
+              flexDirection: 'column',
+            }}
+          >
+            <div style={{ height: 42, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4, padding: '0 10px', borderBottom: `1px solid ${T.border}`, background: T.bg }}>
+              {[
+                { id: 'agent', label: 'Agent', icon: Bot },
+              ].map((item) => {
+                const Icon = item.icon;
+                const active = item.id === 'agent'
+                  ? page === 'agent' || page === 'agent-profile'
+                  : page === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => navigate(item.id)}
+                    style={{
+                      height: 30,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      padding: '0 10px',
+                      border: 0,
+                      borderRadius: 8,
+                      color: active ? T.primary : T.textSecondary,
+                      background: active ? T.primaryWash : 'transparent',
+                      fontSize: 12,
+                      fontWeight: active ? 700 : 500,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <Icon size={14} />
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: 'relative', overflow: 'hidden' }}>
+              {visitedAgentSurfaces.has('agent') && (
+                <>
+                  <div
+                    data-agent-surface="agent"
+                    style={{ position: 'absolute', inset: 0, display: page === 'agent' || page === 'agent-profile' ? 'block' : 'none', overflow: isModelWireflow() ? 'auto' : undefined }}
+                  >
+                    {isModelWireflow() ? (
+                      <ModelServiceWireflowTheme><ModelServiceConsumerWireflow chat /></ModelServiceWireflowTheme>
+                    ) : showTaskWorkbench ? (
+                      <TaskWorkbench />
+                    ) : showV2ProductReview ? (
+                      <V2ProductReview initialState={modernChatState} />
+                    ) : showModernChatReview ? (
+                      <ModernChatReview initialState={modernChatState} withTopicRail />
+                    ) : (
+                      <AgentChatPage
+                        profileOpen={page === 'agent-profile'}
+                        onOpenProfile={() => navigate('agent-profile')}
+                        onCloseProfile={() => navigate('agent')}
+                      />
+                    )}
+                  </div>
+                </>
+              )}
+              {visitedAgentSurfaces.has('agent-atelier') && (
+                <div
+                  data-agent-surface="agent-atelier"
+                  style={{ position: 'absolute', inset: 0, display: page === 'agent-atelier' ? 'block' : 'none' }}
+                >
+                  <AgentFeaturePage initialSurface="atelier" showGlobalNav={false} />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {!page.startsWith('agent') && body}
+      </div>
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        onRun={(target) => {
+          navigate(target);
+          setPaletteOpen(false);
+        }}
+      />
+      <SearchOverlay
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        onOpenResult={(item) => {
+          navigate(item.targetPage);
+          // 原型层用 toast 表达“打开并定位到原对象 anchor”的用户可见反馈。
+          toast.success(`已定位：${item.anchor}`);
+        }}
+      />
+      <ToastHost />
+    </div>
+  );
+}

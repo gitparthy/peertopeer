@@ -1,0 +1,5649 @@
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+
+use crate::social::PrivateReactionOperation;
+use prost::Message;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use secure_content_core::object::{
+    ObjectDescriptor, ObjectTransferDirection, ObjectTransferErrorCode, ObjectTransferFailure,
+    ObjectTransferRecord, ObjectTransferState,
+};
+use secure_content_core::operation::{
+    acquire_operation, apply_readback_decision, complete_operation, recover_interrupted_operation,
+    ContentPreKeyPoolKind, DispatchCause, OperationCompletion, OperationFence, OperationKind,
+    OperationLease, OperationRecord, OperationState, PreparedContentPreKeyPublication,
+    ReadbackDecision,
+};
+use secure_content_core::ports::ObjectTransferRepository;
+use sha2::{Digest, Sha256};
+
+use crate::domain::storage::database::DatabaseOpenSpec;
+use crate::infrastructure::local_scope;
+use crate::infrastructure::storage::{self, key_provider::PlatformKeyProvider};
+
+const MAX_REACTION_RETRY_AFTER_SECONDS: u64 = 300;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum CommentState {
+    Editing = 1,
+    Encrypting = 2,
+    Submitting = 3,
+    Posted = 4,
+    Failed = 5,
+    RateLimited = 6,
+    ParentUnavailable = 7,
+}
+
+impl CommentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Editing => "COMMENT_EDITING",
+            Self::Encrypting => "COMMENT_ENCRYPTING",
+            Self::Submitting => "COMMENT_SUBMITTING",
+            Self::Posted => "COMMENT_POSTED",
+            Self::Failed => "COMMENT_FAILED",
+            Self::RateLimited => "COMMENT_RATE_LIMITED",
+            Self::ParentUnavailable => "COMMENT_PARENT_UNAVAILABLE",
+        }
+    }
+}
+
+impl TryFrom<i64> for CommentState {
+    type Error = String;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Editing),
+            2 => Ok(Self::Encrypting),
+            3 => Ok(Self::Submitting),
+            4 => Ok(Self::Posted),
+            5 => Ok(Self::Failed),
+            6 => Ok(Self::RateLimited),
+            7 => Ok(Self::ParentUnavailable),
+            _ => Err("secure content Comment state is invalid".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum ReactionCommandState {
+    Pending = 1,
+    InFlight = 2,
+    UnknownCommit = 3,
+    Committed = 4,
+    Retrying = 5,
+    Rejected = 6,
+}
+
+impl ReactionCommandState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending | Self::UnknownCommit => "REACTION_PENDING",
+            Self::InFlight | Self::Retrying => "REACTION_RETRYING",
+            Self::Committed => "REACTION_COMMITTED",
+            Self::Rejected => "REACTION_REJECTED",
+        }
+    }
+}
+
+impl TryFrom<i64> for ReactionCommandState {
+    type Error = String;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Pending),
+            2 => Ok(Self::InFlight),
+            3 => Ok(Self::UnknownCommit),
+            4 => Ok(Self::Committed),
+            5 => Ok(Self::Retrying),
+            6 => Ok(Self::Rejected),
+            _ => Err("secure content Reaction command state is invalid".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum LocalPreKeyState {
+    PendingPublication = 1,
+    Published = 2,
+    RootCommitted = 3,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPublication {
+    pub command_id: String,
+    pub key_kind: i32,
+    pub pool_epoch: u64,
+    pub request_bytes: Vec<u8>,
+    pub request_sha256: [u8; 32],
+    pub state: OperationState,
+    pub lease_generation: u64,
+    pub session_generation: u64,
+    pub attempt_count: u32,
+    pub next_attempt_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcquiredPublication {
+    pub command: StoredPublication,
+    pub lease: OperationLease,
+}
+
+impl StoredPublication {
+    fn operation_record(&self) -> Result<OperationRecord, String> {
+        let record = OperationRecord {
+            operation_id: self.command_id.clone(),
+            command_id: self.command_id.clone(),
+            kind: OperationKind::ContentPreKeyPublication,
+            state: self.state,
+            command_sha256: self.request_sha256,
+            session_generation: self.session_generation,
+            lease_generation: self.lease_generation,
+            attempt_count: self.attempt_count,
+            next_attempt_at_unix_ms: self.next_attempt_at_unix_ms,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+        };
+        record
+            .validate_command_bytes(&self.request_bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEndpointPreKey {
+    pub key_id: String,
+    pub private_key: [u8; 32],
+    pub public_key: [u8; 32],
+    pub pool_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMomentCommand {
+    pub draft_id: String,
+    pub draft_revision: u64,
+    pub content_id: String,
+    pub generation: u64,
+    pub submit_command_id: String,
+    pub plan_bytes: Vec<u8>,
+    pub request_bytes: Vec<u8>,
+    pub request_sha256: [u8; 32],
+    pub root_key: [u8; 32],
+    pub state: OperationState,
+    pub lease_generation: u64,
+    pub session_generation: u64,
+    pub attempt_count: u32,
+    pub next_attempt_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    pub post_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcquiredMomentCommand {
+    pub command: StoredMomentCommand,
+    pub lease: OperationLease,
+}
+
+impl StoredMomentCommand {
+    pub(crate) fn operation_record(&self) -> Result<OperationRecord, String> {
+        let record = OperationRecord {
+            operation_id: self.submit_command_id.clone(),
+            command_id: self.submit_command_id.clone(),
+            kind: OperationKind::OwnerSubmission,
+            state: self.state,
+            command_sha256: self.request_sha256,
+            session_generation: self.session_generation,
+            lease_generation: self.lease_generation,
+            attempt_count: self.attempt_count,
+            next_attempt_at_unix_ms: self.next_attempt_at_unix_ms,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+        };
+        record
+            .validate_command_bytes(&self.request_bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMomentDraft {
+    pub draft_id: String,
+    pub draft_revision: u64,
+    pub intent_sha256: [u8; 32],
+    pub content_id: String,
+    pub prepare_command_id: String,
+    pub mention_commitment_salt: Option<[u8; 32]>,
+    pub repost_commitment_salt: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredCommentDraft {
+    pub draft_id: String,
+    pub draft_revision: u64,
+    pub post_id: String,
+    pub content_id: String,
+    pub generation: u64,
+    pub reply_to_comment_id: String,
+    pub text: String,
+    pub mention_intent_json: String,
+    pub mention_commitment_salt: Option<[u8; 32]>,
+    pub intent_sha256: [u8; 32],
+    pub prepare_command_id: String,
+    pub submit_command_id: Option<String>,
+    pub plan_bytes: Option<Vec<u8>>,
+    pub request_bytes: Option<Vec<u8>>,
+    pub request_sha256: Option<[u8; 32]>,
+    pub root_key: Option<[u8; 32]>,
+    pub publication_state: Option<OperationState>,
+    pub lease_generation: u64,
+    pub session_generation: u64,
+    pub attempt_count: u32,
+    pub next_attempt_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    pub comment_id: Option<String>,
+    pub state: CommentState,
+    pub error_code: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub retry_not_before_unix_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcquiredCommentSubmission {
+    pub draft: StoredCommentDraft,
+    pub lease: OperationLease,
+}
+
+impl StoredCommentDraft {
+    pub(crate) fn operation_record(&self) -> Result<OperationRecord, String> {
+        let command_id = self
+            .submit_command_id
+            .as_ref()
+            .ok_or_else(|| "secure content Comment command ID is unavailable".to_string())?;
+        let command_bytes = self
+            .request_bytes
+            .as_deref()
+            .ok_or_else(|| "secure content Comment command bytes are unavailable".to_string())?;
+        let command_sha256 = self
+            .request_sha256
+            .ok_or_else(|| "secure content Comment command hash is unavailable".to_string())?;
+        let state = self
+            .publication_state
+            .ok_or_else(|| "secure content Comment operation state is unavailable".to_string())?;
+        let record = OperationRecord {
+            operation_id: command_id.clone(),
+            command_id: command_id.clone(),
+            kind: OperationKind::OwnerSubmission,
+            state,
+            command_sha256,
+            session_generation: self.session_generation,
+            lease_generation: self.lease_generation,
+            attempt_count: self.attempt_count,
+            next_attempt_at_unix_ms: self.next_attempt_at_unix_ms,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+        };
+        record
+            .validate_command_bytes(command_bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredReactionCommand {
+    pub command_id: String,
+    pub post_id: String,
+    pub comment_id: String,
+    pub kind: i32,
+    pub operation: PrivateReactionOperation,
+    pub request_sha256: [u8; 32],
+    pub request_bytes: Vec<u8>,
+    pub result_sha256: Option<[u8; 32]>,
+    pub result_bytes: Option<Vec<u8>>,
+    pub state: ReactionCommandState,
+    pub session_generation: u64,
+    pub lease_generation: u64,
+    pub attempt_count: u32,
+    pub projection_revision: u64,
+    pub error_code: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub retry_not_before_unix_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredObjectTransfer {
+    pub record: ObjectTransferRecord,
+    pub media_type: String,
+}
+
+pub struct SecureContentStore {
+    pub(super) connection: Mutex<Connection>,
+    pub(super) session_generation: AtomicU64,
+}
+
+impl SecureContentStore {
+    pub fn open(actor_ptid: &str) -> Result<Self, String> {
+        if actor_ptid.trim().is_empty() {
+            return Err("secure content store requires actor PTID".to_string());
+        }
+        let scope = local_scope::user_scope_for_actor_ptid(actor_ptid);
+        let spec = DatabaseOpenSpec::new_secure_content_main(scope);
+        let connection = storage::open_database(&spec, PlatformKeyProvider::shared())
+            .map_err(|error| format!("open secure content SQLCipher store: {error}"))?;
+        Self::from_connection(connection)
+    }
+
+    #[cfg(test)]
+    pub fn in_memory() -> Result<Self, String> {
+        let store = Self::from_connection(
+            Connection::open_in_memory().map_err(|error| error.to_string())?,
+        )?;
+        store.bind_session_generation(1)?;
+        Ok(store)
+    }
+
+    fn from_connection(connection: Connection) -> Result<Self, String> {
+        migrate(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            session_generation: AtomicU64::new(0),
+        })
+    }
+
+    pub(super) fn connection(&self) -> Result<MutexGuard<'_, Connection>, String> {
+        self.connection
+            .lock()
+            .map_err(|_| "secure content store lock poisoned".to_string())
+    }
+
+    pub fn claim_session_generation(&self) -> Result<u64, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = transaction
+            .query_row(
+                "SELECT session_generation
+                 FROM secure_content_runtime_state
+                 WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let generation = from_i64(current, "session generation")
+            .map_err(|error| error.to_string())?
+            .checked_add(1)
+            .ok_or_else(|| "secure content session generation overflowed".to_string())?;
+        let stored_generation = to_i64(generation, "session generation")?;
+        transaction
+            .execute(
+                "UPDATE secure_content_runtime_state
+                 SET session_generation = ?1
+                 WHERE singleton = 1",
+                params![stored_generation],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE secure_content_object_transfers
+                 SET session_generation = ?1",
+                params![stored_generation],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.session_generation.store(generation, Ordering::Release);
+        Ok(generation)
+    }
+
+    #[cfg(test)]
+    pub fn bind_session_generation(&self, session_generation: u64) -> Result<(), String> {
+        if session_generation == 0 {
+            return Err("secure content session generation is required".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE secure_content_runtime_state
+                 SET session_generation = ?1
+                 WHERE singleton = 1",
+                params![to_i64(session_generation, "session generation")?],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE secure_content_object_transfers
+                 SET session_generation = ?1",
+                params![to_i64(session_generation, "session generation")?],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.session_generation
+            .store(session_generation, Ordering::Release);
+        Ok(())
+    }
+
+    fn bound_session_generation(&self) -> Result<i64, ObjectTransferFailure> {
+        let generation = self.session_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return Err(transfer_error(
+                "secure content Store is not bound to a session generation",
+            ));
+        }
+        to_i64(generation, "session generation").map_err(transfer_error)
+    }
+
+    pub fn recover_orphaned_leases(&self) -> Result<usize, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let publications = recover_prekey_publications(&transaction, None)?;
+        let moments = recover_moment_commands(&transaction, None)?;
+        let comments = recover_comment_submissions(&transaction, None)?;
+        let reactions = transaction
+            .execute(
+                "UPDATE secure_content_reaction_commands
+                 SET state = ?1, error_code = 'REACTION_RESULT_UNKNOWN',
+                     retry_after_seconds = NULL, retry_not_before_unix_ms = NULL,
+                     updated_at_unix_ms = unixepoch('subsec') * 1000
+                 WHERE state = ?2",
+                params![
+                    ReactionCommandState::UnknownCommit as i64,
+                    ReactionCommandState::InFlight as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_moment_drafts
+                 WHERE content_id NOT IN (
+                   SELECT content_id FROM secure_content_moment_commands
+                 )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(publications + moments + comments + reactions)
+    }
+
+    pub fn checkpoint_session_generation(&self, session_generation: u64) -> Result<usize, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let session_generation = to_i64(session_generation, "session generation")?;
+        let publications = recover_prekey_publications(&transaction, Some(session_generation))?;
+        let moments = recover_moment_commands(&transaction, Some(session_generation))?;
+        let comments = recover_comment_submissions(&transaction, Some(session_generation))?;
+        let reactions = transaction
+            .execute(
+                "UPDATE secure_content_reaction_commands
+                 SET state = ?1, error_code = 'REACTION_RESULT_UNKNOWN',
+                     retry_after_seconds = NULL, retry_not_before_unix_ms = NULL,
+                     updated_at_unix_ms = unixepoch('subsec') * 1000
+                 WHERE state = ?2 AND session_generation = ?3",
+                params![
+                    ReactionCommandState::UnknownCommit as i64,
+                    ReactionCommandState::InFlight as i64,
+                    session_generation,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(publications + moments + comments + reactions)
+    }
+
+    pub fn persist_prekey_publication(
+        &self,
+        command: &StoredPublication,
+        keys: &[(String, Option<[u8; 32]>, [u8; 32])],
+    ) -> Result<(), String> {
+        let key_material_matches_kind = match command.key_kind {
+            1 => !keys.is_empty(),
+            2 => keys.is_empty(),
+            _ => false,
+        };
+        if command.command_id.trim().is_empty()
+            || command.request_bytes.is_empty()
+            || keys.len() > 100
+            || !key_material_matches_kind
+            || Sha256::digest(&command.request_bytes).as_slice() != command.request_sha256
+        {
+            return Err("secure content publication journal input is invalid".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO secure_content_prekey_commands(
+                    command_id, key_kind, pool_epoch, request_bytes, request_sha256,
+                    state, lease_generation, session_generation, attempt_count,
+                    next_attempt_at_unix_ms, updated_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 0, ?7)
+                 ON CONFLICT(command_id) DO NOTHING",
+                params![
+                    command.command_id,
+                    command.key_kind,
+                    to_i64(command.pool_epoch, "pool epoch")?,
+                    command.request_bytes,
+                    command.request_sha256.as_slice(),
+                    OperationState::Pending as i64,
+                    now_unix_ms(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored_hash: Vec<u8> = transaction
+            .query_row(
+                "SELECT request_sha256 FROM secure_content_prekey_commands
+                 WHERE command_id = ?1",
+                params![command.command_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored_hash != command.request_sha256 {
+            return Err("secure content publication replay conflict".to_string());
+        }
+        for (key_id, private_key, public_key) in keys {
+            transaction
+                .execute(
+                    "INSERT INTO secure_content_prekeys(
+                        key_id, key_kind, pool_epoch, private_key, public_key,
+                        command_id, state, created_at_unix_ms
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(key_id) DO NOTHING",
+                    params![
+                        key_id,
+                        command.key_kind,
+                        to_i64(command.pool_epoch, "pool epoch")?,
+                        private_key.as_ref().map(|key| key.as_slice()),
+                        public_key.as_slice(),
+                        command.command_id,
+                        LocalPreKeyState::PendingPublication as i64,
+                        now_unix_ms(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            let existing: (Vec<u8>, String) = transaction
+                .query_row(
+                    "SELECT public_key, command_id FROM secure_content_prekeys WHERE key_id = ?1",
+                    params![key_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            if existing.0 != *public_key || existing.1 != command.command_id {
+                return Err("secure content PreKey identity conflict".to_string());
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn persist_prepared_prekey_publication(
+        &self,
+        prepared: &PreparedContentPreKeyPublication,
+    ) -> Result<(), String> {
+        prepared
+            .operation
+            .validate_command_bytes(&prepared.proof_free_request_bytes)
+            .map_err(|error| error.to_string())?;
+        let command = StoredPublication {
+            command_id: prepared.operation.command_id.clone(),
+            key_kind: match prepared.kind {
+                ContentPreKeyPoolKind::Endpoint => 1,
+                ContentPreKeyPoolKind::ActorRecovery => 2,
+            },
+            pool_epoch: prepared.pool_epoch,
+            request_bytes: prepared.proof_free_request_bytes.clone(),
+            request_sha256: prepared.operation.command_sha256,
+            state: prepared.operation.state,
+            lease_generation: prepared.operation.lease_generation,
+            session_generation: prepared.operation.session_generation,
+            attempt_count: prepared.operation.attempt_count,
+            next_attempt_at_unix_ms: prepared.operation.next_attempt_at_unix_ms,
+            updated_at_unix_ms: prepared.operation.updated_at_unix_ms,
+        };
+        let keys = zeroize::Zeroizing::new(
+            prepared
+                .endpoint_keys
+                .iter()
+                .map(|key| (key.key_id.clone(), Some(key.private_key), key.public_key))
+                .collect::<Vec<_>>(),
+        );
+        self.persist_prekey_publication(&command, keys.as_slice())
+    }
+
+    pub fn publications_requiring_reconciliation(&self) -> Result<Vec<StoredPublication>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT command_id, key_kind, pool_epoch, request_bytes,
+                        request_sha256, state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms
+                 FROM secure_content_prekey_commands
+                 WHERE state IN (?1, ?2)
+                    OR (state = ?3 AND next_attempt_at_unix_ms <= ?4)
+                 ORDER BY updated_at_unix_ms, command_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    OperationState::Pending as i64,
+                    OperationState::UnknownOutcome as i64,
+                    OperationState::RetryWait as i64,
+                    now_unix_ms(),
+                ],
+                publication_from_row,
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn acquire_publication(
+        &self,
+        command_id: &str,
+        session_generation: u64,
+    ) -> Result<AcquiredPublication, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let command = transaction
+            .query_row(
+                "SELECT command_id, key_kind, pool_epoch, request_bytes,
+                        request_sha256, state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms
+                 FROM secure_content_prekey_commands WHERE command_id = ?1",
+                params![command_id],
+                publication_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        let current = command.operation_record()?;
+        let cause = match current.state {
+            OperationState::Pending => DispatchCause::InitialReconciliation,
+            OperationState::UnknownOutcome => DispatchCause::ReadbackAuthorizedRetry,
+            OperationState::RetryWait => DispatchCause::RetryDeadlineReached,
+            _ => {
+                return Err("secure content publication is not dispatchable".to_string());
+            }
+        };
+        let now = now_unix_ms();
+        let lease = acquire_operation(&current, session_generation, cause, now)
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_prekey_commands
+                 SET state = ?1, lease_generation = ?2, session_generation = ?3,
+                     attempt_count = ?4, next_attempt_at_unix_ms = ?5,
+                     updated_at_unix_ms = ?6
+                 WHERE command_id = ?7 AND state = ?8
+                   AND lease_generation = ?9 AND session_generation = ?10",
+                params![
+                    lease.record.state as i64,
+                    to_i64(lease.record.lease_generation, "lease generation")?,
+                    to_i64(lease.record.session_generation, "session generation")?,
+                    i64::from(lease.record.attempt_count),
+                    lease.record.next_attempt_at_unix_ms,
+                    lease.record.updated_at_unix_ms,
+                    command_id,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content publication lost its operation fence".to_string());
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        let mut command = command;
+        command.state = lease.record.state;
+        command.lease_generation = lease.record.lease_generation;
+        command.session_generation = lease.record.session_generation;
+        command.attempt_count = lease.record.attempt_count;
+        command.next_attempt_at_unix_ms = lease.record.next_attempt_at_unix_ms;
+        command.updated_at_unix_ms = lease.record.updated_at_unix_ms;
+        Ok(AcquiredPublication { command, lease })
+    }
+
+    pub fn complete_publication(
+        &self,
+        acquired: &AcquiredPublication,
+        completion: OperationCompletion,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = acquired.command.operation_record()?;
+        let completed = complete_operation(
+            &current,
+            OperationFence {
+                operation_id: &acquired.lease.record.operation_id,
+                session_generation: acquired.lease.record.session_generation,
+                lease_generation: acquired.lease.record.lease_generation,
+            },
+            completion,
+            now_unix_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_prekey_commands
+                 SET state = ?1, next_attempt_at_unix_ms = ?2,
+                     updated_at_unix_ms = ?3
+                 WHERE command_id = ?4 AND state = ?5
+                   AND lease_generation = ?6 AND session_generation = ?7",
+                params![
+                    completed.state as i64,
+                    completed.next_attempt_at_unix_ms,
+                    completed.updated_at_unix_ms,
+                    acquired.command.command_id,
+                    OperationState::InFlight as i64,
+                    to_i64(acquired.command.lease_generation, "lease generation")?,
+                    to_i64(acquired.command.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 && completed.state == OperationState::Terminal {
+            transaction
+                .execute(
+                    "DELETE FROM secure_content_prekeys
+                     WHERE command_id = ?1 AND state = ?2",
+                    params![
+                        acquired.command.command_id,
+                        LocalPreKeyState::PendingPublication as i64
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        } else if changed == 1 && completed.state == OperationState::Committed {
+            transaction
+                .execute(
+                    "UPDATE secure_content_prekeys SET state = ?1
+                     WHERE command_id = ?2 AND state = ?3",
+                    params![
+                        LocalPreKeyState::Published as i64,
+                        acquired.command.command_id,
+                        LocalPreKeyState::PendingPublication as i64
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn endpoint_prekey(&self, key_id: &str) -> Result<Option<StoredEndpointPreKey>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT key_id, private_key, public_key, pool_epoch
+                 FROM secure_content_prekeys
+                 WHERE key_id = ?1 AND key_kind = 1 AND private_key IS NOT NULL
+                   AND state IN (?2, ?3)",
+                params![
+                    key_id,
+                    LocalPreKeyState::PendingPublication as i64,
+                    LocalPreKeyState::Published as i64
+                ],
+                |row| {
+                    let private_key: Vec<u8> = row.get(1)?;
+                    let public_key: Vec<u8> = row.get(2)?;
+                    Ok(StoredEndpointPreKey {
+                        key_id: row.get(0)?,
+                        private_key: fixed_32(private_key, "endpoint private key")?,
+                        public_key: fixed_32(public_key, "endpoint public key")?,
+                        pool_epoch: from_i64(row.get(3)?, "pool epoch")?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn store_recovery_master(
+        &self,
+        actor_ptid: &str,
+        recovery_epoch: u64,
+        master: &[u8; 32],
+    ) -> Result<(), String> {
+        if actor_ptid.trim().is_empty() || recovery_epoch == 0 {
+            return Err("secure content recovery master identity is invalid".to_string());
+        }
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO secure_content_recovery_masters(
+                    actor_ptid, recovery_epoch, master_key, created_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(actor_ptid, recovery_epoch) DO NOTHING",
+                params![
+                    actor_ptid,
+                    to_i64(recovery_epoch, "recovery epoch")?,
+                    master.as_slice(),
+                    now_unix_ms()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored: Vec<u8> = connection
+            .query_row(
+                "SELECT master_key FROM secure_content_recovery_masters
+                 WHERE actor_ptid = ?1 AND recovery_epoch = ?2",
+                params![actor_ptid, to_i64(recovery_epoch, "recovery epoch")?],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored.as_slice() != master {
+            return Err("secure content recovery master epoch conflict".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn recovery_master(
+        &self,
+        actor_ptid: &str,
+        recovery_epoch: u64,
+    ) -> Result<Option<[u8; 32]>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT master_key FROM secure_content_recovery_masters
+                 WHERE actor_ptid = ?1 AND recovery_epoch = ?2",
+                params![actor_ptid, to_i64(recovery_epoch, "recovery epoch")?],
+                |row| fixed_32(row.get(0)?, "recovery master"),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn latest_recovery_epoch(&self, actor_ptid: &str) -> Result<Option<u64>, String> {
+        let epoch = self
+            .connection()?
+            .query_row(
+                "SELECT MAX(recovery_epoch) FROM secure_content_recovery_masters
+                 WHERE actor_ptid = ?1",
+                params![actor_ptid],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .map(|epoch| from_i64(epoch, "recovery epoch"))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(epoch)
+    }
+
+    pub fn persist_moment_command(&self, command: &StoredMomentCommand) -> Result<(), String> {
+        if command.draft_id.trim().is_empty()
+            || command.content_id.trim().is_empty()
+            || command.submit_command_id.trim().is_empty()
+            || command.generation == 0
+            || command.plan_bytes.is_empty()
+            || command.request_bytes.is_empty()
+            || Sha256::digest(&command.request_bytes).as_slice() != command.request_sha256
+        {
+            return Err("secure content Moment command is invalid".to_string());
+        }
+        command.operation_record()?;
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO secure_content_moment_commands(
+                    draft_id, draft_revision, content_id, generation,
+                    submit_command_id, plan_bytes, request_bytes, request_sha256,
+                    root_key, state, lease_generation, session_generation,
+                    attempt_count, next_attempt_at_unix_ms, post_id, updated_at_unix_ms
+                 ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16
+                 )
+                 ON CONFLICT(draft_id, draft_revision) DO NOTHING",
+                params![
+                    command.draft_id,
+                    to_i64(command.draft_revision, "draft revision")?,
+                    command.content_id,
+                    to_i64(command.generation, "content generation")?,
+                    command.submit_command_id,
+                    command.plan_bytes,
+                    command.request_bytes,
+                    command.request_sha256.as_slice(),
+                    command.root_key.as_slice(),
+                    command.state as i64,
+                    to_i64(command.lease_generation, "lease generation")?,
+                    to_i64(command.session_generation, "session generation")?,
+                    i64::from(command.attempt_count),
+                    command.next_attempt_at_unix_ms,
+                    command.post_id,
+                    command.updated_at_unix_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored: Vec<u8> = connection
+            .query_row(
+                "SELECT request_sha256 FROM secure_content_moment_commands
+                 WHERE draft_id = ?1 AND draft_revision = ?2",
+                params![
+                    command.draft_id,
+                    to_i64(command.draft_revision, "draft revision")?
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored != command.request_sha256 {
+            return Err("secure content Moment command replay conflict".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn reserve_moment_draft(
+        &self,
+        candidate: &StoredMomentDraft,
+    ) -> Result<StoredMomentDraft, String> {
+        if candidate.draft_id.trim().is_empty()
+            || candidate.draft_revision == 0
+            || candidate.content_id.trim().is_empty()
+            || candidate.prepare_command_id.trim().is_empty()
+        {
+            return Err("secure content Moment draft reservation is invalid".to_string());
+        }
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO secure_content_moment_drafts(
+                    draft_id, draft_revision, intent_sha256, content_id,
+                    prepare_command_id, mention_commitment_salt,
+                    repost_commitment_salt, updated_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(draft_id, draft_revision) DO NOTHING",
+                params![
+                    candidate.draft_id,
+                    to_i64(candidate.draft_revision, "draft revision")?,
+                    candidate.intent_sha256.as_slice(),
+                    candidate.content_id,
+                    candidate.prepare_command_id,
+                    candidate
+                        .mention_commitment_salt
+                        .as_ref()
+                        .map(|salt| salt.as_slice()),
+                    candidate
+                        .repost_commitment_salt
+                        .as_ref()
+                        .map(|salt| salt.as_slice()),
+                    now_unix_ms(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored = connection
+            .query_row(
+                "SELECT draft_id, draft_revision, intent_sha256, content_id,
+                        prepare_command_id, mention_commitment_salt,
+                        repost_commitment_salt
+                 FROM secure_content_moment_drafts
+                 WHERE draft_id = ?1 AND draft_revision = ?2",
+                params![
+                    candidate.draft_id,
+                    to_i64(candidate.draft_revision, "draft revision")?
+                ],
+                |row| {
+                    Ok(StoredMomentDraft {
+                        draft_id: row.get(0)?,
+                        draft_revision: from_i64(row.get(1)?, "draft revision")?,
+                        intent_sha256: fixed_32(row.get(2)?, "draft intent hash")?,
+                        content_id: row.get(3)?,
+                        prepare_command_id: row.get(4)?,
+                        mention_commitment_salt: row
+                            .get::<_, Option<Vec<u8>>>(5)?
+                            .map(|value| fixed_32(value, "mention commitment salt"))
+                            .transpose()?,
+                        repost_commitment_salt: row
+                            .get::<_, Option<Vec<u8>>>(6)?
+                            .map(|value| fixed_32(value, "repost commitment salt"))
+                            .transpose()?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if stored.intent_sha256 != candidate.intent_sha256
+            || stored.prepare_command_id != candidate.prepare_command_id
+        {
+            return Err("secure content Moment draft reservation conflict".to_string());
+        }
+        Ok(stored)
+    }
+
+    pub fn moment_command(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+    ) -> Result<Option<StoredMomentCommand>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT draft_id, draft_revision, content_id, generation,
+                        submit_command_id, plan_bytes, request_bytes, request_sha256,
+                        root_key, state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms, post_id
+                 FROM secure_content_moment_commands
+                 WHERE draft_id = ?1 AND draft_revision = ?2",
+                params![draft_id, to_i64(draft_revision, "draft revision")?],
+                moment_from_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn acquire_moment_command(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+        session_generation: u64,
+        cause: DispatchCause,
+    ) -> Result<AcquiredMomentCommand, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut command = transaction
+            .query_row(
+                "SELECT draft_id, draft_revision, content_id, generation,
+                        submit_command_id, plan_bytes, request_bytes, request_sha256,
+                        root_key, state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms, post_id
+                 FROM secure_content_moment_commands
+                 WHERE draft_id = ?1 AND draft_revision = ?2",
+                params![draft_id, to_i64(draft_revision, "draft revision")?],
+                moment_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        let current = command.operation_record()?;
+        let lease = acquire_operation(&current, session_generation, cause, now_unix_ms())
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_moment_commands
+                 SET state = ?1, lease_generation = ?2, session_generation = ?3,
+                     attempt_count = ?4, next_attempt_at_unix_ms = ?5,
+                     updated_at_unix_ms = ?6
+                 WHERE draft_id = ?7 AND draft_revision = ?8
+                   AND state = ?9 AND lease_generation = ?10
+                   AND session_generation = ?11",
+                params![
+                    lease.record.state as i64,
+                    to_i64(lease.record.lease_generation, "lease generation")?,
+                    to_i64(lease.record.session_generation, "session generation")?,
+                    i64::from(lease.record.attempt_count),
+                    lease.record.next_attempt_at_unix_ms,
+                    lease.record.updated_at_unix_ms,
+                    draft_id,
+                    to_i64(draft_revision, "draft revision")?,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content Moment command lost its operation fence".to_string());
+        }
+        apply_operation_record_to_moment(&mut command, &lease.record);
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(AcquiredMomentCommand { command, lease })
+    }
+
+    pub fn reconcilable_moment_commands(&self) -> Result<Vec<StoredMomentCommand>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT draft_id, draft_revision, content_id, generation,
+                        submit_command_id, plan_bytes, request_bytes, request_sha256,
+                        root_key, state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms, post_id
+                 FROM secure_content_moment_commands
+                 WHERE state IN (?1, ?2, ?3)
+                    OR (state = ?4 AND next_attempt_at_unix_ms <= ?5)
+                 ORDER BY updated_at_unix_ms, draft_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    OperationState::Pending as i64,
+                    OperationState::UnknownOutcome as i64,
+                    OperationState::CommittedPendingReadback as i64,
+                    OperationState::RetryWait as i64,
+                    now_unix_ms(),
+                ],
+                moment_from_row,
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn delete_moment_draft(&self, content_id: &str) -> Result<(), String> {
+        if content_id.trim().is_empty() {
+            return Err("secure content content ID is required".to_string());
+        }
+        self.connection()?
+            .execute(
+                "DELETE FROM secure_content_moment_drafts WHERE content_id = ?1",
+                params![content_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn complete_moment_command(
+        &self,
+        acquired: &AcquiredMomentCommand,
+        completion: OperationCompletion,
+        post_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let current = acquired.command.operation_record()?;
+        let completed = complete_operation(
+            &current,
+            acquired.lease.record.fence(),
+            completion,
+            now_unix_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.connection()?
+            .execute(
+                "UPDATE secure_content_moment_commands
+                 SET state = ?1, post_id = COALESCE(?2, post_id),
+                     next_attempt_at_unix_ms = ?3, updated_at_unix_ms = ?4
+                 WHERE draft_id = ?5 AND draft_revision = ?6
+                   AND state = ?7 AND lease_generation = ?8
+                   AND session_generation = ?9",
+                params![
+                    completed.state as i64,
+                    post_id,
+                    completed.next_attempt_at_unix_ms,
+                    completed.updated_at_unix_ms,
+                    acquired.command.draft_id,
+                    to_i64(acquired.command.draft_revision, "draft revision")?,
+                    OperationState::InFlight as i64,
+                    to_i64(acquired.command.lease_generation, "lease generation")?,
+                    to_i64(acquired.command.session_generation, "session generation")?,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn apply_moment_readback(
+        &self,
+        command: &StoredMomentCommand,
+        decision: &ReadbackDecision,
+        post_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let current = command.operation_record()?;
+        let advanced = apply_readback_decision(&current, current.fence(), decision, now_unix_ms())
+            .map_err(|error| error.to_string())?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_moment_commands
+                 SET state = ?1, post_id = COALESCE(?2, post_id),
+                     next_attempt_at_unix_ms = ?3, updated_at_unix_ms = ?4
+                 WHERE draft_id = ?5 AND draft_revision = ?6
+                   AND state = ?7 AND lease_generation = ?8
+                   AND session_generation = ?9",
+                params![
+                    advanced.state as i64,
+                    post_id,
+                    advanced.next_attempt_at_unix_ms,
+                    advanced.updated_at_unix_ms,
+                    command.draft_id,
+                    to_i64(command.draft_revision, "draft revision")?,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 && advanced.state == OperationState::Committed {
+            transaction
+                .execute(
+                    "DELETE FROM secure_content_object_transfers
+                     WHERE direction = ?1 AND owner_scope_id = ?2",
+                    params![ObjectTransferDirection::Upload as i32, command.content_id],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "DELETE FROM secure_content_moment_drafts
+                     WHERE draft_id = ?1 AND draft_revision = ?2",
+                    params![
+                        command.draft_id,
+                        to_i64(command.draft_revision, "draft revision")?
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn reserve_comment_draft(
+        &self,
+        candidate: &StoredCommentDraft,
+    ) -> Result<StoredCommentDraft, String> {
+        if candidate.draft_id.trim().is_empty()
+            || candidate.draft_revision == 0
+            || candidate.post_id.trim().is_empty()
+            || candidate.content_id.trim().is_empty()
+            || candidate.text.trim().is_empty()
+            || candidate.prepare_command_id.trim().is_empty()
+        {
+            return Err("secure content Comment draft is invalid".to_string());
+        }
+        {
+            let connection = self.connection()?;
+            connection
+                .execute(
+                    "INSERT INTO secure_content_comment_drafts(
+                    draft_id, draft_revision, post_id, content_id,
+                    reply_to_comment_id, plaintext_text, mention_intent_json,
+                    mention_commitment_salt, intent_sha256, prepare_command_id,
+                    state, session_generation, updated_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(draft_id, draft_revision) DO NOTHING",
+                    params![
+                        candidate.draft_id,
+                        to_i64(candidate.draft_revision, "Comment draft revision")?,
+                        candidate.post_id,
+                        candidate.content_id,
+                        candidate.reply_to_comment_id,
+                        candidate.text,
+                        candidate.mention_intent_json,
+                        candidate
+                            .mention_commitment_salt
+                            .as_ref()
+                            .map(|salt| salt.as_slice()),
+                        candidate.intent_sha256.as_slice(),
+                        candidate.prepare_command_id,
+                        candidate.state as i64,
+                        to_i64(candidate.session_generation, "session generation")?,
+                        now_unix_ms(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let stored = self
+            .comment_draft(&candidate.draft_id, candidate.draft_revision)?
+            .ok_or_else(|| "secure content Comment draft was not persisted".to_string())?;
+        if stored.post_id != candidate.post_id
+            || stored.reply_to_comment_id != candidate.reply_to_comment_id
+            || stored.text != candidate.text
+            || stored.mention_intent_json != candidate.mention_intent_json
+            || stored.intent_sha256 != candidate.intent_sha256
+        {
+            return Err("secure content Comment draft replay conflict".to_string());
+        }
+        Ok(stored)
+    }
+
+    pub fn comment_draft(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+    ) -> Result<Option<StoredCommentDraft>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT draft_id, draft_revision, post_id, content_id, generation,
+                        reply_to_comment_id, plaintext_text, mention_intent_json,
+                        mention_commitment_salt, intent_sha256, prepare_command_id,
+                        submit_command_id, plan_bytes, request_bytes, request_sha256,
+                        root_key, publication_state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms,
+                        comment_id, state, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms
+                 FROM secure_content_comment_drafts
+                 WHERE draft_id = ?1 AND draft_revision = ?2",
+                params![draft_id, to_i64(draft_revision, "Comment draft revision")?],
+                comment_draft_from_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn comment_drafts(&self) -> Result<Vec<StoredCommentDraft>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT draft_id, draft_revision, post_id, content_id, generation,
+                        reply_to_comment_id, plaintext_text, mention_intent_json,
+                        mention_commitment_salt, intent_sha256, prepare_command_id,
+                        submit_command_id, plan_bytes, request_bytes, request_sha256,
+                        root_key, publication_state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms,
+                        comment_id, state, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms
+                 FROM secure_content_comment_drafts
+                 ORDER BY updated_at_unix_ms DESC, draft_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let drafts = statement
+            .query_map([], comment_draft_from_row)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(drafts)
+    }
+
+    pub fn set_comment_draft_state(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+        state: CommentState,
+        error_code: Option<&str>,
+        retry_after_seconds: Option<u64>,
+    ) -> Result<bool, String> {
+        let updated_at_unix_ms = now_unix_ms();
+        let retry_not_before_unix_ms = retry_deadline(updated_at_unix_ms, retry_after_seconds)?;
+        self.connection()?
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET state = ?1, error_code = ?2, retry_after_seconds = ?3,
+                     retry_not_before_unix_ms = ?4, updated_at_unix_ms = ?5
+                 WHERE draft_id = ?6 AND draft_revision = ?7",
+                params![
+                    state as i64,
+                    error_code,
+                    retry_after_seconds
+                        .map(|value| to_i64(value, "Comment retry after"))
+                        .transpose()?,
+                    retry_not_before_unix_ms,
+                    updated_at_unix_ms,
+                    draft_id,
+                    to_i64(draft_revision, "Comment draft revision")?,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn reset_comment_submission_for_reprepare(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+        session_generation: u64,
+        content_id: &str,
+        prepare_command_id: &str,
+    ) -> Result<bool, String> {
+        if content_id.trim().is_empty() || prepare_command_id.trim().is_empty() {
+            return Err("secure content Comment reprepare identity is invalid".to_string());
+        }
+        let now = now_unix_ms();
+        self.connection()?
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET content_id = ?1, generation = 0, prepare_command_id = ?2,
+                     submit_command_id = NULL, plan_bytes = NULL,
+                     request_bytes = NULL, request_sha256 = NULL, root_key = NULL,
+                     publication_state = NULL, lease_generation = 0,
+                     session_generation = ?3, attempt_count = 0,
+                     next_attempt_at_unix_ms = 0,
+                     comment_id = NULL, state = ?4, error_code = NULL,
+                     retry_after_seconds = NULL, retry_not_before_unix_ms = NULL,
+                     updated_at_unix_ms = ?5
+                 WHERE draft_id = ?6 AND draft_revision = ?7
+                   AND publication_state IN (?8, ?9)
+                   AND state IN (?10, ?11, ?12)
+                   AND plaintext_text != ''
+                   AND (
+                     retry_not_before_unix_ms IS NULL
+                     OR retry_not_before_unix_ms <= ?5
+                   )",
+                params![
+                    content_id,
+                    prepare_command_id,
+                    to_i64(session_generation, "session generation")?,
+                    CommentState::Editing as i64,
+                    now,
+                    draft_id,
+                    to_i64(draft_revision, "Comment draft revision")?,
+                    OperationState::Pending as i64,
+                    OperationState::Terminal as i64,
+                    CommentState::Failed as i64,
+                    CommentState::RateLimited as i64,
+                    CommentState::Submitting as i64,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn persist_comment_submission(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+        generation: u64,
+        submit_command_id: &str,
+        plan_bytes: &[u8],
+        request_bytes: &[u8],
+        request_sha256: &[u8; 32],
+        root_key: &[u8; 32],
+        session_generation: u64,
+    ) -> Result<(), String> {
+        if submit_command_id.trim().is_empty()
+            || plan_bytes.is_empty()
+            || request_bytes.is_empty()
+            || Sha256::digest(request_bytes).as_slice() != request_sha256
+        {
+            return Err("secure content Comment submission is invalid".to_string());
+        }
+        let changed = {
+            let connection = self.connection()?;
+            connection
+                .execute(
+                    "UPDATE secure_content_comment_drafts
+                 SET generation = ?1, submit_command_id = ?2, plan_bytes = ?3,
+                     request_bytes = ?4, request_sha256 = ?5, root_key = ?6,
+                     publication_state = ?7, lease_generation = 0,
+                     session_generation = ?8, attempt_count = 0,
+                     next_attempt_at_unix_ms = 0, state = ?9,
+                     error_code = NULL, retry_after_seconds = NULL,
+                     retry_not_before_unix_ms = NULL,
+                     updated_at_unix_ms = ?10
+                 WHERE draft_id = ?11 AND draft_revision = ?12
+                   AND request_bytes IS NULL",
+                    params![
+                        to_i64(generation, "content generation")?,
+                        submit_command_id,
+                        plan_bytes,
+                        request_bytes,
+                        request_sha256.as_slice(),
+                        root_key.as_slice(),
+                        OperationState::Pending as i64,
+                        to_i64(session_generation, "session generation")?,
+                        CommentState::Submitting as i64,
+                        now_unix_ms(),
+                        draft_id,
+                        to_i64(draft_revision, "Comment draft revision")?,
+                    ],
+                )
+                .map_err(|error| error.to_string())?
+        };
+        if changed == 0 {
+            let stored = self
+                .comment_draft(draft_id, draft_revision)?
+                .ok_or_else(|| "secure content Comment draft is unavailable".to_string())?;
+            if stored.request_sha256 != Some(*request_sha256) {
+                return Err("secure content Comment submission replay conflict".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn acquire_comment_submission(
+        &self,
+        draft_id: &str,
+        draft_revision: u64,
+        session_generation: u64,
+        cause: DispatchCause,
+    ) -> Result<AcquiredCommentSubmission, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut draft = transaction
+            .query_row(
+                "SELECT draft_id, draft_revision, post_id, content_id, generation,
+                        reply_to_comment_id, plaintext_text, mention_intent_json,
+                        mention_commitment_salt, intent_sha256, prepare_command_id,
+                        submit_command_id, plan_bytes, request_bytes, request_sha256,
+                        root_key, publication_state, lease_generation, session_generation,
+                        attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms,
+                        comment_id, state, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms
+                 FROM secure_content_comment_drafts
+                 WHERE draft_id = ?1 AND draft_revision = ?2",
+                params![draft_id, to_i64(draft_revision, "Comment draft revision")?],
+                comment_draft_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        let current = draft.operation_record()?;
+        let lease = acquire_operation(&current, session_generation, cause, now_unix_ms())
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET publication_state = ?1, lease_generation = ?2,
+                     session_generation = ?3, attempt_count = ?4,
+                     next_attempt_at_unix_ms = ?5, state = ?6,
+                     error_code = NULL, retry_after_seconds = NULL,
+                     retry_not_before_unix_ms = NULL, updated_at_unix_ms = ?7
+                 WHERE draft_id = ?8 AND draft_revision = ?9
+                   AND publication_state = ?10
+                   AND lease_generation = ?11 AND session_generation = ?12",
+                params![
+                    lease.record.state as i64,
+                    to_i64(lease.record.lease_generation, "lease generation")?,
+                    to_i64(lease.record.session_generation, "session generation")?,
+                    i64::from(lease.record.attempt_count),
+                    lease.record.next_attempt_at_unix_ms,
+                    CommentState::Submitting as i64,
+                    lease.record.updated_at_unix_ms,
+                    draft_id,
+                    to_i64(draft_revision, "Comment draft revision")?,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content Comment submission lost its operation fence".to_string());
+        }
+        apply_operation_record_to_comment(&mut draft, &lease.record);
+        draft.state = CommentState::Submitting;
+        draft.error_code = None;
+        draft.retry_after_seconds = None;
+        draft.retry_not_before_unix_ms = None;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(AcquiredCommentSubmission { draft, lease })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_comment_submission(
+        &self,
+        acquired: &AcquiredCommentSubmission,
+        completion: OperationCompletion,
+        state: CommentState,
+        error_code: &str,
+        retry_after_seconds: Option<u64>,
+        comment_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let updated_at_unix_ms = now_unix_ms();
+        let current = acquired.draft.operation_record()?;
+        let completed = complete_operation(
+            &current,
+            acquired.lease.record.fence(),
+            completion,
+            updated_at_unix_ms,
+        )
+        .map_err(|error| error.to_string())?;
+        let clears_plaintext = completed.state == OperationState::CommittedPendingReadback
+            || completed.state == OperationState::Committed;
+        let retry_not_before_unix_ms = if completed.state == OperationState::RetryWait {
+            Some(completed.next_attempt_at_unix_ms)
+        } else {
+            None
+        };
+        self.connection()?
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET publication_state = ?1,
+                     comment_id = COALESCE(?2, comment_id),
+                     plaintext_text = CASE WHEN ?3 THEN '' ELSE plaintext_text END,
+                     mention_intent_json = CASE WHEN ?3 THEN '[]' ELSE mention_intent_json END,
+                     mention_commitment_salt = CASE
+                       WHEN ?3 THEN NULL ELSE mention_commitment_salt
+                     END,
+                     state = ?4, error_code = NULLIF(?5, ''),
+                     retry_after_seconds = ?6, retry_not_before_unix_ms = ?7,
+                     next_attempt_at_unix_ms = ?8, updated_at_unix_ms = ?9
+                 WHERE draft_id = ?10 AND draft_revision = ?11
+                   AND publication_state = ?12 AND lease_generation = ?13
+                   AND session_generation = ?14",
+                params![
+                    completed.state as i64,
+                    comment_id,
+                    clears_plaintext,
+                    state as i64,
+                    error_code,
+                    retry_after_seconds
+                        .map(|value| to_i64(value, "Comment retry after"))
+                        .transpose()?,
+                    retry_not_before_unix_ms,
+                    completed.next_attempt_at_unix_ms,
+                    updated_at_unix_ms,
+                    acquired.draft.draft_id,
+                    to_i64(acquired.draft.draft_revision, "Comment draft revision")?,
+                    OperationState::InFlight as i64,
+                    to_i64(acquired.draft.lease_generation, "lease generation")?,
+                    to_i64(acquired.draft.session_generation, "session generation")?,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_comment_readback(
+        &self,
+        draft: &StoredCommentDraft,
+        decision: &ReadbackDecision,
+        state: CommentState,
+        error_code: &str,
+        retry_after_seconds: Option<u64>,
+        comment_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let current = draft.operation_record()?;
+        let updated_at_unix_ms = now_unix_ms();
+        let advanced =
+            apply_readback_decision(&current, current.fence(), decision, updated_at_unix_ms)
+                .map_err(|error| error.to_string())?;
+        let clears_plaintext = advanced.state == OperationState::Committed;
+        let retry_not_before_unix_ms =
+            (advanced.next_attempt_at_unix_ms > 0).then_some(advanced.next_attempt_at_unix_ms);
+        self.connection()?
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET publication_state = ?1,
+                     comment_id = COALESCE(?2, comment_id),
+                     plaintext_text = CASE WHEN ?3 THEN '' ELSE plaintext_text END,
+                     mention_intent_json = CASE WHEN ?3 THEN '[]' ELSE mention_intent_json END,
+                     mention_commitment_salt = CASE
+                       WHEN ?3 THEN NULL ELSE mention_commitment_salt
+                     END,
+                     state = ?4, error_code = NULLIF(?5, ''),
+                     retry_after_seconds = ?6, retry_not_before_unix_ms = ?7,
+                     next_attempt_at_unix_ms = ?8, updated_at_unix_ms = ?9
+                 WHERE draft_id = ?10 AND draft_revision = ?11
+                   AND publication_state = ?12 AND lease_generation = ?13
+                   AND session_generation = ?14",
+                params![
+                    advanced.state as i64,
+                    comment_id,
+                    clears_plaintext,
+                    state as i64,
+                    error_code,
+                    retry_after_seconds
+                        .map(|value| to_i64(value, "Comment retry after"))
+                        .transpose()?,
+                    retry_not_before_unix_ms,
+                    advanced.next_attempt_at_unix_ms,
+                    updated_at_unix_ms,
+                    draft.draft_id,
+                    to_i64(draft.draft_revision, "Comment draft revision")?,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_comment_root(
+        &self,
+        content_id: &str,
+        generation: u64,
+        post_id: &str,
+        comment_id: &str,
+        root_key: &[u8; 32],
+        endpoint_prekey_id: Option<&str>,
+        projection_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::search::ensure_not_denied(
+            &transaction,
+            "social-comment",
+            comment_id,
+            post_id,
+            Some(generation),
+        )?;
+        let mut incoming = crate::social::PrivateCommentProjection::decode_local(projection_bytes)?;
+        if incoming.post_id != post_id
+            || incoming.comment_id != comment_id
+            || incoming.content_id != content_id
+            || incoming.generation != generation.to_string()
+        {
+            return Err("private Comment projection identity is invalid".to_string());
+        }
+        let current_bytes: Option<Vec<u8>> = transaction.query_row(
+            "SELECT projection_bytes FROM secure_content_comment_projections WHERE post_id = ?1 AND comment_id = ?2",
+            params![post_id, comment_id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some(current_bytes) = current_bytes {
+            let current = crate::social::PrivateCommentProjection::decode_local(&current_bytes)?;
+            if incoming.generation == current.generation {
+                let current_revision = current
+                    .reaction_revision
+                    .parse::<u64>()
+                    .map_err(|_| "private Comment reaction revision is invalid".to_string())?;
+                let incoming_revision = incoming
+                    .reaction_revision
+                    .parse::<u64>()
+                    .map_err(|_| "private Comment reaction revision is invalid".to_string())?;
+                if incoming_revision < current_revision
+                    || (!incoming.reactions_hydrated && current.reactions_hydrated)
+                {
+                    incoming.reactions = current.reactions;
+                    incoming.reactions_count = current.reactions_count;
+                    incoming.reaction_revision = current.reaction_revision;
+                    incoming.reactions_hydrated = current.reactions_hydrated;
+                } else if incoming_revision == current_revision
+                    && incoming.reactions_hydrated
+                    && current.reactions_hydrated
+                    && incoming.reactions != current.reactions
+                {
+                    return Err(
+                        "private Comment reactions conflict at the same revision".to_string()
+                    );
+                }
+            }
+        }
+        let merged_bytes = incoming.encode_local()?;
+        let projection_bytes = merged_bytes.as_slice();
+        transaction
+            .execute(
+                "INSERT INTO secure_content_roots(
+                    content_id, generation, post_id, root_key, committed_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(content_id, generation) DO UPDATE SET
+                    post_id = excluded.post_id,
+                    root_key = excluded.root_key",
+                params![
+                    content_id,
+                    to_i64(generation, "content generation")?,
+                    post_id,
+                    root_key.as_slice(),
+                    now_unix_ms(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO secure_content_comment_projections(
+                    post_id, comment_id, content_id, generation,
+                    projection_bytes, updated_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(post_id, comment_id) DO UPDATE SET
+                    content_id = excluded.content_id,
+                    generation = excluded.generation,
+                    projection_bytes = excluded.projection_bytes,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![
+                    post_id,
+                    comment_id,
+                    content_id,
+                    to_i64(generation, "content generation")?,
+                    projection_bytes,
+                    now_unix_ms(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(key_id) = endpoint_prekey_id {
+            let changed = transaction
+                .execute(
+                    "UPDATE secure_content_prekeys
+                     SET state = ?1, private_key = NULL, root_content_id = ?2,
+                         root_generation = ?3
+                     WHERE key_id = ?4 AND key_kind = 1 AND private_key IS NOT NULL
+                       AND state = ?5",
+                    params![
+                        LocalPreKeyState::RootCommitted as i64,
+                        content_id,
+                        to_i64(generation, "content generation")?,
+                        key_id,
+                        LocalPreKeyState::Published as i64,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "secure content Comment root did not consume the exact endpoint PreKey"
+                        .to_string(),
+                );
+            }
+        }
+        super::search::refresh(
+            &transaction,
+            "social-comment",
+            comment_id,
+            post_id,
+            content_id,
+            generation,
+            projection_bytes,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(merged_bytes)
+    }
+
+    pub fn comment_projection(
+        &self,
+        post_id: &str,
+        comment_id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT projection_bytes FROM secure_content_comment_projections
+                 WHERE post_id = ?1 AND comment_id = ?2",
+                params![post_id, comment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn comment_projections(&self) -> Result<Vec<Vec<u8>>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT projection_bytes FROM secure_content_comment_projections
+                 ORDER BY updated_at_unix_ms, post_id, comment_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let projections = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(projections)
+    }
+
+    pub fn clear_comment_projections(&self, post_id: &str) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::search::deny(&transaction, "comment_thread", post_id)?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_comment_projections WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn commit_content_root(
+        &self,
+        content_id: &str,
+        generation: u64,
+        post_id: &str,
+        root_key: &[u8; 32],
+        endpoint_prekey_id: Option<&str>,
+        projection_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::search::ensure_not_denied(
+            &transaction,
+            "social-post",
+            post_id,
+            post_id,
+            Some(generation),
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO secure_content_roots(
+                    content_id, generation, post_id, root_key, committed_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(content_id, generation) DO UPDATE SET
+                    post_id = excluded.post_id,
+                    root_key = excluded.root_key",
+                params![
+                    content_id,
+                    to_i64(generation, "content generation")?,
+                    post_id,
+                    root_key.as_slice(),
+                    now_unix_ms()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO secure_content_moment_projections(
+                    post_id, content_id, generation, projection_bytes, updated_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(post_id) DO UPDATE SET
+                    content_id = excluded.content_id,
+                    generation = excluded.generation,
+                    projection_bytes = excluded.projection_bytes,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![
+                    post_id,
+                    content_id,
+                    to_i64(generation, "content generation")?,
+                    projection_bytes,
+                    now_unix_ms()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(key_id) = endpoint_prekey_id {
+            let changed = transaction
+                .execute(
+                    "UPDATE secure_content_prekeys
+                     SET state = ?1, private_key = NULL, root_content_id = ?2,
+                         root_generation = ?3
+                     WHERE key_id = ?4 AND key_kind = 1 AND private_key IS NOT NULL
+                       AND state = ?5",
+                    params![
+                        LocalPreKeyState::RootCommitted as i64,
+                        content_id,
+                        to_i64(generation, "content generation")?,
+                        key_id,
+                        LocalPreKeyState::Published as i64,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "secure content root commit did not consume the exact endpoint PreKey"
+                        .to_string(),
+                );
+            }
+        }
+        super::search::refresh(
+            &transaction,
+            "social-post",
+            post_id,
+            post_id,
+            content_id,
+            generation,
+            projection_bytes,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(projection_bytes.to_vec())
+    }
+
+    pub fn content_root(
+        &self,
+        content_id: &str,
+        generation: u64,
+    ) -> Result<Option<[u8; 32]>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT root_key FROM secure_content_roots
+                 WHERE content_id = ?1 AND generation = ?2",
+                params![content_id, to_i64(generation, "content generation")?],
+                |row| fixed_32(row.get(0)?, "content root key"),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn save_projection(&self, post_id: &str, projection_bytes: &[u8]) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(incoming) = crate::social::search_projection::decode(
+            "social-post",
+            post_id,
+            post_id,
+            projection_bytes,
+        ) {
+            super::search::ensure_not_denied(
+                &transaction,
+                "social-post",
+                post_id,
+                post_id,
+                Some(incoming.generation),
+            )?;
+            let matches: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM secure_content_moment_projections
+                 WHERE post_id = ?1 AND content_id = ?2 AND generation = ?3)",
+                    params![post_id, incoming.content_id, incoming.generation as i64],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if !matches {
+                return Err("private Social projection revision changed".to_string());
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE secure_content_moment_projections
+                 SET projection_bytes = ?1, updated_at_unix_ms = ?2 WHERE post_id = ?3",
+                params![projection_bytes, now_unix_ms(), post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        super::search::refresh_existing_post(&transaction, post_id, projection_bytes)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn projection(&self, post_id: &str) -> Result<Option<Vec<u8>>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT projection_bytes FROM secure_content_moment_projections
+                 WHERE post_id = ?1",
+                params![post_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn projections(&self) -> Result<Vec<Vec<u8>>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT projection_bytes FROM secure_content_moment_projections
+                 ORDER BY updated_at_unix_ms DESC, post_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn persist_reaction_command(
+        &self,
+        command: &StoredReactionCommand,
+    ) -> Result<StoredReactionCommand, String> {
+        if command.command_id.trim().is_empty()
+            || command.post_id.trim().is_empty()
+            || command.kind <= 0
+            || command.request_bytes.is_empty()
+            || Sha256::digest(&command.request_bytes).as_slice() != command.request_sha256
+            || command.state != ReactionCommandState::Pending
+            || command.result_bytes.is_some()
+            || command.result_sha256.is_some()
+            || command.session_generation == 0
+        {
+            return Err("secure content Reaction command journal input is invalid".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT command_id FROM secure_content_reaction_commands
+                 WHERE post_id = ?1 AND state IN (?2, ?3, ?4, ?5)
+                   AND comment_id = ?6 AND kind = ?7
+                 ORDER BY updated_at_unix_ms DESC LIMIT 1",
+                params![
+                    command.post_id,
+                    ReactionCommandState::Pending as i64,
+                    ReactionCommandState::InFlight as i64,
+                    ReactionCommandState::UnknownCommit as i64,
+                    ReactionCommandState::Retrying as i64,
+                    command.comment_id,
+                    command.kind,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active
+            .as_deref()
+            .is_some_and(|command_id| command_id != command.command_id)
+        {
+            return Err("secure content Reaction command is already pending".to_string());
+        }
+        transaction
+            .execute(
+                "INSERT INTO secure_content_reaction_commands(
+                    command_id, post_id, kind, operation, request_sha256,
+                    request_bytes, result_sha256, result_bytes, state,
+                    session_generation, lease_generation, attempt_count,
+                    projection_revision, error_code, retry_after_seconds,
+                    retry_not_before_unix_ms, updated_at_unix_ms, comment_id
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, 0, 0, 0,
+                          NULL, NULL, NULL, ?9, ?10)
+                 ON CONFLICT(command_id) DO NOTHING",
+                params![
+                    command.command_id,
+                    command.post_id,
+                    command.kind,
+                    command.operation as i64,
+                    command.request_sha256.as_slice(),
+                    command.request_bytes,
+                    ReactionCommandState::Pending as i64,
+                    to_i64(command.session_generation, "session generation")?,
+                    now_unix_ms(),
+                    command.comment_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored = transaction
+            .query_row(
+                "SELECT command_id, post_id, kind, operation, request_sha256,
+                        request_bytes, result_sha256, result_bytes, state,
+                        session_generation, lease_generation, attempt_count,
+                        projection_revision, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms, comment_id
+                 FROM secure_content_reaction_commands WHERE command_id = ?1",
+                params![command.command_id],
+                reaction_command_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        if stored.post_id != command.post_id
+            || stored.comment_id != command.comment_id
+            || stored.kind != command.kind
+            || stored.operation != command.operation
+            || stored.request_sha256 != command.request_sha256
+            || stored.request_bytes != command.request_bytes
+        {
+            return Err("secure content Reaction command replay conflict".to_string());
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(stored)
+    }
+
+    pub fn reaction_command(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<StoredReactionCommand>, String> {
+        self.connection()?
+            .query_row(
+                "SELECT command_id, post_id, kind, operation, request_sha256,
+                        request_bytes, result_sha256, result_bytes, state,
+                        session_generation, lease_generation, attempt_count,
+                        projection_revision, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms, comment_id
+                 FROM secure_content_reaction_commands WHERE command_id = ?1",
+                params![command_id],
+                reaction_command_from_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn reaction_commands(&self) -> Result<Vec<StoredReactionCommand>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT command_id, post_id, kind, operation, request_sha256,
+                        request_bytes, result_sha256, result_bytes, state,
+                        session_generation, lease_generation, attempt_count,
+                        projection_revision, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms, comment_id
+                 FROM secure_content_reaction_commands AS command
+                 WHERE command.rowid = (
+                    SELECT MAX(latest.rowid)
+                    FROM secure_content_reaction_commands AS latest
+                    WHERE latest.post_id = command.post_id
+                      AND latest.comment_id = command.comment_id
+                      AND latest.kind = command.kind
+                 )
+                 ORDER BY command.updated_at_unix_ms DESC, command.rowid DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let commands = statement
+            .query_map([], reaction_command_from_row)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(commands)
+    }
+
+    pub fn acquire_reaction_command(
+        &self,
+        command_id: &str,
+        session_generation: u64,
+    ) -> Result<StoredReactionCommand, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let now = now_unix_ms();
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_reaction_commands
+                 SET state = ?1, session_generation = ?2,
+                     lease_generation = lease_generation + 1,
+                     attempt_count = attempt_count + 1,
+                     retry_after_seconds = NULL, retry_not_before_unix_ms = NULL,
+                     updated_at_unix_ms = ?3
+                 WHERE command_id = ?4 AND state IN (?5, ?6, ?7)
+                   AND (retry_not_before_unix_ms IS NULL OR retry_not_before_unix_ms <= ?3)",
+                params![
+                    ReactionCommandState::InFlight as i64,
+                    to_i64(session_generation, "session generation")?,
+                    now,
+                    command_id,
+                    ReactionCommandState::Pending as i64,
+                    ReactionCommandState::UnknownCommit as i64,
+                    ReactionCommandState::Retrying as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content Reaction command is not retryable yet".to_string());
+        }
+        let command = transaction
+            .query_row(
+                "SELECT command_id, post_id, kind, operation, request_sha256,
+                        request_bytes, result_sha256, result_bytes, state,
+                        session_generation, lease_generation, attempt_count,
+                        projection_revision, error_code, retry_after_seconds,
+                        retry_not_before_unix_ms, comment_id
+                 FROM secure_content_reaction_commands WHERE command_id = ?1",
+                params![command_id],
+                reaction_command_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        if Sha256::digest(&command.request_bytes).as_slice() != command.request_sha256 {
+            return Err("secure content Reaction durable command hash is invalid".to_string());
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(command)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_reaction_failure(
+        &self,
+        command_id: &str,
+        lease_generation: u64,
+        session_generation: u64,
+        state: ReactionCommandState,
+        error_code: &str,
+        retry_after_seconds: Option<u64>,
+    ) -> Result<bool, String> {
+        if !matches!(
+            state,
+            ReactionCommandState::UnknownCommit
+                | ReactionCommandState::Retrying
+                | ReactionCommandState::Rejected
+        ) || error_code.trim().is_empty()
+        {
+            return Err("secure content Reaction failure transition is invalid".to_string());
+        }
+        let retry_after_seconds =
+            retry_after_seconds.map(|seconds| seconds.min(MAX_REACTION_RETRY_AFTER_SECONDS));
+        let updated_at_unix_ms = now_unix_ms();
+        let retry_not_before_unix_ms = retry_deadline(updated_at_unix_ms, retry_after_seconds)?;
+        self.connection()?
+            .execute(
+                "UPDATE secure_content_reaction_commands
+                 SET state = ?1, error_code = ?2, retry_after_seconds = ?3,
+                     retry_not_before_unix_ms = ?4, updated_at_unix_ms = ?5
+                 WHERE command_id = ?6 AND state = ?7
+                   AND lease_generation = ?8 AND session_generation = ?9",
+                params![
+                    state as i64,
+                    error_code,
+                    retry_after_seconds
+                        .map(|value| to_i64(value, "Reaction retry after"))
+                        .transpose()?,
+                    retry_not_before_unix_ms,
+                    updated_at_unix_ms,
+                    command_id,
+                    ReactionCommandState::InFlight as i64,
+                    to_i64(lease_generation, "Reaction lease generation")?,
+                    to_i64(session_generation, "session generation")?,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_reaction_committed(
+        &self,
+        command: &StoredReactionCommand,
+        result_bytes: &[u8],
+        result_sha256: &[u8; 32],
+        projection_revision: u64,
+        reactions: &[crate::social::PrivateReactionSummaryProjection],
+    ) -> Result<bool, String> {
+        if result_bytes.is_empty()
+            || Sha256::digest(result_bytes).as_slice() != result_sha256
+            || projection_revision == 0
+            || command.post_id.trim().is_empty()
+        {
+            return Err("secure content Reaction completion is invalid".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_reaction_commands
+                 SET result_sha256 = ?1, result_bytes = ?2, state = ?3,
+                     projection_revision = ?4, error_code = NULL,
+                     retry_after_seconds = NULL, retry_not_before_unix_ms = NULL,
+                     updated_at_unix_ms = ?5
+                 WHERE command_id = ?6 AND post_id = ?7 AND state = ?8
+                   AND lease_generation = ?9 AND session_generation = ?10
+                   AND comment_id = ?11 AND request_sha256 = ?12",
+                params![
+                    result_sha256.as_slice(),
+                    result_bytes,
+                    ReactionCommandState::Committed as i64,
+                    to_i64(projection_revision, "Reaction projection revision")?,
+                    now_unix_ms(),
+                    command.command_id,
+                    command.post_id,
+                    ReactionCommandState::InFlight as i64,
+                    to_i64(command.lease_generation, "Reaction lease generation")?,
+                    to_i64(command.session_generation, "session generation")?,
+                    command.comment_id,
+                    command.request_sha256.as_slice(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            let post_id = &command.post_id;
+            let comment_id = &command.comment_id;
+            super::search::ensure_not_denied(&transaction, "social-post", post_id, post_id, None)?;
+            let current_bytes: Vec<u8> = if comment_id.is_empty() {
+                transaction.query_row(
+                    "SELECT projection_bytes FROM secure_content_moment_projections WHERE post_id = ?1",
+                    params![post_id], |row| row.get(0),
+                )
+            } else {
+                super::search::ensure_not_denied(&transaction, "social-comment", comment_id, post_id, None)?;
+                transaction.query_row(
+                    "SELECT projection_bytes FROM secure_content_comment_projections WHERE post_id = ?1 AND comment_id = ?2",
+                    params![post_id, comment_id], |row| row.get(0),
+                )
+            }.map_err(|error| error.to_string())?;
+            let projection_bytes = crate::social::project_reaction_target(
+                post_id,
+                comment_id,
+                &current_bytes,
+                reactions,
+                projection_revision,
+            )?;
+            let projection_changed = if comment_id.is_empty() {
+                transaction.execute(
+                    "UPDATE secure_content_moment_projections
+                     SET projection_bytes = ?1, updated_at_unix_ms = ?2
+                     WHERE post_id = ?3",
+                    params![&projection_bytes, now_unix_ms(), post_id],
+                )
+            } else {
+                transaction.execute(
+                    "UPDATE secure_content_comment_projections
+                     SET projection_bytes = ?1, updated_at_unix_ms = ?2
+                     WHERE post_id = ?3 AND comment_id = ?4",
+                    params![&projection_bytes, now_unix_ms(), post_id, comment_id],
+                )
+            }
+            .map_err(|error| error.to_string())?;
+            if projection_changed != 1 {
+                return Err(
+                    "secure content Reaction completion has no private Moment projection"
+                        .to_string(),
+                );
+            }
+            if comment_id.is_empty() {
+                super::search::refresh_existing_post(&transaction, post_id, &projection_bytes)?;
+            } else {
+                let projection =
+                    crate::social::PrivateCommentProjection::decode_local(&projection_bytes)?;
+                super::search::refresh(
+                    &transaction,
+                    "social-comment",
+                    comment_id,
+                    post_id,
+                    &projection.content_id,
+                    projection
+                        .generation
+                        .parse::<u64>()
+                        .map_err(|_| "private Comment generation is invalid")?,
+                    &projection_bytes,
+                )?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn object_transfers_for_resource(
+        &self,
+        post_id: &str,
+    ) -> Result<Vec<StoredObjectTransfer>, String> {
+        if post_id.trim().is_empty() {
+            return Err("secure content resource ID is required".to_string());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT transfer_id, owner_scope_id, operation_id, authority_id,
+                        direction, state, upload_id, generation, descriptor_sha256,
+                        completed_chunk_bitmap, source_local_ref, partial_local_ref,
+                        object_key, base_nonce, plaintext_size, chunk_size,
+                        attempt_count, next_attempt_at_unix_ms, last_error,
+                        updated_at_unix_ms, media_type
+                 FROM secure_content_object_transfers
+                 WHERE authority_id = ?1 OR owner_scope_id = ?1
+                    OR owner_scope_id IN (
+                      SELECT content_id FROM secure_content_roots WHERE post_id = ?1
+                      UNION
+                      SELECT content_id FROM secure_content_moment_projections WHERE post_id = ?1
+                    )
+                 ORDER BY transfer_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let downloads = statement
+            .query_map(params![post_id], |row| {
+                Ok(StoredObjectTransfer {
+                    record: object_transfer_from_row(row)?,
+                    media_type: row
+                        .get::<_, Option<String>>(20)?
+                        .ok_or_else(|| conversion_error("download media type is unavailable"))?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(downloads)
+    }
+
+    pub fn purge_object_download(&self, transfer_id: &str) -> Result<(), String> {
+        if transfer_id.trim().is_empty() {
+            return Err("secure content transfer ID is required".to_string());
+        }
+        let changed = self
+            .connection()?
+            .execute(
+                "DELETE FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1 AND direction = ?2
+                   AND session_generation = ?3",
+                params![
+                    transfer_id,
+                    secure_content_core::object::ObjectTransferDirection::Download as i32,
+                    self.bound_session_generation()
+                        .map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("secure content object transfer generation is stale".to_string())
+        }
+    }
+
+    pub fn abandoned_upload_transfer_ids(&self) -> Result<Vec<String>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT transfer_id
+                 FROM secure_content_object_transfers AS transfer
+                 WHERE transfer.direction = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM secure_content_moment_commands AS command
+                     WHERE command.content_id = transfer.owner_scope_id
+                       AND command.state IN (?2, ?3, ?4, ?5)
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM secure_content_moment_drafts AS draft
+                     WHERE draft.content_id = transfer.owner_scope_id
+                   )
+                 ORDER BY transfer.updated_at_unix_ms, transfer.transfer_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let transfer_ids = statement
+            .query_map(
+                params![
+                    ObjectTransferDirection::Upload as i32,
+                    OperationState::Pending as i64,
+                    OperationState::InFlight as i64,
+                    OperationState::UnknownOutcome as i64,
+                    OperationState::Committed as i64,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(transfer_ids)
+    }
+
+    pub fn upload_transfer_ids_for_content(&self, content_id: &str) -> Result<Vec<String>, String> {
+        if content_id.trim().is_empty() {
+            return Err("secure content content ID is required".to_string());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT transfer_id FROM secure_content_object_transfers
+                 WHERE direction = ?1 AND owner_scope_id = ?2
+                 ORDER BY transfer_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let transfer_ids = statement
+            .query_map(
+                params![ObjectTransferDirection::Upload as i32, content_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(transfer_ids)
+    }
+
+    pub fn purge_upload_transfer(&self, transfer_id: &str) -> Result<(), String> {
+        if transfer_id.trim().is_empty() {
+            return Err("secure content transfer ID is required".to_string());
+        }
+        let changed = self
+            .connection()?
+            .execute(
+                "DELETE FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1 AND direction = ?2
+                   AND session_generation = ?3",
+                params![
+                    transfer_id,
+                    ObjectTransferDirection::Upload as i32,
+                    self.bound_session_generation()
+                        .map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("secure content object transfer generation is stale".to_string())
+        }
+    }
+
+    pub fn purge_private_resource_material(&self, post_id: &str) -> Result<(), String> {
+        if post_id.trim().is_empty() {
+            return Err("secure content post ID is required".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::search::deny(&transaction, "social-post", post_id)?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_object_transfers
+                 WHERE authority_id = ?1 OR owner_scope_id = ?1
+                    OR owner_scope_id IN (
+                      SELECT content_id FROM secure_content_roots WHERE post_id = ?1
+                      UNION
+                      SELECT content_id FROM secure_content_moment_projections WHERE post_id = ?1
+                    )",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_moment_commands
+                 WHERE post_id = ?1 OR content_id = ?1
+                    OR content_id IN (
+                      SELECT content_id FROM secure_content_roots WHERE post_id = ?1
+                      UNION
+                      SELECT content_id FROM secure_content_moment_projections WHERE post_id = ?1
+                    )",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_reaction_commands WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_moment_projections WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_comment_projections WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_roots WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_pending_purges WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn mark_private_resource_purge_pending(&self, post_id: &str) -> Result<(), String> {
+        if post_id.trim().is_empty() {
+            return Err("secure content post ID is required".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::search::deny(&transaction, "social-post", post_id)?;
+        transaction
+            .execute(
+                "INSERT INTO secure_content_pending_purges(post_id, updated_at_unix_ms)
+                 VALUES(?1, ?2)
+                 ON CONFLICT(post_id) DO UPDATE SET updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![post_id, now_unix_ms()],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM secure_content_moment_projections WHERE post_id = ?1",
+                params![post_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn pending_private_resource_purges(&self) -> Result<Vec<String>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT post_id FROM secure_content_pending_purges
+                 ORDER BY updated_at_unix_ms, post_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let post_ids = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(post_ids)
+    }
+
+    pub fn ensure_object_upload_transfer(
+        &self,
+        record: &ObjectTransferRecord,
+        media_type: &str,
+    ) -> Result<ObjectTransferRecord, String> {
+        secure_content_core::object::validate_object_transfer_record(record)?;
+        if record.direction != secure_content_core::object::ObjectTransferDirection::Upload
+            || media_type.trim().is_empty()
+        {
+            return Err("secure content upload journal input is invalid".to_string());
+        }
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO secure_content_object_transfers(
+                    transfer_id, owner_scope_id, operation_id, authority_id,
+                    direction, state, upload_id, generation, descriptor_sha256,
+                    completed_chunk_bitmap, source_local_ref, partial_local_ref,
+                    object_key, base_nonce, plaintext_size, chunk_size, media_type,
+                    attempt_count, next_attempt_at_unix_ms, last_error,
+                    descriptor_bytes, updated_at_unix_ms, session_generation
+                 ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, NULL, ?21, ?22
+                 )
+                 ON CONFLICT(transfer_id) DO NOTHING",
+                params![
+                    record.transfer_id,
+                    record.owner_scope_id,
+                    record.operation_id,
+                    record.authority_id,
+                    record.direction as i32,
+                    record.state as i32,
+                    record.upload_id,
+                    to_i64(record.generation, "upload generation")?,
+                    record.descriptor_sha256,
+                    record.completed_chunk_bitmap,
+                    record.source_local_ref,
+                    record.partial_local_ref,
+                    record.object_key,
+                    record.base_nonce,
+                    to_i64(record.plaintext_size, "plaintext size")?,
+                    record.chunk_size,
+                    media_type,
+                    record.attempt_count,
+                    record.next_attempt_at_unix_ms,
+                    record.last_error.map(|value| value as i32),
+                    record.updated_at_unix_ms,
+                    self.bound_session_generation()
+                        .map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let existing = connection
+            .query_row(
+                "SELECT transfer_id, owner_scope_id, operation_id, authority_id,
+                        direction, state, upload_id, generation, descriptor_sha256,
+                        completed_chunk_bitmap, source_local_ref, partial_local_ref,
+                        object_key, base_nonce, plaintext_size, chunk_size,
+                        attempt_count, next_attempt_at_unix_ms, last_error,
+                        updated_at_unix_ms
+                 FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1",
+                params![record.transfer_id],
+                object_transfer_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        let stored_media_type: String = connection
+            .query_row(
+                "SELECT media_type FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1",
+                params![record.transfer_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if existing.owner_scope_id != record.owner_scope_id
+            || existing.operation_id != record.operation_id
+            || existing.authority_id != record.authority_id
+            || existing.direction != record.direction
+            || existing.source_local_ref != record.source_local_ref
+            || existing.partial_local_ref != record.partial_local_ref
+            || existing.plaintext_size != record.plaintext_size
+            || existing.chunk_size != record.chunk_size
+            || stored_media_type != media_type
+        {
+            return Err("secure content upload journal replay conflict".to_string());
+        }
+        Ok(existing)
+    }
+
+    pub fn ensure_object_download_transfer(
+        &self,
+        record: &ObjectTransferRecord,
+        media_type: &str,
+        cache_path: &Path,
+    ) -> Result<(), String> {
+        secure_content_core::object::validate_object_transfer_record(record)?;
+        if record.direction != secure_content_core::object::ObjectTransferDirection::Download
+            || record.source_local_ref != cache_path.display().to_string()
+            || media_type.trim().is_empty()
+        {
+            return Err("secure content download journal input is invalid".to_string());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let bound_session_generation = self
+            .bound_session_generation()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO secure_content_object_transfers(
+                    transfer_id, owner_scope_id, operation_id, authority_id,
+                    direction, state, upload_id, generation, descriptor_sha256,
+                    completed_chunk_bitmap, source_local_ref, partial_local_ref,
+                    object_key, base_nonce, plaintext_size, chunk_size, media_type,
+                    attempt_count, next_attempt_at_unix_ms, last_error,
+                    descriptor_bytes, updated_at_unix_ms, session_generation
+                 ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, NULL, ?21, ?22
+                 ) ON CONFLICT(transfer_id) DO NOTHING",
+                params![
+                    record.transfer_id,
+                    record.owner_scope_id,
+                    record.operation_id,
+                    record.authority_id,
+                    record.direction as i32,
+                    record.state as i32,
+                    record.upload_id,
+                    to_i64(record.generation, "download generation")?,
+                    record.descriptor_sha256,
+                    record.completed_chunk_bitmap,
+                    record.source_local_ref,
+                    record.partial_local_ref,
+                    record.object_key,
+                    record.base_nonce,
+                    to_i64(record.plaintext_size, "plaintext size")?,
+                    record.chunk_size,
+                    media_type,
+                    record.attempt_count,
+                    record.next_attempt_at_unix_ms,
+                    record.last_error.map(|value| value as i32),
+                    record.updated_at_unix_ms,
+                    bound_session_generation,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT transfer_id, owner_scope_id, operation_id, authority_id,
+                        direction, state, upload_id, generation, descriptor_sha256,
+                        completed_chunk_bitmap, source_local_ref, partial_local_ref,
+                        object_key, base_nonce, plaintext_size, chunk_size,
+                        attempt_count, next_attempt_at_unix_ms, last_error,
+                        updated_at_unix_ms
+                 FROM secure_content_object_transfers WHERE transfer_id = ?1",
+                params![record.transfer_id],
+                object_transfer_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        let existing_media_type: Option<String> = transaction
+            .query_row(
+                "SELECT media_type FROM secure_content_object_transfers WHERE transfer_id = ?1",
+                params![record.transfer_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if existing.owner_scope_id != record.owner_scope_id
+            || existing.operation_id != record.operation_id
+            || existing.authority_id != record.authority_id
+            || existing.direction != record.direction
+            || existing.generation != record.generation
+            || existing.descriptor_sha256 != record.descriptor_sha256
+            || existing.partial_local_ref != record.partial_local_ref
+            || existing.object_key != record.object_key
+            || existing.base_nonce != record.base_nonce
+            || existing.plaintext_size != record.plaintext_size
+            || existing.chunk_size != record.chunk_size
+            || existing_media_type.as_deref() != Some(media_type)
+        {
+            return Err("secure content download journal replay conflict".to_string());
+        }
+
+        if existing.source_local_ref != record.source_local_ref {
+            let changed = transaction
+                .execute(
+                    "UPDATE secure_content_object_transfers
+                     SET source_local_ref = ?1, updated_at_unix_ms = ?2
+                     WHERE transfer_id = ?3 AND session_generation = ?4
+                       AND state NOT IN (?5, ?6)",
+                    params![
+                        record.source_local_ref,
+                        now_unix_ms(),
+                        record.transfer_id,
+                        bound_session_generation,
+                        ObjectTransferState::Cancelled as i32,
+                        ObjectTransferState::Terminal as i32,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("secure content object transfer generation is stale".to_string());
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn persist_object_descriptor(
+        &self,
+        transfer_id: &str,
+        descriptor_bytes: &[u8],
+    ) -> Result<(), String> {
+        let changed = self
+            .connection()?
+            .execute(
+                "UPDATE secure_content_object_transfers
+                 SET descriptor_bytes = ?1
+                 WHERE transfer_id = ?2 AND session_generation = ?3
+                   AND state NOT IN (?4, ?5, ?6)",
+                params![
+                    descriptor_bytes,
+                    transfer_id,
+                    self.bound_session_generation()
+                        .map_err(|error| error.to_string())?,
+                    ObjectTransferState::Cancelled as i32,
+                    ObjectTransferState::Terminal as i32,
+                    ObjectTransferState::Complete as i32,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("secure content object transfer generation is stale".to_string())
+        }
+    }
+
+    pub fn object_descriptor_bytes(&self, transfer_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let value = self
+            .connection()?
+            .query_row(
+                "SELECT descriptor_bytes FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1 AND session_generation = ?2",
+                params![
+                    transfer_id,
+                    self.bound_session_generation()
+                        .map_err(|error| error.to_string())?,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        Ok(value)
+    }
+}
+
+impl ObjectTransferRepository for SecureContentStore {
+    fn object_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<ObjectTransferRecord>, ObjectTransferFailure> {
+        self.connection()
+            .map_err(transfer_error)?
+            .query_row(
+                "SELECT transfer_id, owner_scope_id, operation_id, authority_id,
+                        direction, state, upload_id, generation, descriptor_sha256,
+                        completed_chunk_bitmap, source_local_ref, partial_local_ref,
+                        object_key, base_nonce, plaintext_size, chunk_size,
+                        attempt_count, next_attempt_at_unix_ms, last_error,
+                        updated_at_unix_ms
+                 FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1 AND session_generation = ?2",
+                params![transfer_id, self.bound_session_generation()?],
+                object_transfer_from_row,
+            )
+            .optional()
+            .map_err(|error| transfer_error(error.to_string()))
+    }
+
+    fn upload_media_type(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<String>, ObjectTransferFailure> {
+        self.connection()
+            .map_err(transfer_error)?
+            .query_row(
+                "SELECT media_type FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1 AND session_generation = ?2",
+                params![transfer_id, self.bound_session_generation()?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|error| transfer_error(error.to_string()))
+    }
+
+    fn update_transfer_prepared(
+        &self,
+        transfer_id: &str,
+        descriptor_sha256: &[u8],
+        partial_local_ref: &str,
+        updated_at_unix_ms: i64,
+    ) -> Result<(), ObjectTransferFailure> {
+        let connection = self.connection().map_err(transfer_error)?;
+        let current: Vec<u8> = connection
+            .query_row(
+                "SELECT descriptor_sha256 FROM secure_content_object_transfers
+                 WHERE transfer_id = ?1",
+                params![transfer_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| transfer_error(error.to_string()))?;
+        if current != vec![0; 32] && current != descriptor_sha256 {
+            return Err(ObjectTransferFailure::terminal(
+                ObjectTransferErrorCode::DescriptorMismatch,
+                "secure content object descriptor changed",
+            ));
+        }
+        connection
+            .execute(
+                "UPDATE secure_content_object_transfers
+                 SET descriptor_sha256 = ?1, partial_local_ref = ?2,
+                     updated_at_unix_ms = ?3
+                 WHERE transfer_id = ?4 AND session_generation = ?5
+                   AND state NOT IN (?6, ?7, ?8)",
+                params![
+                    descriptor_sha256,
+                    partial_local_ref,
+                    updated_at_unix_ms,
+                    transfer_id,
+                    self.bound_session_generation()?,
+                    ObjectTransferState::Cancelled as i32,
+                    ObjectTransferState::Terminal as i32,
+                    ObjectTransferState::Complete as i32,
+                ],
+            )
+            .map_err(|error| transfer_error(error.to_string()))
+            .and_then(|changed| {
+                if changed == 1 {
+                    Ok(())
+                } else {
+                    Err(transfer_error(
+                        "secure content object transfer generation is stale",
+                    ))
+                }
+            })
+    }
+
+    fn update_transfer_progress(
+        &self,
+        transfer_id: &str,
+        state: ObjectTransferState,
+        upload_id: &str,
+        generation: u64,
+        completed_chunk_bitmap: &[u8],
+        attempt_count: u32,
+        next_attempt_at_unix_ms: i64,
+        last_error: Option<ObjectTransferErrorCode>,
+        updated_at_unix_ms: i64,
+    ) -> Result<(), ObjectTransferFailure> {
+        let restarts_completed_download = state == ObjectTransferState::Queued
+            && completed_chunk_bitmap.iter().all(|byte| *byte == 0)
+            && attempt_count == 0
+            && next_attempt_at_unix_ms == updated_at_unix_ms
+            && last_error.is_none();
+        let changed = self
+            .connection()
+            .map_err(transfer_error)?
+            .execute(
+                "UPDATE secure_content_object_transfers SET
+                    state = ?1, upload_id = ?2, generation = ?3,
+                    completed_chunk_bitmap = ?4, attempt_count = ?5,
+                    next_attempt_at_unix_ms = ?6, last_error = ?7,
+                    updated_at_unix_ms = ?8
+                 WHERE transfer_id = ?9 AND session_generation = ?10
+                   AND (
+                     (?1 = ?11 AND state NOT IN (?11, ?12))
+                     OR (
+                       ?1 != ?11
+                       AND state NOT IN (?11, ?12, ?13)
+                     )
+                     OR (
+                       ?14 = 1
+                       AND direction = ?15
+                       AND state = ?13
+                     )
+                   )",
+                params![
+                    state as i32,
+                    upload_id,
+                    to_i64(generation, "upload generation").map_err(transfer_error)?,
+                    completed_chunk_bitmap,
+                    attempt_count,
+                    next_attempt_at_unix_ms,
+                    last_error.map(|value| value as i32),
+                    updated_at_unix_ms,
+                    transfer_id,
+                    self.bound_session_generation()?,
+                    ObjectTransferState::Cancelled as i32,
+                    ObjectTransferState::Terminal as i32,
+                    ObjectTransferState::Complete as i32,
+                    i32::from(restarts_completed_download),
+                    ObjectTransferDirection::Download as i32,
+                ],
+            )
+            .map_err(|error| transfer_error(error.to_string()))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(transfer_error(
+                "secure content object transfer generation is stale",
+            ))
+        }
+    }
+
+    fn complete_upload(
+        &self,
+        transfer: &ObjectTransferRecord,
+        _descriptor: &ObjectDescriptor,
+        updated_at_unix_ms: i64,
+    ) -> Result<(), ObjectTransferFailure> {
+        self.update_transfer_progress(
+            &transfer.transfer_id,
+            ObjectTransferState::Complete,
+            &transfer.upload_id,
+            transfer.generation,
+            &transfer.completed_chunk_bitmap,
+            transfer.attempt_count,
+            0,
+            None,
+            updated_at_unix_ms,
+        )
+    }
+
+    fn complete_download(
+        &self,
+        transfer: &ObjectTransferRecord,
+        descriptor: &ObjectDescriptor,
+        _cache_path: &str,
+        updated_at_unix_ms: i64,
+    ) -> Result<(), ObjectTransferFailure> {
+        self.complete_upload(transfer, descriptor, updated_at_unix_ms)
+    }
+}
+
+fn publication_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPublication> {
+    let request_sha256: Vec<u8> = row.get(4)?;
+    Ok(StoredPublication {
+        command_id: row.get(0)?,
+        key_kind: row.get(1)?,
+        pool_epoch: from_i64(row.get(2)?, "pool epoch")?,
+        request_bytes: row.get(3)?,
+        request_sha256: fixed_32(request_sha256, "publication request hash")?,
+        state: operation_state_from_i64(row.get::<_, i64>(5)?).map_err(conversion_error)?,
+        lease_generation: from_i64(row.get(6)?, "lease generation")?,
+        session_generation: from_i64(row.get(7)?, "session generation")?,
+        attempt_count: u32::try_from(row.get::<_, i64>(8)?)
+            .map_err(|_| conversion_error("publication attempt count is invalid"))?,
+        next_attempt_at_unix_ms: row.get(9)?,
+        updated_at_unix_ms: row.get(10)?,
+    })
+}
+
+fn recover_prekey_publications(
+    transaction: &rusqlite::Transaction<'_>,
+    session_generation: Option<i64>,
+) -> Result<usize, String> {
+    let sql = match session_generation {
+        Some(_) => {
+            "SELECT command_id, key_kind, pool_epoch, request_bytes,
+                    request_sha256, state, lease_generation, session_generation,
+                    attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms
+             FROM secure_content_prekey_commands
+             WHERE state = ?1 AND session_generation = ?2
+             ORDER BY command_id"
+        }
+        None => {
+            "SELECT command_id, key_kind, pool_epoch, request_bytes,
+                    request_sha256, state, lease_generation, session_generation,
+                    attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms
+             FROM secure_content_prekey_commands
+             WHERE state = ?1
+             ORDER BY command_id"
+        }
+    };
+    let commands = {
+        let mut statement = transaction
+            .prepare(sql)
+            .map_err(|error| error.to_string())?;
+        match session_generation {
+            Some(generation) => statement
+                .query_map(
+                    params![OperationState::InFlight as i64, generation],
+                    publication_from_row,
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+            None => statement
+                .query_map(
+                    params![OperationState::InFlight as i64],
+                    publication_from_row,
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+        }
+    };
+    let now = now_unix_ms();
+    let mut recovered_count = 0;
+    for command in commands {
+        let current = command.operation_record()?;
+        let recovered =
+            recover_interrupted_operation(&current, now).map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_prekey_commands
+                 SET state = ?1, next_attempt_at_unix_ms = ?2,
+                     updated_at_unix_ms = ?3
+                 WHERE command_id = ?4 AND state = ?5
+                   AND lease_generation = ?6 AND session_generation = ?7",
+                params![
+                    recovered.state as i64,
+                    recovered.next_attempt_at_unix_ms,
+                    recovered.updated_at_unix_ms,
+                    recovered.command_id,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content interrupted publication lost its fence".to_string());
+        }
+        recovered_count += 1;
+    }
+    Ok(recovered_count)
+}
+
+fn recover_moment_commands(
+    transaction: &rusqlite::Transaction<'_>,
+    session_generation: Option<i64>,
+) -> Result<usize, String> {
+    let sql = if session_generation.is_some() {
+        "SELECT draft_id, draft_revision, content_id, generation,
+                submit_command_id, plan_bytes, request_bytes, request_sha256,
+                root_key, state, lease_generation, session_generation,
+                attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms, post_id
+         FROM secure_content_moment_commands
+         WHERE state = ?1 AND session_generation = ?2
+         ORDER BY submit_command_id"
+    } else {
+        "SELECT draft_id, draft_revision, content_id, generation,
+                submit_command_id, plan_bytes, request_bytes, request_sha256,
+                root_key, state, lease_generation, session_generation,
+                attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms, post_id
+         FROM secure_content_moment_commands
+         WHERE state = ?1
+         ORDER BY submit_command_id"
+    };
+    let commands = {
+        let mut statement = transaction
+            .prepare(sql)
+            .map_err(|error| error.to_string())?;
+        match session_generation {
+            Some(generation) => statement
+                .query_map(
+                    params![OperationState::InFlight as i64, generation],
+                    moment_from_row,
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+            None => statement
+                .query_map(params![OperationState::InFlight as i64], moment_from_row)
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+        }
+    };
+    let now = now_unix_ms();
+    let mut recovered_count = 0;
+    for command in commands {
+        let current = command.operation_record()?;
+        let recovered =
+            recover_interrupted_operation(&current, now).map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_moment_commands
+                 SET state = ?1, next_attempt_at_unix_ms = ?2,
+                     updated_at_unix_ms = ?3
+                 WHERE submit_command_id = ?4 AND state = ?5
+                   AND lease_generation = ?6 AND session_generation = ?7",
+                params![
+                    recovered.state as i64,
+                    recovered.next_attempt_at_unix_ms,
+                    recovered.updated_at_unix_ms,
+                    command.submit_command_id,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content interrupted Moment lost its fence".to_string());
+        }
+        recovered_count += 1;
+    }
+    Ok(recovered_count)
+}
+
+fn recover_comment_submissions(
+    transaction: &rusqlite::Transaction<'_>,
+    session_generation: Option<i64>,
+) -> Result<usize, String> {
+    let sql = if session_generation.is_some() {
+        "SELECT draft_id, draft_revision, post_id, content_id, generation,
+                reply_to_comment_id, plaintext_text, mention_intent_json,
+                mention_commitment_salt, intent_sha256, prepare_command_id,
+                submit_command_id, plan_bytes, request_bytes, request_sha256,
+                root_key, publication_state, lease_generation, session_generation,
+                attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms,
+                comment_id, state, error_code, retry_after_seconds,
+                retry_not_before_unix_ms
+         FROM secure_content_comment_drafts
+         WHERE publication_state = ?1 AND session_generation = ?2
+         ORDER BY submit_command_id"
+    } else {
+        "SELECT draft_id, draft_revision, post_id, content_id, generation,
+                reply_to_comment_id, plaintext_text, mention_intent_json,
+                mention_commitment_salt, intent_sha256, prepare_command_id,
+                submit_command_id, plan_bytes, request_bytes, request_sha256,
+                root_key, publication_state, lease_generation, session_generation,
+                attempt_count, next_attempt_at_unix_ms, updated_at_unix_ms,
+                comment_id, state, error_code, retry_after_seconds,
+                retry_not_before_unix_ms
+         FROM secure_content_comment_drafts
+         WHERE publication_state = ?1
+         ORDER BY submit_command_id"
+    };
+    let drafts = {
+        let mut statement = transaction
+            .prepare(sql)
+            .map_err(|error| error.to_string())?;
+        match session_generation {
+            Some(generation) => statement
+                .query_map(
+                    params![OperationState::InFlight as i64, generation],
+                    comment_draft_from_row,
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+            None => statement
+                .query_map(
+                    params![OperationState::InFlight as i64],
+                    comment_draft_from_row,
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+        }
+    };
+    let now = now_unix_ms();
+    let mut recovered_count = 0;
+    for draft in drafts {
+        let current = draft.operation_record()?;
+        let recovered =
+            recover_interrupted_operation(&current, now).map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET publication_state = ?1, state = ?2,
+                     error_code = 'COMMENT_SUBMIT_RESULT_UNKNOWN',
+                     next_attempt_at_unix_ms = ?3, updated_at_unix_ms = ?4
+                 WHERE draft_id = ?5 AND draft_revision = ?6
+                   AND publication_state = ?7 AND lease_generation = ?8
+                   AND session_generation = ?9",
+                params![
+                    recovered.state as i64,
+                    CommentState::Failed as i64,
+                    recovered.next_attempt_at_unix_ms,
+                    recovered.updated_at_unix_ms,
+                    draft.draft_id,
+                    to_i64(draft.draft_revision, "Comment draft revision")?,
+                    current.state as i64,
+                    to_i64(current.lease_generation, "lease generation")?,
+                    to_i64(current.session_generation, "session generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("secure content interrupted Comment lost its fence".to_string());
+        }
+        recovered_count += 1;
+    }
+    Ok(recovered_count)
+}
+
+fn migrate_reaction_operation(connection: &Connection) -> Result<(), String> {
+    let columns = connection
+        .prepare("PRAGMA table_info(secure_content_reaction_commands)")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if !columns.iter().any(|column| column == "remove_reaction") {
+        return Ok(());
+    }
+    // The original signed request and hash are preserved byte-for-byte. The
+    // retired boolean is used only here to qualify the original journal row.
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    {
+        let mut statement = transaction.prepare(
+            "SELECT command_id, post_id, comment_id, kind, remove_reaction, request_bytes, request_sha256
+             FROM secure_content_reaction_commands",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i32>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (id, post, comment, kind, remove, bytes, hash) =
+                row.map_err(|error| error.to_string())?;
+            // React/Unreact share the same original wire fields; the retained
+            // operation determines the signing domain on exact replay.
+            let request = crate::model::social::ReactToPostRequest::decode(bytes.as_slice())
+                .map_err(|_| "secure content original interaction journal is malformed")?;
+            if !(0..=1).contains(&remove)
+                || request.encode_to_vec() != bytes
+                || request.command_id != id
+                || request.post_id != post
+                || request.comment_id != comment
+                || request.kind != kind
+                || kind <= 0
+                || request.actor_signing_key_id.trim().is_empty()
+                || request.actor_device_signature.len() != 64
+                || Sha256::digest(&bytes).as_slice() != hash
+            {
+                return Err(
+                    "secure content original interaction journal identity is invalid".into(),
+                );
+            }
+        }
+    }
+    transaction.execute_batch(
+        "CREATE TABLE secure_content_reaction_operation_migration (
+            command_id TEXT PRIMARY KEY, post_id TEXT NOT NULL,
+            comment_id TEXT NOT NULL DEFAULT '', kind INTEGER NOT NULL,
+            operation INTEGER NOT NULL CHECK(operation IN (3, 4, 5)),
+            request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+            request_bytes BLOB NOT NULL,
+            result_sha256 BLOB CHECK(result_sha256 IS NULL OR length(result_sha256) = 32),
+            result_bytes BLOB, state INTEGER NOT NULL, session_generation INTEGER NOT NULL,
+            lease_generation INTEGER NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 0,
+            projection_revision INTEGER NOT NULL DEFAULT 0, error_code TEXT,
+            retry_after_seconds INTEGER, retry_not_before_unix_ms INTEGER,
+            updated_at_unix_ms INTEGER NOT NULL
+         );
+         INSERT INTO secure_content_reaction_operation_migration
+         SELECT command_id, post_id, comment_id, kind,
+                CASE remove_reaction WHEN 0 THEN 3 WHEN 1 THEN 4 END,
+                request_sha256, request_bytes, result_sha256, result_bytes, state,
+                session_generation, lease_generation, attempt_count, projection_revision,
+                error_code, retry_after_seconds, retry_not_before_unix_ms, updated_at_unix_ms
+         FROM secure_content_reaction_commands;
+         DROP TABLE secure_content_reaction_commands;
+         ALTER TABLE secure_content_reaction_operation_migration RENAME TO secure_content_reaction_commands;
+         CREATE INDEX idx_secure_content_reaction_commands_post
+         ON secure_content_reaction_commands(post_id, updated_at_unix_ms DESC);",
+    ).map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn reaction_command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReactionCommand> {
+    let result_sha256 = row
+        .get::<_, Option<Vec<u8>>>(6)?
+        .map(|value| fixed_32(value, "Reaction result hash"))
+        .transpose()?;
+    let retry_after_seconds = row
+        .get::<_, Option<i64>>(14)?
+        .map(|value| from_i64(value, "Reaction retry after"))
+        .transpose()?;
+    Ok(StoredReactionCommand {
+        command_id: row.get(0)?,
+        post_id: row.get(1)?,
+        comment_id: row.get(16)?,
+        kind: row.get(2)?,
+        operation: PrivateReactionOperation::try_from(row.get::<_, i64>(3)?)
+            .map_err(conversion_error)?,
+        request_sha256: fixed_32(row.get(4)?, "Reaction request hash")?,
+        request_bytes: row.get(5)?,
+        result_sha256,
+        result_bytes: row.get(7)?,
+        state: ReactionCommandState::try_from(row.get::<_, i64>(8)?).map_err(conversion_error)?,
+        session_generation: from_i64(row.get(9)?, "session generation")?,
+        lease_generation: from_i64(row.get(10)?, "Reaction lease generation")?,
+        attempt_count: u32::try_from(row.get::<_, i64>(11)?)
+            .map_err(|_| conversion_error("Reaction attempt count is invalid"))?,
+        projection_revision: from_i64(row.get(12)?, "Reaction projection revision")?,
+        error_code: row.get(13)?,
+        retry_after_seconds,
+        retry_not_before_unix_ms: row.get(15)?,
+    })
+}
+
+fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMomentCommand> {
+    Ok(StoredMomentCommand {
+        draft_id: row.get(0)?,
+        draft_revision: from_i64(row.get(1)?, "draft revision")?,
+        content_id: row.get(2)?,
+        generation: from_i64(row.get(3)?, "content generation")?,
+        submit_command_id: row.get(4)?,
+        plan_bytes: row.get(5)?,
+        request_bytes: row.get(6)?,
+        request_sha256: fixed_32(row.get(7)?, "Moment request hash")?,
+        root_key: fixed_32(row.get(8)?, "content root key")?,
+        state: operation_state_from_i64(row.get::<_, i64>(9)?).map_err(conversion_error)?,
+        lease_generation: from_i64(row.get(10)?, "lease generation")?,
+        session_generation: from_i64(row.get(11)?, "session generation")?,
+        attempt_count: u32::try_from(row.get::<_, i64>(12)?)
+            .map_err(|_| conversion_error("Moment attempt count is invalid"))?,
+        next_attempt_at_unix_ms: row.get(13)?,
+        updated_at_unix_ms: row.get(14)?,
+        post_id: row.get(15)?,
+    })
+}
+
+fn apply_operation_record_to_moment(command: &mut StoredMomentCommand, record: &OperationRecord) {
+    command.state = record.state;
+    command.lease_generation = record.lease_generation;
+    command.session_generation = record.session_generation;
+    command.attempt_count = record.attempt_count;
+    command.next_attempt_at_unix_ms = record.next_attempt_at_unix_ms;
+    command.updated_at_unix_ms = record.updated_at_unix_ms;
+}
+
+fn comment_draft_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCommentDraft> {
+    let request_sha256 = row
+        .get::<_, Option<Vec<u8>>>(14)?
+        .map(|value| fixed_32(value, "Comment request hash"))
+        .transpose()?;
+    let root_key = row
+        .get::<_, Option<Vec<u8>>>(15)?
+        .map(|value| fixed_32(value, "Comment root key"))
+        .transpose()?;
+    let mention_commitment_salt = row
+        .get::<_, Option<Vec<u8>>>(8)?
+        .map(|value| fixed_32(value, "Comment mention commitment salt"))
+        .transpose()?;
+    let publication_state = row
+        .get::<_, Option<i64>>(16)?
+        .map(operation_state_from_i64)
+        .transpose()
+        .map_err(conversion_error)?;
+    let retry_after_seconds = row
+        .get::<_, Option<i64>>(25)?
+        .map(|value| from_i64(value, "Comment retry after"))
+        .transpose()?;
+    let retry_not_before_unix_ms = row.get::<_, Option<i64>>(26)?;
+    Ok(StoredCommentDraft {
+        draft_id: row.get(0)?,
+        draft_revision: from_i64(row.get(1)?, "Comment draft revision")?,
+        post_id: row.get(2)?,
+        content_id: row.get(3)?,
+        generation: from_i64(row.get(4)?, "content generation")?,
+        reply_to_comment_id: row.get(5)?,
+        text: row.get(6)?,
+        mention_intent_json: row.get(7)?,
+        mention_commitment_salt,
+        intent_sha256: fixed_32(row.get(9)?, "Comment intent hash")?,
+        prepare_command_id: row.get(10)?,
+        submit_command_id: row.get(11)?,
+        plan_bytes: row.get(12)?,
+        request_bytes: row.get(13)?,
+        request_sha256,
+        root_key,
+        publication_state,
+        lease_generation: from_i64(row.get(17)?, "lease generation")?,
+        session_generation: from_i64(row.get(18)?, "session generation")?,
+        attempt_count: u32::try_from(row.get::<_, i64>(19)?)
+            .map_err(|_| conversion_error("Comment attempt count is invalid"))?,
+        next_attempt_at_unix_ms: row.get(20)?,
+        updated_at_unix_ms: row.get(21)?,
+        comment_id: row.get(22)?,
+        state: CommentState::try_from(row.get::<_, i64>(23)?).map_err(conversion_error)?,
+        error_code: row.get(24)?,
+        retry_after_seconds,
+        retry_not_before_unix_ms,
+    })
+}
+
+fn apply_operation_record_to_comment(draft: &mut StoredCommentDraft, record: &OperationRecord) {
+    draft.publication_state = Some(record.state);
+    draft.lease_generation = record.lease_generation;
+    draft.session_generation = record.session_generation;
+    draft.attempt_count = record.attempt_count;
+    draft.next_attempt_at_unix_ms = record.next_attempt_at_unix_ms;
+    draft.updated_at_unix_ms = record.updated_at_unix_ms;
+}
+
+fn object_transfer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectTransferRecord> {
+    let direction = row.get::<_, i32>(4)?.try_into().map_err(conversion_error)?;
+    let state = row.get::<_, i32>(5)?.try_into().map_err(conversion_error)?;
+    let last_error = row
+        .get::<_, Option<i32>>(18)?
+        .map(|value| value.try_into().map_err(conversion_error))
+        .transpose()?;
+    Ok(ObjectTransferRecord {
+        transfer_id: row.get(0)?,
+        owner_scope_id: row.get(1)?,
+        operation_id: row.get(2)?,
+        authority_id: row.get(3)?,
+        direction,
+        state,
+        upload_id: row.get(6)?,
+        generation: from_i64(row.get(7)?, "upload generation")?,
+        descriptor_sha256: row.get(8)?,
+        completed_chunk_bitmap: row.get(9)?,
+        source_local_ref: row.get(10)?,
+        partial_local_ref: row.get(11)?,
+        object_key: row.get(12)?,
+        base_nonce: row.get(13)?,
+        plaintext_size: from_i64(row.get(14)?, "plaintext size")?,
+        chunk_size: row.get(15)?,
+        attempt_count: row.get(16)?,
+        next_attempt_at_unix_ms: row.get(17)?,
+        last_error,
+        updated_at_unix_ms: row.get(19)?,
+    })
+}
+
+fn migrate(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS secure_content_runtime_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                session_generation INTEGER NOT NULL CHECK(session_generation >= 0),
+                operation_schema TEXT NOT NULL
+                    DEFAULT 'secure-content-operation-v1'
+             );
+             INSERT OR IGNORE INTO secure_content_runtime_state (
+                singleton, session_generation
+             ) VALUES (1, 0);
+             CREATE TABLE IF NOT EXISTS secure_content_prekey_commands (
+                command_id TEXT PRIMARY KEY,
+                key_kind INTEGER NOT NULL,
+                pool_epoch INTEGER NOT NULL CHECK(pool_epoch > 0),
+                request_bytes BLOB NOT NULL,
+                request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+                state INTEGER NOT NULL,
+                lease_generation INTEGER NOT NULL DEFAULT 0,
+                session_generation INTEGER NOT NULL DEFAULT 0,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_prekeys (
+                key_id TEXT PRIMARY KEY,
+                key_kind INTEGER NOT NULL,
+                pool_epoch INTEGER NOT NULL CHECK(pool_epoch > 0),
+                private_key BLOB CHECK(private_key IS NULL OR length(private_key) = 32),
+                public_key BLOB NOT NULL CHECK(length(public_key) = 32),
+                command_id TEXT NOT NULL REFERENCES secure_content_prekey_commands(command_id),
+                state INTEGER NOT NULL,
+                root_content_id TEXT,
+                root_generation INTEGER,
+                created_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_secure_content_prekeys_state
+               ON secure_content_prekeys(key_kind, pool_epoch, state);
+             CREATE TABLE IF NOT EXISTS secure_content_recovery_masters (
+                actor_ptid TEXT NOT NULL,
+                recovery_epoch INTEGER NOT NULL CHECK(recovery_epoch > 0),
+                master_key BLOB NOT NULL CHECK(length(master_key) = 32),
+                created_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(actor_ptid, recovery_epoch)
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_roots (
+                content_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                post_id TEXT NOT NULL,
+                root_key BLOB NOT NULL CHECK(length(root_key) = 32),
+                committed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(content_id, generation)
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_moment_commands (
+                draft_id TEXT NOT NULL,
+                draft_revision INTEGER NOT NULL,
+                content_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                submit_command_id TEXT NOT NULL UNIQUE,
+                plan_bytes BLOB NOT NULL,
+                request_bytes BLOB NOT NULL,
+                request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+                root_key BLOB NOT NULL CHECK(length(root_key) = 32),
+                state INTEGER NOT NULL,
+                lease_generation INTEGER NOT NULL DEFAULT 0,
+                session_generation INTEGER NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+                post_id TEXT,
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(draft_id, draft_revision)
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_moment_drafts (
+                draft_id TEXT NOT NULL,
+                draft_revision INTEGER NOT NULL,
+                intent_sha256 BLOB NOT NULL CHECK(length(intent_sha256) = 32),
+                content_id TEXT NOT NULL,
+                prepare_command_id TEXT NOT NULL,
+                mention_commitment_salt BLOB CHECK(
+                    mention_commitment_salt IS NULL
+                    OR length(mention_commitment_salt) = 32
+                ),
+                repost_commitment_salt BLOB CHECK(
+                    repost_commitment_salt IS NULL
+                    OR length(repost_commitment_salt) = 32
+                ),
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(draft_id, draft_revision)
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_moment_projections (
+                post_id TEXT PRIMARY KEY,
+                content_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                projection_bytes BLOB NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_reaction_commands (
+                command_id TEXT PRIMARY KEY,
+                post_id TEXT NOT NULL,
+                comment_id TEXT NOT NULL DEFAULT '',
+                kind INTEGER NOT NULL,
+                operation INTEGER NOT NULL CHECK(operation IN (3, 4, 5)),
+                request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+                request_bytes BLOB NOT NULL,
+                result_sha256 BLOB CHECK(result_sha256 IS NULL OR length(result_sha256) = 32),
+                result_bytes BLOB,
+                state INTEGER NOT NULL,
+                session_generation INTEGER NOT NULL,
+                lease_generation INTEGER NOT NULL DEFAULT 0,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                projection_revision INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                retry_after_seconds INTEGER,
+                retry_not_before_unix_ms INTEGER,
+                updated_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_secure_content_reaction_commands_post
+               ON secure_content_reaction_commands(post_id, updated_at_unix_ms DESC);
+             CREATE TABLE IF NOT EXISTS secure_content_comment_drafts (
+                draft_id TEXT NOT NULL,
+                draft_revision INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                content_id TEXT NOT NULL,
+                reply_to_comment_id TEXT NOT NULL,
+                plaintext_text TEXT NOT NULL,
+                mention_intent_json TEXT NOT NULL DEFAULT '[]',
+                mention_commitment_salt BLOB CHECK(
+                    mention_commitment_salt IS NULL
+                    OR length(mention_commitment_salt) = 32
+                ),
+                intent_sha256 BLOB NOT NULL CHECK(length(intent_sha256) = 32),
+                prepare_command_id TEXT NOT NULL,
+                submit_command_id TEXT UNIQUE,
+                plan_bytes BLOB,
+                request_bytes BLOB,
+                request_sha256 BLOB CHECK(request_sha256 IS NULL OR length(request_sha256) = 32),
+                root_key BLOB CHECK(root_key IS NULL OR length(root_key) = 32),
+                publication_state INTEGER,
+                generation INTEGER NOT NULL DEFAULT 0,
+                lease_generation INTEGER NOT NULL DEFAULT 0,
+                session_generation INTEGER NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+                comment_id TEXT,
+                state INTEGER NOT NULL,
+                error_code TEXT,
+                retry_after_seconds INTEGER,
+                retry_not_before_unix_ms INTEGER,
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(draft_id, draft_revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_secure_content_comment_drafts_post
+               ON secure_content_comment_drafts(post_id, updated_at_unix_ms DESC);
+             CREATE TABLE IF NOT EXISTS secure_content_comment_projections (
+                post_id TEXT NOT NULL,
+                comment_id TEXT NOT NULL,
+                content_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                projection_bytes BLOB NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(post_id, comment_id)
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_pending_purges (
+                post_id TEXT PRIMARY KEY,
+                updated_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS secure_content_object_transfers (
+                transfer_id TEXT PRIMARY KEY,
+                owner_scope_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                authority_id TEXT NOT NULL,
+                direction INTEGER NOT NULL,
+                state INTEGER NOT NULL,
+                upload_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                descriptor_sha256 BLOB NOT NULL CHECK(length(descriptor_sha256) = 32),
+                completed_chunk_bitmap BLOB NOT NULL,
+                source_local_ref TEXT NOT NULL,
+                partial_local_ref TEXT NOT NULL,
+                object_key BLOB NOT NULL CHECK(length(object_key) = 32),
+                base_nonce BLOB NOT NULL CHECK(length(base_nonce) = 12),
+                plaintext_size INTEGER NOT NULL CHECK(plaintext_size > 0),
+                chunk_size INTEGER NOT NULL CHECK(chunk_size > 0),
+                media_type TEXT,
+                attempt_count INTEGER NOT NULL,
+                next_attempt_at_unix_ms INTEGER NOT NULL,
+                last_error INTEGER,
+                descriptor_bytes BLOB,
+                updated_at_unix_ms INTEGER NOT NULL,
+                session_generation INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+    let has_session_generation = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_object_transfers)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns.iter().any(|column| column == "session_generation")
+    };
+    if !has_session_generation {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_object_transfers
+                 ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let has_repost_commitment_salt = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_moment_drafts)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns
+            .iter()
+            .any(|column| column == "repost_commitment_salt")
+    };
+    if !has_repost_commitment_salt {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_moment_drafts
+                 ADD COLUMN repost_commitment_salt BLOB
+                 CHECK(
+                    repost_commitment_salt IS NULL
+                    OR length(repost_commitment_salt) = 32
+                 )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let has_mention_commitment_salt = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_moment_drafts)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns
+            .iter()
+            .any(|column| column == "mention_commitment_salt")
+    };
+    if !has_mention_commitment_salt {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_moment_drafts
+                 ADD COLUMN mention_commitment_salt BLOB
+                 CHECK(
+                    mention_commitment_salt IS NULL
+                    OR length(mention_commitment_salt) = 32
+                 )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let has_comment_retry_deadline = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_comment_drafts)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns
+            .iter()
+            .any(|column| column == "retry_not_before_unix_ms")
+    };
+    if !has_comment_retry_deadline {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_comment_drafts
+                 ADD COLUMN retry_not_before_unix_ms INTEGER",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let comment_draft_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_comment_drafts)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns
+    };
+    if !comment_draft_columns
+        .iter()
+        .any(|column| column == "mention_intent_json")
+    {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_comment_drafts
+                 ADD COLUMN mention_intent_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if !comment_draft_columns
+        .iter()
+        .any(|column| column == "mention_commitment_salt")
+    {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_comment_drafts
+                 ADD COLUMN mention_commitment_salt BLOB
+                 CHECK(
+                    mention_commitment_salt IS NULL
+                    OR length(mention_commitment_salt) = 32
+                 )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    migrate_operation_schema(connection)?;
+    super::search::migrate(connection)?;
+    Ok(())
+}
+
+fn migrate_operation_schema(connection: &Connection) -> Result<(), String> {
+    let runtime_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_runtime_state)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns
+    };
+    if !runtime_columns
+        .iter()
+        .any(|column| column == "operation_schema")
+    {
+        connection
+            .execute(
+                "ALTER TABLE secure_content_runtime_state
+                 ADD COLUMN operation_schema TEXT NOT NULL
+                 DEFAULT 'desktop-secure-content-legacy'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let prekey_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(secure_content_prekey_commands)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        columns
+    };
+    for (column, declaration) in [
+        ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at_unix_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !prekey_columns.iter().any(|candidate| candidate == column) {
+            connection
+                .execute(
+                    &format!(
+                        "ALTER TABLE secure_content_prekey_commands
+                         ADD COLUMN {column} {declaration}"
+                    ),
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for (table, columns) in [
+        (
+            "secure_content_moment_commands",
+            [
+                ("lease_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("next_attempt_at_unix_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        ),
+        (
+            "secure_content_comment_drafts",
+            [
+                ("lease_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("next_attempt_at_unix_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        ),
+        (
+            "secure_content_reaction_commands",
+            [
+                ("comment_id", "TEXT NOT NULL DEFAULT ''"),
+                ("retry_after_seconds", "INTEGER"),
+                ("retry_not_before_unix_ms", "INTEGER"),
+            ],
+        ),
+    ] {
+        let existing = {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .map_err(|error| error.to_string())?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            columns
+        };
+        for (column, declaration) in columns {
+            if !existing.iter().any(|candidate| candidate == column) {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    migrate_reaction_operation(connection)?;
+    connection
+        .execute(
+            "UPDATE secure_content_moment_commands
+             SET lease_generation = 1, attempt_count = MAX(attempt_count, 1)
+             WHERE state IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               AND lease_generation = 0",
+            params![
+                OperationState::InFlight as i64,
+                OperationState::UnknownOutcome as i64,
+                OperationState::CommittedPendingReadback as i64,
+                OperationState::Committed as i64,
+                OperationState::RetryWait as i64,
+                OperationState::Terminal as i64,
+                OperationState::Cancelled as i64,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE secure_content_comment_drafts
+             SET lease_generation = 1, attempt_count = MAX(attempt_count, 1)
+             WHERE publication_state IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               AND lease_generation = 0",
+            params![
+                OperationState::InFlight as i64,
+                OperationState::UnknownOutcome as i64,
+                OperationState::CommittedPendingReadback as i64,
+                OperationState::Committed as i64,
+                OperationState::RetryWait as i64,
+                OperationState::Terminal as i64,
+                OperationState::Cancelled as i64,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let schema = connection
+        .query_row(
+            "SELECT operation_schema
+             FROM secure_content_runtime_state
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if schema == "secure-content-operation-v1" {
+        return Ok(());
+    }
+    if schema != "desktop-secure-content-legacy" {
+        return Err("secure content operation schema is unsupported".to_string());
+    }
+
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for (table, column) in [
+        ("secure_content_prekey_commands", "state"),
+        ("secure_content_moment_commands", "state"),
+        ("secure_content_comment_drafts", "publication_state"),
+    ] {
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE {table}
+                     SET {column} = CASE {column}
+                       WHEN 1 THEN 2
+                       WHEN 2 THEN 3
+                       WHEN 3 THEN 4
+                       WHEN 4 THEN 6
+                       WHEN 5 THEN 8
+                       WHEN 6 THEN 5
+                       ELSE {column}
+                     END
+                     WHERE {column} IS NOT NULL"
+                ),
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for (table, column) in [
+        ("secure_content_moment_commands", "state"),
+        ("secure_content_comment_drafts", "publication_state"),
+    ] {
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE {table}
+                     SET lease_generation = 1, attempt_count = MAX(attempt_count, 1)
+                     WHERE {column} IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                       AND lease_generation = 0"
+                ),
+                params![
+                    OperationState::InFlight as i64,
+                    OperationState::UnknownOutcome as i64,
+                    OperationState::CommittedPendingReadback as i64,
+                    OperationState::Committed as i64,
+                    OperationState::RetryWait as i64,
+                    OperationState::Terminal as i64,
+                    OperationState::Cancelled as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE secure_content_runtime_state
+             SET operation_schema = 'secure-content-operation-v1'
+             WHERE singleton = 1
+               AND operation_schema = 'desktop-secure-content-legacy'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+fn retry_deadline(
+    now_unix_ms: i64,
+    retry_after_seconds: Option<u64>,
+) -> Result<Option<i64>, String> {
+    retry_after_seconds
+        .map(|seconds| {
+            let millis = seconds
+                .checked_mul(1_000)
+                .ok_or_else(|| "secure content Comment retry deadline overflowed".to_string())?;
+            now_unix_ms
+                .checked_add(to_i64(millis, "Comment retry delay")?)
+                .ok_or_else(|| "secure content Comment retry deadline overflowed".to_string())
+        })
+        .transpose()
+}
+
+fn to_i64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("secure content {field} exceeds storage range"))
+}
+
+fn from_i64(value: i64, field: &str) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| conversion_error(format!("{field} is negative")))
+}
+
+fn operation_state_from_i64(value: i64) -> Result<OperationState, String> {
+    i32::try_from(value)
+        .map_err(|_| "secure content operation state exceeds i32".to_string())?
+        .try_into()
+        .map_err(|error: secure_content_core::operation::OperationFailure| error.to_string())
+}
+
+fn fixed_32(value: Vec<u8>, field: &str) -> rusqlite::Result<[u8; 32]> {
+    value
+        .try_into()
+        .map_err(|_| conversion_error(format!("{field} is not 32 bytes")))
+}
+
+fn conversion_error(error: impl ToString) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Blob,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    )
+}
+
+fn transfer_error(error: impl Into<String>) -> ObjectTransferFailure {
+    ObjectTransferFailure::retryable(ObjectTransferErrorCode::RetryLater, None, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_generation_remains_monotonic_after_store_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "secure-content-session-generation-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let first = SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(first.claim_session_generation().unwrap(), 1);
+        assert_eq!(first.claim_session_generation().unwrap(), 2);
+        drop(first);
+
+        let reopened =
+            SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(reopened.claim_session_generation().unwrap(), 3);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn publication() -> StoredPublication {
+        let request_bytes = b"canonical-publication".to_vec();
+        StoredPublication {
+            command_id: "cpk-pub-v1-test".to_string(),
+            key_kind: 1,
+            pool_epoch: 7,
+            request_sha256: Sha256::digest(&request_bytes).into(),
+            request_bytes,
+            state: OperationState::Pending,
+            lease_generation: 0,
+            session_generation: 0,
+            attempt_count: 0,
+            next_attempt_at_unix_ms: 0,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn download_transfer() -> ObjectTransferRecord {
+        ObjectTransferRecord {
+            transfer_id: "social-download-1".to_string(),
+            owner_scope_id: "content-1".to_string(),
+            operation_id: "object-1".to_string(),
+            authority_id: "post-1".to_string(),
+            direction: secure_content_core::object::ObjectTransferDirection::Download,
+            state: ObjectTransferState::Queued,
+            upload_id: String::new(),
+            generation: 1,
+            descriptor_sha256: vec![3; 32],
+            completed_chunk_bitmap: vec![0],
+            source_local_ref: "/tmp/secure-content-object-1.jpg".to_string(),
+            partial_local_ref: "/tmp/secure-content-object-1.partial".to_string(),
+            object_key: vec![4; 32],
+            base_nonce: vec![0; 12],
+            plaintext_size: 128,
+            chunk_size: 128,
+            attempt_count: 0,
+            next_attempt_at_unix_ms: 1,
+            last_error: None,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn upload_transfer() -> ObjectTransferRecord {
+        let mut record = download_transfer();
+        record.transfer_id = "social-upload-1".to_string();
+        record.direction = secure_content_core::object::ObjectTransferDirection::Upload;
+        record.generation = 0;
+        record.source_local_ref = "/tmp/secure-content-source.jpg".to_string();
+        record
+    }
+
+    fn moment_draft(content_id: &str, intent_byte: u8) -> StoredMomentDraft {
+        StoredMomentDraft {
+            draft_id: "draft-1".to_string(),
+            draft_revision: 7,
+            intent_sha256: [intent_byte; 32],
+            content_id: content_id.to_string(),
+            prepare_command_id: "moment-prepare-1".to_string(),
+            mention_commitment_salt: None,
+            repost_commitment_salt: None,
+        }
+    }
+
+    fn moment_command(state: OperationState) -> StoredMomentCommand {
+        let dispatched = !matches!(state, OperationState::Prepared | OperationState::Pending);
+        StoredMomentCommand {
+            draft_id: "draft-1".to_string(),
+            draft_revision: 1,
+            content_id: "content-1".to_string(),
+            generation: 1,
+            submit_command_id: "submit-1".to_string(),
+            plan_bytes: vec![1],
+            request_bytes: vec![2],
+            request_sha256: Sha256::digest([2]).into(),
+            root_key: [4; 32],
+            state,
+            lease_generation: if dispatched { 1 } else { 0 },
+            session_generation: 1,
+            attempt_count: if dispatched { 1 } else { 0 },
+            next_attempt_at_unix_ms: 0,
+            updated_at_unix_ms: 1,
+            post_id: None,
+        }
+    }
+
+    fn comment_draft() -> StoredCommentDraft {
+        StoredCommentDraft {
+            draft_id: "comment-draft-1".to_string(),
+            draft_revision: 1,
+            post_id: "post-1".to_string(),
+            content_id: "comment-content-1".to_string(),
+            generation: 0,
+            reply_to_comment_id: String::new(),
+            text: "retained private Comment".to_string(),
+            mention_intent_json: "[]".to_string(),
+            mention_commitment_salt: None,
+            intent_sha256: [3; 32],
+            prepare_command_id: "comment-prepare-1".to_string(),
+            submit_command_id: None,
+            plan_bytes: None,
+            request_bytes: None,
+            request_sha256: None,
+            root_key: None,
+            publication_state: None,
+            lease_generation: 0,
+            session_generation: 7,
+            attempt_count: 0,
+            next_attempt_at_unix_ms: 0,
+            updated_at_unix_ms: 1,
+            comment_id: None,
+            state: CommentState::Editing,
+            error_code: None,
+            retry_after_seconds: None,
+            retry_not_before_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn secure_content_store_recovers_unknown_publication_and_fences_completion() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let command = publication();
+        store
+            .persist_prekey_publication(&command, &[("key-1".to_string(), Some([7; 32]), [8; 32])])
+            .unwrap();
+        let leased = store.acquire_publication(&command.command_id, 11).unwrap();
+        assert!(!leased.lease.reconciles_unknown_outcome);
+        assert_eq!(leased.command.state, OperationState::InFlight);
+        assert_eq!(leased.command.lease_generation, 1);
+
+        assert_eq!(store.recover_orphaned_leases().unwrap(), 1);
+        let replay = store.acquire_publication(&command.command_id, 12).unwrap();
+        assert!(replay.lease.reconciles_unknown_outcome);
+        assert_eq!(replay.command.lease_generation, 2);
+        assert!(!store
+            .complete_publication(&leased, OperationCompletion::Committed)
+            .unwrap());
+        assert!(store
+            .complete_publication(&replay, OperationCompletion::Committed)
+            .unwrap());
+    }
+
+    #[test]
+    fn secure_content_teardown_checkpoints_only_the_retiring_session_generation() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let first = publication();
+        let mut second = publication();
+        second.command_id = "cpk-pub-v1-next-session".to_string();
+        second.request_bytes = b"next-session-publication".to_vec();
+        second.request_sha256 = Sha256::digest(&second.request_bytes).into();
+        store
+            .persist_prekey_publication(&first, &[("key-old".to_string(), Some([7; 32]), [8; 32])])
+            .unwrap();
+        store
+            .persist_prekey_publication(
+                &second,
+                &[("key-new".to_string(), Some([9; 32]), [10; 32])],
+            )
+            .unwrap();
+        store.acquire_publication(&first.command_id, 11).unwrap();
+        store.acquire_publication(&second.command_id, 12).unwrap();
+
+        assert_eq!(store.checkpoint_session_generation(11).unwrap(), 1);
+
+        let pending = store.publications_requiring_reconciliation().unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .find(|command| command.command_id == first.command_id)
+                .map(|command| command.state),
+            Some(OperationState::UnknownOutcome),
+        );
+        let connection = store.connection().unwrap();
+        let second_state = connection
+            .query_row(
+                "SELECT state FROM secure_content_prekey_commands WHERE command_id = ?1",
+                params![second.command_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            operation_state_from_i64(second_state).unwrap(),
+            OperationState::InFlight,
+        );
+        assert!(store.endpoint_prekey("key-old").unwrap().is_some());
+        assert!(store.endpoint_prekey("key-new").unwrap().is_some());
+    }
+
+    #[test]
+    fn secure_content_store_root_commit_deletes_only_the_matching_prekey() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let command = publication();
+        store
+            .persist_prekey_publication(
+                &command,
+                &[
+                    ("key-1".to_string(), Some([7; 32]), [8; 32]),
+                    ("key-2".to_string(), Some([9; 32]), [10; 32]),
+                ],
+            )
+            .unwrap();
+        let leased = store.acquire_publication(&command.command_id, 1).unwrap();
+        store
+            .complete_publication(&leased, OperationCompletion::Committed)
+            .unwrap();
+        store
+            .commit_content_root("content-1", 1, "post-1", &[4; 32], Some("key-1"), b"{}")
+            .unwrap();
+
+        assert!(store.endpoint_prekey("key-1").unwrap().is_none());
+        assert!(store.endpoint_prekey("key-2").unwrap().is_some());
+        assert_eq!(store.content_root("content-1", 1).unwrap(), Some([4; 32]));
+    }
+
+    #[test]
+    fn secure_content_store_recovery_masters_are_epoch_keyed() {
+        let store = SecureContentStore::in_memory().unwrap();
+        store
+            .store_recovery_master("ptid:alice", 3, &[3; 32])
+            .unwrap();
+        store
+            .store_recovery_master("ptid:alice", 4, &[4; 32])
+            .unwrap();
+        store
+            .store_recovery_master("ptid:alice", 4, &[4; 32])
+            .unwrap();
+        assert!(store
+            .store_recovery_master("ptid:alice", 4, &[5; 32])
+            .is_err());
+
+        assert_eq!(
+            store.recovery_master("ptid:alice", 3).unwrap(),
+            Some([3; 32])
+        );
+        assert_eq!(
+            store.recovery_master("ptid:alice", 4).unwrap(),
+            Some([4; 32])
+        );
+        assert_eq!(store.recovery_master("ptid:alice", 5).unwrap(), None);
+        assert_eq!(store.latest_recovery_epoch("ptid:alice").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn secure_content_download_journal_is_idempotent_and_conflict_closed() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let cache = std::env::temp_dir().join("secure-content-object-1.jpg");
+        let mut record = download_transfer();
+        record.source_local_ref = cache.display().to_string();
+
+        store
+            .ensure_object_download_transfer(&record, "image/jpeg", &cache)
+            .unwrap();
+        store
+            .ensure_object_download_transfer(&record, "image/jpeg", &cache)
+            .unwrap();
+
+        let persisted = store.object_transfer(&record.transfer_id).unwrap().unwrap();
+        assert_eq!(persisted, record);
+
+        let mut conflicting = record;
+        conflicting.object_key = vec![9; 32];
+        assert!(store
+            .ensure_object_download_transfer(&conflicting, "image/jpeg", &cache)
+            .is_err());
+    }
+
+    #[test]
+    fn secure_content_upload_journal_resumes_with_original_crypto_material() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let original = upload_transfer();
+        let mut retry = original.clone();
+        retry.object_key = vec![9; 32];
+        retry.base_nonce = [vec![8; 8], vec![0; 4]].concat();
+
+        let first = store
+            .ensure_object_upload_transfer(&original, "image/jpeg")
+            .unwrap();
+        let replay = store
+            .ensure_object_upload_transfer(&retry, "image/jpeg")
+            .unwrap();
+
+        assert_eq!(first, original);
+        assert_eq!(replay.object_key, original.object_key);
+        assert_eq!(replay.base_nonce, original.base_nonce);
+
+        retry.source_local_ref = "/tmp/other-source.jpg".to_string();
+        assert!(store
+            .ensure_object_upload_transfer(&retry, "image/jpeg")
+            .is_err());
+    }
+
+    #[test]
+    fn secure_content_pending_moment_and_abandoned_upload_are_recoverable() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let upload = upload_transfer();
+        store
+            .ensure_object_upload_transfer(&upload, "image/jpeg")
+            .unwrap();
+        assert_eq!(
+            store.abandoned_upload_transfer_ids().unwrap(),
+            vec![upload.transfer_id.clone()]
+        );
+        store
+            .reserve_moment_draft(&moment_draft("content-1", 1))
+            .unwrap();
+        assert!(store.abandoned_upload_transfer_ids().unwrap().is_empty());
+
+        let command = moment_command(OperationState::Pending);
+        store.persist_moment_command(&command).unwrap();
+        assert_eq!(
+            store.reconcilable_moment_commands().unwrap(),
+            vec![command.clone()]
+        );
+        assert!(store.abandoned_upload_transfer_ids().unwrap().is_empty());
+
+        let acquired = store
+            .acquire_moment_command(
+                &command.draft_id,
+                command.draft_revision,
+                2,
+                DispatchCause::InitialReconciliation,
+            )
+            .unwrap();
+        assert!(store
+            .acquire_moment_command(
+                &command.draft_id,
+                command.draft_revision,
+                2,
+                DispatchCause::InitialReconciliation,
+            )
+            .is_err());
+        assert!(store
+            .complete_moment_command(&acquired, OperationCompletion::Terminal, None)
+            .unwrap());
+        store.delete_moment_draft("content-1").unwrap();
+        assert_eq!(
+            store.abandoned_upload_transfer_ids().unwrap(),
+            vec![upload.transfer_id]
+        );
+    }
+
+    #[test]
+    fn secure_content_publish_atomically_removes_upload_secrets() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let upload = upload_transfer();
+        store
+            .ensure_object_upload_transfer(&upload, "image/jpeg")
+            .unwrap();
+        let command = moment_command(OperationState::Pending);
+        store.persist_moment_command(&command).unwrap();
+        let acquired = store
+            .acquire_moment_command(
+                &command.draft_id,
+                command.draft_revision,
+                1,
+                DispatchCause::InitialReconciliation,
+            )
+            .unwrap();
+
+        assert!(store
+            .complete_moment_command(
+                &acquired,
+                OperationCompletion::CommittedPendingReadback,
+                Some("post-1"),
+            )
+            .unwrap());
+        let committed = store
+            .moment_command(&command.draft_id, command.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .apply_moment_readback(
+                &committed,
+                &ReadbackDecision::CommitFromReadback {
+                    receipt_sha256: [9; 32],
+                },
+                Some("post-1"),
+            )
+            .unwrap());
+        assert!(store
+            .object_transfer(&upload.transfer_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn secure_content_transfer_callbacks_are_session_generation_fenced() {
+        let path = std::env::temp_dir().join(format!(
+            "secure-content-transfer-fence-{}.sqlite",
+            ulid::Ulid::new()
+        ));
+        let old = SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        old.bind_session_generation(1).unwrap();
+        let record = upload_transfer();
+        old.ensure_object_upload_transfer(&record, "image/jpeg")
+            .unwrap();
+
+        let current =
+            SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        current.bind_session_generation(2).unwrap();
+        assert!(old
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Transferring,
+                "old-upload",
+                1,
+                &[0],
+                0,
+                0,
+                None,
+                2,
+            )
+            .is_err());
+        current
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Transferring,
+                "current-upload",
+                1,
+                &[0],
+                0,
+                0,
+                None,
+                3,
+            )
+            .unwrap();
+        current
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Terminal,
+                "current-upload",
+                1,
+                &[0],
+                0,
+                0,
+                Some(ObjectTransferErrorCode::IntegrityFailed),
+                4,
+            )
+            .unwrap();
+        assert!(current
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Transferring,
+                "late-upload",
+                1,
+                &[1],
+                0,
+                0,
+                None,
+                5,
+            )
+            .is_err());
+        drop(current);
+        drop(old);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn completed_download_can_restart_after_plaintext_cache_eviction() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let record = download_transfer();
+        let cache = Path::new(&record.source_local_ref);
+        store
+            .ensure_object_download_transfer(&record, "image/jpeg", cache)
+            .unwrap();
+        store
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Complete,
+                &record.upload_id,
+                record.generation,
+                &[1],
+                0,
+                0,
+                None,
+                2,
+            )
+            .unwrap();
+
+        store
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Queued,
+                &record.upload_id,
+                record.generation,
+                &[0],
+                0,
+                3,
+                None,
+                3,
+            )
+            .unwrap();
+
+        let restarted = store.object_transfer(&record.transfer_id).unwrap().unwrap();
+        assert_eq!(restarted.state, ObjectTransferState::Queued);
+        assert_eq!(restarted.completed_chunk_bitmap, vec![0]);
+        assert_eq!(restarted.next_attempt_at_unix_ms, 3);
+    }
+
+    #[test]
+    fn completed_download_rebinds_cache_path_after_session_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "secure-content-download-cache-rebind-{}.sqlite",
+            ulid::Ulid::new()
+        ));
+        let store = SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(store.claim_session_generation().unwrap(), 1);
+
+        let mut record = download_transfer();
+        let old_cache = std::env::temp_dir().join(format!(
+            "secure-content-download-cache-old-{}.jpg",
+            ulid::Ulid::new()
+        ));
+        record.source_local_ref = old_cache.display().to_string();
+        store
+            .ensure_object_download_transfer(&record, "image/jpeg", &old_cache)
+            .unwrap();
+        store
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Complete,
+                &record.upload_id,
+                record.generation,
+                &[1],
+                0,
+                0,
+                None,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(store.claim_session_generation().unwrap(), 2);
+        let new_cache = std::env::temp_dir().join(format!(
+            "secure-content-download-cache-new-{}.jpg",
+            ulid::Ulid::new()
+        ));
+        let mut rebound = record.clone();
+        rebound.source_local_ref = new_cache.display().to_string();
+        store
+            .ensure_object_download_transfer(&rebound, "image/jpeg", &new_cache)
+            .unwrap();
+
+        let persisted = store.object_transfer(&record.transfer_id).unwrap().unwrap();
+        assert_eq!(persisted.state, ObjectTransferState::Complete);
+        assert_eq!(persisted.source_local_ref, rebound.source_local_ref);
+        assert_eq!(persisted.descriptor_sha256, record.descriptor_sha256);
+        assert_eq!(persisted.object_key, record.object_key);
+        assert_eq!(persisted.base_nonce, record.base_nonce);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_downloads_reject_cache_path_rebinding_after_session_restart() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let mut records = Vec::new();
+        for (suffix, state) in [
+            ("cancelled", ObjectTransferState::Cancelled),
+            ("terminal", ObjectTransferState::Terminal),
+        ] {
+            let mut record = download_transfer();
+            record.transfer_id = format!("social-download-{suffix}");
+            record.source_local_ref = format!("/tmp/secure-content-{suffix}-old.jpg");
+            store
+                .ensure_object_download_transfer(
+                    &record,
+                    "image/jpeg",
+                    Path::new(&record.source_local_ref),
+                )
+                .unwrap();
+            store
+                .update_transfer_progress(
+                    &record.transfer_id,
+                    state,
+                    &record.upload_id,
+                    record.generation,
+                    &[0],
+                    0,
+                    0,
+                    None,
+                    2,
+                )
+                .unwrap();
+            records.push(record);
+        }
+
+        store.claim_session_generation().unwrap();
+        for record in records {
+            let original_cache = record.source_local_ref.clone();
+            let mut rebound = record.clone();
+            rebound.source_local_ref = format!("{original_cache}.new");
+            assert!(store
+                .ensure_object_download_transfer(
+                    &rebound,
+                    "image/jpeg",
+                    Path::new(&rebound.source_local_ref),
+                )
+                .is_err());
+            assert_eq!(
+                store
+                    .object_transfer(&record.transfer_id)
+                    .unwrap()
+                    .unwrap()
+                    .source_local_ref,
+                original_cache
+            );
+        }
+    }
+
+    #[test]
+    fn secure_content_download_completion_cas_rejects_stale_session_generation() {
+        let path = std::env::temp_dir().join(format!(
+            "secure-content-download-completion-fence-{}.sqlite",
+            ulid::Ulid::new()
+        ));
+        let old = SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        old.bind_session_generation(1).unwrap();
+        let record = download_transfer();
+        old.ensure_object_download_transfer(
+            &record,
+            "image/jpeg",
+            Path::new(&record.source_local_ref),
+        )
+        .unwrap();
+
+        let current =
+            SecureContentStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+        current.bind_session_generation(2).unwrap();
+        let descriptor = ObjectDescriptor {
+            object_id: record.operation_id.clone(),
+            storage_ref: "opaque-storage-ref".to_string(),
+            commitment: secure_content_core::object::ObjectUploadSpec {
+                ciphertext_size: record.plaintext_size + 16,
+                ciphertext_sha256: vec![7; 32],
+                media_type: None,
+                chunk_size: record.chunk_size,
+                chunk_count: 1,
+                encryption_suite:
+                    secure_content_core::object::ObjectEncryptionSuite::Aes256GcmChunked,
+                tag_size: 16,
+                nonce_strategy: secure_content_core::object::ObjectNonceStrategy::Counter32Be,
+                chunk_ciphertext_sha256: vec![vec![8; 32]],
+            },
+        };
+
+        assert!(old
+            .complete_download(&record, &descriptor, &record.source_local_ref, 2)
+            .is_err());
+        assert_eq!(
+            current
+                .object_transfer(&record.transfer_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ObjectTransferState::Queued
+        );
+
+        drop(current);
+        drop(old);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn secure_content_download_journal_keeps_terminal_state_immutable() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let cache = std::env::temp_dir().join("secure-content-object-reset.jpg");
+        let mut record = download_transfer();
+        record.source_local_ref = cache.display().to_string();
+        let _ = std::fs::remove_file(&cache);
+        store
+            .ensure_object_download_transfer(&record, "image/jpeg", &cache)
+            .unwrap();
+        store
+            .update_transfer_progress(
+                &record.transfer_id,
+                ObjectTransferState::Terminal,
+                "",
+                record.generation,
+                &[1],
+                1,
+                0,
+                Some(ObjectTransferErrorCode::IntegrityFailed),
+                2,
+            )
+            .unwrap();
+
+        store
+            .ensure_object_download_transfer(&record, "image/jpeg", &cache)
+            .unwrap();
+        let terminal = store.object_transfer(&record.transfer_id).unwrap().unwrap();
+        assert_eq!(terminal.state, ObjectTransferState::Terminal);
+        assert_eq!(terminal.completed_chunk_bitmap, vec![1]);
+        assert_eq!(terminal.attempt_count, 1);
+        assert_eq!(
+            terminal.last_error,
+            Some(ObjectTransferErrorCode::IntegrityFailed)
+        );
+    }
+
+    #[test]
+    fn secure_content_private_resource_purge_removes_root_and_download_secrets() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let record = download_transfer();
+        let upload = upload_transfer();
+        store
+            .commit_content_root("content-1", 1, "post-1", &[4; 32], None, b"{}")
+            .unwrap();
+        store
+            .ensure_object_download_transfer(
+                &record,
+                "image/jpeg",
+                Path::new("/tmp/secure-content-object-1.jpg"),
+            )
+            .unwrap();
+        store
+            .ensure_object_upload_transfer(&upload, "image/jpeg")
+            .unwrap();
+        let command = moment_command(OperationState::UnknownOutcome);
+        store.persist_moment_command(&command).unwrap();
+
+        let downloads = store.object_transfers_for_resource("post-1").unwrap();
+        assert_eq!(downloads.len(), 2);
+        assert!(downloads.iter().any(|transfer| transfer.record == record));
+        assert!(downloads.iter().any(|transfer| transfer.record == upload));
+
+        store.mark_private_resource_purge_pending("post-1").unwrap();
+        assert_eq!(
+            store.pending_private_resource_purges().unwrap(),
+            vec!["post-1".to_string()]
+        );
+        assert_eq!(store.projection("post-1").unwrap(), None);
+        assert!(store.content_root("content-1", 1).unwrap().is_some());
+        assert!(store.moment_command("draft-1", 1).unwrap().is_some());
+
+        store.purge_private_resource_material("post-1").unwrap();
+
+        assert_eq!(store.content_root("content-1", 1).unwrap(), None);
+        assert!(store
+            .object_transfer(&record.transfer_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .object_transfer(&upload.transfer_id)
+            .unwrap()
+            .is_none());
+        assert!(store.moment_command("draft-1", 1).unwrap().is_none());
+        assert!(store.pending_private_resource_purges().unwrap().is_empty());
+    }
+
+    #[test]
+    fn secure_content_single_download_purge_does_not_remove_content_root() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let record = download_transfer();
+        store
+            .commit_content_root("content-1", 1, "post-1", &[4; 32], None, b"{}")
+            .unwrap();
+        store
+            .ensure_object_download_transfer(
+                &record,
+                "image/jpeg",
+                Path::new("/tmp/secure-content-object-1.jpg"),
+            )
+            .unwrap();
+
+        store.purge_object_download(&record.transfer_id).unwrap();
+
+        assert_eq!(store.content_root("content-1", 1).unwrap(), Some([4; 32]));
+        assert!(store
+            .object_transfer(&record.transfer_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn secure_content_moment_draft_reservation_reuses_content_identity() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let mut first_candidate = moment_draft("content-first", 3);
+        first_candidate.mention_commitment_salt = Some([7; 32]);
+        first_candidate.repost_commitment_salt = Some([9; 32]);
+        let first = store.reserve_moment_draft(&first_candidate).unwrap();
+        let mut replay_candidate = moment_draft("content-candidate-ignored", 3);
+        replay_candidate.mention_commitment_salt = Some([6; 32]);
+        replay_candidate.repost_commitment_salt = Some([8; 32]);
+        let replay = store.reserve_moment_draft(&replay_candidate).unwrap();
+
+        assert_eq!(first.content_id, "content-first");
+        assert_eq!(first.mention_commitment_salt, Some([7; 32]));
+        assert_eq!(first.repost_commitment_salt, Some([9; 32]));
+        assert_eq!(replay, first);
+        assert!(store
+            .reserve_moment_draft(&moment_draft("content-other", 4))
+            .is_err());
+    }
+
+    #[test]
+    fn secure_content_comment_retry_preserves_plaintext_and_submission_identity() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let mut candidate = comment_draft();
+        candidate.mention_intent_json =
+            r#"[{"actor_ptid":"ptid:bob","offset":9,"length":3,"display":"Bob"}]"#.to_string();
+        candidate.mention_commitment_salt = Some([6; 32]);
+        let draft = store.reserve_comment_draft(&candidate).unwrap();
+        let mut replay_candidate = candidate.clone();
+        replay_candidate.content_id = "ignored-new-content-id".to_string();
+        replay_candidate.mention_commitment_salt = Some([7; 32]);
+        assert_eq!(
+            store.reserve_comment_draft(&replay_candidate).unwrap(),
+            draft,
+        );
+        assert_eq!(draft.state, CommentState::Editing);
+        assert_eq!(draft.mention_commitment_salt, Some([6; 32]));
+        assert!(store
+            .set_comment_draft_state(
+                &draft.draft_id,
+                draft.draft_revision,
+                CommentState::Encrypting,
+                None,
+                None,
+            )
+            .unwrap());
+
+        let request = b"encrypted-comment-request";
+        let request_sha256: [u8; 32] = Sha256::digest(request).into();
+        store
+            .persist_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                4,
+                "comment-submit-1",
+                b"comment-plan",
+                request,
+                &request_sha256,
+                &[9; 32],
+                7,
+            )
+            .unwrap();
+        let acquired = store
+            .acquire_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                7,
+                DispatchCause::ExplicitUserAction,
+            )
+            .unwrap();
+        assert_eq!(acquired.draft.state, CommentState::Submitting);
+        assert_eq!(
+            acquired.draft.submit_command_id.as_deref(),
+            Some("comment-submit-1")
+        );
+
+        assert!(store
+            .complete_comment_submission(
+                &acquired,
+                OperationCompletion::RetryAt(now_unix_ms() + 17_000),
+                CommentState::RateLimited,
+                "COMMENT_RATE_LIMITED",
+                Some(17),
+                None,
+            )
+            .unwrap());
+        let retained = store
+            .comment_draft(&draft.draft_id, draft.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.text, "retained private Comment");
+        assert_eq!(retained.mention_intent_json, candidate.mention_intent_json);
+        assert_eq!(retained.mention_commitment_salt, Some([6; 32]));
+        assert_eq!(retained.state, CommentState::RateLimited);
+        assert_eq!(retained.retry_after_seconds, Some(17));
+        assert!(retained
+            .retry_not_before_unix_ms
+            .is_some_and(|deadline| deadline > now_unix_ms()));
+        assert_eq!(retained.request_sha256, Some(request_sha256));
+        assert_eq!(retained.publication_state, Some(OperationState::RetryWait));
+
+        assert!(store
+            .acquire_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                7,
+                DispatchCause::RetryDeadlineReached,
+            )
+            .is_err());
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE secure_content_comment_drafts
+                 SET publication_state = ?1,
+                     error_code = 'SOCIAL_PRIVATE_EXPIRED_PLAN',
+                     retry_not_before_unix_ms = ?2
+                 WHERE draft_id = ?3 AND draft_revision = ?4",
+                params![
+                    OperationState::Terminal as i64,
+                    now_unix_ms() - 1,
+                    draft.draft_id,
+                    to_i64(draft.draft_revision, "Comment draft revision").unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(store
+            .reset_comment_submission_for_reprepare(
+                &draft.draft_id,
+                draft.draft_revision,
+                7,
+                "comment-content-retry",
+                "comment-prepare-retry",
+            )
+            .unwrap());
+        let reset = store
+            .comment_draft(&draft.draft_id, draft.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.text, "retained private Comment");
+        assert_eq!(reset.mention_intent_json, candidate.mention_intent_json);
+        assert_eq!(reset.mention_commitment_salt, Some([6; 32]));
+        assert_eq!(reset.content_id, "comment-content-retry");
+        assert_eq!(reset.prepare_command_id, "comment-prepare-retry");
+        assert_eq!(reset.state, CommentState::Editing);
+        assert!(reset.plan_bytes.is_none());
+        assert!(reset.request_bytes.is_none());
+        assert!(reset.root_key.is_none());
+        let replacement = b"replacement-encrypted-comment-request";
+        let replacement_sha256: [u8; 32] = Sha256::digest(replacement).into();
+        store
+            .persist_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                5,
+                "comment-submit-2",
+                b"replacement-comment-plan",
+                replacement,
+                &replacement_sha256,
+                &[8; 32],
+                7,
+            )
+            .unwrap();
+        let retried = store
+            .acquire_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                7,
+                DispatchCause::ExplicitUserAction,
+            )
+            .unwrap();
+        assert_eq!(
+            retried.draft.submit_command_id.as_deref(),
+            Some("comment-submit-2")
+        );
+        let mut stale = retried.clone();
+        stale.draft.session_generation = 8;
+        assert!(store
+            .complete_comment_submission(
+                &stale,
+                OperationCompletion::CommittedPendingReadback,
+                CommentState::Failed,
+                "COMMENT_READBACK_PENDING",
+                None,
+                Some("comment-1"),
+            )
+            .is_err());
+        assert!(store
+            .complete_comment_submission(
+                &retried,
+                OperationCompletion::CommittedPendingReadback,
+                CommentState::Failed,
+                "COMMENT_READBACK_PENDING",
+                None,
+                Some("comment-1"),
+            )
+            .unwrap());
+        let committed = store
+            .comment_draft(&draft.draft_id, draft.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.publication_state,
+            Some(OperationState::CommittedPendingReadback)
+        );
+        assert!(committed.text.is_empty());
+        assert!(store
+            .acquire_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                7,
+                DispatchCause::ReadbackAuthorizedRetry,
+            )
+            .is_err());
+        assert!(store
+            .apply_comment_readback(
+                &committed,
+                &ReadbackDecision::KeepCommittedPendingReadback {
+                    retry_after_unix_ms: Some(now_unix_ms() + 2_000),
+                },
+                CommentState::Failed,
+                "COMMENT_READBACK_FAILED",
+                Some(2),
+                Some("comment-1"),
+            )
+            .unwrap());
+        let pending_readback = store
+            .comment_draft(&draft.draft_id, draft.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_readback.publication_state,
+            Some(OperationState::CommittedPendingReadback)
+        );
+        assert_eq!(
+            pending_readback.error_code.as_deref(),
+            Some("COMMENT_READBACK_FAILED")
+        );
+        assert!(store
+            .apply_comment_readback(
+                &pending_readback,
+                &ReadbackDecision::CommitFromReadback {
+                    receipt_sha256: [8; 32],
+                },
+                CommentState::Posted,
+                "",
+                None,
+                Some("comment-1"),
+            )
+            .unwrap());
+        let posted = store
+            .comment_draft(&draft.draft_id, draft.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(posted.state, CommentState::Posted);
+        assert!(posted.text.is_empty());
+        assert_eq!(posted.mention_intent_json, "[]");
+        assert!(posted.mention_commitment_salt.is_none());
+        assert_eq!(posted.comment_id.as_deref(), Some("comment-1"));
+    }
+
+    #[test]
+    fn secure_content_comment_reprepare_accepts_unsent_submitting_draft() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let draft = comment_draft();
+        store.reserve_comment_draft(&draft).unwrap();
+        let request = b"encrypted-comment-request";
+        let request_sha256: [u8; 32] = Sha256::digest(request).into();
+        store
+            .persist_comment_submission(
+                &draft.draft_id,
+                draft.draft_revision,
+                4,
+                "comment-submit-1",
+                b"expired-comment-plan",
+                request,
+                &request_sha256,
+                &[9; 32],
+                draft.session_generation,
+            )
+            .unwrap();
+
+        assert!(store
+            .reset_comment_submission_for_reprepare(
+                &draft.draft_id,
+                draft.draft_revision,
+                draft.session_generation,
+                "comment-content-retry",
+                "comment-prepare-retry",
+            )
+            .unwrap());
+        let reset = store
+            .comment_draft(&draft.draft_id, draft.draft_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.state, CommentState::Editing);
+        assert_eq!(reset.text, draft.text);
+        assert_eq!(reset.content_id, "comment-content-retry");
+        assert!(reset.request_bytes.is_none());
+        assert!(reset.root_key.is_none());
+    }
+
+    #[test]
+    fn secure_content_comment_root_and_projection_commit_atomically() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let projection = br#"{"comment_id":"comment-1","content_id":"comment-content-1","generation":"3","post_id":"post-1","reply_to_comment_id":"","author_ptid":"ptid:alice","state":"COMMENT_POSTED","text":"private","mentions":[],"reactions_count":0,"replies_count":0}"#;
+        store
+            .commit_comment_root(
+                "comment-content-1",
+                3,
+                "post-1",
+                "comment-1",
+                &[7; 32],
+                None,
+                projection,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.content_root("comment-content-1", 3).unwrap(),
+            Some([7; 32]),
+        );
+        let stored = crate::social::PrivateCommentProjection::decode_local(
+            &store
+                .comment_projection("post-1", "comment-1")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.text.as_deref(), Some("private"));
+        store.clear_comment_projections("post-1").unwrap();
+        assert_eq!(
+            store.comment_projection("post-1", "comment-1").unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn private_reaction_unknown_outcome_retries_the_exact_durable_command() {
+        let store = SecureContentStore::in_memory().unwrap();
+        store
+            .commit_content_root(
+                "post-1",
+                1,
+                "post-1",
+                &[7; 32],
+                None,
+                br#"{"post_id":"post-1","content_id":"post-1","generation":"1","author_ptid":"ptid:alice","audience_kind":"FRIENDS","state":"CONTENT_READY","mentions":[],"reaction_revision":"0","reactions":[]}"#,
+            )
+            .unwrap();
+        let request_bytes = b"signed-private-reaction".to_vec();
+        let command = StoredReactionCommand {
+            command_id: "reaction-v1-command".to_string(),
+            post_id: "post-1".to_string(),
+            comment_id: String::new(),
+            kind: 1,
+            operation: PrivateReactionOperation::React,
+            request_sha256: Sha256::digest(&request_bytes).into(),
+            request_bytes: request_bytes.clone(),
+            result_sha256: None,
+            result_bytes: None,
+            state: ReactionCommandState::Pending,
+            session_generation: 1,
+            lease_generation: 0,
+            attempt_count: 0,
+            projection_revision: 0,
+            error_code: None,
+            retry_after_seconds: None,
+            retry_not_before_unix_ms: None,
+        };
+        store.persist_reaction_command(&command).unwrap();
+        let first = store
+            .acquire_reaction_command(&command.command_id, 1)
+            .unwrap();
+        assert_eq!(first.request_bytes, request_bytes);
+        assert_eq!(first.attempt_count, 1);
+        assert!(store
+            .mark_reaction_failure(
+                &command.command_id,
+                first.lease_generation,
+                first.session_generation,
+                ReactionCommandState::UnknownCommit,
+                "REACTION_RESULT_UNKNOWN",
+                None,
+            )
+            .unwrap());
+
+        let retry = store
+            .acquire_reaction_command(&command.command_id, 2)
+            .unwrap();
+        assert_eq!(retry.request_bytes, request_bytes);
+        assert_eq!(retry.request_sha256, command.request_sha256);
+        assert_eq!(retry.attempt_count, 2);
+        assert!(!store
+            .mark_reaction_failure(
+                &command.command_id,
+                first.lease_generation,
+                first.session_generation,
+                ReactionCommandState::Rejected,
+                "REACTION_REJECTED",
+                None,
+            )
+            .unwrap());
+
+        let result_bytes = b"committed-private-reaction".to_vec();
+        let result_sha256: [u8; 32] = Sha256::digest(&result_bytes).into();
+        assert!(store
+            .mark_reaction_committed(&retry, &result_bytes, &result_sha256, 4, &[])
+            .unwrap());
+        let committed = store
+            .reaction_command(&command.command_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.state, ReactionCommandState::Committed);
+        assert_eq!(committed.result_bytes, Some(result_bytes));
+        assert_eq!(committed.result_sha256, Some(result_sha256));
+        assert_eq!(committed.projection_revision, 4);
+        let projection: serde_json::Value =
+            serde_json::from_slice(&store.projection("post-1").unwrap().unwrap()).unwrap();
+        assert_eq!(projection["reaction_revision"], "4");
+        assert_eq!(projection["reactions_hydrated"], true);
+
+        let next_request_bytes = b"signed-private-unreaction".to_vec();
+        let next_command = StoredReactionCommand {
+            command_id: "reaction-v1-next".to_string(),
+            post_id: "post-1".to_string(),
+            comment_id: String::new(),
+            kind: 1,
+            operation: PrivateReactionOperation::Unreact,
+            request_sha256: Sha256::digest(&next_request_bytes).into(),
+            request_bytes: next_request_bytes,
+            result_sha256: None,
+            result_bytes: None,
+            state: ReactionCommandState::Pending,
+            session_generation: 2,
+            lease_generation: 0,
+            attempt_count: 0,
+            projection_revision: 0,
+            error_code: None,
+            retry_after_seconds: None,
+            retry_not_before_unix_ms: None,
+        };
+        store.persist_reaction_command(&next_command).unwrap();
+
+        let commands = store.reaction_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command_id, next_command.command_id);
+
+        let oversized_retry = store
+            .acquire_reaction_command(&next_command.command_id, 2)
+            .unwrap();
+        assert!(store
+            .mark_reaction_failure(
+                &next_command.command_id,
+                oversized_retry.lease_generation,
+                oversized_retry.session_generation,
+                ReactionCommandState::Retrying,
+                "REACTION_RETRYABLE",
+                Some(u64::MAX),
+            )
+            .unwrap());
+        let retryable = store
+            .reaction_command(&next_command.command_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retryable.retry_after_seconds,
+            Some(MAX_REACTION_RETRY_AFTER_SECONDS),
+        );
+        assert!(retryable.retry_not_before_unix_ms.is_some());
+    }
+
+    #[test]
+    fn private_reaction_journal_separates_targets_and_rolls_back_corrupt_commands() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let make = |id: &str, comment: &str, kind| {
+            let request_bytes = id.as_bytes().to_vec();
+            StoredReactionCommand {
+                command_id: id.into(),
+                post_id: "post-1".into(),
+                comment_id: comment.into(),
+                kind,
+                operation: PrivateReactionOperation::React,
+                request_sha256: Sha256::digest(&request_bytes).into(),
+                request_bytes,
+                result_sha256: None,
+                result_bytes: None,
+                state: ReactionCommandState::Pending,
+                session_generation: 1,
+                lease_generation: 0,
+                attempt_count: 0,
+                projection_revision: 0,
+                error_code: None,
+                retry_after_seconds: None,
+                retry_not_before_unix_ms: None,
+            }
+        };
+        for command in [
+            make("post-like", "", 1),
+            make("post-love", "", 2),
+            make("root-like", "root", 1),
+            make("reply-like", "reply", 1),
+        ] {
+            store.persist_reaction_command(&command).unwrap();
+        }
+        assert_eq!(store.reaction_commands().unwrap().len(), 4);
+        assert!(store
+            .persist_reaction_command(&make("second-root", "root", 1))
+            .is_err());
+        let mut substitution = make("root-like", "other", 1);
+        substitution.request_bytes = b"root-like".to_vec();
+        substitution.request_sha256 = Sha256::digest(&substitution.request_bytes).into();
+        assert!(store.persist_reaction_command(&substitution).is_err());
+        store.connection().unwrap().execute(
+            "UPDATE secure_content_reaction_commands SET request_bytes = ?1 WHERE command_id = 'root-like'",
+            params![b"corrupt".as_slice()],
+        ).unwrap();
+        assert!(store.acquire_reaction_command("root-like", 1).is_err());
+        assert_eq!(
+            store.reaction_command("root-like").unwrap().unwrap().state,
+            ReactionCommandState::Pending
+        );
+        let acquired = store.acquire_reaction_command("reply-like", 1).unwrap();
+        assert_eq!(acquired.comment_id, "reply");
+        assert_eq!(acquired.request_bytes, b"reply-like");
+    }
+
+    #[test]
+    fn private_reaction_readback_cannot_overwrite_newer_comment_reactions() {
+        let store = SecureContentStore::in_memory().unwrap();
+        let initial = br#"{"comment_id":"comment","content_id":"content","generation":"1","post_id":"post","reply_to_comment_id":"","author_ptid":"ptid:alice","state":"COMMENT_POSTED","text":"private","mentions":[],"reactions_count":0,"replies_count":0,"reaction_revision":"0","reactions":[],"reactions_hydrated":true}"#;
+        let newer = crate::social::project_reaction_target(
+            "post",
+            "comment",
+            initial,
+            &[crate::social::PrivateReactionSummaryProjection {
+                kind: 1,
+                count: "2".into(),
+                reacted_by_viewer: true,
+            }],
+            4,
+        )
+        .unwrap();
+        store
+            .commit_comment_root("content", 1, "post", "comment", &[7; 32], None, &newer)
+            .unwrap();
+        let result = store
+            .commit_comment_root("content", 1, "post", "comment", &[7; 32], None, initial)
+            .unwrap();
+        let projection = crate::social::PrivateCommentProjection::decode_local(&result).unwrap();
+        assert_eq!(projection.reaction_revision, "4");
+        assert_eq!(projection.reactions_count, 2);
+        assert_eq!(
+            store
+                .comment_projection("post", "comment")
+                .unwrap()
+                .unwrap(),
+            result
+        );
+        assert!(store
+            .commit_comment_root(
+                "content",
+                1,
+                "other-post",
+                "comment",
+                &[7; 32],
+                None,
+                initial
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn private_reaction_target_migrates_existing_durable_post_commands() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE secure_content_reaction_commands (
+                command_id TEXT PRIMARY KEY, post_id TEXT NOT NULL, kind INTEGER NOT NULL,
+                remove_reaction INTEGER NOT NULL, request_sha256 BLOB NOT NULL,
+                request_bytes BLOB NOT NULL, result_sha256 BLOB, result_bytes BLOB,
+                state INTEGER NOT NULL, session_generation INTEGER NOT NULL,
+                lease_generation INTEGER NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 0,
+                projection_revision INTEGER NOT NULL DEFAULT 0, error_code TEXT,
+                retry_after_seconds INTEGER, retry_not_before_unix_ms INTEGER,
+                updated_at_unix_ms INTEGER NOT NULL
+            );"
+        ).unwrap();
+        let bytes = crate::model::social::ReactToPostRequest {
+            post_id: "post".into(),
+            comment_id: String::new(),
+            kind: 1,
+            command_id: "existing".into(),
+            actor_signing_key_id: "device-1".into(),
+            actor_device_signature: vec![7; 64],
+        }
+        .encode_to_vec();
+        connection
+            .execute(
+                "INSERT INTO secure_content_reaction_commands(
+                command_id, post_id, kind, remove_reaction, request_sha256, request_bytes,
+                state, session_generation, updated_at_unix_ms
+            ) VALUES('existing','post',1,0,?1,?2,1,1,1)",
+                params![Sha256::digest(&bytes).as_slice(), bytes.as_slice()],
+            )
+            .unwrap();
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        let command = connection
+            .query_row(
+                "SELECT command_id, post_id, kind, operation, request_sha256,
+             request_bytes, result_sha256, result_bytes, state, session_generation,
+             lease_generation, attempt_count, projection_revision, error_code,
+             retry_after_seconds, retry_not_before_unix_ms, comment_id
+             FROM secure_content_reaction_commands WHERE command_id = 'existing'",
+                [],
+                reaction_command_from_row,
+            )
+            .unwrap();
+        assert_eq!(command.comment_id, "");
+        assert_eq!(command.operation, PrivateReactionOperation::React);
+        assert_eq!(command.request_bytes, bytes);
+        assert_eq!(
+            command.request_sha256,
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(secure_content_reaction_commands)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "remove_reaction"));
+    }
+}

@@ -1,0 +1,899 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/catalog"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/errcode"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/infrastructure/persistence"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/model"
+	providercli "github.com/peers-labs/peers-touch/station/app/subserver/agent/service/cli"
+)
+
+type RuntimeAdmissionResolver struct {
+	providers     *ProviderConfigService
+	models        *ModelConfigService
+	runtimeModels *RuntimeModelCatalog
+	now           func() time.Time
+	externalReady func() bool
+	managedBin    func() string
+}
+
+func (r *RuntimeAdmissionResolver) SetManagedBin(resolve func() string) {
+	r.managedBin = resolve
+}
+
+func (r *RuntimeAdmissionResolver) SetRuntimeModelCatalog(
+	runtimeModels *RuntimeModelCatalog,
+) {
+	r.runtimeModels = runtimeModels
+}
+
+func NewRuntimeAdmissionResolver(
+	providers *ProviderConfigService,
+	models *ModelConfigService,
+) *RuntimeAdmissionResolver {
+	return &RuntimeAdmissionResolver{
+		providers: providers,
+		models:    models,
+		now:       func() time.Time { return time.Now().UTC() },
+	}
+}
+
+func (r *RuntimeAdmissionResolver) SetExternalRuntimeAvailability(
+	available func() bool,
+) {
+	r.externalReady = available
+}
+
+type AdmissionSnapshot struct {
+	SnapshotID            string
+	RuntimeKind           model.RuntimeKind
+	RuntimeProfileID      string
+	ProviderID            string
+	ModelID               string
+	ProviderConfigVersion string
+	Capabilities          *model.RuntimeCapabilitySnapshot
+	Budget                *model.RuntimeBudget
+}
+
+type ResolvedAvailableModel struct {
+	ID            string
+	ProviderID    string
+	ProviderName  string
+	DisplayName   string
+	Type          string
+	Enabled       bool
+	ContextWindow int32
+	Capabilities  map[string]bool
+}
+
+func (r *RuntimeAdmissionResolver) ListAvailableModels(
+	ctx context.Context,
+	actorPTID string,
+) ([]ResolvedAvailableModel, error) {
+	userProviders, err := r.providers.ListEffective(ctx, actorPTID)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []ResolvedAvailableModel
+	for i := range userProviders {
+		userMatch := &userProviders[i]
+		allowed, err := r.providers.CanUse(ctx, actorPTID, userMatch, "")
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			continue
+		}
+		definition, err := r.providers.effectiveProviderCatalog(ctx, userMatch, r.runtimeModels)
+		if err != nil {
+			return nil, err
+		}
+		if definition == nil {
+			requiresKey := userMatch.Protocol != "ollama"
+			definition = &catalog.CatalogProvider{ID: userMatch.Name, Name: userMatch.DisplayName,
+				RuntimeKind: userMatch.RuntimeKind, Protocol: userMatch.Protocol, ShowAPIKey: &requiresKey}
+			if definition.Name == "" {
+				definition.Name = userMatch.Name
+			}
+		}
+		cp := *definition
+		if !catalogProviderAdvertised(cp) || !r.CatalogProviderAvailable(cp) {
+			continue
+		}
+		credentialOwner := userMatch
+		if userMatch.BackendProviderID != "" {
+			credentialOwner, err = r.providers.CLIBackend(ctx, userMatch)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !admitProvider(cp, credentialOwner) {
+			continue
+		}
+		hidden := parseHiddenModels(func() string {
+			if userMatch != nil {
+				return userMatch.HiddenModels
+			}
+			return ""
+		}())
+		dbModels, err := r.models.ListOwned(ctx, providerOwner(userMatch), cp.ID)
+		if err != nil {
+			return nil, errcode.New(
+				errcode.AgentInternal,
+				http.StatusInternalServerError,
+				fmt.Sprintf("failed to load model capability source for provider %q", cp.ID),
+				err,
+			)
+		}
+		if userMatch.BackendProviderID != "" {
+			dbModels = nil
+		}
+		effectiveModels, err := ResolveEffectiveProviderModels(&cp, dbModels, hidden)
+		if err != nil {
+			return nil, errcode.New(
+				errcode.AgentInvalidSourceState,
+				http.StatusConflict,
+				fmt.Sprintf("provider %q model metadata is invalid", cp.ID),
+				err,
+			)
+		}
+		for _, effectiveModel := range effectiveModels {
+			if !effectiveModel.Enabled ||
+				effectiveModel.Type != "chat" ||
+				effectiveModel.ContextWindow <= 1 {
+				continue
+			}
+			allowed, err := r.providers.CanUse(ctx, actorPTID, userMatch, effectiveModel.ID)
+			if err != nil {
+				return nil, err
+			}
+			if !allowed {
+				continue
+			}
+			result = append(result, ResolvedAvailableModel{
+				ID:            effectiveModel.ID,
+				ProviderID:    cp.ID,
+				ProviderName:  cp.Name,
+				DisplayName:   effectiveModel.DisplayName,
+				Type:          effectiveModel.Type,
+				Enabled:       effectiveModel.Enabled,
+				ContextWindow: int32(effectiveModel.ContextWindow),
+				Capabilities:  effectiveModel.Capabilities,
+			})
+		}
+	}
+
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].ProviderID != result[j].ProviderID {
+			return result[i].ProviderID < result[j].ProviderID
+		}
+		return result[i].ID < result[j].ID
+	})
+
+	return result, nil
+}
+
+func (r *RuntimeAdmissionResolver) Resolve(
+	ctx context.Context,
+	actorPTID string,
+	providerID string,
+	modelID string,
+) (*AdmissionSnapshot, error) {
+	if strings.TrimSpace(providerID) == "" {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest,
+			"provider_id is required", nil)
+	}
+	if strings.TrimSpace(modelID) == "" {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest,
+			"model_id is required", nil)
+	}
+
+	userMatch, err := r.providers.ResolveForActor(ctx, actorPTID, providerID, modelID)
+	if err != nil {
+		return nil, err
+	}
+
+	cp, err := r.providers.effectiveProviderCatalog(ctx, userMatch, r.runtimeModels)
+	if err != nil {
+		return nil, err
+	}
+	if userMatch.RuntimeKind == providerRuntimeCLI {
+		if cp == nil {
+			return nil, errcode.NewRuntimeUnavailable("direct_model", "cli_adapter_not_registered")
+		}
+		if _, err := readProviderRuntimeConfig(cp, userMatch); err != nil {
+			return nil, err
+		}
+	}
+	if cp == nil && userMatch == nil {
+		return nil, errcode.New(errcode.AgentProviderDisabled, http.StatusBadRequest,
+			fmt.Sprintf("provider %q not found", providerID), nil)
+	}
+
+	if cp != nil && !catalogProviderAdvertised(*cp) {
+		return nil, errcode.NewRuntimeUnavailable(
+			runtimeKindForUnavailableProvider(cp.RuntimeKind),
+			"runtime_not_advertised",
+		)
+	}
+	if cp != nil && !r.CatalogProviderAvailable(*cp) {
+		reason := "adapter_unavailable"
+		if cp.RuntimeKind == providerRuntimeCLI {
+			reason = "cli_binary_missing"
+		}
+		return nil, errcode.NewRuntimeUnavailable(
+			runtimeKindForUnavailableProvider(cp.RuntimeKind),
+			reason,
+		)
+	}
+	if userMatch != nil && !r.ProviderRuntimeAvailable(userMatch.RuntimeKind, userMatch.Protocol) {
+		return nil, errcode.NewRuntimeUnavailable(
+			runtimeKindForUnavailableProvider(userMatch.RuntimeKind),
+			"runtime_not_advertised",
+		)
+	}
+
+	if userMatch != nil && !userMatch.Enabled {
+		return nil, errcode.NewRuntimeUnavailable(
+			runtimeKindForUnavailableProvider(userMatch.RuntimeKind),
+			"provider_disabled",
+		)
+	}
+
+	credentialOwner := userMatch
+	if userMatch.BackendProviderID != "" {
+		credentialOwner, err = r.providers.CLIBackend(ctx, userMatch)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if cp != nil {
+		requiresAPIKey := cp.ShowAPIKey == nil || *cp.ShowAPIKey
+		if requiresAPIKey {
+			key, keyErr := providerCredentialAPIKey(credentialOwner)
+			if keyErr != nil || key == "" {
+				return nil, errcode.NewProviderCredentialMissing(providerID)
+			}
+		}
+	}
+
+	modelEnabled := false
+	var contextWindow int32
+	var modelType string
+	var catalogMatch *catalog.CatalogModel
+	var databaseMatch *persistence.AgentModel
+	dbModels, err := r.models.ListOwned(ctx, providerOwner(userMatch), providerID)
+	if err != nil {
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to load model capability source", err)
+	}
+	if userMatch.BackendProviderID != "" {
+		dbModels = nil
+	}
+	for i := range dbModels {
+		if dbModels[i].ModelID == modelID {
+			databaseMatch = &dbModels[i]
+			break
+		}
+	}
+	if containsStr(parseHiddenModels(userMatch.HiddenModels), modelID) || (databaseMatch != nil && !databaseMatch.Enabled) {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest,
+			fmt.Sprintf("model %q is disabled", modelID), nil)
+	}
+
+	if cp != nil {
+		hidden := parseHiddenModels(func() string {
+			if userMatch != nil {
+				return userMatch.HiddenModels
+			}
+			return ""
+		}())
+		for _, m := range cp.Models {
+			if m.ID == modelID {
+				if !m.Enabled || m.Type != "chat" || containsStr(hidden, modelID) {
+					return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest,
+						fmt.Sprintf("model %q is not available for agent execution", modelID), nil)
+				}
+				modelEnabled = true
+				contextWindow = int32(m.ContextWindow)
+				modelType = m.Type
+				catalogModel := m
+				catalogMatch = &catalogModel
+				break
+			}
+		}
+		if !modelEnabled && userMatch.BackendProviderID == "" {
+			if databaseMatch != nil {
+				modelEnabled = true
+				contextWindow = int32(databaseMatch.ContextWindow)
+				modelType = "chat"
+			}
+		}
+	} else if userMatch != nil {
+		if databaseMatch != nil {
+			modelEnabled = true
+			contextWindow = int32(databaseMatch.ContextWindow)
+			modelType = "chat"
+		}
+	}
+
+	if !modelEnabled {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest,
+			fmt.Sprintf("model %q is not available for provider %q", modelID, providerID), nil)
+	}
+	if databaseMatch != nil && databaseMatch.ContextWindow > 0 {
+		contextWindow = int32(databaseMatch.ContextWindow)
+	}
+
+	if modelType != "" && modelType != "chat" {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest,
+			fmt.Sprintf("model %q type %q is not supported for agent execution", modelID, modelType), nil)
+	}
+	if contextWindow <= 1 {
+		return nil, errcode.New(errcode.AgentInvalidSourceState, http.StatusConflict,
+			fmt.Sprintf("model %q has no valid context window", modelID), nil)
+	}
+
+	facts, err := resolveModelCapabilityFacts(catalogMatch, databaseMatch)
+	if err != nil {
+		return nil, errcode.New(errcode.AgentInvalidSourceState, http.StatusConflict,
+			fmt.Sprintf("model %q capability metadata is invalid", modelID), err)
+	}
+	budget := defaultRuntimeBudget(contextWindow)
+	sourceVersion, err := runtimeCapabilitySourceVersion(
+		cp,
+		catalogMatch,
+		userMatch,
+		databaseMatch,
+		facts,
+		contextWindow,
+		budget,
+	)
+	if err != nil {
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to hash runtime capability source", err)
+	}
+	if userMatch.BackendProviderID != "" {
+		hash, err := canonicalJSONHash(map[string]any{"profileSource": sourceVersion,
+			"backendID": credentialOwner.ID, "backendVersion": credentialOwner.Version})
+		if err != nil {
+			return nil, err
+		}
+		sourceVersion = "cap-src-" + hash
+	}
+	observedAt := time.Now().UTC()
+	if r.now != nil {
+		observedAt = r.now().UTC()
+	}
+	capabilities := buildCapabilitySnapshot(
+		providerID,
+		modelID,
+		contextWindow,
+		cp,
+		userMatch,
+		facts,
+		sourceVersion,
+		observedAt,
+	)
+
+	snapshotID, err := computeSnapshotID(
+		actorPTID,
+		providerID,
+		modelID,
+		capabilities,
+		budget,
+	)
+	if err != nil {
+		return nil, errcode.New(
+			errcode.AgentInternal,
+			http.StatusInternalServerError,
+			"failed to hash runtime capability snapshot",
+			err,
+		)
+	}
+	capabilities.SnapshotId = snapshotID
+	providerConfigVersion := "0"
+	if userMatch != nil {
+		providerConfigVersion = fmt.Sprintf("%d", userMatch.Version)
+	}
+
+	return &AdmissionSnapshot{
+		SnapshotID:            snapshotID,
+		RuntimeKind:           resolvedRuntimeKind(cp, userMatch),
+		RuntimeProfileID:      modernChatAgentProfileID,
+		ProviderID:            providerID,
+		ModelID:               modelID,
+		ProviderConfigVersion: providerConfigVersion,
+		Capabilities:          capabilities,
+		Budget:                budget,
+	}, nil
+}
+
+func runtimeKindForUnavailableProvider(providerRuntimeKind string) string {
+	switch strings.ToLower(strings.TrimSpace(providerRuntimeKind)) {
+	case "external", "external-agent", "external_agent":
+		return "external_agent"
+	default:
+		return "direct_model"
+	}
+}
+
+type runtimeCapabilityFacts map[string]bool
+
+const (
+	runtimeCapabilityDiscoverySource = "station-runtime-capability-authority"
+	runtimeAttachmentCountLimit      = 10
+	runtimeAttachmentBytesLimit      = 10 * 1024 * 1024
+)
+
+var runtimeCapabilityIDs = []string{
+	"text-input",
+	"image-input",
+	"file-input",
+	"audio-input",
+	"text-output",
+	"image-output",
+	"structured-output",
+	"streaming",
+	"reasoning",
+	"prompt-cache",
+	"external-resume",
+	"native-tools",
+	"parallel-tools",
+	"local-bridge",
+}
+
+func resolveModelCapabilityFacts(
+	catalogModel *catalog.CatalogModel,
+	databaseModel *persistence.AgentModel,
+) (runtimeCapabilityFacts, error) {
+	facts := runtimeCapabilityFacts{
+		"text-input":  true,
+		"text-output": true,
+	}
+	if catalogModel != nil {
+		for _, name := range catalogModel.Capabilities {
+			if capabilityID := normalizeRuntimeCapabilityID(name); capabilityID != "" {
+				facts[capabilityID] = true
+			}
+		}
+		if strings.TrimSpace(catalogModel.ThinkingControl) != "" {
+			facts["reasoning"] = true
+		}
+	}
+	if databaseModel == nil || len(databaseModel.CapabilitiesJSON) == 0 ||
+		string(databaseModel.CapabilitiesJSON) == "null" {
+		return facts, nil
+	}
+	overrides, err := parseModelCapabilityFlags(databaseModel.CapabilitiesJSON)
+	if err != nil {
+		return nil, err
+	}
+	for capabilityID, enabled := range overrides {
+		facts[capabilityID] = enabled
+	}
+	return facts, nil
+}
+
+func parseModelCapabilityFlags(raw json.RawMessage) (runtimeCapabilityFacts, error) {
+	result := make(runtimeCapabilityFacts)
+	var names []string
+	if err := json.Unmarshal(raw, &names); err == nil {
+		for _, name := range names {
+			if capabilityID := normalizeRuntimeCapabilityID(name); capabilityID != "" {
+				result[capabilityID] = true
+			}
+		}
+		return result, nil
+	}
+
+	var flags map[string]bool
+	if err := json.Unmarshal(raw, &flags); err != nil {
+		return nil, err
+	}
+	for name, enabled := range flags {
+		if capabilityID := normalizeRuntimeCapabilityID(name); capabilityID != "" {
+			result[capabilityID] = enabled
+		}
+	}
+	return result, nil
+}
+
+func normalizeRuntimeCapabilityID(name string) string {
+	normalized := strings.NewReplacer("_", "-", " ", "-").Replace(
+		strings.ToLower(strings.TrimSpace(name)),
+	)
+	switch normalized {
+	case "text", "chat", "text-input":
+		return "text-input"
+	case "image", "vision", "image-input":
+		return "image-input"
+	case "file", "pdf", "file-input":
+		return "file-input"
+	case "audio", "audio-input":
+		return "audio-input"
+	case "text-output":
+		return "text-output"
+	case "image-output":
+		return "image-output"
+	case "structured", "structured-output":
+		return "structured-output"
+	case "stream", "streaming":
+		return "streaming"
+	case "reasoning":
+		return "reasoning"
+	case "prompt-cache", "prompt-caching":
+		return "prompt-cache"
+	case "external-resume":
+		return "external-resume"
+	case "tools", "tool-use", "native-tools":
+		return "native-tools"
+	case "parallel-tools", "parallel-tool-use":
+		return "parallel-tools"
+	case "local-bridge":
+		return "local-bridge"
+	default:
+		return ""
+	}
+}
+
+func runtimeCapabilitySourceVersion(
+	catalogProvider *catalog.CatalogProvider,
+	catalogModel *catalog.CatalogModel,
+	databaseProvider *persistence.AgentProvider,
+	databaseModel *persistence.AgentModel,
+	facts runtimeCapabilityFacts,
+	contextWindow int32,
+	budget *model.RuntimeBudget,
+) (string, error) {
+	payload := map[string]interface{}{
+		"runtimeProfileId": modernChatAgentProfileID,
+		"facts":            facts,
+		"limits": map[string]interface{}{
+			"contextTokens":   contextWindow,
+			"outputTokens":    budget.GetMaxOutputTokens(),
+			"attachmentCount": runtimeAttachmentCountLimit,
+			"attachmentBytes": runtimeAttachmentBytesLimit,
+		},
+		"budget": budget,
+	}
+	if catalogProvider != nil {
+		payload["catalogProvider"] = map[string]interface{}{
+			"id":          catalogProvider.ID,
+			"protocol":    catalogProvider.Protocol,
+			"runtimeKind": catalogProvider.RuntimeKind,
+		}
+	}
+	if catalogModel != nil {
+		payload["catalogModel"] = map[string]interface{}{
+			"id":              catalogModel.ID,
+			"type":            catalogModel.Type,
+			"contextWindow":   catalogModel.ContextWindow,
+			"thinkingControl": catalogModel.ThinkingControl,
+		}
+	}
+	if databaseProvider != nil {
+		payload["providerVersion"] = databaseProvider.Version
+	}
+	if databaseModel != nil {
+		payload["databaseModel"] = map[string]interface{}{
+			"version":       databaseModel.Version,
+			"contextWindow": databaseModel.ContextWindow,
+		}
+	}
+	hash, err := canonicalJSONHash(payload)
+	if err != nil {
+		return "", err
+	}
+	return "cap-src-" + hash, nil
+}
+
+func buildCapabilitySnapshot(
+	providerID, modelID string,
+	contextWindow int32,
+	catalogProvider *catalog.CatalogProvider,
+	userMatch *persistence.AgentProvider,
+	facts runtimeCapabilityFacts,
+	sourceVersion string,
+	observedAt time.Time,
+) *model.RuntimeCapabilitySnapshot {
+	protocol := "openai-compatible"
+	runtimeKind := "http"
+	if catalogProvider != nil {
+		if strings.TrimSpace(catalogProvider.Protocol) != "" {
+			protocol = catalogProvider.Protocol
+		}
+		if strings.TrimSpace(catalogProvider.RuntimeKind) != "" {
+			runtimeKind = catalogProvider.RuntimeKind
+		}
+	}
+	if userMatch != nil {
+		if userMatch.Protocol != "" {
+			protocol = userMatch.Protocol
+		}
+		if userMatch.RuntimeKind != "" {
+			runtimeKind = userMatch.RuntimeKind
+		}
+	}
+
+	inputCaps := &model.RuntimeInputCapabilities{
+		Text:  facts["text-input"],
+		Image: facts["image-input"],
+		File:  facts["file-input"],
+		Audio: facts["audio-input"],
+	}
+	outputCaps := &model.RuntimeOutputCapabilities{
+		Text:       facts["text-output"],
+		Image:      facts["image-output"],
+		Structured: facts["structured-output"],
+	}
+	execCaps := &model.RuntimeExecutionCapabilities{
+		Streaming:      facts["streaming"],
+		Reasoning:      facts["reasoning"],
+		PromptCache:    facts["prompt-cache"],
+		ExternalResume: facts["external-resume"],
+	}
+	agenticCaps := &model.RuntimeAgenticCapabilities{
+		NativeTools:   facts["native-tools"],
+		ParallelTools: facts["parallel-tools"],
+		LocalBridge:   facts["local-bridge"],
+	}
+	budget := defaultRuntimeBudget(contextWindow)
+	limits := &model.RuntimeCapabilityLimits{
+		ContextTokens:   uint64(contextWindow),
+		OutputTokens:    budget.GetMaxOutputTokens(),
+		AttachmentCount: runtimeAttachmentCountLimit,
+		AttachmentBytes: runtimeAttachmentBytesLimit,
+	}
+
+	resolution := []*model.RuntimeCapability{
+		{CapabilityId: "provider", Resolution: model.RuntimeCapabilityResolution_RUNTIME_CAPABILITY_RESOLUTION_NATIVE, ReasonCode: providerID},
+		{CapabilityId: "model", Resolution: model.RuntimeCapabilityResolution_RUNTIME_CAPABILITY_RESOLUTION_NATIVE, ReasonCode: modelID},
+		{CapabilityId: "protocol", Resolution: model.RuntimeCapabilityResolution_RUNTIME_CAPABILITY_RESOLUTION_NATIVE, ReasonCode: protocol},
+		{CapabilityId: "runtime", Resolution: model.RuntimeCapabilityResolution_RUNTIME_CAPABILITY_RESOLUTION_NATIVE, ReasonCode: runtimeKind},
+	}
+	for _, capabilityID := range runtimeCapabilityIDs {
+		resolutionState := model.RuntimeCapabilityResolution_RUNTIME_CAPABILITY_RESOLUTION_REJECTED
+		reasonCode := "model_capability_not_declared"
+		if facts[capabilityID] {
+			resolutionState = model.RuntimeCapabilityResolution_RUNTIME_CAPABILITY_RESOLUTION_NATIVE
+			reasonCode = "model_capability_declared"
+		}
+		resolution = append(resolution, &model.RuntimeCapability{
+			CapabilityId: capabilityID,
+			Resolution:   resolutionState,
+			ReasonCode:   reasonCode,
+		})
+	}
+
+	return &model.RuntimeCapabilitySnapshot{
+		SnapshotId: "",
+		Input:      inputCaps,
+		Output:     outputCaps,
+		Runtime:    execCaps,
+		Agentic:    agenticCaps,
+		Limits:     limits,
+		Resolution: resolution,
+		Provenance: &model.RuntimeCapabilityProvenance{
+			DiscoverySource: runtimeCapabilityDiscoverySource,
+			SourceVersion:   sourceVersion,
+			ObservedAt:      timestamppb.New(observedAt),
+		},
+	}
+}
+
+func defaultRuntimeBudget(contextWindow int32) *model.RuntimeBudget {
+	if contextWindow <= 0 {
+		contextWindow = 128000
+	}
+	window := uint64(contextWindow)
+	maxOutput := uint64(8192)
+	if maxOutput >= window {
+		maxOutput = window / 4
+		if maxOutput == 0 {
+			maxOutput = 1
+		}
+	}
+	maxInput := window - maxOutput
+	return &model.RuntimeBudget{
+		MaxAttempts:           3,
+		MaxAgentSteps:         50,
+		MaxToolCalls:          100,
+		MaxIdenticalToolCalls: 3,
+		MaxDelegationDepth:    3,
+		WallTimeMs:            300000,
+		MaxInputTokens:        maxInput,
+		MaxOutputTokens:       maxOutput,
+		MaxAttachmentBytes:    runtimeAttachmentBytesLimit,
+	}
+}
+
+func computeSnapshotID(
+	actorPTID, providerID, modelID string,
+	caps *model.RuntimeCapabilitySnapshot,
+	budget *model.RuntimeBudget,
+) (string, error) {
+	payload := struct {
+		Ptid       string                              `json:"ptid"`
+		ProviderID string                              `json:"provider_id"`
+		ModelID    string                              `json:"model_id"`
+		Input      *model.RuntimeInputCapabilities     `json:"input"`
+		Output     *model.RuntimeOutputCapabilities    `json:"output"`
+		Runtime    *model.RuntimeExecutionCapabilities `json:"runtime"`
+		Agentic    *model.RuntimeAgenticCapabilities   `json:"agentic"`
+		Limits     *model.RuntimeCapabilityLimits      `json:"limits"`
+		Resolution []*model.RuntimeCapability          `json:"resolution"`
+		Provenance map[string]string                   `json:"provenance"`
+		Budget     *model.RuntimeBudget                `json:"budget"`
+	}{
+		Ptid:       actorPTID,
+		ProviderID: providerID,
+		ModelID:    modelID,
+		Input:      caps.GetInput(),
+		Output:     caps.GetOutput(),
+		Runtime:    caps.GetRuntime(),
+		Agentic:    caps.GetAgentic(),
+		Limits:     caps.Limits,
+		Resolution: caps.GetResolution(),
+		Provenance: map[string]string{
+			"discoverySource": caps.GetProvenance().GetDiscoverySource(),
+			"sourceVersion":   caps.GetProvenance().GetSourceVersion(),
+		},
+		Budget: budget,
+	}
+	hash, err := canonicalJSONHash(payload)
+	if err != nil {
+		return "", err
+	}
+	return "snap-" + hash[:32], nil
+}
+
+func catalogProviderAdvertised(cp catalog.CatalogProvider) bool {
+	return ProviderRuntimeAdvertised(cp.RuntimeKind, cp.Protocol)
+}
+
+func CatalogProviderAvailable(cp catalog.CatalogProvider) bool {
+	return catalogProviderAvailable(cp, nil)
+}
+
+func catalogProviderAvailable(cp catalog.CatalogProvider, pathEntries []string) bool {
+	if strings.EqualFold(strings.TrimSpace(cp.RuntimeKind), providerRuntimeCLI) ||
+		strings.EqualFold(strings.TrimSpace(cp.Protocol), providerRuntimeCLI) {
+		return providercli.VerifyCliBinaryFor(cp.CLIArgv, pathEntries).Available
+	}
+	return true
+}
+
+func (r *RuntimeAdmissionResolver) CatalogProviderAvailable(
+	cp catalog.CatalogProvider,
+) bool {
+	if isExternalRuntime(cp.RuntimeKind, cp.Protocol) {
+		return r != nil && r.externalReady != nil && r.externalReady()
+	}
+	var pathEntries []string
+	if r != nil && r.managedBin != nil {
+		pathEntries = append(pathEntries, r.managedBin())
+	}
+	return catalogProviderAvailable(cp, pathEntries)
+}
+
+func (r *RuntimeAdmissionResolver) ProviderRuntimeAvailable(
+	runtimeKind string,
+	protocol string,
+) bool {
+	if !ProviderRuntimeAdvertised(runtimeKind, protocol) {
+		return false
+	}
+	if isExternalRuntime(runtimeKind, protocol) {
+		return r != nil && r.externalReady != nil && r.externalReady()
+	}
+	return true
+}
+
+// ProviderRuntimeAdvertised reports whether Station has an executable adapter
+// for the declared runtime and protocol in the active product profile.
+func ProviderRuntimeAdvertised(runtimeKind, protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(runtimeKind)) {
+	case "", "http":
+		switch strings.ToLower(strings.TrimSpace(protocol)) {
+		case "openai-compatible", "openai", "anthropic", "ollama":
+			return true
+		default:
+			return false
+		}
+	case "cli":
+		return strings.EqualFold(strings.TrimSpace(protocol), "cli")
+	case "external", "external-agent", "external_agent":
+		return strings.EqualFold(
+			strings.TrimSpace(protocol),
+			"session-cli-v1",
+		)
+	default:
+		return false
+	}
+}
+
+func runtimeAdvertised(runtimeKind string) bool {
+	switch strings.ToLower(strings.TrimSpace(runtimeKind)) {
+	case "", "http", "cli", "external", "external-agent", "external_agent":
+		return true
+	default:
+		return false
+	}
+}
+
+func isExternalRuntime(runtimeKind, protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(runtimeKind)) {
+	case "external", "external-agent", "external_agent":
+		return strings.EqualFold(strings.TrimSpace(protocol), "session-cli-v1")
+	default:
+		return false
+	}
+}
+
+func resolvedRuntimeKind(
+	catalogProvider *catalog.CatalogProvider,
+	databaseProvider *persistence.AgentProvider,
+) model.RuntimeKind {
+	runtimeKind := ""
+	protocol := ""
+	if catalogProvider != nil {
+		runtimeKind = catalogProvider.RuntimeKind
+		protocol = catalogProvider.Protocol
+	}
+	if databaseProvider != nil {
+		if strings.TrimSpace(databaseProvider.RuntimeKind) != "" {
+			runtimeKind = databaseProvider.RuntimeKind
+		}
+		if strings.TrimSpace(databaseProvider.Protocol) != "" {
+			protocol = databaseProvider.Protocol
+		}
+	}
+	if isExternalRuntime(runtimeKind, protocol) {
+		return model.RuntimeKind_RUNTIME_KIND_EXTERNAL_AGENT
+	}
+	return model.RuntimeKind_RUNTIME_KIND_DIRECT_MODEL
+}
+
+func admitProvider(cp catalog.CatalogProvider, userMatch *persistence.AgentProvider) bool {
+	enabled := cp.Enabled
+	if userMatch != nil {
+		enabled = userMatch.Enabled
+	}
+	if !enabled {
+		return false
+	}
+	requiresAPIKey := cp.ShowAPIKey == nil || *cp.ShowAPIKey
+	if !requiresAPIKey {
+		return true
+	}
+	if !ProviderCredentialConfigured(userMatch) {
+		return false
+	}
+	key, err := providerCredentialAPIKey(userMatch)
+	return err == nil && strings.TrimSpace(key) != ""
+}
+
+func admitCatalogModel(m catalog.CatalogModel, hidden []string) bool {
+	return m.Enabled && m.Type == "chat" && !containsStr(hidden, m.ID)
+}
+
+func containsStr(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}

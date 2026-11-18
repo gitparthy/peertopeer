@@ -1,0 +1,1108 @@
+/**
+ * MomentComposer.tsx — Composer card with draft save/restore
+ *
+ * Renders the compose form for creating a new moment. Integrates
+ * with DraftRestorationPort for draft persistence and recovery.
+ * Audience selection, image attachment, and publish flow are
+ * self-contained; the parent receives the created post via callback.
+ *
+ * W6B: Refactored from inline MomentsPage logic into standalone
+ * component with draft recovery and audience selection.
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
+import { Button, Icon, type IconId } from '@peers-touch/ui';
+
+import {
+  notifyError,
+  notifySuccess,
+  notifyWarning,
+} from '../../app/feedback/mobileFeedback';
+import { useLifecycleKernel } from '../../app/lifecycle';
+import { useVisualKeyboardOverlap } from '../../app/layout/useVisualKeyboardOverlap';
+import { useMobileI18n } from '../../app/mobileI18n';
+import { useMobilePageDisposal } from '../../components/mobilePageLifetime';
+import type { MobileAuthSession } from '../../features/auth/authSession';
+import type { SocialIntentPort } from '../../features/social/socialIntents';
+import {
+  createNativeMediaRequestId,
+  discardNativeMomentMedia,
+  pickNativeMedia,
+  uploadNativeMomentMedia,
+  type NativeStagedMediaHandle,
+} from '../../services/mobileCommands';
+import { useMomentsDraft, type MomentDraftPayload } from '../../features/social/useMomentsDraft';
+import {
+  type Audience,
+  type ImageAttachment,
+  type Post,
+} from '../../gen/proto/domain/social/post_pb';
+import { readableErrorMessage } from '../../utils/errorMessage';
+import {
+  SOCIAL_AUDIENCE_CHOICES,
+  buildSocialAudience,
+  isPublicSocialAudience,
+  socialAudienceChoiceFromAudience,
+  socialAudienceTargetFromAudience,
+  type SocialAudienceChoice,
+} from '../../features/social/socialAudience';
+import { useSocialCirclesStore } from '../../features/social/socialCircles';
+import { useSocialStore } from '../../features/social/socialStore';
+import {
+  MomentAudienceTargetPicker,
+  type MomentAudienceTargetChoice,
+} from './MomentAudienceTargetPicker';
+import './MomentComposer.css';
+
+const MAX_IMAGES_PER_POST = 9;
+const VISIBLE_SOCIAL_AUDIENCE_CHOICES = SOCIAL_AUDIENCE_CHOICES.filter(
+  (choice) => choice.id !== 'DIRECT',
+);
+const MOMENT_MEDIA_PREVIEW_GRADIENTS = [
+  'linear-gradient(135deg, #fccb90 0%, #d57eeb 100%)',
+  'linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%)',
+  'linear-gradient(135deg, #e0c3fc 0%, #8ec5fc 100%)',
+] as const;
+
+function isMomentAudienceTargetChoice(
+  choice: SocialAudienceChoice,
+): choice is MomentAudienceTargetChoice {
+  return choice === 'CIRCLE'
+    || choice === 'GROUP'
+    || choice === 'CUSTOM_ALLOW'
+    || choice === 'CUSTOM_DENY';
+}
+
+const SOCIAL_AUDIENCE_PRESENTATION: Record<
+  SocialAudienceChoice,
+  { readonly detailKey: string; readonly icon: IconId }
+> = {
+  PUBLIC: {
+    detailKey: 'mobile.moments.audience.publicDescription',
+    icon: 'globe',
+  },
+  FOLLOWERS: {
+    detailKey: 'mobile.moments.audience.followersDescription',
+    icon: 'users-round',
+  },
+  FRIENDS: {
+    detailKey: 'mobile.moments.audience.friendsDescription',
+    icon: 'shield-check',
+  },
+  CIRCLE: {
+    detailKey: 'mobile.moments.audience.circleDescription',
+    icon: 'users-round',
+  },
+  GROUP: {
+    detailKey: 'mobile.moments.audience.groupDescription',
+    icon: 'users-round',
+  },
+  CUSTOM_ALLOW: {
+    detailKey: 'mobile.moments.audience.customAllowDescription',
+    icon: 'user-round',
+  },
+  CUSTOM_DENY: {
+    detailKey: 'mobile.moments.audience.customDenyDescription',
+    icon: 'user-minus',
+  },
+  DIRECT: {
+    detailKey: 'mobile.moments.audience.directDescription',
+    icon: 'user-round',
+  },
+  SELF: {
+    detailKey: 'mobile.moments.audience.selfDescription',
+    icon: 'lock-keyhole',
+  },
+};
+
+export interface MomentComposerStyle extends CSSProperties {
+  '--moment-composer-keyboard-overlap': string;
+}
+
+export function createMomentComposerStyle(
+  keyboardOverlapHeight: number,
+): MomentComposerStyle {
+  return {
+    '--moment-composer-keyboard-overlap': `${keyboardOverlapHeight}px`,
+  };
+}
+
+export interface MomentMediaPreviewStyle extends CSSProperties {
+  '--moment-media-preview-bg': string;
+}
+
+export function createMomentMediaPreviewStyle(
+  index: number,
+): MomentMediaPreviewStyle {
+  return {
+    '--moment-media-preview-bg':
+      MOMENT_MEDIA_PREVIEW_GRADIENTS[
+        index % MOMENT_MEDIA_PREVIEW_GRADIENTS.length
+      ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pending image type (local state only)
+// ---------------------------------------------------------------------------
+
+export interface PendingMomentImage {
+  localId: string;
+  previewUrl: string;
+  status: 'uploading' | 'done' | 'error';
+  source: 'local-upload' | 'restored-reference';
+  stagedHandle?: NativeStagedMediaHandle;
+  persistedRef?: string;
+  image?: ImageAttachment;
+  error?: string;
+}
+
+let pendingImageSeq = 0;
+
+function nextPendingImageId(): string {
+  pendingImageSeq += 1;
+  return `mobile-moment-image-${Date.now()}-${pendingImageSeq}`;
+}
+
+function revokePreviewUrl(previewUrl: string): void {
+  if (previewUrl.startsWith('blob:')) {
+    URL.revokeObjectURL(previewUrl);
+  }
+}
+
+export function createRestoredMomentImages(
+  mediaRefs: readonly string[],
+): PendingMomentImage[] {
+  return mediaRefs.map((persistedRef) => {
+    const staged = decodeStagedMediaRef(persistedRef);
+    return {
+      localId: nextPendingImageId(),
+      previewUrl: persistedRef,
+      status: 'done',
+      source: 'restored-reference',
+      persistedRef,
+      ...(staged ? {
+        stagedHandle: {
+          handle: staged.handle,
+          mediaKind: 'image' as const,
+          mimeType: staged.mimeType,
+          byteLength: 0,
+          sha256Base64: '',
+        },
+      } : {}),
+    };
+  });
+}
+
+export function canPublishMoment(
+  text: string,
+  successfulMediaCount: number,
+  uploadingCount: number,
+  errorCount: number,
+  publishing: boolean,
+  audienceReady: boolean,
+): boolean {
+  return Boolean(text.trim() || successfulMediaCount > 0)
+    && audienceReady
+    && uploadingCount === 0
+    && errorCount === 0
+    && !publishing;
+}
+
+export function hasAuthoritativeImageReadback(
+  post: Post,
+  submitted: readonly PendingMomentImage[],
+): boolean {
+  if (submitted.length === 0) return true;
+  if (post.content.case !== 'imagePost') return false;
+
+  const returnedById = new Map(
+    post.content.value.images.map((image) => [image.id || image.url, image]),
+  );
+  return submitted.every((item) => {
+    const submittedId = item.persistedRef ?? item.image?.id ?? item.image?.url;
+    if (!submittedId) return false;
+    const returned = returnedById.get(submittedId);
+    if (!returned) return false;
+    if (!item.image?.mediaEncryption) return true;
+    return returned.mediaEncryption?.keyB64 === item.image.mediaEncryption.keyB64
+      && returned.mediaEncryption?.nonceB64 === item.image.mediaEncryption.nonceB64
+      && returned.mediaEncryption?.ciphertextSha256B64
+        === item.image.mediaEncryption.ciphertextSha256B64;
+  });
+}
+
+interface StagedMediaReference {
+  readonly handle: string;
+  readonly attachmentId: string;
+  readonly mimeType: string;
+}
+
+const STAGED_MEDIA_PREFIX = 'native-moment-v1:';
+
+function encodeStagedMediaRef(
+  stagedHandle: NativeStagedMediaHandle,
+  attachmentId: string,
+): string {
+  return `${STAGED_MEDIA_PREFIX}${encodeURIComponent(stagedHandle.handle)}:${encodeURIComponent(
+    attachmentId,
+  )}:${encodeURIComponent(stagedHandle.mimeType)}`;
+}
+
+function decodeStagedMediaRef(reference: string): StagedMediaReference | null {
+  if (!reference.startsWith(STAGED_MEDIA_PREFIX)) return null;
+  const fields = reference.slice(STAGED_MEDIA_PREFIX.length).split(':');
+  if (fields.length !== 3 || fields.some((field) => !field)) return null;
+  return {
+    handle: decodeURIComponent(fields[0]),
+    attachmentId: decodeURIComponent(fields[1]),
+    mimeType: decodeURIComponent(fields[2]),
+  };
+}
+
+function actorPtidsFromInput(value: string): string[] {
+  return value.split(/[\s,]+/).filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+interface MomentComposerProps {
+  readonly session: MobileAuthSession;
+  readonly intents: Pick<SocialIntentPort, 'publishMoment'>;
+  readonly onPublished: () => void;
+  readonly onClose: () => void;
+}
+
+type PendingDraftRemoval = { readonly kind: 'publish' };
+
+export function MomentComposer({
+  session,
+  intents,
+  onPublished,
+  onClose,
+}: MomentComposerProps) {
+  const { t } = useMobileI18n();
+  const [publicWriteRejected, setPublicWriteRejected] = useState(false);
+  const lifecycle = useLifecycleKernel();
+  const keyboardOverlapHeight = useVisualKeyboardOverlap();
+  const composerStyle = useMemo(
+    () => createMomentComposerStyle(keyboardOverlapHeight),
+    [keyboardOverlapHeight],
+  );
+
+  const [text, setText] = useState('');
+  const [audienceChoice, setAudienceChoice] =
+    useState<SocialAudienceChoice>('PUBLIC');
+  const [circleId, setCircleId] = useState('');
+  const [groupConversationId, setGroupConversationId] = useState('');
+  const [actorPtidsInput, setActorPtidsInput] = useState('');
+  const [audienceActorLabels, setAudienceActorLabels] = useState<
+    Record<string, string>
+  >({});
+  const [pendingImages, setPendingImages] = useState<PendingMomentImage[]>([]);
+  const [audienceOpen, setAudienceOpen] = useState(false);
+  const [targetAudienceChoice, setTargetAudienceChoice] =
+    useState<MomentAudienceTargetChoice | null>(null);
+  const [publishing, setPublishing] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [pendingDraftRemoval, setPendingDraftRemoval] =
+    useState<PendingDraftRemoval | null>(null);
+  const pendingImagesRef = useRef<PendingMomentImage[]>([]);
+  const retainStagedMediaOnUnmountRef = useRef(false);
+  const draftRestoreRequestedRef = useRef(false);
+  const draftIdRef = useRef(globalThis.crypto.randomUUID());
+  const circles = useSocialCirclesStore((state) => state.circles);
+  const messagingConversations = useSocialStore(
+    (state) => state.messagingConversations,
+  );
+  const groups = useMemo(
+    () => messagingConversations.filter(
+      (conversation) => conversation.active && conversation.kind === 2,
+    ),
+    [messagingConversations],
+  );
+  const selectedActorPtids = useMemo(
+    () => actorPtidsFromInput(actorPtidsInput),
+    [actorPtidsInput],
+  );
+  const audience = useMemo<Audience | null>(() => {
+    try {
+      return buildSocialAudience(audienceChoice, {
+        circleId,
+        groupConversationId,
+        actorPtids: selectedActorPtids,
+      });
+    } catch {
+      return null;
+    }
+  }, [
+    audienceChoice,
+    circleId,
+    groupConversationId,
+    selectedActorPtids,
+  ]);
+
+  // Draft management
+  const {
+    hasDraft,
+    draftPersisted,
+    saveDraft,
+    persistDraftNow,
+    discardDraft,
+    restoreDraft,
+    retryPersistence,
+    saving,
+    discarding,
+    persistenceFailure,
+  } = useMomentsDraft(
+    useCallback((payload: MomentDraftPayload) => {
+      setText(payload.text);
+      const restoredChoice = socialAudienceChoiceFromAudience(payload.audience);
+      const restoredTarget = socialAudienceTargetFromAudience(payload.audience);
+      setAudienceChoice(restoredChoice);
+      setCircleId(restoredTarget.circleId ?? '');
+      setGroupConversationId(restoredTarget.groupConversationId ?? '');
+      const restoredActorPtids = restoredTarget.actorPtids ?? [];
+      setActorPtidsInput(restoredActorPtids.join(', '));
+      setAudienceActorLabels(Object.fromEntries(
+        restoredActorPtids.map((actorPtid) => [actorPtid, actorPtid]),
+      ));
+      setPendingImages((current) => {
+        current.forEach((item) => revokePreviewUrl(item.previewUrl));
+        const restoredImages = createRestoredMomentImages(payload.mediaRefs);
+        pendingImagesRef.current = restoredImages;
+        return restoredImages;
+      });
+    }, []),
+  );
+
+  useEffect(() => {
+    if (
+      lifecycle.phase !== 'ACTIVE'
+      || draftRestoreRequestedRef.current
+    ) {
+      return;
+    }
+    draftRestoreRequestedRef.current = true;
+    void restoreDraft().catch(() => undefined);
+  }, [lifecycle.phase, restoreDraft]);
+
+  // Keep ref in sync
+  useEffect(() => {
+    pendingImagesRef.current = pendingImages;
+  }, [pendingImages]);
+
+  // Cleanup preview URLs on unmount
+  useMobilePageDisposal(() => {
+    pendingImagesRef.current.forEach((item) => {
+      revokePreviewUrl(item.previewUrl);
+      if (item.stagedHandle && !retainStagedMediaOnUnmountRef.current) {
+        void discardNativeMomentMedia({
+          stationPeerId: session.stationPeerId,
+          actorPtid: session.actorRef.ptid,
+          deviceId: session.deviceId,
+          lifecycleGeneration: session.lifecycleGeneration,
+          sessionId: session.sessionId,
+          handle: item.stagedHandle.handle,
+        });
+      }
+    });
+  });
+
+  const uploadingCount = useMemo(
+    () => pendingImages.filter((item) => item.status === 'uploading').length,
+    [pendingImages],
+  );
+  const errorCount = useMemo(
+    () => pendingImages.filter((item) => item.status === 'error').length,
+    [pendingImages],
+  );
+  const successfulMediaRefs = useMemo(
+    () => pendingImages
+      .filter((item) => item.status === 'done' && item.persistedRef)
+      .map((item) => item.persistedRef as string),
+    [pendingImages],
+  );
+  const slotsLeft = MAX_IMAGES_PER_POST - pendingImages.length;
+  const canPublish = canPublishMoment(
+    text,
+    successfulMediaRefs.length,
+    uploadingCount,
+    errorCount,
+    publishing,
+    Boolean(audience),
+  ) && !saving && !discarding && !closing && !pendingDraftRemoval;
+  const editingDisabled =
+    publishing || closing || Boolean(pendingDraftRemoval);
+  const canClear = hasDraft
+    || Boolean(text.trim())
+    || pendingImages.length > 0
+    || audienceChoice !== 'PUBLIC';
+  const audienceLabel = t(
+    SOCIAL_AUDIENCE_CHOICES.find((choice) => choice.id === audienceChoice)?.labelKey
+      ?? 'mobile.moments.audience.public',
+  );
+  const audiencePresentation = SOCIAL_AUDIENCE_PRESENTATION[audienceChoice];
+  const selectedCircle = circles.find(
+    (circle) => circle.id.toString() === circleId,
+  );
+  const selectedGroup = groups.find(
+    (group) => group.conversationId === groupConversationId,
+  );
+  const selectedActorNames = selectedActorPtids.map(
+    (actorPtid) => audienceActorLabels[actorPtid] ?? actorPtid,
+  );
+  const audienceDetail = audienceChoice === 'CIRCLE' && selectedCircle
+    ? `${selectedCircle.name} · ${t('mobile.social.circles.memberCount', {
+        count: selectedCircle.memberCount.toString(),
+      })}`
+    : audienceChoice === 'GROUP' && selectedGroup
+      ? `${selectedGroup.name || selectedGroup.conversationId} · ${t(
+          'mobile.moments.audience.activeMembers',
+          { count: selectedGroup.memberPtids.length },
+        )}`
+      : audienceChoice === 'CUSTOM_ALLOW' && selectedActorNames.length > 0
+        ? selectedActorNames.join(', ')
+        : audienceChoice === 'CUSTOM_DENY' && selectedActorNames.length > 0
+          ? t('mobile.moments.audience.followersExceptSelection', {
+              names: selectedActorNames.join(', '),
+            })
+          : t(audiencePresentation.detailKey);
+
+  // Auto-save text, audience, and generated-contract media references.
+  useEffect(() => {
+    if (
+      lifecycle.phase === 'ACTIVE'
+      && !pendingDraftRemoval
+      && audience
+    ) {
+      saveDraft(text, audience, successfulMediaRefs);
+    }
+  }, [
+    audience,
+    lifecycle.phase,
+    pendingDraftRemoval,
+    saveDraft,
+    successfulMediaRefs,
+    text,
+  ]);
+
+  const resetComposer = useCallback(() => {
+    pendingImagesRef.current.forEach((item) => {
+      revokePreviewUrl(item.previewUrl);
+      if (item.stagedHandle) {
+        void discardNativeMomentMedia({
+          stationPeerId: session.stationPeerId,
+          actorPtid: session.actorRef.ptid,
+          deviceId: session.deviceId,
+          lifecycleGeneration: session.lifecycleGeneration,
+          sessionId: session.sessionId,
+          handle: item.stagedHandle.handle,
+        });
+      }
+    });
+    setPendingImages([]);
+    setText('');
+    setAudienceChoice('PUBLIC');
+    setCircleId('');
+    setGroupConversationId('');
+    setActorPtidsInput('');
+    setAudienceActorLabels({});
+    setAudienceOpen(false);
+    setTargetAudienceChoice(null);
+    retainStagedMediaOnUnmountRef.current = false;
+    draftIdRef.current = globalThis.crypto.randomUUID();
+    setPendingDraftRemoval(null);
+  }, [
+    session.actorRef.ptid,
+    session.deviceId,
+    session.lifecycleGeneration,
+    session.sessionId,
+    session.stationPeerId,
+  ]);
+
+  const completePublishedMoment = useCallback(() => {
+    notifySuccess(t('mobile.moments.published'));
+    resetComposer();
+    onPublished();
+  }, [onPublished, resetComposer, t]);
+
+  const handlePersistenceRetry = useCallback(async () => {
+    if (!await retryPersistence()) return;
+
+    if (pendingDraftRemoval?.kind === 'publish') {
+      completePublishedMoment();
+    }
+  }, [
+    completePublishedMoment,
+    pendingDraftRemoval,
+    retryPersistence,
+  ]);
+
+  const handleClose = useCallback(async () => {
+    if (publishing || closing || pendingDraftRemoval || !audience) return;
+    setClosing(true);
+    const persisted = await persistDraftNow(
+      text,
+      audience,
+      successfulMediaRefs,
+    );
+    if (persisted) {
+      retainStagedMediaOnUnmountRef.current = true;
+      onClose();
+      return;
+    }
+    setClosing(false);
+  }, [
+    audience,
+    closing,
+    onClose,
+    pendingDraftRemoval,
+    persistDraftNow,
+    publishing,
+    successfulMediaRefs,
+    text,
+  ]);
+
+  const handleClear = useCallback(async () => {
+    if (editingDisabled || saving || discarding || !canClear) return;
+    if (!await discardDraft()) return;
+    resetComposer();
+    notifySuccess(t('mobile.moments.composer.draftCleared'));
+  }, [
+    canClear,
+    discardDraft,
+    discarding,
+    editingDisabled,
+    resetComposer,
+    saving,
+    t,
+  ]);
+
+  // -- Image upload --
+
+  const uploadPublicImage = async (
+    item: PendingMomentImage,
+  ): Promise<PendingMomentImage> => {
+    if (!item.stagedHandle) return item;
+    try {
+      const image = await uploadNativeMomentMedia({
+        stationPeerId: session.stationPeerId,
+        actorPtid: session.actorRef.ptid,
+        deviceId: session.deviceId,
+        lifecycleGeneration: session.lifecycleGeneration,
+        sessionId: session.sessionId,
+        handle: item.stagedHandle.handle,
+      });
+      const persistedRef = image.id || image.url;
+      const uploaded = {
+        ...item,
+        status: 'done' as const,
+        persistedRef,
+        image,
+        stagedHandle: undefined,
+        error: undefined,
+      };
+      setPendingImages((current) => current.map((candidate) => (
+        candidate.localId === item.localId
+          ? uploaded
+          : candidate
+      )));
+      return uploaded;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      setPendingImages((current) => current.map((candidate) => (
+        candidate.localId === item.localId
+          ? { ...candidate, status: 'error', error: errorMsg }
+          : candidate
+      )));
+      throw error;
+    }
+  };
+
+  const handlePickImages = async () => {
+    if (editingDisabled) return;
+    if (pendingImages.some((item) => item.source === 'restored-reference')) {
+      notifyWarning(t('mobile.moments.composer.mixedMediaUnavailable'));
+      return;
+    }
+    if (slotsLeft <= 0) {
+      notifyWarning(t('mobile.moments.imageMaxReached', { max: MAX_IMAGES_PER_POST }));
+      return;
+    }
+    let selection: Awaited<ReturnType<typeof pickNativeMedia>>;
+    try {
+      selection = await pickNativeMedia({
+        stationPeerId: session.stationPeerId,
+        actorPtid: session.actorRef.ptid,
+        sessionId: session.sessionId,
+        requestId: createNativeMediaRequestId(),
+        surfaceKind: 'moment_media',
+        capability: 'photo_library',
+        deadlineMs: Date.now() + 5 * 60 * 1000,
+        acceptedMediaKinds: ['image'],
+        maxItemCount: slotsLeft,
+        maxTotalBytes: 30 * 1024 * 1024,
+      });
+    } catch (error) {
+      notifyError(readableErrorMessage(error, 'moment_media_pick_failed'));
+      return;
+    }
+    if (selection.outcome === 'cancelled') return;
+    if (selection.outcome !== 'selected') {
+      notifyError(selection.errorCode || `moment_media_${selection.outcome}`);
+      return;
+    }
+    const drafts = selection.items.slice(0, slotsLeft).map((stagedHandle) => {
+      const localId = nextPendingImageId();
+      const attachmentId = globalThis.crypto.randomUUID();
+      return {
+        localId,
+        stagedHandle,
+        previewUrl: '',
+        status: 'done' as const,
+        source: 'local-upload' as const,
+        persistedRef: encodeStagedMediaRef(stagedHandle, attachmentId),
+      };
+    });
+    setPendingImages((current) => [...current, ...drafts]);
+  };
+
+  const removeImage = (localId: string) => {
+    if (editingDisabled) return;
+    setPendingImages((current) => {
+      const removed = current.find((item) => item.localId === localId);
+      if (removed) {
+        revokePreviewUrl(removed.previewUrl);
+        if (removed.stagedHandle) {
+          void discardNativeMomentMedia({
+            stationPeerId: session.stationPeerId,
+            actorPtid: session.actorRef.ptid,
+            deviceId: session.deviceId,
+            lifecycleGeneration: session.lifecycleGeneration,
+            sessionId: session.sessionId,
+            handle: removed.stagedHandle.handle,
+          });
+        }
+      }
+      return current.filter((item) => item.localId !== localId);
+    });
+  };
+
+  const retryImage = (localId: string) => {
+    if (editingDisabled) return;
+    const target = pendingImages.find((item) => item.localId === localId);
+    if (!target?.stagedHandle) return;
+    setPendingImages((current) => current.map((item) => (
+      item.localId === localId ? { ...item, status: 'done', error: undefined } : item
+    )));
+  };
+
+  // -- Publish --
+
+  const publish = async () => {
+    const trimmed = text.trim();
+    let completedImages = pendingImages.filter(
+      (item) => item.status === 'done' && item.persistedRef,
+    );
+    if (!trimmed && completedImages.length === 0) {
+      notifyWarning(t('mobile.moments.emptyError'));
+      return;
+    }
+    if (uploadingCount > 0) {
+      notifyWarning(t('mobile.moments.imageUploading'));
+      return;
+    }
+    if (errorCount > 0) {
+      notifyWarning(t('mobile.moments.imageHasErrors'));
+      return;
+    }
+    if (!audience) {
+      notifyError(t('mobile.moments.audience.targetRequired'));
+      return;
+    }
+    if (!await persistDraftNow(text, audience, successfulMediaRefs)) {
+      return;
+    }
+    if (isPublicSocialAudience(audience)) {
+      setPublicWriteRejected(true);
+      notifyError(t('mobile.moments.publicSignedWriteRequired'));
+      return;
+    }
+    setPublicWriteRejected(false);
+
+    setPublishing(true);
+    if (isPublicSocialAudience(audience)) {
+      try {
+        completedImages = await Promise.all(
+          completedImages.map((item) => uploadPublicImage(item)),
+        );
+      } catch (error) {
+        setPublishing(false);
+        notifyError(readableErrorMessage(error, 'moment_media_upload_failed'));
+        return;
+      }
+      const uploadedRefs = completedImages
+        .map((item) => item.persistedRef)
+        .filter((reference): reference is string => Boolean(reference));
+      if (!await persistDraftNow(text, audience, uploadedRefs)) {
+        setPublishing(false);
+        return;
+      }
+    }
+
+    const images = completedImages
+      .filter((item) => item.image)
+      .map((item) => item.image as ImageAttachment);
+    const imageIds = completedImages.map((item) => item.persistedRef as string);
+    const privateFiles = completedImages.map((item) => {
+      const reference = item.persistedRef
+        ? decodeStagedMediaRef(item.persistedRef)
+        : null;
+      return reference
+        ? { handle: reference.handle, attachmentId: reference.attachmentId }
+        : null;
+    });
+    if (
+      !isPublicSocialAudience(audience)
+      && privateFiles.some((file) => file === null)
+    ) {
+      setPublishing(false);
+      notifyError(t('mobile.moments.audience.privateMediaUnavailable'));
+      return;
+    }
+
+    let result: Awaited<ReturnType<SocialIntentPort['publishMoment']>>;
+    try {
+      result = await intents.publishMoment({
+        draftId: draftIdRef.current,
+        draftRevision: 1,
+        draft: completedImages.length > 0
+          ? {
+            kind: 'image',
+            text: trimmed,
+            audience,
+            imageIds,
+            ...(images.length === completedImages.length ? { images } : {}),
+          }
+          : { kind: 'text', text: trimmed, audience },
+        ...(privateFiles.length > 0
+          ? { privateFiles: privateFiles.filter((file) => file !== null) }
+          : {}),
+      });
+    } catch (error) {
+      setPublishing(false);
+      notifyError(readableErrorMessage(error, 'moment_publish_failed'));
+      return;
+    }
+
+    const published = result.route === 'PUBLIC'
+      ? result.outcome.ok
+        && Boolean(result.outcome.data.post)
+        && hasAuthoritativeImageReadback(
+          result.outcome.data.post as Post,
+          completedImages,
+        )
+      : result.projection.state === 'PUBLISHED'
+        && Boolean(result.projection.postId);
+
+    if (published) {
+      setPendingDraftRemoval({ kind: 'publish' });
+      const removed = await discardDraft();
+      setPublishing(false);
+      if (removed) completePublishedMoment();
+    } else if (result.route === 'PUBLIC' && result.outcome.ok) {
+      setPublishing(false);
+      notifyError(t('mobile.moments.imageReadbackFailed'));
+    } else if (result.route === 'PUBLIC' && !result.outcome.ok) {
+      setPublishing(false);
+      notifyError(result.outcome.error.message);
+    } else if (result.route === 'PRIVATE') {
+      setPublishing(false);
+      notifyError(
+        result.projection.state === 'UNKNOWN_OUTCOME'
+          ? t('mobile.moments.publishUnknown')
+          : t('mobile.moments.publishPrivateFailed'),
+      );
+    }
+  };
+
+  return (
+    <div
+      className="moments-sheet-backdrop moments-composer-backdrop moment-composer-overlay"
+      data-product-surface="moments.composer"
+      data-keyboard-overlap={keyboardOverlapHeight}
+      role="presentation"
+      style={composerStyle}
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) void handleClose();
+      }}
+    >
+      <section
+        className="moments-bottom-sheet moments-composer-card moment-composer-surface"
+        data-acceptance-id="social-composer"
+        data-audience-choice={audienceChoice}
+        data-draft-persisted={draftPersisted}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('mobile.moments.newPost')}
+        aria-busy={publishing || closing}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="moments-sheet-handle" />
+        <header className="moments-sheet-header moment-composer-header">
+          <button
+            type="button"
+            className="moment-composer-clear"
+            data-acceptance-id="social-composer-clear"
+            disabled={editingDisabled || saving || discarding || !canClear}
+            onClick={() => void handleClear()}
+          >
+            {t('mobile.moments.composer.clear')}
+          </button>
+          <h2>{t('mobile.moments.newPost')}</h2>
+          <button
+            type="button"
+            className="primary"
+            data-acceptance-id="social-composer-publish"
+            disabled={!canPublish}
+            aria-busy={publishing}
+            onClick={() => void publish()}
+          >
+            {t('mobile.moments.publish')}
+          </button>
+        </header>
+
+        {persistenceFailure && (
+          <div
+            className="moments-state moments-state--error"
+            data-draft-failure={persistenceFailure.operation}
+            data-product-surface="moments.composer-draft-failed"
+            role="alert"
+          >
+            <Icon iconId="warning" size={18} aria-hidden="true" />
+            <span className="moment-composer-draft-failure-detail">
+              {t('common.state.error')}: {persistenceFailure.message}
+            </span>
+            <Button
+              actionId="social-composer-draft-retry"
+              emphasis="quiet"
+              density="compact"
+              execution={saving || discarding ? 'pending' : 'idle'}
+              leading={<Icon iconId="rotate-ccw" size={14} />}
+              onActivate={() => void handlePersistenceRetry()}
+            >
+              {t('common.action.retry')}
+            </Button>
+          </div>
+        )}
+
+        <textarea
+          className="moment-composer-textarea"
+          value={text}
+          data-acceptance-id="social-composer-text"
+          aria-label={t('mobile.moments.placeholder')}
+          onChange={(event) => setText(event.target.value)}
+          placeholder={t('mobile.moments.placeholder')}
+          maxLength={5000}
+          disabled={editingDisabled}
+        />
+
+        {(pendingImages.length > 0 || slotsLeft > 0) && (
+          <div
+            className="moment-composer-media"
+            aria-label={t('mobile.moments.attachImage', {
+              count: pendingImages.length,
+              max: MAX_IMAGES_PER_POST,
+            })}
+          >
+          {pendingImages.map((item, index) => (
+            <div
+              className={`moment-composer-media-preview ${item.status}`}
+              data-product-surface={`moments.composer-media-${
+                item.status === 'done' ? 'ready' : item.status
+              }`}
+              key={item.localId}
+              style={createMomentMediaPreviewStyle(index)}
+            >
+              {item.status === 'error' && item.stagedHandle && (
+                <button
+                  type="button"
+                  className="moment-composer-media-retry"
+                  disabled={editingDisabled}
+                  onClick={() => retryImage(item.localId)}
+                  aria-label={t('mobile.moments.retryImage')}
+                >
+                  <Icon iconId="rotate-ccw" size={15} />
+                </button>
+              )}
+              <button
+                type="button"
+                className="moment-composer-media-remove"
+                disabled={editingDisabled}
+                onClick={() => removeImage(item.localId)}
+                aria-label={t('mobile.moments.removeImage')}
+              >
+                <Icon iconId="close" size={15} />
+              </button>
+            </div>
+          ))}
+          {slotsLeft > 0 && (
+            <button
+              type="button"
+              className="moment-composer-media-add"
+              data-acceptance-id="social-composer-media-add"
+              disabled={editingDisabled}
+              onClick={() => void handlePickImages()}
+              aria-label={t('mobile.moments.attachImage', {
+                count: pendingImages.length,
+                max: MAX_IMAGES_PER_POST,
+              })}
+            >
+              <Icon iconId="image-plus" size={24} />
+            </button>
+          )}
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="moment-composer-audience-row"
+          data-acceptance-id="social-audience-select"
+          data-product-surface="moments.composer-audience"
+          disabled={editingDisabled}
+          onClick={() => setAudienceOpen(true)}
+        >
+          <span className="moment-composer-audience-icon">
+            <Icon iconId={audiencePresentation.icon} size={17} />
+          </span>
+          <span className="moment-composer-audience-copy">
+            <strong>{audienceLabel}</strong>
+            <small>{audienceDetail}</small>
+          </span>
+          <Icon iconId="chevron-right" size={17} />
+        </button>
+
+        {publicWriteRejected && audience && isPublicSocialAudience(audience) && (
+          <span className="moment-composer-validation" role="alert" data-acceptance-id="social-public-write-rejected">
+            {t('mobile.moments.publicSignedWriteRequired')}
+          </span>
+        )}
+        {!audience && (
+          <span
+            className="moment-composer-validation"
+            role="alert"
+          >
+            {t('mobile.moments.audience.targetRequired')}
+          </span>
+        )}
+
+        <div className="moment-composer-meta">
+          <span>
+            <Icon iconId="shield-check" size={14} />
+            {t('mobile.moments.composer.privacyHint')}
+          </span>
+          <span>{text.length}/5000</span>
+        </div>
+      </section>
+
+      {audienceOpen && (
+        <div
+          className="moments-sheet-backdrop moments-audience-backdrop"
+          role="presentation"
+          onPointerDown={(event) => {
+            event.stopPropagation();
+            setAudienceOpen(false);
+          }}
+        >
+          <section
+            className="moments-bottom-sheet moments-audience-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('mobile.moments.audience.label')}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="moments-sheet-handle" />
+            <header className="moments-sheet-header">
+              <span />
+              <h2>{t('mobile.moments.audience.label')}</h2>
+              <span />
+            </header>
+            <p className="moment-audience-sheet-copy">
+              {t('mobile.moments.audience.sheetDescription')}
+            </p>
+            <div className="moments-audience-list">
+              {VISIBLE_SOCIAL_AUDIENCE_CHOICES.map((option) => {
+                const presentation = SOCIAL_AUDIENCE_PRESENTATION[option.id];
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className="moments-choice-row moment-audience-choice"
+                    data-audience-option={option.id}
+                    onClick={() => {
+                      if (isMomentAudienceTargetChoice(option.id)) {
+                        setTargetAudienceChoice(option.id);
+                        return;
+                      }
+                      setAudienceChoice(option.id);
+                      setAudienceOpen(false);
+                    }}
+                  >
+                    <span className="moment-audience-choice-icon">
+                      <Icon iconId={presentation.icon} size={18} />
+                    </span>
+                    <span className="moment-audience-choice-copy">
+                      <strong>{t(option.labelKey)}</strong>
+                      <small>{t(presentation.detailKey)}</small>
+                    </span>
+                    {audienceChoice === option.id
+                      ? <Icon iconId="check" size={18} />
+                      : <Icon iconId="chevron-right" size={17} />}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {targetAudienceChoice && (
+        <MomentAudienceTargetPicker
+          choice={targetAudienceChoice}
+          selectedActorLabels={audienceActorLabels}
+          selectedActorPtids={selectedActorPtids}
+          onDismiss={() => setTargetAudienceChoice(null)}
+          onSelectCircle={(nextCircleId) => {
+            setCircleId(nextCircleId);
+            setAudienceChoice('CIRCLE');
+            setTargetAudienceChoice(null);
+            setAudienceOpen(false);
+          }}
+          onSelectGroup={(nextGroupConversationId) => {
+            setGroupConversationId(nextGroupConversationId);
+            setAudienceChoice('GROUP');
+            setTargetAudienceChoice(null);
+            setAudienceOpen(false);
+          }}
+          onSelectActors={(actorPtids, actorLabels) => {
+            setActorPtidsInput(actorPtids.join(', '));
+            setAudienceActorLabels({ ...actorLabels });
+            setAudienceChoice(targetAudienceChoice);
+            setTargetAudienceChoice(null);
+            setAudienceOpen(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}

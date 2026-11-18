@@ -1,0 +1,190 @@
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+} from 'react';
+
+import { visualKeyboardOverlap } from '../../app/layout/useVisualKeyboardOverlap';
+
+export { visualKeyboardOverlap };
+
+export type ChatInputPanelState =
+  | 'none'
+  | 'emoji'
+  | 'attachment'
+  | 'emoji-attachment';
+
+interface ChatBottomOcclusionInput {
+  readonly composerHeight: number | null;
+  readonly inputPanelHeight: number | null;
+  readonly keyboardOverlapHeight: number;
+  readonly tabBarVisible: boolean;
+}
+
+export interface ChatBottomOcclusionStyle extends CSSProperties {
+  '--chat-composer-measured-height': string;
+  '--chat-input-panel-measured-height': string;
+  '--chat-visual-keyboard-overlap': string;
+  '--chat-bottom-tab-contribution': string;
+}
+
+interface UseChatBottomOcclusionOptions {
+  readonly activePanel: ChatInputPanelState;
+  readonly tabBarVisible: boolean;
+}
+
+export function chatInputPanelState({
+  emojiOpen,
+  attachmentOpen,
+}: {
+  readonly emojiOpen: boolean;
+  readonly attachmentOpen: boolean;
+}): ChatInputPanelState {
+  if (emojiOpen && attachmentOpen) return 'emoji-attachment';
+  if (emojiOpen) return 'emoji';
+  if (attachmentOpen) return 'attachment';
+  return 'none';
+}
+
+export function shouldResetChatViewport({
+  composerFocused,
+  visualViewportOffsetTop,
+  windowScrollY,
+}: {
+  readonly composerFocused: boolean;
+  readonly visualViewportOffsetTop: number;
+  readonly windowScrollY: number;
+}): boolean {
+  return composerFocused && (
+    visualViewportOffsetTop > 0
+    || windowScrollY > 0
+  );
+}
+
+export function createChatBottomOcclusionStyle({
+  composerHeight,
+  inputPanelHeight,
+  keyboardOverlapHeight,
+  tabBarVisible,
+}: ChatBottomOcclusionInput): ChatBottomOcclusionStyle {
+  return {
+    '--chat-composer-measured-height': composerHeight === null
+      ? 'var(--chat-composer-min-height)'
+      : `${composerHeight}px`,
+    '--chat-input-panel-measured-height': `${inputPanelHeight ?? 0}px`,
+    '--chat-visual-keyboard-overlap': `${keyboardOverlapHeight}px`,
+    '--chat-bottom-tab-contribution': tabBarVisible
+      ? 'var(--tabbar-height)'
+      : '0px',
+  };
+}
+
+export function useChatBottomOcclusion({
+  activePanel,
+  tabBarVisible,
+}: UseChatBottomOcclusionOptions) {
+  const [composerElement, composerRef] = useState<HTMLDivElement | null>(null);
+  const [inputPanelElement, inputPanelRef] = useState<HTMLDivElement | null>(null);
+  const composerHeight = useObservedBlockSize(composerElement);
+  const inputPanelHeight = useObservedBlockSize(inputPanelElement);
+  const keyboardOverlapHeight = useChatVisualKeyboardOverlap(composerElement);
+
+  const style = useMemo(
+    () => createChatBottomOcclusionStyle({
+      composerHeight,
+      inputPanelHeight,
+      keyboardOverlapHeight,
+      tabBarVisible,
+    }),
+    [
+      composerHeight,
+      inputPanelHeight,
+      keyboardOverlapHeight,
+      tabBarVisible,
+    ],
+  );
+
+  return {
+    activePanel,
+    composerRef,
+    inputPanelRef,
+    keyboardOverlapHeight,
+    style,
+    tabBarVisible,
+  } as const;
+}
+
+function useObservedBlockSize(element: HTMLElement | null): number | null {
+  const [height, setHeight] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (!element) {
+      setHeight(null);
+      return undefined;
+    }
+
+    const update = () => {
+      const nextHeight = Math.ceil(element.getBoundingClientRect().height);
+      setHeight((currentHeight) => (
+        currentHeight === nextHeight ? currentHeight : nextHeight
+      ));
+    };
+    update();
+
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [element]);
+
+  return height;
+}
+
+function useChatVisualKeyboardOverlap(composerElement: HTMLElement | null): number {
+  const [overlap, setOverlap] = useState(0);
+
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport) {
+      setOverlap(0);
+      return undefined;
+    }
+
+    const update = () => {
+      if (shouldResetChatViewport({
+        composerFocused: composerElement?.contains(document.activeElement) === true,
+        visualViewportOffsetTop: viewport.offsetTop,
+        windowScrollY: window.scrollY,
+      })) {
+        window.scrollTo(0, 0);
+        document.documentElement.scrollTop = 0;
+        document.body.scrollTop = 0;
+      }
+      const layoutViewportHeight = Math.max(
+        window.innerHeight,
+        document.documentElement.clientHeight,
+      );
+      const nextOverlap = visualKeyboardOverlap(
+        layoutViewportHeight,
+        viewport.height,
+        viewport.offsetTop,
+      );
+      setOverlap((currentOverlap) => (
+        currentOverlap === nextOverlap ? currentOverlap : nextOverlap
+      ));
+    };
+
+    update();
+    viewport.addEventListener('resize', update);
+    viewport.addEventListener('scroll', update);
+    window.addEventListener('resize', update);
+    return () => {
+      viewport.removeEventListener('resize', update);
+      viewport.removeEventListener('scroll', update);
+      window.removeEventListener('resize', update);
+    };
+  }, [composerElement]);
+
+  return overlap;
+}

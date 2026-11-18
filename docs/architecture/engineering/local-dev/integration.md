@@ -1,0 +1,394 @@
+# Local Dev Control Plane - Integration
+
+> **Status**: active
+> **Version**: v2.1
+> **Created**: 2026-09-13 | **Updated**: 2026-11-15
+> **Owner**: Platform Team
+> **Module**: `tooling/scripts/local-dev/`
+
+---
+
+## 1. Existing System Mapping
+
+| Existing path | Current role | Target role |
+|---------------|--------------|-------------|
+| `env/peers-touch/<profile>/` | Profile and deploy topology | Remains canonical topology owner |
+| `<worktree>/.local/dev/profiles/` | Imported cache or local compose profile | Worktree-local Profile created by canonical `profile-init`; never remote deploy authority |
+| `<worktree>/.local/dev/active/` | Legacy worktree profile pointer | No runtime reader; replaced by machine registry binding |
+| `<worktree>/.local/dev/pids|logs|data/` | Legacy worktree/profile runtime state | New runtime state resolves under the workspace-scoped global dev root |
+| `<worktree>/.local/deploy/envs/` | Legacy imported deploy cache | Never deployment authority; deploy resolves a unique tracked-clean env-repository definition |
+| `/tmp/peers-touch-profile-leases/` | Legacy Acceptance/deploy live locks | Not used by canonical `make station`; replaced by one machine control-plane lease root |
+| `~/.peers-touch/dev/registry.json` | Observed snapshot until explicit promotion | Authoritative after `make env-register` |
+| `~/Library/Application Support/PeersTouch/acceptance/` | Legacy Acceptance Evidence Store | One-time verified move to `~/.peers-touch/dev/acceptance/` |
+| `.dev-workflow/tasks/<taskId>/task.json` | Optional task-local recovery | Repository-local atomic snapshot; never runtime authority |
+| `tooling/scripts/local-dev/workflow-snapshot.mjs` | Peers Dev server previously owned this projection | Canonical one-shot read-only Workflow Snapshot |
+
+The migration must be atomic at the runtime command boundary. There must not be
+permanent dual-read precedence between global registry and `.local/dev/active`.
+
+## 2. Target Directory Layout
+
+```text
+~/.peers-touch/dev/
+├── README.md
+├── registry.json
+├── registry.lock
+├── resources.json
+├── acceptance/
+│   └── <workspaceId>/<gateId>/<runId>/
+├── leases/
+│   ├── local-slot-<n>.lock
+│   ├── simulator-ios-<provider-UUID>.lock
+│   ├── station-deploy-<environment>.lock
+│   └── station-reset-<station-fixture>.lock
+└── workspaces/
+    └── <workspaceId>/
+        ├── runtime/
+        ├── pids/
+        ├── logs/
+        ├── debug/
+        └── data/
+```
+
+The target root is platform-adapted on non-Unix systems, but the logical
+contract remains `Peers Touch machine dev root`. Platform resolution belongs to
+one resolver, not each script.
+
+## 3. Command Integration
+
+Target command behavior:
+
+Station equipment may call `devctl station start --target-profile <name>`.
+This resolves the reviewed target without rewriting the active binding. The
+same target reaches `station-dev.sh`, deployment admission, OS-held lease
+validation and post-deploy readback. A caller must not combine this target
+with a run-scoped Acceptance profile file. Native and Mobile Provisioners share
+`tooling/acceptance/provisioners/station_equipment.py`; it delegates readiness
+and deploy to Local Dev and leaves business fixtures and attestation to their
+owners. Remote equipment precedes the retained remote source lease; final
+attestation after lease acquisition closes concurrent deployment races.
+
+| Command | Control-plane action |
+|---------|----------------------|
+| `make env-register` | Explicitly enroll the verified current workspace and allocate one profile/slot/capability binding |
+| `make env-unregister [WORKSPACE_ID=<id>]` | Remove the exact idle registration owned by the caller; reject any live OS-held lease |
+| `make profile <name>` | Select a reviewed Profile; register with the lowest free slot on first use; non-stable remote Profiles receive connect+deploy, while stable/local/compose Profiles receive connect only |
+| `make env-update` | Atomically replace requested binding fields and the registered branch while no lease is held |
+| `make env-check` | Verify current root/ID/branch, live Git source, selected definition, slot, capabilities, target host, and budget |
+| `make dev-start TASK=<id> ...` | Optionally create task-local recovery state |
+| `make dev-update TASK=<id> EXPECTED_REVISION=<n> ...` | Update one explicit task with revision/CAS |
+| `make dev-status TASK=<id>` | Read one explicit task |
+| `make dev-status-all` | Read task-local records and isolate corrupt tasks |
+| `make dev-close TASK=<id> ...` | Close only the selected task and settle only its owned resources |
+| `make plan-validate PLAN=<path>` | Validate one explicit frozen Plan Version |
+| `make plan-inspect PLAN=<path>` | Inspect one explicit Plan without machine occupancy |
+| `make plan-task PLAN=<path> TASK=<id>` | Read one explicit Plan task |
+| `make profile-init <name> SLOT=<n>` | Create one non-overwriting worktree-local compose Profile |
+| `make profile <name>` | Call canonical `env-update` behavior for only the current `workspaceId` binding |
+| `make config` | Resolve current binding + env definition + allocation |
+| `make status` | Show current worktree declared and observed state |
+| `make env-status-all` | Show all registered worktrees, conflicts, processes and leases |
+| `make workflow-snapshot` | Print one redacted workflow projection and exit |
+| `make desktop` | Acquire current workspace `local.slot` lease and start native Tauri Desktop |
+| `make mobile` | Acquire current workspace `local.slot` lease |
+| `make station-check` | Require `station.connect` |
+| `make station` / restart | Require exclusive `station.deploy` |
+| destructive Acceptance reset | Require an Agent-resettable Profile, exclusive `station.reset`, and an exact run scope |
+
+The generic reset lease API for the later destructive wrapper is:
+
+```bash
+node tooling/scripts/local-dev/machine-dev.mjs lease \
+  --resource-kind station.reset \
+  --resource-id <station-fixture-scope> \
+  --reset-scope <station-fixture-scope> \
+  --budget-seconds <seconds> \
+  -- <reset-command>
+```
+
+It validates the canonical Profile-ID reset policy, authoritative binding,
+`allowedCapabilities`, remote tracked-clean topology, prepared current source,
+and exact reset scope before acquiring the OS lock. It does not implement
+deletion or consult task progress, Plan state, host identity, Hook output, or a
+second human-authorization channel.
+
+`make station` uses the same API with `station.deploy` and holds the lease
+across source synchronization, build, restart, deploy health readback, and the
+final profile health check. The mutation child inherits the locked file
+descriptor and verifies its exact lease metadata before bypassing acquisition;
+an environment marker alone cannot establish possession. Direct Station
+deployment enters the same canonical lease path, while the old `/tmp` profile
+lease remains only for non-Station deployment roles.
+
+## 4. Bootstrap Snapshot Boundary
+
+Before explicit promotion, `~/.peers-touch/dev/registry.json` is intentionally
+diagnostic:
+
+- It records current worktree/profile/slot/Station facts.
+- It records dirty and untracked env definitions.
+- It records detected conflicts.
+- It records the target and legacy Acceptance roots.
+- Runtime commands reject it as non-authoritative.
+- It does not migrate, delete, or symlink any worktree `.local`.
+
+`env-status-all` may read and label the snapshot, but only `env-register`
+promotes it. This permits visibility without silently changing active runtimes.
+
+## 5. Migration Constraints
+
+- Preserve each worktree's independent profile choice.
+- Derive reset policy only from the verified canonical Profile ID. A
+  case-insensitive terminal `stable` suffix is protected; all other reviewed Profile
+  IDs are Agent-resettable. Do not read a control-mode field or legacy cache.
+- Do not select a default profile for unbound worktrees.
+- Do not assign slot 0 as a fallback.
+- Agents may create a worktree-local Profile with `make profile-init`; remote
+  topology must remain tracked source in the explicitly scoped environment
+  repository.
+- `PT_DEV_PROFILE_FILE` is reserved for a profile directly contained by a
+  declared Acceptance runtime profile root with
+  `acceptance-runtime-manifest` authority.
+- Do not activate untracked env profiles as deploy authority.
+- Do not move product data into the dev root.
+- Move Acceptance evidence into the dedicated `acceptance/` child; do not mix
+  it with registry, lease, workspace runtime, or product data.
+- Do not infer a running process from a stale PID file.
+- Do not delete existing `.local` trees until their owned runtime data is
+  classified and the command cutover is proven.
+- After cutover, delete old active-profile resolution and shared-local
+  bootstrap code; no compatibility shim remains.
+- Quiesce all Acceptance writers before evidence migration.
+- Prefer an atomic same-volume directory rename. If unavailable, copy,
+  validate every immutable run and aggregate file/byte counts, atomically
+  switch the resolver, then delete the legacy root.
+- Do not use symlinks, dual writes, dual reads, or fallback from the target
+  Evidence Store to the legacy product path.
+- CI retains explicit `PT_ACCEPTANCE_ARTIFACT_ROOT`; local development uses the
+  canonical Dev Control Plane root without configuration.
+- Repository root must not contain tracked or untracked `debug-*`, `.dbg/`,
+  runtime logs, traces, screenshots, DOM dumps, or ad-hoc test prompts.
+- New debug sessions write under
+  `~/.peers-touch/dev/workspaces/<workspaceId>/debug/<sessionId>/` and are
+  removed when closed. Durable findings are promoted to formal docs,
+  operational knowledge, or Acceptance evidence.
+
+## 6. Verification
+
+Implementation must include:
+
+```text
+register -> bind independently -> allocate slot -> acquire lease -> run
+  -> observe -> release -> report
+```
+
+Required negative fixtures:
+
+- Same basename, different canonical roots.
+- Same profile, different worktrees.
+- Same slot requested concurrently.
+- Shared connect plus exclusive deploy.
+- Competing deploy.
+- Competing reset.
+- Stale lock metadata with no live lock.
+- Live process whose PID file points to another executable.
+- Missing registry, malformed registry, and unsupported schema.
+- Dirty/untracked environment repository definition.
+- Missing or ambiguous remote target or credential.
+- Mixed-case `stable` Profile requesting `station.reset`.
+- Non-stable reset with missing binding capability, exact scope, current
+  source identity, or OS lease.
+
+The local unowned-port negative fixture claims a listening socket from the
+canonical `slotPorts` allocation before registering its isolated test workspace.
+It keeps that socket until test cleanup and tests `PORT_CONFLICT` against the same
+slot. An occupied candidate is skipped only on `EADDRINUSE`; exhausting the
+canonical slot range fails the fixture. Fixed test ports, probe-then-release
+allocation, and terminating unrelated listeners cannot establish this proof.
+
+Focused implementation verification:
+
+```bash
+node --test --test-timeout=1200000 \
+  tooling/scripts/lib/machine-dev-paths.test.mjs \
+  tooling/scripts/local-dev/*.test.mjs
+```
+
+Workflow Snapshot verification:
+
+```bash
+node --test tooling/scripts/local-dev/workflow-snapshot*.test.mjs
+make workflow-snapshot
+```
+
+The snapshot contains current source, explicitly selected task-local records,
+isolated task errors, and optional runtime status. It never infers a current
+task, joins historical workflow stores, or turns task progress into runtime
+intent or occupancy.
+
+Lifecycle verification proves Workflow Snapshot emits one document and exits
+without opening a listener, browser, PID file, background process, or runtime
+lease.
+
+The lease suite launches isolated child processes for every required lease
+class and proves contention plus release on success, command failure, signal,
+timeout, and stale metadata recovery. It does not contact a Station.
+
+## 7. Acceptance Root Closure Contract
+
+The old root is pollution to remove, not a compatibility surface to support.
+Migration remains incomplete until every condition below holds:
+
+1. Every worktree returned by `git worktree list` is recorded as
+   `canonical-ready` in the run-scoped migration manifest, or is removed from
+   the Git worktree registry. Discovery does not enroll it in the machine
+   registry.
+2. No process, live run, writer lock, or lease can still target the old root.
+3. The target root contains every immutable run and valid `latest.json`
+   pointer, with matching per-file hashes, manifest identities, file count,
+   logical byte count, and allocated byte accounting.
+4. The canonical resolver and tests reject the product Application Support
+   namespace and expose no old-root fallback.
+5. The old root is deleted and a second filesystem observation confirms it is
+   absent.
+6. The machine registry drops `legacyAcceptanceEvidence` and the entire
+   `acceptanceEvidenceMigration` object.
+7. Active architecture, platform, skill, and operational docs remove the
+   legacy migration branch. Only the closed ADR and immutable completion
+   receipt may retain historical context.
+
+## 8. Registration And Activity Rules
+
+- `make profile <name>` and `make env-register` are the only operations that
+  enroll the current `workspaceId`. The former is the normal explicit
+  first-use path with atomic free-slot allocation; non-stable remote Profiles
+  receive connect+deploy while stable/local/compose Profiles receive connect
+  only. The latter accepts purpose metadata, profile, capability set, and slot.
+- `make profiles`, `git worktree list`, repository scans, and old
+  `.local/dev/active` pointers are discovery only.
+- `make env-status-all` lists registered worktrees first, then separately
+  reports unregistered observations and potential risks.
+- `active` requires a matching live process/listener or lease. A selected
+  profile, recent commit, active project plan, or open IDE window is
+  insufficient.
+- An idle registration retains its allocation but is reported as `idle`, not
+  active.
+- A registration with root or branch drift blocks mutation until repaired or
+  explicitly removed. Advancing HEAD on the registered branch does not make
+  the binding stale.
+
+The implementation must provide a stable completion Gate:
+
+```bash
+python3 tooling/scripts/local-dev-control-plane-audit.py \
+  --require-no-legacy-acceptance-root
+```
+
+The Gate owns the closed forbidden-pattern set and scans runtime code, active
+docs, skills, and the live machine registry. During migration it must report the
+remaining owners. After closure it must return zero. Closed ADRs, immutable
+migration receipts, and historical execution plans may retain audit context but
+cannot be imported or executed as current runtime policy.
+
+## 9. Resource Dependency Cutover
+
+LDCP-D23/D25/D26/D27 extend the existing owners. The Node owner and both Mobile
+entries are implemented; base/selected/layout iOS Provisioners use the same
+explicit assignment/physical lease caller. Source regression checks pass.
+Native/source/data proof remains a separate closure obligation. Documents do
+not alter live Profile assignments or Station processes.
+
+| Existing consumer/owner | Target responsibility |
+|-------------------------|-----------------------|
+| Existing Profile parser + sibling env definitions | Project same-level Station and Simulator requirements from reviewed Profile source; keep machine identity out of shared definitions |
+| `machine-dev-registry.mjs` | User-directed Profile-to-ID assignments, visible sharing, overwrite admission, source fencing and observed status |
+| `machine-dev-lease.py` | Actual physical-device and slot locks, bounded process supervision |
+| `machine-dev.mjs` | Common request/binding/status/release composition |
+| `tooling/scripts/local-dev/mobile-ios-sim.sh` | Request a Profile-selected ID, retain slot and physical lease, enforce Station connect-only |
+| `apps/mobile/scripts/ios-dev-sim.sh` | Consume verified provider binding; no independent device selector/allocation |
+| `MobileSimulatorProvisioner`, selected and layout subclasses | Consume common allocation; retain business Fixture/Harness/evidence responsibilities |
+| Platform adapter within Local Dev | Provider create/inspect/boot/install/stop/delete |
+| Space-clean Skill | Audit classified usage and call the owner; never sweep provider devices independently |
+
+### 9.1 Single Request And Partial Acquisition
+
+Resolve current workspace, reviewed Profile, selected resource ID, operation,
+provider state and data scope once. Node/Python callers consume the same
+validated binding and sharing projection. Slot
+exclusivity does not replace physical UUID locking. Acquire related resources
+in stable order, revalidate after locking and unwind partial holds on failure.
+An inherited marker alone never proves possession.
+
+Mobile connect-only must bypass the current `# Ensure Station` deploy branch.
+An unavailable Station does not grant deployment permission. Acceptance
+Station equipment retains its original explicit operation and lease ordering;
+these contracts do not authorize deploying four during this work.
+
+The old Station equipment branch and independent simulator create/boot/
+uninstall/delete callbacks are removed from these consumers. Manual Xcode
+builds target `id=<held UUID>` through the generated Tauri build phase, followed
+by admitted installation and provider digest readback. Web changes reload;
+native changes require a new entry invocation rather than Tauri's fuzzy
+device-name dev selector.
+
+### 9.2 Data, Handoff And Consumer Inventory
+
+Users specify count/purpose or readable device names. Agent/control plane
+queries inventory and assignments, shows names/model/runtime/state/shared
+Profiles and resolves IDs internally. Users do not have to enumerate UUIDs.
+Profile scenarios choose from the resolved assignments freely. Shared IDs resolve one provider, and
+each Profile sees other references, actual contents and holders.
+No consumer silently chooses another ID from a count or fixed client role.
+
+Manual handoff records device identity, purpose and installed source as retained.
+An idle port slot does not authorize replacement. Before a conflicting install,
+binding change, data reset or session interruption, the canonical owner gives
+the readable device/Profile/content notice and asks whether to force.
+Refusal preserves state. Force is operation-specific and checked again under
+the physical lock; it is not a permanently enabled flag. App uninstall does not
+by itself remove iOS keychain; the original credential/Fixture owner must prove
+the actual data effect.
+
+All iOS creation consumers in `mobile_simulator.py` (base, selected and layout)
+and both launch scripts cut over to the common owner. Remove their independent
+creation/selection/cleanup logic; retain actual provider commands only inside
+the adapter. Shared Provisioner cleanup must expose failure without losing the
+machine-owned retry record.
+
+### 9.3 Atomicity And Verification
+
+The common owner may land internally before consumers. Each consumer cutover
+must be complete for that entrypoint; never keep a runtime fallback that
+directly allocates devices. Existing unaffected Android paths retain their
+owner, but cannot be reported as satisfying the iOS resource contract.
+Rollback uses VCS revert of the atomic cut, not a compatibility allocator.
+
+Native proof uses the existing simulator build/Harness and direct simctl/
+filesystem readback. LDCP-R01 to R10 require readable discovery, exact ID assignment, visible shared
+references, physical contention, crash recovery, data/retention protection,
+connect-only, truthful cleanup, explicit overwrite and post-confirmation races.
+
+Count-only requests must reach discovery/matching rather than fail for missing
+raw IDs. Duplicate display names, renamed labels and stale list positions must
+not change the internally selected resource. Human notices show device names
+and Profile impact; exact UUIDs/source digests remain available as details.
+New Gate IDs must be registered before execution; requirement IDs are not Gates.
+Fixtures use private owned roots and declared local requirements. They cannot
+redirect machine-global identity or locks through an artifact-root override.
+
+Tracked sibling env changes remain a separately explicit source scope.
+If a real Profile lacks a declared compatible simulator requirement, report it
+as unavailable; do not invent remote topology or mutate shared env implicitly.
+Historical device adoption and deletion are separate operations.
+
+Detach/release preserves other Profile references and current contents.
+No cleanup callback may delete a shared device because one Suite or Profile
+has finished. Physical delete reports all affected references and uses the
+explicit resource owner, authorization and provider readback.
+
+### 9.4 Downstream Documentation
+
+At runtime cutover, update `docs/global/local-dev-environment.md` and canonical
+`pt-local-dev-env`, `pt-dev-runtime-handoff`, `pt-dev-workflow` and
+`pt-debug-space-clean` references. They consume this architecture without
+copying schemas or introducing another runtime permission owner.

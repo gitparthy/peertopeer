@@ -1,0 +1,2442 @@
+import { create } from 'zustand';
+import type { DomainCacheRepository } from '@peers-touch/client-storage';
+
+import type { MobileAuthSession } from '../auth/authSession';
+import type { FederationContext } from '../../gen/proto/domain/federation/federation_projection_service_pb';
+import type { Post } from '../../gen/proto/domain/social/post_pb';
+import { mobileAuthScope, mobileAuthScopeKey } from '../auth/mobileAuthIdentity';
+import { requireMobileMutationAdmission } from '../../runtimes/mutationAdmission';
+import {
+  createMobileClientStorageRuntime,
+  type MobileClientStorageRuntime,
+} from '../../storage/mobileClientStorage';
+import type {
+  FriendConversationSettings,
+  UpdateFriendConversationSettingsInput,
+} from './socialApiTypes';
+import {
+  messagingConversationSummary,
+  messagingCreateDirect,
+  messagingCreateGroup,
+  messagingDissolveConversation,
+  messagingListConversations,
+  messagingListMessages,
+  messagingListThreadMessages,
+  messagingMembershipTransition,
+  messagingCommandStatus,
+  messagingSendMessage,
+  messagingSubmitEdit,
+  messagingSubmitLeaveIntent,
+  messagingSubmitMetadataInteraction,
+  messagingSubmitReadCursor,
+  messagingSubmitTyping,
+  messagingTransferOwnership,
+  messagingUpdateConversation,
+  messagingUpdateMemberAuthority,
+  type MessagingAttachmentStageProjection,
+  type MessagingCreateGroupResult,
+  type MessagingLeaveIntentSubmissionResult,
+  type MessagingMemberAuthorityResult,
+  type MessagingPendingCommandResult,
+  type MessagingPendingConversationCommandResult,
+  type MessagingSubmitCommandResult,
+} from '../../services/mobileCommands';
+import {
+  applyReliabilityProjectionCheckpoints,
+  listReliabilityCommands,
+  readReliabilityRuntimeStatus,
+} from '../../runtimes/commandRuntime';
+import {
+  createSocialGateway,
+  createNotificationGateway,
+  createProfileGateway,
+  createMomentsGateway,
+  unwrapOutcome,
+  type SocialGateway,
+  type NotificationGateway,
+  type ProfileGateway,
+  type MomentsGateway,
+  type EditableProfileInput,
+  type ProfileUpdateResult,
+} from '../../services/gateways';
+import type {
+  FriendRequestMutationResult,
+} from '../../services/gateways/socialGateway';
+import {
+  federationCatalogEntryToResult,
+  normalizeFriendRequest,
+  normalizeNotification,
+  normalizePeerProfile,
+  normalizeSession,
+  normalizeUnreadCounts,
+} from './socialNormalizers';
+import {
+  applyPresenceToMap,
+  applyTypingStateToMap,
+  mergeNotifications,
+  peerPtidFromSession,
+  projectAcceptedContacts,
+  projectConversations,
+  projectOutgoingRequests,
+  projectPendingInboundRequests,
+  projectUnreadNotificationCount,
+  projectUnreadNotifications,
+  pruneTypingPeers,
+} from './socialProjection';
+import type { MessagingConversationProjection } from '../../services/mobileCommands';
+import {
+  groupCommandOutcomeKey,
+  refreshGroupCommandOutcomes,
+  trackGroupCommand,
+  type GroupCommandKind,
+  type GroupCommandOutcomes,
+} from '../chat/groupCommandState';
+import {
+  refreshChatMessageCommandOutcomes,
+  trackChatMessageCommand,
+  type ChatMessageCommandOutcomes,
+} from '../chat/messageCommandState';
+import { projectMessagingMessage } from '../chat/messageProjection';
+import {
+  SocialApiError,
+  readableErrorMessage,
+  type SocialMessage,
+  type FriendChatSession,
+  type FriendRequest,
+  type FriendshipStatus,
+  type PeerProfile,
+  type SocialConversation,
+  type SocialNotification,
+  type SocialTimestamp,
+  type TypingEntry,
+  type UnreadCounts,
+  type ActorSearchResult,
+  type PeopleSearchScope,
+} from './socialTypes';
+
+const FEDERATED_HANDLE_RE = /^@?([a-zA-Z0-9._-]+)(?:@([a-zA-Z0-9.-]+(?::\d+)?))?$/;
+
+interface ParsedHandle {
+  isFederated: boolean;
+  hasHost: boolean;
+  canonical: string;
+  localPart: string;
+}
+
+export interface SocialAuthoredFeedState {
+  readonly posts: readonly Post[];
+  readonly nextCursor: string;
+  readonly hasMore: boolean;
+  readonly loading: boolean;
+  readonly error: SocialApiError | null;
+}
+
+export interface SocialState {
+  sessionKey: string | null;
+  authSession: MobileAuthSession | null;
+  currentUserPtid: string | null;
+  socialGateway: SocialGateway | null;
+  notificationGateway: NotificationGateway | null;
+  profileGateway: ProfileGateway | null;
+  momentsGateway: MomentsGateway | null;
+  storage: MobileClientStorageRuntime | null;
+  sessions: FriendChatSession[];
+  messagingConversations: MessagingConversationProjection[];
+  conversationSummaries: Record<string, {
+    lastMessage?: SocialMessage;
+    unreadCount: number;
+  }>;
+  friendRequests: FriendRequest[];
+  messages: Record<string, SocialMessage[]>;
+  threadMessages: Record<string, SocialMessage[]>;
+  messageCommandOutcomes: ChatMessageCommandOutcomes;
+  groupCommandOutcomes: GroupCommandOutcomes;
+  conversationSettings: Record<string, FriendConversationSettings>;
+  notifications: SocialNotification[];
+  notificationNextCursor: string;
+  notificationHasMore: boolean;
+  unreadCounts: UnreadCounts;
+  peerOnline: Record<string, boolean>;
+  currentUserProfile: PeerProfile | null;
+  peerProfiles: Record<string, PeerProfile | null>;
+  peerProfileLoading: Record<string, boolean>;
+  peerProfileErrors: Record<string, SocialApiError | null>;
+  friendshipStatus: Record<string, FriendshipStatus>;
+  blockedUsers: FriendshipStatus[];
+  typingPeers: Record<string, Record<string, TypingEntry>>;
+  peopleSearchResults: ActorSearchResult[];
+  peopleSearchFederations: FederationContext[];
+  peopleSearchFederationsError: SocialApiError | null;
+  peopleSearchLoading: boolean;
+  peopleSearchError: SocialApiError | null;
+  authoredFeeds: Record<string, SocialAuthoredFeedState>;
+  activeSessionUlid: string | null;
+  loading: boolean;
+  error: SocialApiError | null;
+  lastReconcileAt: number | null;
+  bindSession: (session: MobileAuthSession | null) => void;
+  reconcile: () => Promise<void>;
+  refreshFriendRequests: () => Promise<void>;
+  refreshSessions: () => Promise<void>;
+  refreshBlockedUsers: () => Promise<void>;
+  loadFriendshipStatus: (targetPtid: string) => Promise<void>;
+  followUser: (targetPtid: string) => Promise<void>;
+  unfollowUser: (targetPtid: string) => Promise<void>;
+  blockUser: (targetPtid: string) => Promise<void>;
+  unblockUser: (targetPtid: string) => Promise<void>;
+  refreshConversationSettings: () => Promise<void>;
+  loadConversationSettings: (sessionUlid: string) => Promise<void>;
+  updateConversationSettings: (sessionUlid: string, input: UpdateFriendConversationSettingsInput) => Promise<void>;
+  refreshNotifications: () => Promise<void>;
+  notificationLoading: boolean;
+  notificationError: SocialApiError | null;
+  markActiveSessionRead: (sessionUlid: string, upToUlid?: string) => Promise<void>;
+  loadMoreNotifications: () => Promise<void>;
+  markNotificationRead: (notificationId: string) => Promise<void>;
+  markAllNotificationsRead: () => Promise<void>;
+  deleteNotification: (notificationId: string) => Promise<void>;
+  acceptFriendRequest: (requestId: string) => Promise<void>;
+  rejectFriendRequest: (requestId: string) => Promise<void>;
+  sendFriendRequest: (
+    receiverPtid: string,
+    receiverHomeStationPeerId: string,
+    federationId: string,
+    message?: string,
+  ) => Promise<FriendRequestMutationResult['command']>;
+  openDirectConversation: (peerPtid: string, federationId?: string) => Promise<string>;
+  createGroup: (input: {
+    conversationId: string;
+    name: string;
+    description?: string;
+    memberPtids: string[];
+    federationId: string;
+  }) => Promise<MessagingCreateGroupResult>;
+  updateGroupConversation: (
+    conversationId: string,
+    input: { name?: string; description?: string },
+  ) => Promise<MessagingPendingConversationCommandResult>;
+  addGroupMember: (
+    conversationId: string,
+    targetPtid: string,
+  ) => Promise<MessagingPendingConversationCommandResult>;
+  removeGroupMember: (
+    conversationId: string,
+    targetPtid: string,
+  ) => Promise<MessagingPendingConversationCommandResult>;
+  updateGroupMemberAuthority: (
+    conversationId: string,
+    targetPtid: string,
+    input: { role?: 'member' | 'admin'; muted?: boolean },
+  ) => Promise<MessagingMemberAuthorityResult>;
+  transferGroupOwnership: (
+    conversationId: string,
+    nextOwnerPtid: string,
+  ) => Promise<MessagingMemberAuthorityResult>;
+  leaveGroup: (
+    conversationId: string,
+  ) => Promise<MessagingLeaveIntentSubmissionResult>;
+  dissolveGroup: (
+    conversationId: string,
+  ) => Promise<MessagingPendingConversationCommandResult>;
+  selectSession: (sessionUlid: string | null) => Promise<void>;
+  loadMessages: (sessionUlid: string) => Promise<void>;
+  loadThreadMessages: (sessionUlid: string, threadRootMessageUlid: string) => Promise<void>;
+  refreshMessageCommandOutcomes: () => Promise<void>;
+  refreshGroupCommandOutcomes: () => Promise<void>;
+  clearGroupCommandOutcome: (
+    conversationId: string,
+    kind: GroupCommandKind,
+    targetPtid?: string,
+  ) => void;
+  drainProfileCacheWrites: () => Promise<void>;
+  loadCurrentUserProfile: (force?: boolean) => Promise<void>;
+  updateCurrentUserProfile: (input: EditableProfileInput, observedRevision?: bigint) => Promise<ProfileUpdateResult>;
+  loadPeerProfile: (peerPtid: string, force?: boolean) => Promise<void>;
+  loadAuthoredPosts: (actorPtid: string, cursor?: string) => Promise<void>;
+  sendMessage: (
+    sessionUlid: string,
+    content: string,
+    attachments?: MessagingAttachmentStageProjection[],
+    context?: {
+      replyToMessageId?: string;
+      threadRootMessageId?: string;
+    },
+  ) => Promise<MessagingSubmitCommandResult | null>;
+  editMessage: (
+    sessionUlid: string,
+    messageUlid: string,
+    content: string,
+  ) => Promise<MessagingPendingCommandResult>;
+  recallMessage: (
+    sessionUlid: string,
+    messageUlid: string,
+  ) => Promise<MessagingPendingCommandResult>;
+  hideMessageForActor: (
+    sessionUlid: string,
+    messageUlid: string,
+  ) => Promise<MessagingPendingCommandResult>;
+  moderateMessage: (
+    sessionUlid: string,
+    messageUlid: string,
+    reasonCode: string,
+  ) => Promise<MessagingPendingCommandResult>;
+  setMessageReaction: (
+    sessionUlid: string,
+    messageUlid: string,
+    reaction: string,
+    remove: boolean,
+    threadRootMessageUlid?: string,
+  ) => Promise<MessagingPendingCommandResult>;
+  setMessagePinned: (
+    sessionUlid: string,
+    messageUlid: string,
+    remove: boolean,
+    threadRootMessageUlid?: string,
+  ) => Promise<MessagingPendingCommandResult>;
+  setPeerOnline: (ptid: string, online: boolean) => void;
+  applyTypingState: (sessionUlid: string, fromActorPtid: string, typing: boolean) => void;
+  sweepTypingPeers: (staleBefore: number) => void;
+  sendTypingState: (sessionUlid: string, typing: boolean) => Promise<void>;
+  refreshFederationContexts: () => Promise<void>;
+  searchPeople: (query: string, scope: PeopleSearchScope) => Promise<void>;
+  clearPeopleSearch: () => void;
+  clearError: () => void;
+}
+
+const emptyUnreadCounts: UnreadCounts = { total: 0, byCategory: {} };
+let peopleSearchRequest: object | null = null;
+let friendRequestRefresh: object | null = null;
+let sessionRefresh: object | null = null;
+let socialReconcile: object | null = null;
+let notificationRead: object | null = null;
+let messagingScope = {};
+const messageLoads = new Map<string, object>();
+const summaryReads = new Map<string, object>();
+const readCursors = new Map<string, object>();
+const authoredFeedRequests = new Map<string, object>();
+const friendRequestSubmissions = new WeakMap<MobileAuthSession, Set<string>>();
+const profileCacheWrites = new Set<Promise<void>>();
+const profileCacheWriteTails = new WeakMap<
+  DomainCacheRepository<unknown>,
+  Map<string, Promise<void>>
+>();
+
+export const useSocialStore = create<SocialState>((set, get) => ({
+  notificationLoading: false,
+  notificationError: null,
+  sessionKey: null,
+  authSession: null,
+  currentUserPtid: null,
+  socialGateway: null,
+  notificationGateway: null,
+  profileGateway: null,
+  momentsGateway: null,
+  storage: null,
+  sessions: [],
+  messagingConversations: [],
+  conversationSummaries: {},
+  friendRequests: [],
+  messages: {},
+  threadMessages: {},
+  messageCommandOutcomes: {},
+  groupCommandOutcomes: {},
+  conversationSettings: {},
+  notifications: [],
+  notificationNextCursor: '',
+  notificationHasMore: false,
+  unreadCounts: emptyUnreadCounts,
+  peerOnline: {},
+  currentUserProfile: null,
+  peerProfiles: {},
+  peerProfileLoading: {},
+  peerProfileErrors: {},
+  friendshipStatus: {},
+  blockedUsers: [],
+  typingPeers: {},
+  peopleSearchResults: [],
+  peopleSearchFederations: [],
+  peopleSearchFederationsError: null,
+  peopleSearchLoading: false,
+  peopleSearchError: null,
+  authoredFeeds: {},
+  activeSessionUlid: null,
+  loading: false,
+  error: null,
+  lastReconcileAt: null,
+
+  bindSession: (session) => {
+    notificationRead = null;
+    set({ notificationLoading: false, notificationError: null });
+    if (session && get().sessionKey === mobileAuthScopeKey(session)) return;
+    messagingScope = {};
+    sessionRefresh = null;
+    socialReconcile = null;
+    messageLoads.clear();
+    summaryReads.clear();
+    readCursors.clear();
+    authoredFeedRequests.clear();
+    if (!session) {
+      set({
+        sessionKey: null,
+        authSession: null,
+        currentUserPtid: null,
+        socialGateway: null,
+        notificationGateway: null,
+        profileGateway: null,
+        momentsGateway: null,
+        storage: null,
+        sessions: [],
+        messagingConversations: [],
+        conversationSummaries: {},
+        friendRequests: [],
+        messages: {},
+        threadMessages: {},
+        messageCommandOutcomes: {},
+        groupCommandOutcomes: {},
+        conversationSettings: {},
+        notifications: [],
+        notificationNextCursor: '',
+        notificationHasMore: false,
+        unreadCounts: emptyUnreadCounts,
+        peerOnline: {},
+        currentUserProfile: null,
+        peerProfiles: {},
+        peerProfileLoading: {},
+        peerProfileErrors: {},
+        friendshipStatus: {},
+        blockedUsers: [],
+        typingPeers: {},
+        peopleSearchResults: [],
+        peopleSearchFederations: [],
+        peopleSearchFederationsError: null,
+        peopleSearchLoading: false,
+        peopleSearchError: null,
+        authoredFeeds: {},
+        activeSessionUlid: null,
+        loading: false,
+        error: null,
+        lastReconcileAt: null,
+      });
+      return;
+    }
+
+    const sessionKey = mobileAuthScopeKey(session);
+    const currentUserPtid = resolveActorPtid(session);
+
+    set({
+      sessionKey,
+      authSession: session,
+      currentUserPtid,
+      socialGateway: createSocialGateway(session),
+      notificationGateway: createNotificationGateway(session),
+      profileGateway: createProfileGateway(session),
+      momentsGateway: createMomentsGateway(session),
+      storage: createMobileClientStorageRuntime(session),
+      sessions: [],
+      messagingConversations: [],
+      conversationSummaries: {},
+      friendRequests: [],
+      messages: {},
+      threadMessages: {},
+      messageCommandOutcomes: {},
+      groupCommandOutcomes: {},
+      conversationSettings: {},
+      notifications: [],
+      notificationNextCursor: '',
+      notificationHasMore: false,
+      unreadCounts: emptyUnreadCounts,
+      peerOnline: {},
+      currentUserProfile: null,
+      peerProfiles: {},
+      peerProfileLoading: {},
+      peerProfileErrors: {},
+      friendshipStatus: {},
+      blockedUsers: [],
+      typingPeers: {},
+      peopleSearchResults: [],
+      peopleSearchFederations: [],
+      peopleSearchFederationsError: null,
+      peopleSearchLoading: false,
+      peopleSearchError: null,
+      authoredFeeds: {},
+      activeSessionUlid: null,
+      loading: false,
+      error: null,
+      lastReconcileAt: null,
+    });
+
+    if (currentUserPtid) {
+      void hydrateCurrentUserProfileFromCache(
+        sessionKey,
+        currentUserPtid,
+        get,
+        set,
+      );
+    }
+  },
+
+  reconcile: async () => {
+    const scope = get().authSession;
+    const request = {};
+    socialReconcile = request;
+    const isCurrent = () => socialReconcile === request && get().authSession === scope;
+    const {
+      refreshFriendRequests,
+      refreshBlockedUsers,
+      refreshNotifications,
+      refreshFederationContexts,
+    } = get();
+    const coldStart = get().friendRequests.length === 0
+      && get().notifications.length === 0;
+    set({ loading: coldStart, error: null });
+    try {
+      await Promise.all([
+        refreshFriendRequests(),
+        refreshBlockedUsers(),
+        refreshNotifications(),
+        refreshFederationContexts(),
+      ]);
+      if (!isCurrent()) return;
+      set({ lastReconcileAt: Date.now(), loading: false });
+    } catch (error) {
+      if (!isCurrent()) return;
+      set({ error: normalizeError(error), loading: false });
+    }
+  },
+
+  refreshFriendRequests: async () => {
+    const scope = get().authSession;
+    const refresh = {};
+    friendRequestRefresh = refresh;
+    const gw = requireSocialGateway(get());
+    const isCurrent = () => friendRequestRefresh === refresh
+      && get().authSession === scope
+      && get().socialGateway === gw;
+    const paginationError = () => new SocialApiError({
+      method: 'GET',
+      path: '/api/v1/social/friend-requests',
+      message: 'mobile.contacts.requestFailed',
+    });
+    const requests = new Map<string, FriendRequest>();
+    const limit = 50;
+    let offset = 0;
+    let total: number | undefined;
+    try {
+      while (isCurrent()) {
+        const outcome = await gw.listFriendRequests(0, limit, offset);
+        if (!isCurrent()) return;
+        const result = unwrapOutcome(outcome);
+        if (
+          !Number.isSafeInteger(result.total)
+          || result.total < 0
+          || (total !== undefined && total !== result.total)
+        ) {
+          throw paginationError();
+        }
+        total = result.total;
+        const previousCount = requests.size;
+        for (const raw of result.requests) {
+          const request = normalizeFriendRequest(raw);
+          if (!request.requestId.trim()) throw paginationError();
+          requests.set(request.requestId, request);
+        }
+        if (requests.size > total) throw paginationError();
+        if (requests.size === total) break;
+        if (requests.size === previousCount) throw paginationError();
+
+        // Server pages may be shorter than requested or overlap prior IDs.
+        offset += result.requests.length;
+        if (!Number.isSafeInteger(offset)) throw paginationError();
+      }
+      if (!isCurrent()) return;
+      set({ friendRequests: [...requests.values()] });
+    } catch (error) {
+      if (!isCurrent()) return;
+      throw error;
+    }
+  },
+
+  refreshSessions: async () => {
+    const state = get();
+    const scope = state.authSession;
+    const refresh = {};
+    sessionRefresh = refresh;
+    const isCurrent = () => sessionRefresh === refresh && get().authSession === scope;
+    const account = messagingAccount(state);
+    const currentUserPtid = state.currentUserPtid;
+    if (!currentUserPtid) return;
+
+    try {
+      const conversations = (await messagingListConversations(account))
+        .filter((conversation) => conversation.active);
+      if (!isCurrent()) return;
+      const entries = await Promise.all(conversations.map(async (conversation) => {
+        const request = {};
+        const readCursor = readCursors.get(conversation.conversationId);
+        summaryReads.set(conversation.conversationId, request);
+        const summary = await messagingConversationSummary({
+          ...account,
+          conversationId: conversation.conversationId,
+        });
+        return { conversation, summary, request, readCursor };
+      }));
+      if (!isCurrent()) return;
+      const conversationIds = new Set(conversations.map((conversation) => conversation.conversationId));
+      for (const id of messageLoads.keys()) {
+        if (!conversationIds.has(id)) messageLoads.delete(id);
+      }
+      set((current) => {
+        const existing = new Map(current.sessions.map((session) => [session.ulid, session]));
+        const conversationSummaries = Object.fromEntries(entries.map(({
+          conversation,
+          summary,
+          request,
+          readCursor,
+        }) => {
+          const previous = current.conversationSummaries[conversation.conversationId];
+          if (summaryReads.get(conversation.conversationId) !== request) {
+            return [conversation.conversationId, previous ?? {
+              unreadCount: 0,
+            }];
+          }
+          return [conversation.conversationId, {
+            lastMessage: summary.lastMessage
+              ? projectMessagingMessage(conversation.conversationId, summary.lastMessage)
+              : undefined,
+            unreadCount: readCursors.get(conversation.conversationId) === readCursor
+              ? summary.unreadCount
+              : previous?.unreadCount ?? 0,
+          }];
+        }));
+        return {
+          messagingConversations: conversations,
+          conversationSummaries,
+          sessions: entries
+            .filter(({ conversation }) => conversation.kind === 1)
+            .map(({ conversation, request }) => {
+            const session = sessionFromMessaging(
+              conversation, currentUserPtid, existing.get(conversation.conversationId),
+            );
+            // A later history read owns its preview even if this list finishes last.
+            if (summaryReads.get(session.ulid) !== request) return session;
+            const summary = conversationSummaries[session.ulid];
+            const lastMessage = summary?.lastMessage;
+            return {
+              ...session,
+              lastMessage,
+              lastMessageUlid: lastMessage?.ulid ?? '',
+              lastMessageAt: lastMessage?.sentAt ?? session.lastMessageAt,
+              unreadCountA: summary?.unreadCount ?? session.unreadCountA,
+            };
+          }),
+        };
+      });
+    } catch (error) {
+      if (!isCurrent()) return;
+      throw error;
+    }
+  },
+
+  refreshBlockedUsers: async () => {
+    const scope = get().authSession;
+    const gw = requireSocialGateway(get());
+    const blockedUsers = unwrapOutcome(await gw.listBlockedUsers());
+    if (get().authSession !== scope) return;
+    set((state) => {
+      const nextStatus = { ...state.friendshipStatus };
+      blockedUsers.forEach((item) => {
+        if (item.targetPtid) nextStatus[item.targetPtid] = item;
+      });
+      return { blockedUsers, friendshipStatus: nextStatus };
+    });
+  },
+
+  loadFriendshipStatus: async (targetPtid) => {
+    const ptid = targetPtid.trim();
+    if (!ptid) return;
+    const gw = requireSocialGateway(get());
+    try {
+      const status = unwrapOutcome(await gw.getFriendshipStatus(ptid));
+      set((state) => ({
+        friendshipStatus: {
+          ...state.friendshipStatus,
+          [ptid]: { ...status, targetPtid: ptid },
+        },
+      }));
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  followUser: async (targetPtid) => {
+    const ptid = targetPtid.trim();
+    if (!ptid) return;
+    const state = get();
+    const gw = requireSocialGateway(state);
+    try {
+      const accepted = unwrapOutcome(await gw.followUser(ptid));
+      if (!accepted) throw new Error('mobile.social.followFailed');
+      if (get().authSession !== state.authSession) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      await get().loadFriendshipStatus(ptid);
+      if (!get().friendshipStatus[ptid]?.following) {
+        throw new Error('mobile.social.followUnconfirmed');
+      }
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  unfollowUser: async (targetPtid) => {
+    const ptid = targetPtid.trim();
+    if (!ptid) return;
+    const state = get();
+    const gw = requireSocialGateway(state);
+    try {
+      const accepted = unwrapOutcome(await gw.unfollowUser(ptid));
+      if (!accepted) throw new Error('mobile.social.unfollowFailed');
+      if (get().authSession !== state.authSession) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      await get().loadFriendshipStatus(ptid);
+      if (get().friendshipStatus[ptid]?.following) {
+        throw new Error('mobile.social.unfollowUnconfirmed');
+      }
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  blockUser: async (targetPtid) => {
+    const ptid = targetPtid.trim();
+    if (!ptid) return;
+    const current = get();
+    const gw = requireSocialGateway(current);
+    try {
+      const authoritative = unwrapOutcome(
+        await gw.getFriendshipStatus(ptid),
+      );
+      const targetHomeStationPeerId =
+        authoritative.targetHomeStationPeerId
+        || relationshipTargetHomeStationPeerId(current, ptid);
+      const result = unwrapOutcome(
+        await gw.blockUser(
+          ptid,
+          targetHomeStationPeerId,
+          authoritative.revision ?? 0,
+        ),
+      );
+      if (result.relationship) {
+        set((state) => ({
+          friendshipStatus: {
+            ...state.friendshipStatus,
+            [ptid]: result.relationship!,
+          },
+          activeSessionUlid: state.sessions.some(
+            (session) =>
+              session.ulid === state.activeSessionUlid &&
+              peerPtidFromSession(session, state.currentUserPtid) === ptid,
+          )
+            ? null
+            : state.activeSessionUlid,
+        }));
+      }
+      await Promise.allSettled([
+        get().loadFriendshipStatus(ptid),
+        get().refreshFriendRequests(),
+        get().refreshBlockedUsers(),
+      ]);
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  unblockUser: async (targetPtid) => {
+    const ptid = targetPtid.trim();
+    if (!ptid) return;
+    const current = get();
+    const gw = requireSocialGateway(current);
+    try {
+      const authoritative = unwrapOutcome(
+        await gw.getFriendshipStatus(ptid),
+      );
+      const targetHomeStationPeerId =
+        authoritative.targetHomeStationPeerId
+        || relationshipTargetHomeStationPeerId(current, ptid);
+      const result = unwrapOutcome(
+        await gw.unblockUser(
+          ptid,
+          targetHomeStationPeerId,
+          authoritative.revision ?? 0,
+        ),
+      );
+      if (result.relationship) {
+        set((state) => ({
+          friendshipStatus: {
+            ...state.friendshipStatus,
+            [ptid]: result.relationship!,
+          },
+        }));
+      }
+      await Promise.allSettled([
+        get().loadFriendshipStatus(ptid),
+        get().refreshFriendRequests(),
+        get().refreshBlockedUsers(),
+      ]);
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  refreshConversationSettings: async () => {
+    const scope = get().authSession;
+    const gw = requireSocialGateway(get());
+    const conversations = get().messagingConversations;
+    const entries = await Promise.allSettled(conversations.map(async (conversation) => {
+      const settings = unwrapOutcome(await gw.getConversationSettings(
+        conversation.conversationId,
+      ));
+      return [conversation.conversationId, settings] as const;
+    }));
+    if (get().authSession !== scope) return;
+    set((state) => {
+      const next = { ...state.conversationSettings };
+      entries.forEach((entry) => {
+        if (entry.status === 'fulfilled') next[entry.value[0]] = entry.value[1];
+      });
+      return { conversationSettings: next };
+    });
+  },
+
+  loadConversationSettings: async (sessionUlid) => {
+    const scope = get().authSession;
+    const gw = requireSocialGateway(get());
+    const settings = unwrapOutcome(await gw.getConversationSettings(sessionUlid));
+    if (get().authSession !== scope || get().socialGateway !== gw) return;
+    set((state) => ({ conversationSettings: { ...state.conversationSettings, [sessionUlid]: settings } }));
+  },
+
+  updateConversationSettings: async (sessionUlid, input) => {
+    const scope = get().authSession;
+    const gw = requireSocialGateway(get());
+    const settings = unwrapOutcome(await gw.updateConversationSettings(sessionUlid, input));
+    if (get().authSession !== scope || get().socialGateway !== gw) return;
+    set((state) => ({ conversationSettings: { ...state.conversationSettings, [sessionUlid]: settings } }));
+  },
+
+  refreshNotifications: async () => {
+    const scope = get().authSession;
+    const notifGw = requireNotificationGateway(get());
+    const read = {};
+    notificationRead = read;
+    const current = () => notificationRead === read && get().authSession === scope
+      && get().notificationGateway === notifGw;
+    const retainedCount = Math.max(30, get().notifications.length);
+    set({ notificationLoading: true, notificationError: null });
+    try {
+      const notifications = new Map<string, SocialNotification>();
+      const cursors = new Set<string>();
+      let cursor = '';
+      do {
+        const previousCount = notifications.size;
+        const page = unwrapOutcome(await notifGw.listNotifications(30, cursor || undefined));
+        if (!current()) return;
+        page.notifications.forEach(raw => {
+          const notification = normalizeNotification(raw);
+          notifications.set(notification.id, notification);
+        });
+        cursor = page.nextCursor;
+        if (cursor && notifications.size === previousCount) throw new Error('mobile.notifications.readbackFailed');
+        if (cursor && cursors.has(cursor)) throw new Error('mobile.notifications.readbackFailed');
+        if (cursor) cursors.add(cursor);
+      } while (current() && cursor && notifications.size < retainedCount);
+      const unreadCounts = unwrapOutcome(await notifGw.getUnreadCounts());
+      if (!current()) return;
+      set({
+        notifications: [...notifications.values()],
+        notificationNextCursor: cursor,
+        notificationHasMore: Boolean(cursor),
+        unreadCounts: normalizeUnreadCounts(unreadCounts),
+        notificationLoading: false,
+      });
+    } catch (error) {
+      if (!current()) return;
+      set({ notificationLoading: false, notificationError: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  markActiveSessionRead: async (sessionUlid, upToUlid) => {
+    const state = get();
+    const scope = state.authSession;
+    const currentUserPtid = state.currentUserPtid;
+    if (!currentUserPtid || state.activeSessionUlid !== sessionUlid) return;
+
+    const messages = state.messages[sessionUlid] ?? [];
+    const target = upToUlid
+      ? messages.find((message) => message.ulid === upToUlid)
+      : messages.at(-1);
+    if (!target?.eventSequence || target.eventSequence <= 0) return;
+    await messagingSubmitReadCursor({
+      ...messagingAccount(state),
+      admissionDomain: mutationDomainForConversation(state, sessionUlid),
+      conversationId: sessionUlid,
+      lastReadSequence: target.eventSequence,
+    });
+    if (get().authSession !== scope || get().activeSessionUlid !== sessionUlid) return;
+
+    // A selected or hydrated conversation alone cannot acknowledge unread content.
+    readCursors.set(sessionUlid, {});
+    await get().refreshSessions();
+  },
+
+  loadMoreNotifications: async () => {
+    const scope = get().authSession;
+    const notifGw = requireNotificationGateway(get());
+    const { notificationHasMore, notificationNextCursor, notificationLoading } = get();
+    if (notificationLoading || !notificationHasMore || !notificationNextCursor) return;
+    const read = {};
+    notificationRead = read;
+    const current = () => notificationRead === read && get().authSession === scope
+      && get().notificationGateway === notifGw;
+    set({ notificationLoading: true, notificationError: null });
+    try {
+      const data = unwrapOutcome(await notifGw.listNotifications(30, notificationNextCursor));
+      if (!current()) return;
+      if (data.nextCursor === notificationNextCursor) throw new Error('mobile.notifications.readbackFailed');
+      const incoming = data.notifications.map(normalizeNotification);
+      set((state) => ({
+        notifications: mergeNotifications(state.notifications, incoming),
+        notificationNextCursor: data.nextCursor,
+        notificationHasMore: Boolean(data.nextCursor),
+        notificationLoading: false,
+      }));
+    } catch (error) {
+      if (!current()) return;
+      set({ notificationError: normalizeError(error), notificationLoading: false });
+      throw error;
+    }
+  },
+
+  markNotificationRead: async (notificationId) => {
+    const scope = get().authSession;
+    const notifGw = requireNotificationGateway(get());
+    if (!scope) throw new Error('mobile.social.notAuthenticated');
+    requireMobileMutationAdmission(mobileAuthScopeKey(scope), 'notification');
+    notificationRead = null;
+    unwrapOutcome(await notifGw.markNotificationsRead([notificationId]));
+    if (get().authSession !== scope || get().notificationGateway !== notifGw) {
+      throw new Error('mobile.social.notAuthenticated');
+    }
+    await get().refreshNotifications();
+    if (get().authSession !== scope
+      || get().notifications.find(item => item.id === notificationId)?.status !== 2) {
+      throw new Error('mobile.notifications.readbackFailed');
+    }
+  },
+
+  markAllNotificationsRead: async () => {
+    const scope = get().authSession;
+    const notifGw = requireNotificationGateway(get());
+    if (!scope) throw new Error('mobile.social.notAuthenticated');
+    requireMobileMutationAdmission(mobileAuthScopeKey(scope), 'notification');
+    notificationRead = null;
+    unwrapOutcome(await notifGw.markAllNotificationsRead());
+    if (get().authSession !== scope || get().notificationGateway !== notifGw) {
+      throw new Error('mobile.social.notAuthenticated');
+    }
+    await get().refreshNotifications();
+    if (get().authSession !== scope || get().unreadCounts.total !== 0) {
+      throw new Error('mobile.notifications.readbackFailed');
+    }
+  },
+
+  deleteNotification: async (notificationId) => {
+    const scope = get().authSession;
+    const notifGw = requireNotificationGateway(get());
+    if (!scope) throw new Error('mobile.social.notAuthenticated');
+    requireMobileMutationAdmission(mobileAuthScopeKey(scope), 'notification');
+    notificationRead = null;
+    unwrapOutcome(await notifGw.deleteNotifications([notificationId]));
+    if (get().authSession !== scope || get().notificationGateway !== notifGw) {
+      throw new Error('mobile.social.notAuthenticated');
+    }
+    await get().refreshNotifications();
+    if (get().authSession !== scope || get().notifications.some(item => item.id === notificationId)) {
+      throw new Error('mobile.notifications.readbackFailed');
+    }
+  },
+
+  acceptFriendRequest: async (requestId) => {
+    const state = get();
+    const gw = requireSocialGateway(state);
+    const request = state.friendRequests.find((item) => requestKey(item) === requestId);
+    try {
+      if (
+        !request
+        || request.receiverPtid !== state.currentUserPtid
+        || !request.federationId.trim()
+        || !request.senderHomeStationPeerId.trim()
+        || !request.receiverHomeStationPeerId.trim()
+      ) {
+        throw new SocialApiError({
+          method: 'POST',
+          path: '/api/v1/social/friend-request/accept',
+          message: 'mobile.contacts.requestFailed',
+        });
+      }
+      const payload = unwrapOutcome(await gw.acceptFriendRequest(request));
+      if (get().authSession !== state.authSession) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      if (!payload.command.checkpointReady || !payload.request) {
+        throw new Error('mobile.contacts.requestUnconfirmed');
+      }
+      set((state) => ({
+        friendRequests: state.friendRequests.map((request) =>
+          requestKey(request) === requestId
+            ? payload.request!
+            : request,
+        ),
+      }));
+      const reliability = await readReliabilityRuntimeStatus();
+      if (
+        !reliability.active
+        || !reliability.stationPeerId
+        || !reliability.actorPtid
+        || reliability.stationPeerId !== state.authSession?.stationPeerId
+        || reliability.actorPtid !== state.currentUserPtid
+      ) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      await applyReliabilityProjectionCheckpoints(
+        reliability.stationPeerId,
+        reliability.actorPtid,
+        reliability.runtimeGeneration,
+        () => get().refreshFriendRequests(),
+      );
+      await get().reconcile();
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  rejectFriendRequest: async (requestId) => {
+    const state = get();
+    const gw = requireSocialGateway(state);
+    const request = state.friendRequests.find((item) => requestKey(item) === requestId);
+    try {
+      if (
+        !request
+        || request.receiverPtid !== state.currentUserPtid
+        || !request.federationId.trim()
+        || !request.senderHomeStationPeerId.trim()
+        || !request.receiverHomeStationPeerId.trim()
+      ) {
+        throw new SocialApiError({
+          method: 'POST',
+          path: '/api/v1/social/friend-request/reject',
+          message: 'mobile.contacts.requestFailed',
+        });
+      }
+      const payload = unwrapOutcome(await gw.rejectFriendRequest(request));
+      if (get().authSession !== state.authSession) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      if (!payload.command.checkpointReady || !payload.request) {
+        throw new Error('mobile.contacts.requestUnconfirmed');
+      }
+      set((state) => ({
+        friendRequests: state.friendRequests.map((request) =>
+          requestKey(request) === requestId
+            ? payload.request!
+            : request,
+        ),
+      }));
+      const reliability = await readReliabilityRuntimeStatus();
+      if (
+        !reliability.active
+        || !reliability.stationPeerId
+        || !reliability.actorPtid
+        || reliability.stationPeerId !== state.authSession?.stationPeerId
+        || reliability.actorPtid !== state.currentUserPtid
+      ) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      await applyReliabilityProjectionCheckpoints(
+        reliability.stationPeerId,
+        reliability.actorPtid,
+        reliability.runtimeGeneration,
+        () => get().refreshFriendRequests(),
+      );
+      await get().reconcile();
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  sendFriendRequest: async (receiverPtid, receiverHomeStationPeerId, federationId, message) => {
+    const state = get();
+    const scope = requireAuthSession(state);
+    const gw = requireSocialGateway(state);
+    const submissionKey = JSON.stringify([receiverPtid, federationId]);
+    const submissions = friendRequestSubmissions.get(scope) ?? new Set<string>();
+    if (submissions.has(submissionKey)) {
+      throw new Error('mobile.contacts.requestUnconfirmed');
+    }
+    submissions.add(submissionKey);
+    friendRequestSubmissions.set(scope, submissions);
+    try {
+      if (!receiverHomeStationPeerId.trim() || !federationId.trim()) {
+        throw new SocialApiError({
+          method: 'POST',
+          path: '/api/v1/social/friend-request/send',
+          message: 'mobile.contacts.requestFailed',
+        });
+      }
+      const reliability = await readReliabilityRuntimeStatus();
+      if (
+        get().authSession !== state.authSession
+        || !reliability.active
+        || !reliability.stationPeerId
+        || !reliability.actorPtid
+        || reliability.stationPeerId !== state.authSession?.stationPeerId
+        || reliability.actorPtid !== state.currentUserPtid
+      ) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      const commands = await listReliabilityCommands(
+        reliability.stationPeerId,
+        reliability.actorPtid,
+        reliability.runtimeGeneration,
+      );
+      if (get().authSession !== state.authSession) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      const existingCommand = commands.some(({ envelope }) => {
+        const body = envelope.payload.case === 'friendRequest'
+          ? envelope.payload.value.body
+          : undefined;
+        return body?.federationId === federationId
+          && body.sender?.ptid === state.currentUserPtid
+          && body.receiver?.ptid === receiverPtid;
+      });
+      if (existingCommand) {
+        throw new Error('mobile.contacts.requestUnconfirmed');
+      }
+      const payload = unwrapOutcome(await gw.sendFriendRequest(
+        receiverPtid,
+        receiverHomeStationPeerId,
+        federationId,
+        message,
+      ));
+      if (get().authSession !== state.authSession) {
+        throw new Error('mobile.social.notAuthenticated');
+      }
+      if (payload.command.checkpointReady) {
+        await applyReliabilityProjectionCheckpoints(
+          reliability.stationPeerId,
+          reliability.actorPtid,
+          reliability.runtimeGeneration,
+          () => get().refreshFriendRequests(),
+        );
+      } else {
+        await get().refreshFriendRequests();
+      }
+      return payload.command;
+    } catch (error) {
+      if (get().authSession === scope) set({ error: normalizeError(error) });
+      throw error;
+    } finally {
+      submissions.delete(submissionKey);
+    }
+  },
+
+  openDirectConversation: async (peerPtid) => {
+    const state = get();
+    const account = messagingAccount(state);
+    // Scope (Local vs Federation) is derived server-side from the two actors'
+    // Home Stations; the client no longer selects or validates a federation.
+    const result = await messagingCreateDirect({ ...account, peerPtid });
+    if (get().authSession !== state.authSession) {
+      throw new Error('mobile.social.notAuthenticated');
+    }
+    if (!result.conversationId.trim()) {
+      throw new Error('mobile.contacts.openChatFailed');
+    }
+    return result.conversationId;
+  },
+
+  createGroup: async (input) => {
+    const state = get();
+    const result = await messagingCreateGroup({
+      ...messagingAccount(state),
+      conversationId: input.conversationId,
+      name: input.name,
+      memberPtids: input.memberPtids,
+      federationId: input.federationId,
+    });
+    if (get().authSession !== state.authSession) {
+      throw new Error('mobile.social.notAuthenticated');
+    }
+    if (result.state === 'failed') {
+      throw new Error('mobile.group.operationCreateFailed');
+    }
+    if (result.state === 'pending') {
+      set((current) => ({
+        groupCommandOutcomes: trackGroupCommand(
+          current.groupCommandOutcomes,
+          {
+            commandId: result.commandId,
+            conversationId: result.conversationId,
+            kind: 'create',
+          },
+        ),
+      }));
+    }
+    return result;
+  },
+
+  updateGroupConversation: async (conversationId, input) => {
+    const state = get();
+    const result = await messagingUpdateConversation({
+      ...messagingAccount(state),
+      conversationId,
+      ...input,
+    });
+    if (get().authSession !== state.authSession) return result;
+    set((current) => ({
+      groupCommandOutcomes: trackGroupCommand(
+        current.groupCommandOutcomes,
+        {
+          commandId: result.commandId,
+          conversationId,
+          kind: 'update',
+          expectedName: input.name,
+          expectedDescription: input.description,
+        },
+      ),
+    }));
+    return result;
+  },
+
+  addGroupMember: async (conversationId, targetPtid) => {
+    const state = get();
+    const result = await messagingMembershipTransition({
+      ...messagingAccount(state),
+      conversationId,
+      action: 'add_actor',
+      targetPtid,
+      role: 'member',
+    });
+    if (get().authSession !== state.authSession) return result;
+    set((current) => ({
+      groupCommandOutcomes: trackGroupCommand(
+        current.groupCommandOutcomes,
+        {
+          commandId: result.commandId,
+          conversationId,
+          kind: 'add-member',
+          targetPtid,
+          expectedRole: 'member',
+        },
+      ),
+    }));
+    return result;
+  },
+
+  removeGroupMember: async (conversationId, targetPtid) => {
+    const state = get();
+    const result = await messagingMembershipTransition({
+      ...messagingAccount(state),
+      conversationId,
+      action: 'remove_actor',
+      targetPtid,
+    });
+    if (get().authSession !== state.authSession) return result;
+    set((current) => ({
+      groupCommandOutcomes: trackGroupCommand(
+        current.groupCommandOutcomes,
+        {
+          commandId: result.commandId,
+          conversationId,
+          kind: 'remove-member',
+          targetPtid,
+        },
+      ),
+    }));
+    return result;
+  },
+
+  updateGroupMemberAuthority: async (conversationId, targetPtid, input) => {
+    const state = get();
+    const result = await messagingUpdateMemberAuthority({
+      ...messagingAccount(state),
+      conversationId,
+      targetPtid,
+      ...input,
+    });
+    if (get().authSession !== state.authSession) return result;
+    if (result.members) {
+      set((current) => ({
+        messagingConversations: current.messagingConversations.map(
+          (conversation) => conversation.conversationId === conversationId
+            ? {
+                ...conversation,
+                ownerPtid: result.ownerPtid ?? conversation.ownerPtid,
+                memberPtids: result.members!.map((member) => member.ptid),
+                members: result.members!,
+                membershipEpoch: result.membershipEpoch ?? conversation.membershipEpoch,
+                mlsEpoch: result.mlsEpoch ?? conversation.mlsEpoch,
+              }
+            : conversation,
+        ),
+      }));
+    }
+    if (result.state === 'pending') {
+      set((current) => ({
+        groupCommandOutcomes: trackGroupCommand(
+          current.groupCommandOutcomes,
+          {
+            commandId: result.commandId,
+            conversationId,
+            kind: 'update-member',
+            targetPtid,
+            expectedRole: input.role,
+            expectedMuted: input.muted,
+          },
+        ),
+      }));
+    }
+    return result;
+  },
+
+  transferGroupOwnership: async (conversationId, nextOwnerPtid) => {
+    const state = get();
+    const result = await messagingTransferOwnership({
+      ...messagingAccount(state),
+      conversationId,
+      nextOwnerPtid,
+    });
+    if (get().authSession !== state.authSession) return result;
+    if (result.members) {
+      set((current) => ({
+        messagingConversations: current.messagingConversations.map(
+          (conversation) => conversation.conversationId === conversationId
+            ? {
+                ...conversation,
+                ownerPtid: result.ownerPtid ?? nextOwnerPtid,
+                memberPtids: result.members!.map((member) => member.ptid),
+                members: result.members!,
+                membershipEpoch: result.membershipEpoch ?? conversation.membershipEpoch,
+                mlsEpoch: result.mlsEpoch ?? conversation.mlsEpoch,
+              }
+            : conversation,
+        ),
+      }));
+    }
+    if (result.state === 'pending') {
+      set((current) => ({
+        groupCommandOutcomes: trackGroupCommand(
+          current.groupCommandOutcomes,
+          {
+            commandId: result.commandId,
+            conversationId,
+            kind: 'transfer-ownership',
+            targetPtid: nextOwnerPtid,
+          },
+        ),
+      }));
+    }
+    return result;
+  },
+
+  leaveGroup: async (conversationId) => {
+    const state = get();
+    const result = await messagingSubmitLeaveIntent({
+      ...messagingAccount(state),
+      conversationId,
+    });
+    if (get().authSession !== state.authSession) return result;
+    set((current) => ({
+      groupCommandOutcomes: trackGroupCommand(
+        current.groupCommandOutcomes,
+        {
+          commandId: result.intentId,
+          conversationId,
+          kind: 'leave',
+          statusReadable: false,
+        },
+      ),
+    }));
+    return result;
+  },
+
+  dissolveGroup: async (conversationId) => {
+    const state = get();
+    const result = await messagingDissolveConversation({
+      ...messagingAccount(state),
+      conversationId,
+    });
+    if (get().authSession !== state.authSession) return result;
+    set((current) => ({
+      groupCommandOutcomes: trackGroupCommand(
+        current.groupCommandOutcomes,
+        {
+          commandId: result.commandId,
+          conversationId,
+          kind: 'dissolve',
+        },
+      ),
+    }));
+    return result;
+  },
+
+  selectSession: async (sessionUlid) => {
+    set({ activeSessionUlid: sessionUlid });
+    if (sessionUlid) {
+      await Promise.allSettled([
+        get().loadMessages(sessionUlid),
+        get().loadConversationSettings(sessionUlid),
+      ]);
+    }
+  },
+
+  loadMessages: async (sessionUlid) => {
+    const state = get();
+    const scope = state.authSession;
+    const generation = messagingScope;
+    const request = {};
+    const readCursor = readCursors.get(sessionUlid);
+    messageLoads.set(sessionUlid, request);
+    summaryReads.set(sessionUlid, request);
+    const isCurrent = () => get().authSession === scope
+      && messagingScope === generation && messageLoads.get(sessionUlid) === request;
+    try {
+      const projections = await messagingListMessages({
+        ...messagingAccount(state),
+        conversationId: sessionUlid,
+      });
+      if (!isCurrent()) return;
+      const messages = projections.map((message) => projectMessagingMessage(sessionUlid, message));
+      const messageCommandOutcomes = await refreshChatMessageCommandOutcomes(
+        get().messageCommandOutcomes,
+        messages,
+        state.currentUserPtid ?? '',
+        (commandId) => messagingCommandStatus({
+          ...messagingAccount(state),
+          commandId,
+        }),
+      );
+      if (!isCurrent()) return;
+      const lastMessage = messages.at(-1);
+      const unread = projections.filter((message) =>
+        message.senderPtid !== state.currentUserPtid
+        && !message.readByPtids.includes(state.currentUserPtid ?? '')
+        && !message.retracted,
+      ).length;
+      set((state) => ({
+        messages: { ...state.messages, [sessionUlid]: messages },
+        messageCommandOutcomes,
+        conversationSummaries: summaryReads.get(sessionUlid) === request
+          ? {
+              ...state.conversationSummaries,
+              [sessionUlid]: {
+                lastMessage,
+                unreadCount: readCursors.get(sessionUlid) === readCursor
+                  ? unread
+                  : state.conversationSummaries[sessionUlid]?.unreadCount ?? 0,
+              },
+            }
+          : state.conversationSummaries,
+        sessions: summaryReads.get(sessionUlid) === request
+          ? state.sessions.map((session) => session.ulid === sessionUlid ? {
+            ...session,
+            lastMessage,
+            lastMessageUlid: lastMessage?.ulid ?? '',
+            lastMessageAt: lastMessage?.sentAt ?? session.lastMessageAt,
+            unreadCountA: readCursors.get(sessionUlid) === readCursor
+              ? unread : session.unreadCountA,
+          } : session)
+          : state.sessions,
+      }));
+    } catch (error) {
+      if (!isCurrent()) return;
+      set({ error: normalizeError(error) });
+      throw error;
+    } finally {
+      if (messageLoads.get(sessionUlid) === request) messageLoads.delete(sessionUlid);
+    }
+  },
+
+  loadThreadMessages: async (sessionUlid, threadRootMessageUlid) => {
+    const state = get();
+    const scope = state.authSession;
+    try {
+      const messages = (
+        await messagingListThreadMessages({
+          ...messagingAccount(state),
+          conversationId: sessionUlid,
+          threadRootMessageId: threadRootMessageUlid,
+        })
+      ).map((message) => projectMessagingMessage(sessionUlid, message));
+      const messageCommandOutcomes = await refreshChatMessageCommandOutcomes(
+        get().messageCommandOutcomes,
+        [
+          ...(get().messages[sessionUlid] ?? []),
+          ...messages,
+        ],
+        state.currentUserPtid ?? '',
+        (commandId) => messagingCommandStatus({
+          ...messagingAccount(state),
+          commandId,
+        }),
+      );
+      if (get().authSession !== scope) return;
+      set((state) => ({
+        threadMessages: {
+          ...state.threadMessages,
+          [threadRootMessageUlid]: messages,
+        },
+        messageCommandOutcomes,
+      }));
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  refreshMessageCommandOutcomes: async () => {
+    const state = get();
+    const scope = state.authSession;
+    const messages = Object.values(state.messages).flat();
+    const threadMessages = Object.values(state.threadMessages).flat();
+    const messageCommandOutcomes = await refreshChatMessageCommandOutcomes(
+      state.messageCommandOutcomes,
+      [...messages, ...threadMessages],
+      state.currentUserPtid ?? '',
+      (commandId) => messagingCommandStatus({
+        ...messagingAccount(state),
+        commandId,
+      }),
+    );
+    if (get().authSession !== scope) return;
+    set({ messageCommandOutcomes });
+  },
+
+  refreshGroupCommandOutcomes: async () => {
+    const state = get();
+    const scope = state.authSession;
+    const groupCommandOutcomes = await refreshGroupCommandOutcomes(
+      state.groupCommandOutcomes,
+      state.messagingConversations,
+      state.currentUserPtid ?? '',
+      (commandId) => messagingCommandStatus({
+        ...messagingAccount(state),
+        commandId,
+      }),
+    );
+    if (get().authSession !== scope) return;
+    set({ groupCommandOutcomes });
+  },
+
+  clearGroupCommandOutcome: (conversationId, kind, targetPtid) => {
+    const key = groupCommandOutcomeKey(conversationId, kind, targetPtid);
+    set((state) => {
+      if (!(key in state.groupCommandOutcomes)) return state;
+      const groupCommandOutcomes = { ...state.groupCommandOutcomes };
+      delete groupCommandOutcomes[key];
+      return { groupCommandOutcomes };
+    });
+  },
+
+  drainProfileCacheWrites: async () => {
+    while (profileCacheWrites.size > 0) {
+      await Promise.all([...profileCacheWrites]);
+    }
+  },
+
+  loadCurrentUserProfile: async (force = false) => {
+    const state = get();
+    const ptid = state.currentUserPtid?.trim() ?? '';
+    if (!ptid) return;
+    if (!force && state.currentUserProfile) return;
+    const owner = captureProfileOperationOwner(state);
+    const isCurrent = () => isCurrentProfileOperation(get, owner);
+
+    const repository = owner.storage?.repositories.peerProfiles;
+    if (!force && repository) {
+      const cached = await readCachedPeerProfile(repository, ptid).catch((error) => {
+        if (!isCurrent()) return null;
+        throw error;
+      });
+      if (!isCurrent()) return;
+      if (cached?.profile) {
+        set((prev) => ({
+          currentUserProfile: cached.profile,
+          peerProfiles: { ...prev.peerProfiles, [ptid]: cached.profile },
+        }));
+        if (!cached.stale) return;
+      }
+    }
+
+    const profileGw = requireProfileGateway(state);
+    try {
+      const profile = unwrapOutcome(await profileGw.getPeerProfile(ptid));
+      if (!isCurrent()) return;
+      await persistProfileCache(repository, ptid, profile, isCurrent);
+      if (!isCurrent()) return;
+      set((prev) => ({
+        currentUserProfile: profile,
+        peerProfiles: { ...prev.peerProfiles, [ptid]: profile },
+      }));
+    } catch (error) {
+      if (!isCurrent()) return;
+      set({ error: normalizeError(error) });
+    }
+  },
+
+  updateCurrentUserProfile: async (input, inputRevision) => {
+    const state = get();
+    const ptid = state.currentUserPtid?.trim() ?? '';
+    if (!ptid) {
+      throw new SocialApiError({
+        method: 'POST',
+        path: '/actor/profile',
+        message: 'mobile.auth.missingIdentityScope',
+      });
+    }
+    const observedRevision = inputRevision ?? state.currentUserProfile?.profileRevision ?? 0n;
+    if (observedRevision === 0n) {
+      throw new SocialApiError({
+        method: 'POST',
+        path: '/actor/profile',
+        code: 'PROFILE_REVISION_UNAVAILABLE',
+        message: 'mobile.settings.profileUnavailable',
+      });
+    }
+    const owner = captureProfileOperationOwner(state);
+    const isCurrent = () => isCurrentProfileOperation(get, owner);
+
+    try {
+      const result = unwrapOutcome(
+        await requireProfileGateway(state).updateCurrentProfile(
+          input,
+          observedRevision,
+        ),
+      );
+      const profile = result.profile;
+      if (!isCurrent()) throw staleProfileOperationError('POST', '/actor/profile');
+      await persistProfileCache(
+        owner.storage?.repositories.peerProfiles,
+        ptid,
+        profile,
+        isCurrent,
+      );
+      if (!isCurrent()) throw staleProfileOperationError('POST', '/actor/profile');
+      set((current) => ({
+        currentUserProfile: profile,
+        peerProfiles: {
+          ...current.peerProfiles,
+          [ptid]: profile,
+        },
+        error: null,
+      }));
+      return result;
+    } catch (error) {
+      if (!isCurrent()) throw staleProfileOperationError('POST', '/actor/profile');
+      throw error;
+    }
+  },
+
+  loadPeerProfile: async (peerPtid, force = false) => {
+    const ptid = peerPtid.trim();
+    if (!ptid || ptid === get().currentUserPtid) return;
+    const state = get();
+    if (!force && ptid in state.peerProfiles) return;
+    if (!force && state.peerProfileLoading[ptid]) return;
+    const owner = captureProfileOperationOwner(state);
+    const isCurrent = () => isCurrentProfileOperation(get, owner);
+
+    const repository = owner.storage?.repositories.peerProfiles;
+    if (!force && repository) {
+      const cached = await readCachedPeerProfile(repository, ptid).catch((error) => {
+        if (!isCurrent()) return null;
+        throw error;
+      });
+      if (!isCurrent()) return;
+      if (cached?.profile) {
+        set((prev) => ({ peerProfiles: { ...prev.peerProfiles, [ptid]: cached.profile } }));
+        if (!cached.stale) return;
+      }
+    }
+
+    const profileGw = requireProfileGateway(state);
+    set((prev) => ({
+      peerProfileLoading: { ...prev.peerProfileLoading, [ptid]: true },
+      peerProfileErrors: { ...prev.peerProfileErrors, [ptid]: null },
+    }));
+
+    try {
+      const profile = unwrapOutcome(await profileGw.getPeerProfile(ptid));
+      if (!isCurrent()) return;
+      await persistProfileCache(repository, ptid, profile, isCurrent);
+      if (!isCurrent()) return;
+      set((prev) => ({
+        peerProfiles: { ...prev.peerProfiles, [ptid]: profile },
+        peerProfileLoading: { ...prev.peerProfileLoading, [ptid]: false },
+      }));
+    } catch (error) {
+      if (!isCurrent()) return;
+      set((prev) => ({
+        peerProfiles: { ...prev.peerProfiles, [ptid]: null },
+        peerProfileLoading: { ...prev.peerProfileLoading, [ptid]: false },
+        peerProfileErrors: { ...prev.peerProfileErrors, [ptid]: normalizeError(error) },
+      }));
+    }
+  },
+
+  loadAuthoredPosts: async (actorPtid, cursor = '') => {
+    const ptid = actorPtid.trim();
+    if (!ptid) return;
+    const state = get();
+    const gateway = state.momentsGateway;
+    if (!gateway) throw new Error('mobile.social.runtimeUnavailable');
+    const request = {};
+    authoredFeedRequests.set(ptid, request);
+    set((current) => ({
+      authoredFeeds: {
+        ...current.authoredFeeds,
+        [ptid]: {
+          posts: cursor ? current.authoredFeeds[ptid]?.posts ?? [] : [],
+          nextCursor: cursor,
+          hasMore: current.authoredFeeds[ptid]?.hasMore ?? true,
+          loading: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const page = unwrapOutcome(await gateway.fetchUserFeed(ptid, cursor, 30));
+      if (
+        authoredFeedRequests.get(ptid) !== request
+        || get().momentsGateway !== gateway
+      ) return;
+      set((current) => {
+        const previous = cursor ? current.authoredFeeds[ptid]?.posts ?? [] : [];
+        const posts = [...previous, ...page.posts].filter(
+          (post, index, all) => all.findIndex((item) => item.id === post.id) === index,
+        );
+        return {
+          authoredFeeds: {
+            ...current.authoredFeeds,
+            [ptid]: {
+              posts,
+              nextCursor: page.nextCursor,
+              hasMore: page.hasMore,
+              loading: false,
+              error: null,
+            },
+          },
+        };
+      });
+    } catch (error) {
+      if (
+        authoredFeedRequests.get(ptid) !== request
+        || get().momentsGateway !== gateway
+      ) return;
+      set((current) => ({
+        authoredFeeds: {
+          ...current.authoredFeeds,
+          [ptid]: {
+            posts: current.authoredFeeds[ptid]?.posts ?? [],
+            nextCursor: current.authoredFeeds[ptid]?.nextCursor ?? '',
+            hasMore: current.authoredFeeds[ptid]?.hasMore ?? false,
+            loading: false,
+            error: normalizeError(error),
+          },
+        },
+      }));
+    } finally {
+      if (authoredFeedRequests.get(ptid) === request) {
+        authoredFeedRequests.delete(ptid);
+      }
+    }
+  },
+
+  sendMessage: async (sessionUlid, content, attachments, context) => {
+    const state = get();
+    const trimmed = content.trim();
+    if (!trimmed && !attachments?.length) return null;
+
+    try {
+      const outcome = await messagingSendMessage({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        plaintext: trimmed,
+        replyToMessageId: context?.replyToMessageId,
+        threadRootMessageId: context?.threadRootMessageId,
+        attachmentStageIds: attachments?.map((attachment) => attachment.stageId),
+      });
+      await get().loadMessages(sessionUlid);
+      if (context?.threadRootMessageId) {
+        await get().loadThreadMessages(sessionUlid, context.threadRootMessageId);
+      }
+      return outcome;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  editMessage: async (sessionUlid, messageUlid, content) => {
+    const state = get();
+    const trimmed = content.trim();
+    if (!trimmed) {
+      throw new Error('mobile.messaging.editContentRequired');
+    }
+
+    try {
+      const submission = await messagingSubmitEdit({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        messageId: messageUlid,
+        plaintext: trimmed,
+      });
+      set((current) => ({
+        messageCommandOutcomes: trackChatMessageCommand(
+          current.messageCommandOutcomes,
+          {
+            conversationId: sessionUlid,
+            messageId: messageUlid,
+            kind: 'edit',
+            submission,
+            expectedContent: trimmed,
+          },
+        ),
+      }));
+      await Promise.allSettled([get().loadMessages(sessionUlid)]);
+      return submission;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  recallMessage: async (sessionUlid, messageUlid) => {
+    const state = get();
+    try {
+      const submission = await messagingSubmitMetadataInteraction({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        messageId: messageUlid,
+        interaction: { kind: 'retract' },
+      });
+      set((current) => ({
+        messageCommandOutcomes: trackChatMessageCommand(
+          current.messageCommandOutcomes,
+          {
+            conversationId: sessionUlid,
+            messageId: messageUlid,
+            kind: 'recall',
+            submission,
+          },
+        ),
+      }));
+      await Promise.allSettled([get().loadMessages(sessionUlid)]);
+      return submission;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  hideMessageForActor: async (sessionUlid, messageUlid) => {
+    const state = get();
+    try {
+      const submission = await messagingSubmitMetadataInteraction({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        messageId: messageUlid,
+        interaction: { kind: 'hideForActor' },
+      });
+      set((current) => ({
+        messageCommandOutcomes: trackChatMessageCommand(
+          current.messageCommandOutcomes,
+          {
+            conversationId: sessionUlid,
+            messageId: messageUlid,
+            kind: 'hideForActor',
+            submission,
+          },
+        ),
+      }));
+      await Promise.allSettled([get().loadMessages(sessionUlid)]);
+      return submission;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  moderateMessage: async (sessionUlid, messageUlid, reasonCode) => {
+    const state = get();
+    if (!reasonCode.trim()) {
+      throw new Error('mobile.messaging.moderationReasonRequired');
+    }
+    try {
+      const submission = await messagingSubmitMetadataInteraction({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        messageId: messageUlid,
+        interaction: { kind: 'moderate', reasonCode },
+      });
+      set((current) => ({
+        messageCommandOutcomes: trackChatMessageCommand(
+          current.messageCommandOutcomes,
+          {
+            conversationId: sessionUlid,
+            messageId: messageUlid,
+            kind: 'moderate',
+            submission,
+          },
+        ),
+      }));
+      await Promise.allSettled([get().loadMessages(sessionUlid)]);
+      return submission;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  setMessageReaction: async (
+    sessionUlid,
+    messageUlid,
+    reaction,
+    remove,
+    threadRootMessageUlid,
+  ) => {
+    const state = get();
+    try {
+      const submission = await messagingSubmitMetadataInteraction({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        messageId: messageUlid,
+        interaction: { kind: 'reaction', reaction, remove },
+      });
+      set((current) => ({
+        messageCommandOutcomes: trackChatMessageCommand(
+          current.messageCommandOutcomes,
+          {
+            conversationId: sessionUlid,
+            messageId: messageUlid,
+            kind: 'reaction',
+            submission,
+            reaction,
+            remove,
+          },
+        ),
+      }));
+      const refreshes = [get().loadMessages(sessionUlid)];
+      if (threadRootMessageUlid) {
+        refreshes.push(
+          get().loadThreadMessages(sessionUlid, threadRootMessageUlid),
+        );
+      }
+      await Promise.allSettled(refreshes);
+      return submission;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  setMessagePinned: async (
+    sessionUlid,
+    messageUlid,
+    remove,
+    threadRootMessageUlid,
+  ) => {
+    const state = get();
+    try {
+      const submission = await messagingSubmitMetadataInteraction({
+        ...messagingAccount(state),
+        admissionDomain: mutationDomainForConversation(state, sessionUlid),
+        conversationId: sessionUlid,
+        messageId: messageUlid,
+        interaction: { kind: 'pin', remove },
+      });
+      set((current) => ({
+        messageCommandOutcomes: trackChatMessageCommand(
+          current.messageCommandOutcomes,
+          {
+            conversationId: sessionUlid,
+            messageId: messageUlid,
+            kind: 'pin',
+            submission,
+            remove,
+          },
+        ),
+      }));
+      const refreshes = [get().loadMessages(sessionUlid)];
+      if (threadRootMessageUlid) {
+        refreshes.push(
+          get().loadThreadMessages(sessionUlid, threadRootMessageUlid),
+        );
+      }
+      await Promise.allSettled(refreshes);
+      return submission;
+    } catch (error) {
+      set({ error: normalizeError(error) });
+      throw error;
+    }
+  },
+
+  setPeerOnline: (ptid, online) =>
+    set((state) => {
+      const next = applyPresenceToMap(state.peerOnline, ptid, online);
+      return next ? { peerOnline: next } : state;
+    }),
+
+  applyTypingState: (sessionUlid, fromActorPtid, typing) => {
+    if (!sessionUlid || !fromActorPtid) return;
+    set((state) => {
+      const next = applyTypingStateToMap(state.typingPeers, sessionUlid, fromActorPtid, typing);
+      return next ? { typingPeers: next } : state;
+    });
+  },
+
+  sweepTypingPeers: (staleBefore) =>
+    set((state) => {
+      const next = pruneTypingPeers(state.typingPeers, staleBefore);
+      return next ? { typingPeers: next } : state;
+    }),
+
+  sendTypingState: async (sessionUlid, typing) => {
+    const state = get();
+    if (!sessionUlid) return;
+    await messagingSubmitTyping({
+      ...messagingAccount(state),
+      admissionDomain: mutationDomainForConversation(state, sessionUlid),
+      conversationId: sessionUlid,
+      isTyping: typing,
+    });
+  },
+
+  refreshFederationContexts: async () => {
+    const profileGw = get().profileGateway;
+    if (!profileGw) {
+      set({ peopleSearchFederations: [], peopleSearchFederationsError: null });
+      return;
+    }
+    const result = await profileGw.listFederationContexts();
+    if (get().profileGateway !== profileGw) return;
+    set({
+      peopleSearchFederations: result.ok ? result.data : [],
+      peopleSearchFederationsError: result.ok ? null : new SocialApiError(result.error),
+    });
+  },
+
+  searchPeople: async (query, scope) => {
+    const trimmed = query.trim();
+    const contextId = scope.kind === 'federation' ? scope.federationId.trim() : '';
+    if (!trimmed) {
+      get().clearPeopleSearch();
+      return;
+    }
+    if (scope.kind === 'federation' && !contextId) {
+      peopleSearchRequest = null;
+      set({
+        peopleSearchResults: [],
+        peopleSearchLoading: false,
+        peopleSearchError: new SocialApiError({
+          method: 'POST',
+          path: '/sub-federation/catalog/search',
+          code: 'FEDERATION_CONTEXT_REQUIRED',
+          message: 'mobile.contacts.federationRequired',
+        }),
+      });
+      return;
+    }
+    const profileGw = get().profileGateway;
+    const request = {};
+    peopleSearchRequest = request;
+    const isCurrent = () => peopleSearchRequest === request && get().profileGateway === profileGw;
+    set({ peopleSearchResults: [], peopleSearchLoading: true, peopleSearchError: null });
+    try {
+      if (!profileGw) throw new Error('mobile.social.runtimeUnavailable');
+      const parsed = parseHandleInput(trimmed);
+      let items: ActorSearchResult[];
+      if (scope.kind === 'station') {
+        if (parsed.hasHost) {
+          throw new SocialApiError({
+            method: 'GET',
+            path: '/api/v1/social/users/search',
+            code: 'FEDERATION_CONTEXT_REQUIRED',
+            message: 'mobile.contacts.federationRequired',
+          });
+        }
+        items = unwrapOutcome(await profileGw.searchActors(
+          trimmed.replace(/^@/, ''),
+        )).items;
+      } else if (parsed.isFederated && parsed.hasHost) {
+        const result = unwrapOutcome(
+          await profileGw.resolveFederationHandle(contextId, parsed.canonical),
+        );
+        items = result.asSearchResult ? [result.asSearchResult] : [];
+      } else {
+        const entries = unwrapOutcome(
+          await profileGw.searchFederationActors(
+            contextId,
+            parsed.localPart || trimmed.replace(/^@/, ''),
+          ),
+        );
+        items = entries.map(federationCatalogEntryToResult);
+      }
+      if (!isCurrent()) return;
+      set({ peopleSearchResults: items, peopleSearchLoading: false });
+    } catch (error) {
+      if (!isCurrent()) return;
+      set({ peopleSearchResults: [], peopleSearchLoading: false, peopleSearchError: normalizeError(error) });
+    }
+  },
+
+  clearPeopleSearch: () => {
+    peopleSearchRequest = null;
+    set({
+      peopleSearchResults: [],
+      peopleSearchError: null,
+      peopleSearchLoading: false,
+    });
+  },
+
+  clearError: () => set({ error: null }),
+}));
+
+export function selectConversations(state: SocialState): SocialConversation[] {
+  return projectConversations(state);
+}
+
+export function pendingInboundRequests(state: SocialState): FriendRequest[] {
+  return projectPendingInboundRequests(state.friendRequests, state.currentUserPtid);
+}
+
+export function outgoingRequests(state: SocialState): FriendRequest[] {
+  return projectOutgoingRequests(state.friendRequests, state.currentUserPtid);
+}
+
+export function unreadNotifications(state: SocialState): SocialNotification[] {
+  return projectUnreadNotifications(state.notifications);
+}
+
+export function unreadNotificationCount(state: SocialState): number {
+  return projectUnreadNotificationCount({ notifications: state.notifications, unreadTotal: state.unreadCounts.total });
+}
+
+export function formatSocialError(error: SocialApiError): string {
+  const code = error.context.code ? ` (${error.context.code})` : '';
+  return `${error.context.message}${code}`;
+}
+
+type SocialSetState = (partial: Partial<SocialState> | ((state: SocialState) => Partial<SocialState>)) => void;
+type ProfileOperationOwner = Pick<
+  SocialState,
+  'sessionKey' | 'authSession' | 'currentUserPtid' | 'profileGateway' | 'storage'
+>;
+
+function captureProfileOperationOwner(state: SocialState): ProfileOperationOwner {
+  return {
+    sessionKey: state.sessionKey,
+    authSession: state.authSession,
+    currentUserPtid: state.currentUserPtid,
+    profileGateway: state.profileGateway,
+    storage: state.storage,
+  };
+}
+
+function isCurrentProfileOperation(
+  getState: () => SocialState,
+  owner: ProfileOperationOwner,
+): boolean {
+  const current = getState();
+  return current.sessionKey === owner.sessionKey
+    && current.authSession === owner.authSession
+    && current.currentUserPtid === owner.currentUserPtid
+    && current.profileGateway === owner.profileGateway
+    && current.storage === owner.storage;
+}
+
+function staleProfileOperationError(method: 'GET' | 'POST', path: string): SocialApiError {
+  return new SocialApiError({
+    method,
+    path,
+    message: 'mobile.social.notAuthenticated',
+  });
+}
+
+async function persistProfileCache(
+  repository: DomainCacheRepository<unknown> | undefined,
+  ptid: string,
+  profile: PeerProfile,
+  isCurrent: () => boolean,
+): Promise<void> {
+  if (!repository || !isCurrent()) return;
+  let tails = profileCacheWriteTails.get(repository);
+  if (!tails) {
+    tails = new Map<string, Promise<void>>();
+    profileCacheWriteTails.set(repository, tails);
+  }
+  const previous = tails.get(ptid) ?? Promise.resolve();
+  const write = previous
+    .then(async () => {
+      if (!isCurrent()) return;
+      await repository.write(ptid, profile);
+    })
+    .catch(() => undefined);
+  tails.set(ptid, write);
+  profileCacheWrites.add(write);
+  void write.then(() => {
+    profileCacheWrites.delete(write);
+    if (tails?.get(ptid) === write) tails.delete(ptid);
+  });
+  await write;
+}
+
+async function hydrateCurrentUserProfileFromCache(
+  expectedSessionKey: string,
+  ptid: string | null,
+  getState: () => SocialState,
+  setState: SocialSetState,
+) {
+  const storage = getState().storage;
+  if (!storage || !ptid) return;
+
+  const cached = await readCachedPeerProfile(storage.repositories.peerProfiles, ptid);
+  if (
+    !cached?.profile
+    || getState().sessionKey !== expectedSessionKey
+  ) return;
+
+  setState((state) => ({
+    currentUserProfile: state.currentUserProfile ?? cached.profile,
+    peerProfiles: ptid in state.peerProfiles ? state.peerProfiles : { ...state.peerProfiles, [ptid]: cached.profile },
+  }));
+}
+
+async function readCachedPeerProfile(
+  repository: DomainCacheRepository<unknown>,
+  ptid: string,
+): Promise<{ profile: PeerProfile; stale: boolean } | null> {
+  const cached = await repository.read(ptid);
+  if (!cached.envelope) return null;
+  return { profile: cached.envelope.value as PeerProfile, stale: cached.stale };
+}
+
+function requireSocialGateway(state: SocialState): SocialGateway {
+  if (!state.socialGateway) {
+    throw new SocialApiError({ method: 'GET', path: '/social', message: 'mobile.social.notAuthenticated' });
+  }
+  return state.socialGateway;
+}
+
+function requireNotificationGateway(state: SocialState): NotificationGateway {
+  if (!state.notificationGateway) {
+    throw new SocialApiError({ method: 'GET', path: '/notification', message: 'mobile.social.notAuthenticated' });
+  }
+  return state.notificationGateway;
+}
+
+function requireProfileGateway(state: SocialState): ProfileGateway {
+  if (!state.profileGateway) {
+    throw new SocialApiError({ method: 'GET', path: '/profile', message: 'mobile.social.notAuthenticated' });
+  }
+  return state.profileGateway;
+}
+
+function requireAuthSession(state: SocialState): MobileAuthSession {
+  if (!state.authSession) {
+    throw new SocialApiError({ method: 'GET', path: '/social', message: 'mobile.social.notAuthenticated' });
+  }
+  return state.authSession;
+}
+
+function messagingAccount(state: SocialState) {
+  const session = requireAuthSession(state);
+  const actorPtid = state.currentUserPtid?.trim();
+  if (!actorPtid) {
+    throw new SocialApiError({
+      method: 'INVOKE',
+      path: 'messaging',
+      message: 'mobile.social.notAuthenticated',
+    });
+  }
+  return {
+    stationPeerId: session.stationPeerId,
+    actorPtid,
+    deviceId: session.deviceId,
+    lifecycleGeneration: session.lifecycleGeneration,
+  };
+}
+
+function conversationKind(
+  state: SocialState,
+  conversationId: string,
+): 'friend' | 'group' {
+  const kind = state.messagingConversations.find(
+    (conversation) => conversation.conversationId === conversationId,
+  )?.kind;
+  if (kind === 2) return 'group';
+  if (kind === 1 || state.sessions.some((session) => session.ulid === conversationId)) {
+    return 'friend';
+  }
+  throw new Error('mobile.chat.conversationUnavailable');
+}
+
+function mutationDomainForConversation(
+  state: SocialState,
+  conversationId: string,
+): 'social' | 'group' {
+  return conversationKind(state, conversationId) === 'group' ? 'group' : 'social';
+}
+
+function relationshipTargetHomeStationPeerId(
+  state: SocialState,
+  targetPtid: string,
+): string {
+  const projected = state.friendshipStatus[targetPtid]?.targetHomeStationPeerId;
+  if (projected) return projected;
+  for (const request of state.friendRequests) {
+    if (request.senderPtid === targetPtid && request.senderHomeStationPeerId) {
+      return request.senderHomeStationPeerId;
+    }
+    if (
+      request.receiverPtid === targetPtid &&
+      request.receiverHomeStationPeerId
+    ) {
+      return request.receiverHomeStationPeerId;
+    }
+  }
+  throw new SocialApiError({
+    method: 'POST',
+    path: '/api/v1/social/relationships',
+    message: 'mobile.social.relationshipAuthorityUnavailable',
+  });
+}
+
+function normalizeError(error: unknown): SocialApiError {
+  if (error instanceof SocialApiError) return error;
+  return new SocialApiError({ method: 'GET', path: '/social', message: readableErrorMessage(error) });
+}
+
+function resolveActorPtid(session: MobileAuthSession): string | null {
+  return mobileAuthScope(session).ptid;
+}
+
+function parseHandleInput(raw: string): ParsedHandle {
+  const trimmed = raw.trim();
+  if (!trimmed || !trimmed.startsWith('@')) {
+    return { isFederated: false, hasHost: false, canonical: '', localPart: '' };
+  }
+  const match = FEDERATED_HANDLE_RE.exec(trimmed);
+  if (!match?.[1]) return { isFederated: false, hasHost: false, canonical: '', localPart: '' };
+  const local = match[1];
+  const host = match[2];
+  if (!host) return { isFederated: true, hasHost: false, canonical: '', localPart: local };
+  return {
+    isFederated: true,
+    hasHost: true,
+    canonical: `@${local.toLowerCase()}@${host.toLowerCase()}`,
+    localPart: local,
+  };
+}
+
+function requestKey(request: FriendRequest): string {
+  return request.requestId || request.id || '';
+}
+
+function upsertFriendshipStatus(items: FriendshipStatus[], nextItem: FriendshipStatus): FriendshipStatus[] {
+  const exists = items.some((item) => item.targetPtid === nextItem.targetPtid);
+  return exists
+    ? items.map((item) => (item.targetPtid === nextItem.targetPtid ? nextItem : item))
+    : [nextItem, ...items];
+}
+
+function sessionFromMessaging(
+  conversation: MessagingConversationProjection,
+  currentActorPtid: string,
+  previous?: FriendChatSession,
+): FriendChatSession {
+  const peerPtid = conversation.memberPtids.find((ptid) => ptid !== currentActorPtid) ?? '';
+  const timestamp = socialTimestampFromUnixMs(conversation.updatedAtUnixMs);
+  return {
+    ulid: conversation.conversationId,
+    participantAPtid: currentActorPtid,
+    participantBPtid: peerPtid,
+    lastMessageUlid: previous?.lastMessageUlid ?? '',
+    lastMessageAt: previous?.lastMessageAt ?? timestamp,
+    unreadCountA: previous?.unreadCountA ?? 0,
+    unreadCountB: 0,
+    createdAt: previous?.createdAt ?? timestamp,
+    updatedAt: timestamp,
+    participantADisplayName: participantDisplayName(previous, currentActorPtid),
+    participantAAvatar: participantAvatar(previous, currentActorPtid),
+    participantBDisplayName:
+      participantDisplayName(previous, peerPtid) || peerPtid,
+    participantBAvatar: participantAvatar(previous, peerPtid),
+    participantAOnline: participantOnline(previous, currentActorPtid),
+    participantBOnline: participantOnline(previous, peerPtid),
+    lastMessage: previous?.lastMessage,
+  };
+}
+
+function socialTimestampFromUnixMs(unixMs: number): SocialTimestamp {
+  return {
+    seconds: Math.floor(unixMs / 1000),
+    nanos: (unixMs % 1000) * 1_000_000,
+  };
+}
+
+function participantDisplayName(
+  session: FriendChatSession | undefined,
+  ptid: string,
+): string {
+  if (!session || !ptid) return '';
+  if (session.participantAPtid === ptid) return session.participantADisplayName;
+  if (session.participantBPtid === ptid) return session.participantBDisplayName;
+  return '';
+}
+
+function participantAvatar(
+  session: FriendChatSession | undefined,
+  ptid: string,
+): string {
+  if (!session || !ptid) return '';
+  if (session.participantAPtid === ptid) return session.participantAAvatar;
+  if (session.participantBPtid === ptid) return session.participantBAvatar;
+  return '';
+}
+
+function participantOnline(
+  session: FriendChatSession | undefined,
+  ptid: string,
+): boolean {
+  if (!session || !ptid) return false;
+  if (session.participantAPtid === ptid) return session.participantAOnline;
+  if (session.participantBPtid === ptid) return session.participantBOnline;
+  return false;
+}

@@ -1,0 +1,350 @@
+# Cross-Station Private Social - Integration
+
+> **Status**: active
+> **Version**: v1.4
+> **Created**: 2026-10-03 | **Updated**: 2026-11-08
+> **Owner**: Social / Federation
+
+---
+
+## 1. Repository-Backed Current State
+
+| Surface | Current asset | Required change |
+|---|---|---|
+| Social private wire | `model/domain/social/private_content.proto` | add a separate private federation message family |
+| Content PreKeys | `model/domain/secure_content/prekey.proto` | reuse unchanged canonical types |
+| Key Exchange peer wire | `model/domain/key_exchange/key_exchange.proto` | add federated Content PreKey claim wrapper |
+| Federation frames | `model/domain/federation/delivery.proto` | add four durable Social payload kinds |
+| Shared transport | `apps/station/frame/core/federation/delivery/` | register typed Social receivers; retain neutral mechanics |
+| Key Exchange authority | `apps/station/app/subserver/key_exchange/` | authenticated remote claim and exact replay |
+| Conversation Group authority | `apps/station/app/subserver/conversation/` | extend the existing snapshot with Federation ID; retain membership ownership and submit fence |
+| Social authority | `apps/station/app/subserver/social/` | source UOW, receiver projection, interaction, invalidation, object peer read |
+| Native crypto | `apps/desktop/src-tauri/src/secure_content/`, `social/` | consume remote proof/projection without new crypto |
+| Native projection | `apps/desktop/src/store/privateMoments.ts`, `runtimes/momentsRuntime.ts` | remote delivery and source-unavailable states |
+| Browser boundary | `apps/desktop/src/pages/registry.ts`, `services/appRuntime.ts`, module registry | exclude Social from browser-gateway boot |
+| Acceptance | `tooling/acceptance/**/social*` | register positive cross-Station gates before functional tasks |
+
+## 2. Ownership Integration
+
+### Social
+
+Social owns:
+
+- audience expansion and immutable recipient snapshot;
+- canonical Post, Comment, Reaction, and lifecycle rows;
+- source transaction and Federation outbox intent;
+- recipient-side viewer projection and tombstone;
+- object authorization and remote interaction policy.
+
+### Federation
+
+Federation owns:
+
+- Station authentication and active membership validation;
+- domain-neutral frame format;
+- durable outbox/inbox, lease, retry, ordering, deduplication, and dispatch;
+- authenticated peer request/stream plumbing.
+
+Federation does not parse private Social policy beyond selecting the registered
+payload handler and enforcing generic bounds.
+
+### Key Exchange
+
+Key Exchange owns:
+
+- endpoint and actor-recovery Content PreKey pools;
+- claim validation and irreversible consumption;
+- exact replay receipts;
+- remote claim route authorization; and
+- the `CSS-D10` read-only remote submit-validation route.
+
+Social persists the exact claim request and consumes the typed result. Social
+never reads Key Exchange tables directly.
+
+### Secure Content
+
+Secure Content contributes existing payload, object, envelope, proof, PreKey,
+and local crypto contracts. It does not own a cross-Station business workflow.
+
+### Native Desktop
+
+Desktop Rust owns local key material, proof verification, decryption, encrypted
+projection storage, recovery, and account/session fencing. The React surface
+renders runtime projection and submits user intent.
+
+## 3. Proto And Generated Output Policy
+
+The scoped generator `tooling/scripts/proto-gen-secure-content.mjs` is extended
+to include:
+
+- `domain/social/private_federation.proto`;
+- `domain/federation/delivery.proto`;
+- existing `domain/key_exchange/key_exchange.proto`.
+
+It remains the only generator used by this plan for these contracts and updates:
+
+- Station Go generated files;
+- Desktop TypeScript generated files;
+- Mobile TypeScript generated files.
+
+Desktop and Mobile Rust bindings are generated at build time. Their `build.rs`
+input lists may be updated only when needed to compile the shared contract.
+
+Within the historical Desktop execution plan, Mobile allowance is generated-only:
+
+- allowed: `apps/mobile/src/gen/proto/**` and required proto input registration;
+- forbidden: Mobile feature, runtime, UI, action, acceptance, or readiness
+  changes.
+
+Mobile product integration is now required by Social Core but remains outside
+that historical plan. It consumes the completed contract through
+`docs/architecture/platform/client/mobile/social-parity/` and a separate future
+execution plan.
+
+`make model-gen` is not this plan's generation command because it targets the
+separate `packages/model` SDK outputs.
+
+## 4. Station Integration
+
+### Source publish
+
+The existing Social prepare/submit UOW gains:
+
+1. verified recipient locality and Federation partition;
+2. Conversation-owned `GROUP` snapshot with Federation ID and unchanged submit
+   fence;
+3. local and remote Key Exchange claim ports;
+4. `CSS-D10` remote claim validation before the local transaction,
+   with local claim validation retained inside that transaction;
+5. per-remote-actor frame construction;
+6. transaction-scoped shared Federation outbox writes.
+
+The existing remote-recipient rejection stays active until the complete source
+and receiver path passes functional proof. Its deletion is part of the delivery
+cutover, not the contract task.
+
+### Receiver
+
+Social registers handlers for the four new payload kinds during Station
+composition. Receiver handlers use the Federation inbox UOW hook so receipt and
+domain mutation are atomic.
+
+### Delivery resilience
+
+Federation persists the signed trace ID with each immutable frame, restores it
+into dispatcher and authenticated receiver contexts, and emits one typed
+post-transition observation to the registered payload owner. Social registers
+the private-resource observer and maps only finite transition and failure
+classes into its delivery metrics.
+
+Source-author point reads derive the exact remote frame IDs from the committed
+recipient-locality snapshot and return an aggregate outbox status. Recipient
+Stations expose an actor-scoped, cursor-paged list of active remote private
+Moment references at `GET /api/v1/social/moments/remote-private`; this is a
+Social-owned projection API and never exposes co-recipient or frame identity.
+
+### Object peer route
+
+Federation exposes the authenticated peer route and bounded stream plumbing.
+Social supplies the authorization callback and ciphertext reader. Neither layer
+creates a public URL.
+
+Recipient Social first resolves the imported resource/object descriptor,
+validates the local viewer endpoint, computes the `CSS-D11` actor-scoped grant
+commitment, and partitions the requested Native range into exact one-MiB peer
+ranges. Source Social derives the actor's target Station from the committed
+recipient-locality snapshot and cross-checks every token/body/path binding
+before reading its object store.
+
+Direct Federation transport streams each range. Relay records the route limit
+with the pending request and checks it from the frame envelope before payload
+allocation. `Cancel`/`Cancelled` frames preserve bounded multiplexing; draining
+requests retain admission until a response or acknowledgement arrives, and
+request IDs never repeat within one TCP stream. Relay logs the private-object
+route category and fresh peer-hop request ID only.
+
+Recipient Social validates status, content type, length, range, ETag,
+descriptor digest, total size, and strict base64url canonical response metadata
+before committing Native-facing headers. It does not retry after response
+commitment; Desktop resumes from its durable checkpoint through the unchanged
+Home Station route.
+
+## 5. Desktop Integration
+
+`momentsRuntime` remains the only freshness owner:
+
+- consumes remote delivery/invalidation events;
+- asks the Native owner to enumerate Station-backed remote references, then
+  reconciles pending and imported resources even after an EventBus gap;
+- restores state after reconnect/restart;
+- clears actor-scoped state on account or Station switch.
+
+Pages only render projection and trigger commands. Remote states extend the
+existing private Moment state model; they do not create a second store.
+Verified plaintext remains visible when the source Station is temporarily
+unavailable, while new remote operations retain explicit retryable state.
+
+The browser-gateway boot path must not register the Moments page, runtime,
+module, navigation item, or Social action surface. Tauri WebView registration
+remains enabled.
+
+## 6. Acceptance Integration
+
+Acceptance contract registration is the first execution closure. It adds
+fail-closed gate definitions and runner tests before later tasks invoke them.
+
+Required gates:
+
+- `social-cross-station-contract`;
+- `social-cross-station-eventbus-contract`;
+- `social-cross-station-prekey`;
+- `social-cross-station-delivery`;
+- `social-cross-station-interaction`;
+- `social-cross-station-revocation-recovery`;
+- `social-cross-station-desktop-functional`;
+- `social-cross-station-native-e2e`;
+- `browser-social-zero-registration`.
+
+The existing `social-private-desktop-e2e` remains the same-Station and public
+continuity regression. No Mobile gate is added retroactively to this Desktop plan;
+Mobile owns separate required iOS, Android and interop cells.
+
+### Runner-owned Private Suite
+
+`social-cross-station-native-e2e` is the sole producer of the original AS17 through
+AS24 and `same-station-regression` Suite. Both development and formal policies
+use shared Runner E2E preparation, `CrossStationSocialNativeProvisioner`, the
+original `W7RuntimeOwner.run_social_cross_station_suite`, and its existing
+receiver, painted comment/reply, durable retry and empty-device recovery oracles.
+
+The provisioner prepares both physical schemas through the existing Secure
+Content owner before retaining service/source leases. It independently verifies
+live schema and Station identity, then inventories unchanged schema/reset/journal
+bytes with the explicit logical role-to-physical Profile mapping. Preparation
+epoch and Evidence Run ID are distinct identities and are bound independently.
+
+The private and public Native Suites both compose the declared shared Relay
+through `SocialRelayFixture`. Relay equipment precedes retained service/source
+leases; both Stations join through `RelayAttachmentFixture` after private schema
+verification. The parent inventories the attested Relay, both unchanged Station
+identities and active route generations before actor resolution or client launch.
+DHT locator publication alone does not establish this profile/content route.
+The private Suite does not acquire the public opaque-capture capability. New
+attachments, invitations and CA additions retain the original owner's cleanup;
+existing active operator attachments are reused without replacement.
+
+`PreparedSocialNativeRuntime` delegates binary, ports, Station discovery, storage
+and process ownership to the prepared Native binding. Authentication uses the
+original Foundation Harness; logout and stop use `NativeClientLifecycleLedger`.
+Alice and Bob launch once, Eve is fixture-only, and fresh-storage Bob2 replaces
+Bob. The Suite retains one preparation, three launches and at most two Native
+windows; no scenario rebuilds or redeploys.
+
+AS18 uses the original follow, Circle and Conversation owners to publish the
+`FOLLOWERS`, `CIRCLE`, `GROUP`, `CUSTOM_ALLOW` and `CUSTOM_DENY(FOLLOWERS)` matrix.
+Each resource is read through Alice's local author path and Bob's remote receiver
+path; Conversation membership is observed before publication. The Native
+unsupported-PUBLIC-base probe retains the existing prepare and local-durable-row
+rejection counters. These actions do not by themselves prove the separate
+cross-Federation, unresolved-recipient or per-slot deduplication obligations.
+
+AS21 admits and commits the exact retained text draft while the receiver is
+online, preserving CSS-D10's authoritative PreKey revalidation before commit.
+The explicitly opt-in `social_acceptance` receiver returns a standard retryable
+result for one parent-bound private Post frame under a source/run/Profile/
+Station/actor-bound lease of at most 90 seconds. The parent proves one original
+pending outbox, the held frame's exact wire hash, and zero receiver resource rows
+before stopping that same receiver container. Two publication retries during
+the genuine outage must retain the original Post and frame. After fail-safe
+restoration and hold release, the unchanged domain receiver validates and
+persists that frame; the durable command settles before receiver readback and
+renderer-reload checks. Release is retained before arming and runs on failure.
+Ordinary builds have no controller or control-file reader; invalidations always
+delegate unchanged. The two rule schemas share only their bounded, same-euid,
+no-follow, flock-protected atomic file owner.
+
+The Suite-owned `social-private-delivery` capability installs a digest-bound
+probe once in each existing PostgreSQL container. AS21 observes one original
+outbox frame during both pending attempts, then the same delivered frame and
+one actual receiver resource row. The probe reads credentials and the existing
+Station key inside the container; it cannot create, rotate or export Station keys.
+Its standalone replay composition installs the unchanged canonical
+`federation.RegisterPeerScopes` policies before constructing the production
+HTTP transport. Conflicting registrations fail closed. The delivery source
+Gate exercises real HTTP token minting from a fresh registry, immutable frame
+transmission and repeated initialization after registry sealing.
+
+AS24 sends the original duplicate plus signed late, expired, hash-conflicted,
+untrusted-signature, wrong-Station and wrong-actor frames through the original
+Federation HTTP transport and `/federation/delivery`. Each exact typed result
+is compared with before/after hashes and counts of the addressed resource,
+envelope and tombstone rows. The untrusted-signature fixture retains the real
+source identity, signing key ID and valid outer peer authentication, but signs
+the inner frame with a fresh in-memory Ed25519 key. That adversarial key is
+never registered, persisted or exported and is cleared immediately after
+signing. The delivery source Gate verifies both successful outer authentication
+and rejected inner signature. Each original replay observation is persisted
+immutably in the owner-private AS24 directory before its assertion, including
+failed responses; this does not publish a partial Scenario result.
+A late original delivery after the genuine AS22
+deletion must remain denied; valid target content is reacquired and observed
+on Bob2. These observations remain unproven until the source-bound Suite passes.
+
+AS23 restarts the receiver Station before replacing Bob. The prepared parent
+binds the existing `mobile.station-outage` capability to Bob's exact
+source-attested deployment; the shared handler retains Profile authorization,
+container identity, stop/start and fail-safe restoration. This does not allocate
+a Mobile runtime. The original producer requires unchanged source and container
+with different process IDs, then records both operations in AS23 evidence
+before the empty-device recovery and painted comment readback. A failed restart
+or restoration prevents Suite publication. AS21 outbox and AS24 frame
+observations use the same prepared parent and require its successful cleanup.
+
+Before friendship preparation, the original Suite Fixture owner verifies that
+Alice and Bob do not directionally block each other, restoring retained test
+blocks through the existing revision-bound Social command and reading back both
+projections. The poll-denial scenario restores its block before authenticated
+client cleanup on every exit. A failed restore prevents successful publication
+of the Suite result and preserves any primary scenario failure.
+
+`social-private-desktop-e2e` and `social-cross-station-desktop-functional` declare
+the producer dependency in the execution graph. Consumers require the original
+current-source sealed manifest/result, exact run/epoch, physical schema and
+successful cleanup. Development consumes `developmentManifest`; formal consumes
+`runManifest`. Consumers retain original ArtifactRefs without copying the
+producer evidence. The Suite cannot certify itself as formal proof.
+
+Current execution is specified by the
+[Social completion Plan](../federation/execution-plans/20261108-social-completion-native-runner/plan.md).
+Desktop commands explicitly select `desktop-macos-native` and reviewed
+`--service-profile` bindings. Machine Dev owns the workspace slot. Historical
+slot13, private CLI and activation-ancestor/result-discovery routes are absent
+from this Suite. Historical frozen Plans are records, not current execution
+instructions; other Secure Content Suites retain their own admission owners.
+
+## 7. Atomic Cutovers
+
+| Concern | New path | Old path removed or changed | Proof |
+|---|---|---|---|
+| Remote audience | verified locality + remote Key Exchange claim | unconditional remote-recipient rejection | supported remote audience succeeds; unsupported cases still fail before commit |
+| Remote submit validation | digest-bound, read-only Key Exchange peer validation | local-only claim validation | stale endpoint/recovery and unavailable peer reject before source Social commit without changing claim replay |
+| Federated Group | Conversation snapshot with Federation ID + unchanged submit fence | locality rejection for same-Federation remote members | mixed local/remote Group succeeds exactly once; stale/cross-Federation snapshots commit nothing |
+| Remote delivery | viewer-scoped Federation frame | local-only delivery intent | source/receiver UOW failpoints and duplicate corpus |
+| Object read | Social-authorized Federation peer stream | any direct remote/public fallback | wrong actor/device/object/range negatives |
+| Interaction | source-authority command/result | receiver-local authoritative mutation | exact replay and parent revoke tests |
+| Revocation | source revision + receiver tombstone | TTL/event-only cleanup | stale delivery cannot resurrect |
+| Browser | native-only registration policy | unconditional page/runtime/module registration | source/build/route zero-registration gate |
+| Acceptance | positive cross-Station feature and gates | negative-only remote boundary as current claim | exact-source two-Station proof |
+
+## 8. Deletion Obligations
+
+At completion:
+
+- no supported same-Federation recipient reaches the old locality rejection;
+- no Social-specific transport, client direct-remote route, or public object
+  fallback exists;
+- no recipient projection stores co-recipient data;
+- no Browser Social registration exists;
+- no Mobile product implementation is introduced by the historical Desktop plan;
+- no current-source documentation points to the removed generic Social activity
+  module.

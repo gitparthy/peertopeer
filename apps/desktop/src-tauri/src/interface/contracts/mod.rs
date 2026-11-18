@@ -1,0 +1,672 @@
+use serde::{Deserialize, Serialize};
+
+pub const CONTRACT_VERSION: &str = "2026-03-24.desktop-tauri-rust.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StubPayload {
+    pub command: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthValidateTokenInput {
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineListInput {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineActionInput {
+    pub post_id: String,
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileUpdateInput {
+    pub display_name: Option<String>,
+    pub note: Option<String>,
+    pub avatar: Option<String>,
+    pub header: Option<String>,
+    pub region: Option<String>,
+    pub timezone: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub links: Option<Vec<ProfileLinkInput>>,
+    pub observed_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileLinkInput {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfilePrivacyInput {
+    pub visibility: String,
+    pub allow_direct_message: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileUploadInput {
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminNetworkProbeInput {
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminExecuteActionInput {
+    pub action: String,
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderUpdateInput {
+    pub id: String,
+    pub enabled: bool,
+    pub api_key: Option<String>,
+    pub config_json: Option<String>,
+    pub runtime_config: Option<serde_json::Value>,
+    pub runtime_kind: Option<String>,
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCheckInput {
+    pub id: String,
+    pub config_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCreateInput {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub logo: String,
+    pub api_key: Option<String>,
+    pub config_json: String,
+    pub runtime_kind: Option<String>,
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsListInput {
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsSearchInput {
+    pub q: String,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltinSkillIdInput {
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCreateInput {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillUpdateInput {
+    pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillToggleInput {
+    pub id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillVersionsInput {
+    pub id: String,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRollbackInput {
+    pub id: String,
+    pub target_version: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpNameInput {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpCreateInput {
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpUpdateInput {
+    pub name: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToggleInput {
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronCreateInput {
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronUpdateInput {
+    pub id: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronToggleInput {
+    pub id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronRunsInput {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthSetCredentialsInput {
+    pub id: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthAuthorizeInput {
+    pub id: String,
+    pub environment: Option<String>,
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountUpsertOAuthInput {
+    pub provider: String,
+    pub provider_user_id: String,
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_url: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthResourceInput {
+    pub id: String,
+    pub resource: String,
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryListInput {
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySearchInput {
+    pub query: String,
+    pub layers: Option<Vec<String>>,
+    pub limit: Option<u32>,
+    pub agent_id: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub period: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEventsInput {
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryExportInput {
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryImportInput {
+    pub data: serde_json::Value,
+    pub skip_duplicates: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPersonaInput {
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicIdInput {
+    pub topic_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotebookIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotebookCreateInput {
+    pub topic_id: String,
+    pub title: String,
+    pub content: String,
+    pub r#type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotebookUpdateInput {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletConfigSetInput {
+    pub id: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletActionInput {
+    pub id: String,
+    pub action: String,
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletCreateSessionInput {
+    pub id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: Option<String>,
+    pub manifest: AppletGatewayManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletInvokeInput {
+    pub id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub capability: String,
+    pub action: Option<String>,
+    pub params: Option<serde_json::Value>,
+    pub manifest: AppletGatewayManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletGatewayManifest {
+    pub id: String,
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<AppletGatewayService>,
+    #[serde(default)]
+    pub skills: Vec<AppletGatewaySkill>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletGatewayService {
+    pub id: String,
+    pub kind: String,
+    pub binding: String,
+    #[serde(rename = "allowedMethods")]
+    pub allowed_methods: Vec<String>,
+    #[serde(rename = "allowedPaths")]
+    pub allowed_paths: Vec<String>,
+    #[serde(rename = "publicPathPrefix")]
+    pub public_path_prefix: Option<String>,
+    #[serde(rename = "stationPathPrefix")]
+    pub station_path_prefix: Option<String>,
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppletGatewaySkill {
+    pub id: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: String,
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillImportAddressInput {
+    pub address: String,
+    pub oauth_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillImportGitHubInput {
+    pub owner: String,
+    pub repo: String,
+    pub branch: Option<String>,
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMarketIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMarketAddInput {
+    pub source_id: Option<String>,
+    pub url: String,
+    pub name: Option<String>,
+    pub branch: Option<String>,
+    pub manifest_path: Option<String>,
+    pub publisher_id: Option<String>,
+    pub signing_key_id: Option<String>,
+    pub public_key_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMarketSyncInput {
+    pub market_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMarketListInput {
+    pub market_id: String,
+    pub q: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMarketDetailInput {
+    pub market_id: String,
+    pub file_path: String,
+    pub risk_acknowledged: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentIdInput {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCreateInput {
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentUpdateInput {
+    pub id: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDuplicateInput {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSearchInput {
+    pub q: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSelectInput {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreferencesSetInput {
+    pub prefs: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareSessionInput {
+    pub session_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareIdInput {
+    pub share_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsTailInput {
+    pub cursor: i64,
+    pub limit: Option<u32>,
+    pub max_bytes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthSimulateStartInput {
+    pub create_bot: Option<bool>,
+    pub app_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthSessionInput {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthCreateBotSessionInput {
+    pub app_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSectionInput {
+    pub section: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSectionSetInput {
+    pub section: String,
+    pub values: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFieldResetInput {
+    pub section: String,
+    pub field: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelAddInput {
+    pub provider_id: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelUpdateInput {
+    pub provider_id: String,
+    pub model_id: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelDeleteInput {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelDiscoverInput {
+    pub provider_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelToggleInput {
+    pub provider_id: String,
+    pub model_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSnapshotGetInput {
+    pub slices: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextActionDispatchInput {
+    pub action: String,
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalUrlInput {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthLoopbackStartInput {
+    pub id: String,
+    pub environment: Option<String>,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthLoopbackPollInput {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsureStationSessionInput {
+    pub session_id: String,
+    pub account_id: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyExchangeUploadInput {
+    pub ik_pub: String,
+    pub spk_id: i32,
+    pub spk_pub: String,
+    pub spk_sig: String,
+    pub opk_ids: Vec<i32>,
+    pub opk_pubs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyExchangeFetchInput {
+    pub did: String,
+    pub device_id: Option<String>,
+    pub home_station_peer_id: Option<String>,
+}
+
+// ============================================================================
+// Friend Request
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequestSendInput {
+    pub receiver_ptid: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequestActionInput {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequestListInput {
+    pub status: Option<i32>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+// ============================================================================
+// Notification
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationListInput {
+    pub category: Option<i32>,
+    pub status: Option<i32>,
+    pub cursor: Option<String>,
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationMarkReadInput {
+    pub notification_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationMarkAllReadInput {
+    pub category: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeleteInput {
+    pub notification_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationPreferencePatchInput {
+    pub category: i32,
+    pub enabled: bool,
+    pub push_enabled: bool,
+    pub sound_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationPreferencesUpdateInput {
+    pub updates: Vec<NotificationPreferencePatchInput>,
+    pub observed_revision: u64,
+}

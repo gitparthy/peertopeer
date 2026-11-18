@@ -1,0 +1,89 @@
+/* Mobile evidence host.
+ *
+ * This styles ONLY the review workbench and the standalone device frame.
+ * The rendered product inside is MobileApp and brings its own ma-* layout +
+ * north-star tokens; no product skin lives here anymore. When the host is
+ * embedded inside the shared board (.nb-phone-body) the board owns the
+ * bezel, so this frame collapses to screen-filling content. */
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+/* ── Review workbench (outside the device) ─────────────────────── */
+.mp-workbench {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 12px 40px;
+  background: var(--pt-canvas);
+  font-family: var(--pt-font);
+  color: var(--pt-text);
+}
+.mp-evidence-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: min(420px, 100%);
+  padding: 10px 12px;
+  border: 1px solid var(--pt-border);
+  border-radius: var(--pt-radius-lg);
+  background: var(--pt-surface);
+  box-shadow: var(--pt-shadow-rest);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pt-secondary);
+}
+.mp-evidence-toolbar .pt-select { min-width: 0; flex: 1; }
+.mp-scene-label {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pt-muted);
+}
+.mp-scene-label span {
+  padding: 3px 9px;
+  border-radius: var(--pt-radius-full);
+  background: var(--pt-text);
+  color: var(--pt-canvas);
+}
+
+/* ── Standalone device frame (npm run dev / :3108) ─────────────── */
+.mp-device {
+  position: relative;
+  /* Outer width includes the 10px bezel, so the simulated screen keeps the
+     true 390pt logical width the status bar geometry assumes. */
+  width: 410px;
+  height: 800px;
+  border-radius: 46px;
+  padding: 10px;
+  background: #0c0e0c;
+  box-shadow: 0 24px 64px -24px rgba(10, 18, 14, 0.55), inset 0 0 0 2px #2a2e2a;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+.mp-device-screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 36px;
+  background: var(--pt-canvas);
+}
+
+/* Embedded in the shared MobileFrame the board already paints the bezel. */
+.nb-phone-body .mp-workbench { height: 100%; min-height: 0; padding: 0; gap: 0; overflow: hidden; }
+.nb-phone-body .mp-evidence-toolbar,
+.nb-phone-body .mp-scene-label { display: none; }
+.nb-phone-body .mp-device {
+  flex: 1 1 auto;
+  width: 100%; height: auto; min-height: 0;
+  padding: 0; border-radius: 0;
+  background: transparent; box-shadow: none;
+}
+.nb-phone-body .mp-device-screen { border-radius: 0; }

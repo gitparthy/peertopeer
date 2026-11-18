@@ -1,0 +1,178 @@
+import { useEffect, useMemo, useState } from 'react';
+import { Icon, IconButton, Spin } from '@peers-touch/ui';
+
+import { useMobileI18n } from '../../app/mobileI18n';
+import { isAccessGranted } from '../../features/auth/authSession';
+import { useAuthStore } from '../../features/auth/authStore';
+import type { ImageAttachment } from '../../gen/proto/domain/social/post_pb';
+import {
+  createMomentMediaGateway,
+  type MomentMediaGateway,
+} from '../../services/gateways/momentMediaGateway';
+import { readableErrorMessage } from '../../utils/errorMessage';
+
+
+type MomentImageState =
+  | { readonly status: 'loading'; readonly src: null; readonly error: null }
+  | { readonly status: 'ready'; readonly src: string; readonly error: null }
+  | { readonly status: 'failed'; readonly src: null; readonly error: string };
+
+interface MomentImageProps {
+  readonly attachment: ImageAttachment;
+  readonly alt: string;
+}
+
+export async function loadMomentImageObjectUrl(
+  gateway: MomentMediaGateway,
+  attachment: ImageAttachment,
+  signal: AbortSignal,
+  createObjectUrl: (blob: Blob) => string = URL.createObjectURL,
+): Promise<string> {
+  const blob = await gateway.loadImage(attachment, signal);
+  return momentImageRequiresDataUrl(
+    typeof navigator === 'undefined' ? '' : navigator.userAgent,
+  )
+    ? readBlobAsDataUrl(blob)
+    : createObjectUrl(blob);
+}
+
+export function momentImageRequiresDataUrl(userAgent: string): boolean {
+  return /\bAndroid\b/i.test(userAgent);
+}
+
+export function revokeMomentImageObjectUrl(
+  source: string | null,
+  revokeObjectUrl: (url: string) => void = URL.revokeObjectURL,
+): void {
+  if (source?.startsWith('blob:')) revokeObjectUrl(source);
+}
+
+function readBlobAsDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(
+      reader.error ?? new Error('mobile.moments.media.decodeFailed'),
+    );
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('mobile.moments.media.decodeFailed'));
+        return;
+      }
+      resolve(reader.result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+export function MomentImage({ attachment, alt }: MomentImageProps) {
+  const { t } = useMobileI18n();
+  const session = useAuthStore((state) => (
+    isAccessGranted(state.accessDecision) ? state.session : null
+  ));
+  const gateway = useMemo(
+    () => session ? createMomentMediaGateway(session) : null,
+    [session],
+  );
+  const attachmentKey = [
+    attachment.id,
+    attachment.url,
+    attachment.mediaEncryption?.ciphertextSha256B64 ?? '',
+  ].join('\u0000');
+  const [attempt, setAttempt] = useState(0);
+  const [state, setState] = useState<MomentImageState>({
+    status: 'loading',
+    src: null,
+    error: null,
+  });
+
+  useEffect(() => {
+    if (!gateway) {
+      setState({
+        status: 'failed',
+        src: null,
+        error: 'mobile.moments.media.sessionUnavailable',
+      });
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    let active = true;
+    let objectUrl: string | null = null;
+    setState({ status: 'loading', src: null, error: null });
+    void loadMomentImageObjectUrl(gateway, attachment, controller.signal)
+      .then((source) => {
+        objectUrl = source;
+        if (!active) {
+          revokeMomentImageObjectUrl(objectUrl);
+          objectUrl = null;
+          return;
+        }
+        setState({ status: 'ready', src: source, error: null });
+      })
+      .catch((error) => {
+        if (!active || (error as { name?: string }).name === 'AbortError') return;
+        setState({
+          status: 'failed',
+          src: null,
+          error: readableErrorMessage(error, 'moment_media_failed'),
+        });
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+      revokeMomentImageObjectUrl(objectUrl);
+      objectUrl = null;
+    };
+  }, [attachmentKey, attempt, gateway]);
+
+  if (state.status === 'ready') {
+    return (
+      <img
+        src={state.src}
+        alt={alt}
+        loading="lazy"
+        onError={() => {
+          revokeMomentImageObjectUrl(state.src);
+          setState({
+            status: 'failed',
+            src: null,
+            error: 'mobile.moments.media.decodeFailed',
+          });
+        }}
+      />
+    );
+  }
+
+  if (state.status === 'failed') {
+    return (
+      <div
+        className="moments-restored-image-reference moments-image-recovery"
+        data-moment-image-failure={state.error}
+        role="alert"
+      >
+        <Icon iconId="image-off" size={22} aria-hidden="true" />
+        <span className="moments-image-recovery-label">{t('mobile.moments.imageFailed')}</span>
+        <IconButton
+          actionId="moments.image.retry"
+          iconId="rotate-ccw"
+          iconSize={14}
+          density="compact"
+          emphasis="quiet"
+          onActivate={() => setAttempt((current) => current + 1)}
+          label={t('common.action.retry')}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="moments-restored-image-reference moments-image-loading"
+      role="status"
+      aria-label={t('common.state.loading')}
+    >
+      <Spin active size="small" />
+    </div>
+  );
+}

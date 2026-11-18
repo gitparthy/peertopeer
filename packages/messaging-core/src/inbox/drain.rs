@@ -1,0 +1,677 @@
+use crate::proto::chat::{
+    AcknowledgeDeviceInboxItemRequest, ClaimDeviceInboxRequest, ClaimDeviceInboxResponse,
+    DurableDeviceInboxItem,
+};
+use crate::proto::{actor::ActorDeviceRef, actor_device_ptid};
+use std::sync::Arc;
+
+const DEVICE_INBOX_ITEM_NOT_HEAD: &str = "[code=DEVICE_INBOX_ITEM_NOT_HEAD]";
+
+/// Machine-readable prefix a store-layer validation error starts with when
+/// the claimed item is deterministically invalid for this device. The marker
+/// lets repositories reject through their existing `String` error surface
+/// without widening every store method to a typed enum.
+pub const ITEM_REJECTION_MARKER: &str = "[messaging-item-rejected:";
+pub const ITEM_REJECTION_MARKER_END: &str = "]";
+
+/// Why a claimed item is permanently rejected. The vocabulary mirrors the
+/// Station queue reject codes; the client only quarantines locally and acks
+/// today, but the recorded reason stays interchangeable with a future
+/// Station-side reject RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemRejectionCode {
+    PayloadInvalid,
+    IntegrityFailed,
+    RecipientMismatch,
+}
+
+impl ItemRejectionCode {
+    pub fn as_wire_name(&self) -> &'static str {
+        match self {
+            ItemRejectionCode::PayloadInvalid => "PAYLOAD_INVALID",
+            ItemRejectionCode::IntegrityFailed => "INTEGRITY_FAILED",
+            ItemRejectionCode::RecipientMismatch => "RECIPIENT_MISMATCH",
+        }
+    }
+
+    fn parse_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "PAYLOAD_INVALID" => Some(ItemRejectionCode::PayloadInvalid),
+            "INTEGRITY_FAILED" => Some(ItemRejectionCode::IntegrityFailed),
+            "RECIPIENT_MISMATCH" => Some(ItemRejectionCode::RecipientMismatch),
+            _ => None,
+        }
+    }
+}
+
+/// Wrap a human-readable validation message with a permanent-rejection
+/// marker. Store layers return this string through their ordinary error
+/// channel; consumers decode it with [`classify_reception_error`].
+pub fn mark_item_rejection(code: ItemRejectionCode, message: impl Into<String>) -> String {
+    format!(
+        "{ITEM_REJECTION_MARKER}{}{ITEM_REJECTION_MARKER_END} {}",
+        code.as_wire_name(),
+        message.into()
+    )
+}
+
+/// Failure raised while consuming a claimed inbox item.
+///
+/// * `rejection = None` — a retryable local/environmental failure (storage
+///   error, missing crypto state, ratchet gap). The drain must stop at this
+///   item and claim it again later; acking past it would lose a deliverable
+///   message.
+/// * `rejection = Some(code)` — a deterministic rejection of the item bytes
+///   themselves. Identical retries can never succeed, and the consumer has
+///   already durably quarantined the raw item. The drain acks the item so a
+///   poison conversation cannot head-of-line-block the device lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumeError {
+    rejection: Option<ItemRejectionCode>,
+    message: String,
+}
+
+impl ConsumeError {
+    pub fn retry(message: impl Into<String>) -> Self {
+        Self {
+            rejection: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn rejected(code: ItemRejectionCode, message: impl Into<String>) -> Self {
+        Self {
+            rejection: Some(code),
+            message: message.into(),
+        }
+    }
+
+    pub fn is_permanent(&self) -> bool {
+        self.rejection.is_some()
+    }
+
+    pub fn rejection_code(&self) -> Option<ItemRejectionCode> {
+        self.rejection
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for ConsumeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Every unclassified failure defaults to retryable. This `From` is the
+/// safety-first boundary: processors only escalate to a permanent rejection
+/// at deterministic validation sites they own.
+impl From<String> for ConsumeError {
+    fn from(message: String) -> Self {
+        match parse_marked_rejection(&message) {
+            Some(code) => ConsumeError::rejected(code, message),
+            None => ConsumeError::retry(message),
+        }
+    }
+}
+
+impl From<&str> for ConsumeError {
+    fn from(message: &str) -> Self {
+        ConsumeError::from(message.to_string())
+    }
+}
+
+fn parse_marked_rejection(message: &str) -> Option<ItemRejectionCode> {
+    let body = message.strip_prefix(ITEM_REJECTION_MARKER)?;
+    let code = body.split(ITEM_REJECTION_MARKER_END).next()?;
+    ItemRejectionCode::parse_wire_name(code)
+}
+
+/// Classify a raw processor/store error string into a typed consumption
+/// failure, honouring the store-layer rejection marker.
+pub fn classify_reception_error(message: impl Into<String>) -> ConsumeError {
+    ConsumeError::from(message.into())
+}
+
+pub type AcknowledgedItemObserver = Arc<dyn Fn(&DurableDeviceInboxItem) + Send + Sync>;
+pub type BeforeConsumeHook =
+    Arc<dyn Fn(&DurableDeviceInboxItem) -> Result<(), String> + Send + Sync>;
+pub type ConsumerEpochObserver = Arc<dyn Fn(u64) + Send + Sync>;
+
+pub trait QueueTransport {
+    fn claim(&self, request: ClaimDeviceInboxRequest) -> Result<ClaimDeviceInboxResponse, String>;
+    fn acknowledge(&self, request: AcknowledgeDeviceInboxItemRequest) -> Result<(), String>;
+}
+
+pub trait ClaimedItemConsumer {
+    fn consume(&self, item: &DurableDeviceInboxItem, consumer_epoch: u64)
+        -> Result<(), ConsumeError>;
+}
+
+impl<C: ClaimedItemConsumer + ?Sized> ClaimedItemConsumer for Arc<C> {
+    fn consume(
+        &self,
+        item: &DurableDeviceInboxItem,
+        consumer_epoch: u64,
+    ) -> Result<(), ConsumeError> {
+        self.as_ref().consume(item, consumer_epoch)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainProgress {
+    pub consumer_epoch: u64,
+    pub cursor: i64,
+    pub lane_head: i64,
+    pub processed: usize,
+    pub quarantined: usize,
+}
+
+pub struct QueueDrain<T, C> {
+    transport: T,
+    consumer: C,
+    device: ActorDeviceRef,
+    consumer_id: String,
+    batch_limit: u32,
+    before_consume_hook: Option<BeforeConsumeHook>,
+    consumer_epoch_observer: Option<ConsumerEpochObserver>,
+    acknowledged_item_observer: Option<AcknowledgedItemObserver>,
+}
+
+impl<T: QueueTransport, C: ClaimedItemConsumer> QueueDrain<T, C> {
+    pub fn new(
+        transport: T,
+        consumer: C,
+        device: ActorDeviceRef,
+        consumer_id: String,
+        batch_limit: u32,
+    ) -> Result<Self, String> {
+        if actor_device_ptid(&device).is_err()
+            || device.device_id.trim().is_empty()
+            || consumer_id.trim().is_empty()
+            || batch_limit == 0
+            || batch_limit > 100
+        {
+            return Err("messaging drain configuration is invalid".to_string());
+        }
+        Ok(Self {
+            transport,
+            consumer,
+            device,
+            consumer_id,
+            batch_limit,
+            before_consume_hook: None,
+            consumer_epoch_observer: None,
+            acknowledged_item_observer: None,
+        })
+    }
+
+    pub fn with_before_consume_hook(mut self, hook: BeforeConsumeHook) -> Self {
+        self.before_consume_hook = Some(hook);
+        self
+    }
+
+    pub fn with_consumer_epoch_observer(mut self, observer: ConsumerEpochObserver) -> Self {
+        self.consumer_epoch_observer = Some(observer);
+        self
+    }
+
+    pub fn with_acknowledged_item_observer(mut self, observer: AcknowledgedItemObserver) -> Self {
+        self.acknowledged_item_observer = Some(observer);
+        self
+    }
+
+    pub fn drain_once(
+        &self,
+        cursor: i64,
+        expected_consumer_epoch: u64,
+    ) -> Result<DrainProgress, String> {
+        if cursor < 0 {
+            return Err("messaging drain cursor cannot be negative".to_string());
+        }
+        let claim = |after_lane_sequence, consumer_epoch| {
+            self.transport.claim(ClaimDeviceInboxRequest {
+                device: Some(self.device.clone()),
+                consumer_id: self.consumer_id.clone(),
+                expected_consumer_epoch: consumer_epoch,
+                after_lane_sequence,
+                batch_limit: self.batch_limit,
+            })
+        };
+        let (response, response_cursor) = match claim(cursor, expected_consumer_epoch) {
+            Ok(response) => (response, cursor),
+            Err(error) if cursor > 0 && error.contains(DEVICE_INBOX_ITEM_NOT_HEAD) => {
+                // Local consumption commits before remote acknowledgement. Replay from the
+                // Station head after a crash and let the durable marker make it idempotent.
+                (claim(0, 0)?, 0)
+            }
+            Err(error) => return Err(error),
+        };
+        if response.consumer_epoch == 0
+            || response.lane_head_sequence < response.acked_through_sequence
+        {
+            return Err("messaging claim response lane state is invalid".to_string());
+        }
+        if let Some(observer) = &self.consumer_epoch_observer {
+            observer(response.consumer_epoch);
+        }
+
+        let mut next_cursor = response_cursor.max(response.acked_through_sequence);
+        let mut processed = 0;
+        let mut quarantined = 0;
+        for item in &response.items {
+            if item.lane_sequence != next_cursor + 1 {
+                return Err("messaging claimed batch is not contiguous".to_string());
+            }
+            if let Some(hook) = &self.before_consume_hook {
+                let _ = hook(item)?;
+            }
+            if let Err(consume_error) = self.consumer.consume(item, response.consumer_epoch) {
+                if !consume_error.is_permanent() {
+                    // Retryable failure: the item is deliverable but local
+                    // state is not ready. Leave it unacked and stop the lane.
+                    return Err(consume_error.message().to_string());
+                }
+                // Permanent rejection: the consumer has already durably
+                // quarantined the raw item. Ack through it so a poison
+                // conversation cannot stall deliveries behind it.
+                quarantined += 1;
+            }
+            self.transport
+                .acknowledge(AcknowledgeDeviceInboxItemRequest {
+                    device: Some(self.device.clone()),
+                    item_id: item.item_id.clone(),
+                    lane_sequence: item.lane_sequence,
+                    consumer_epoch: response.consumer_epoch,
+                    payload_sha256: item.payload_sha256.clone(),
+                })?;
+            if let Some(observer) = &self.acknowledged_item_observer {
+                observer(item);
+            }
+            next_cursor = item.lane_sequence;
+            processed += 1;
+        }
+
+        Ok(DrainProgress {
+            consumer_epoch: response.consumer_epoch,
+            cursor: next_cursor,
+            lane_head: response.lane_head_sequence,
+            processed,
+            quarantined,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::actor_device_ref;
+    use std::cell::RefCell;
+
+    struct Transport {
+        items: Vec<DurableDeviceInboxItem>,
+        claims: RefCell<Vec<ClaimDeviceInboxRequest>>,
+        acknowledgements: RefCell<Vec<AcknowledgeDeviceInboxItemRequest>>,
+    }
+
+    impl QueueTransport for Transport {
+        fn claim(
+            &self,
+            request: ClaimDeviceInboxRequest,
+        ) -> Result<ClaimDeviceInboxResponse, String> {
+            self.claims.borrow_mut().push(request.clone());
+            Ok(ClaimDeviceInboxResponse {
+                consumer_epoch: 3,
+                items: self
+                    .items
+                    .iter()
+                    .filter(|item| item.lane_sequence > request.after_lane_sequence)
+                    .cloned()
+                    .collect(),
+                lane_head_sequence: self.items.len() as i64,
+                acked_through_sequence: request.after_lane_sequence,
+            })
+        }
+
+        fn acknowledge(&self, request: AcknowledgeDeviceInboxItemRequest) -> Result<(), String> {
+            self.acknowledgements.borrow_mut().push(request);
+            Ok(())
+        }
+    }
+
+    struct Consumer {
+        fail_at: Option<i64>,
+        reject_at: Option<i64>,
+        consumed: RefCell<Vec<i64>>,
+    }
+
+    impl ClaimedItemConsumer for Consumer {
+        fn consume(
+            &self,
+            item: &DurableDeviceInboxItem,
+            _consumer_epoch: u64,
+        ) -> Result<(), ConsumeError> {
+            if self.fail_at == Some(item.lane_sequence) {
+                return Err(ConsumeError::retry(
+                    "injected local commit failure".to_string(),
+                ));
+            }
+            if self.reject_at == Some(item.lane_sequence) {
+                return Err(ConsumeError::rejected(
+                    ItemRejectionCode::PayloadInvalid,
+                    "injected deterministic rejection".to_string(),
+                ));
+            }
+            self.consumed.borrow_mut().push(item.lane_sequence);
+            Ok(())
+        }
+    }
+
+    fn item(sequence: i64) -> DurableDeviceInboxItem {
+        DurableDeviceInboxItem {
+            item_id: format!("item-{sequence}"),
+            event_id: format!("event-{sequence}"),
+            conversation_id: "conversation-1".to_string(),
+            lane_sequence: sequence,
+            payload_sha256: vec![sequence as u8; 32],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn projection_observer_runs_only_after_acknowledgement() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer_state = observed.clone();
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1), item(2)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: None,
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-1".to_string(),
+            10,
+        )
+        .unwrap()
+        .with_acknowledged_item_observer(Arc::new(move |item| {
+            observer_state.lock().unwrap().push((
+                item.conversation_id.clone(),
+                item.event_id.clone(),
+                item.lane_sequence,
+            ));
+        }));
+
+        drain.drain_once(0, 0).unwrap();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                ("conversation-1".to_string(), "event-1".to_string(), 1),
+                ("conversation-1".to_string(), "event-2".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn consumer_epoch_is_observed_before_item_processing() {
+        let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observer_state = observed.clone();
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: Some(1),
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-1".to_string(),
+            10,
+        )
+        .unwrap()
+        .with_consumer_epoch_observer(Arc::new(move |epoch| {
+            observer_state.store(epoch, std::sync::atomic::Ordering::Release);
+        }));
+
+        assert!(drain.drain_once(0, 0).is_err());
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::Acquire),
+            3,
+            "a failed item must not strand the worker on its pre-claim epoch"
+        );
+    }
+
+    #[test]
+    fn failure_stops_lane_before_ack_and_later_items() {
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1), item(2), item(3)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: Some(2),
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-1".to_string(),
+            10,
+        )
+        .unwrap();
+
+        assert!(drain.drain_once(0, 0).is_err());
+        assert_eq!(*drain.consumer.consumed.borrow(), vec![1]);
+        let acknowledgements = drain.transport.acknowledgements.borrow();
+        assert_eq!(acknowledgements.len(), 1);
+        assert_eq!(acknowledgements[0].lane_sequence, 1);
+    }
+
+    #[test]
+    fn permanent_rejection_is_acked_and_never_blocks_later_items() {
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1), item(2), item(3)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: None,
+                reject_at: Some(2),
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-1".to_string(),
+            10,
+        )
+        .unwrap();
+
+        let progress = drain.drain_once(0, 0).unwrap();
+        assert_eq!(*drain.consumer.consumed.borrow(), vec![1, 3]);
+        assert_eq!(progress.cursor, 3);
+        assert_eq!(progress.processed, 3);
+        assert_eq!(progress.quarantined, 1);
+        let acknowledgements = drain.transport.acknowledgements.borrow();
+        assert_eq!(acknowledgements.len(), 3);
+        assert_eq!(
+            acknowledgements.iter().map(|ack| ack.lane_sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn store_rejection_marker_classifies_as_permanent_only_when_well_formed() {
+        assert_eq!(
+            classify_reception_error(mark_item_rejection(
+                ItemRejectionCode::RecipientMismatch,
+                "membership projection is invalid"
+            ))
+            .rejection_code(),
+            Some(ItemRejectionCode::RecipientMismatch)
+        );
+        assert!(classify_reception_error(
+            "messaging Direct decrypt failed: ratchet gap".to_string()
+        )
+        .rejection_code()
+        .is_none());
+        assert!(classify_reception_error(
+            "[messaging-item-rejected:BOGUS] nope".to_string()
+        )
+        .rejection_code()
+        .is_none());
+    }
+
+    #[test]
+    fn before_consume_failure_stops_lane_before_commit_and_ack() {
+        let inspected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inspected_state = inspected.clone();
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1), item(2), item(3)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: None,
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-1".to_string(),
+            10,
+        )
+        .unwrap()
+        .with_before_consume_hook(Arc::new(move |item| {
+            inspected_state.lock().unwrap().push(item.lane_sequence);
+            if item.lane_sequence == 2 {
+                return Err("injected pre-consume failure".to_string());
+            }
+            Ok(())
+        }));
+
+        assert_eq!(
+            drain.drain_once(0, 0).unwrap_err(),
+            "injected pre-consume failure"
+        );
+        assert_eq!(*inspected.lock().unwrap(), vec![1, 2]);
+        assert_eq!(*drain.consumer.consumed.borrow(), vec![1]);
+        assert_eq!(drain.transport.acknowledgements.borrow().len(), 1);
+    }
+
+    #[test]
+    fn restart_resumes_after_durable_cursor() {
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1), item(2), item(3)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: None,
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-after-restart".to_string(),
+            10,
+        )
+        .unwrap();
+        let progress = drain.drain_once(1, 0).unwrap();
+        assert_eq!(progress.cursor, 3);
+        assert_eq!(progress.processed, 2);
+        assert_eq!(*drain.consumer.consumed.borrow(), vec![2, 3]);
+        assert_eq!(drain.transport.claims.borrow()[0].after_lane_sequence, 1);
+    }
+
+    #[test]
+    fn restart_replays_server_head_when_local_cursor_is_ahead_of_acknowledgement() {
+        struct AheadCursorTransport {
+            claims: RefCell<Vec<ClaimDeviceInboxRequest>>,
+            acknowledgements: RefCell<Vec<AcknowledgeDeviceInboxItemRequest>>,
+        }
+
+        impl QueueTransport for AheadCursorTransport {
+            fn claim(
+                &self,
+                request: ClaimDeviceInboxRequest,
+            ) -> Result<ClaimDeviceInboxResponse, String> {
+                self.claims.borrow_mut().push(request.clone());
+                if request.after_lane_sequence > 0 {
+                    return Err(
+                        "station returned 409 [code=DEVICE_INBOX_ITEM_NOT_HEAD]".to_string()
+                    );
+                }
+                Ok(ClaimDeviceInboxResponse {
+                    consumer_epoch: 4,
+                    items: vec![item(1)],
+                    lane_head_sequence: 1,
+                    acked_through_sequence: 0,
+                })
+            }
+
+            fn acknowledge(
+                &self,
+                request: AcknowledgeDeviceInboxItemRequest,
+            ) -> Result<(), String> {
+                self.acknowledgements.borrow_mut().push(request);
+                Ok(())
+            }
+        }
+
+        let drain = QueueDrain::new(
+            AheadCursorTransport {
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: None,
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-after-crash".to_string(),
+            10,
+        )
+        .unwrap();
+
+        let progress = drain.drain_once(1, 3).unwrap();
+
+        assert_eq!(drain.transport.claims.borrow().len(), 2);
+        assert_eq!(drain.transport.claims.borrow()[1].after_lane_sequence, 0);
+        assert_eq!(*drain.consumer.consumed.borrow(), vec![1]);
+        assert_eq!(progress.cursor, 1);
+    }
+
+    #[test]
+    fn non_contiguous_batch_fails_closed() {
+        let drain = QueueDrain::new(
+            Transport {
+                items: vec![item(1), item(3)],
+                claims: RefCell::new(Vec::new()),
+                acknowledgements: RefCell::new(Vec::new()),
+            },
+            Consumer {
+                fail_at: None,
+                reject_at: None,
+                consumed: RefCell::new(Vec::new()),
+            },
+            actor_device_ref("ptid:alice", "device-1"),
+            "consumer-1".to_string(),
+            10,
+        )
+        .unwrap();
+        assert!(drain.drain_once(0, 0).is_err());
+        assert_eq!(*drain.consumer.consumed.borrow(), vec![1]);
+        assert_eq!(drain.transport.acknowledgements.borrow().len(), 1);
+    }
+}

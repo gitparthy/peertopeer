@@ -1,0 +1,168 @@
+---
+name: "pt-god-view"
+description: "Thin facade for classifying Peers-Touch work and dispatching exactly one owning workflow or specialist skill. Invoke for new work, resume, status, handoff, or explicit methodology routing."
+stage: "orchestrator"
+requires: []
+produces: ["work classification", "owning-skill route", "route blocker when intent is ambiguous"]
+---
+
+# God View
+
+Human operating standard: `docs/global/workflow.md`.
+
+`pt-god-view` is the methodology facade. It answers one question:
+
+```text
+Given the user's intent and current project state, which owner must act next?
+```
+
+It does not perform that owner's work.
+
+## Boundary
+
+God View owns:
+
+- intent classification;
+- explicit Plan versus no-Plan request policy;
+- stage and specialist routing;
+- ambiguity detection;
+- one concise explanation of the selected route.
+
+God View does not:
+
+- edit repository files;
+- create or amend plans;
+- update optional task progress or evidence;
+- build Ready/Parked queues or choose concurrency lanes;
+- execute implementation, verification, Acceptance, commit, or delivery;
+- reproduce the operating procedure of a dispatched Skill.
+
+For non-trivial mutation, route to `pt-dev-workflow`, the sole intake-to-close
+application service. For status projection, route to the read-only
+`pt-context-anchor`. For Goal authoring or scheduling, route to the
+host-neutral `pt-goal-orchestrator` after the owning workflow has supplied
+verified sources and binding. Host-specific syntax or tools are selected later
+by a detected `pt-*-host-adapter`.
+
+## Invoke When
+
+- The user says `continue`, `resume`, `status`, `handoff`, `new task`, or the
+  Chinese equivalents.
+- The request spans multiple methodology stages.
+- The user explicitly asks to use the Peers-Touch methodology.
+- The correct specialist owner is unclear.
+
+Do not invoke for casual conversation or a self-contained read-only question
+whose owner is already obvious.
+
+## Routing Procedure
+
+1. Identify the explicitly selected repository/worktree. If multiple candidates
+   remain plausible, return `WORKTREE_SELECTION_REQUIRED`.
+2. Resolve explicit user Plan policy before task-size or stage classification.
+   `no plan`, `不要 plan`, and equivalent instructions select standalone work
+   and forbid PLAN analysis/persistence for the current request.
+3. If a Plan path or taskId is explicit, preserve that selection. Never infer
+   either from branch, mtime, nearby files, old active-work, or chat history.
+4. Classify intent:
+   - `STATUS_OR_HANDOFF`
+   - `NON_TRIVIAL_MUTATION`
+   - `STANDALONE_MUTATION`
+   - `STANDALONE_SMALL_FIX`
+   - `PRODUCT`
+   - `DESIGN`
+   - `PLAN`
+   - `REVIEW`
+   - `GOAL`
+5. Select exactly one primary owner from the table below.
+6. Announce the route and reason in one short sentence.
+7. Invoke the owner and stop applying God View logic. The owner may dispatch
+   narrower specialists under its own contract.
+
+## Route Table
+
+| Intent | Primary owner |
+|---|---|
+| Non-trivial implementation, continuation, verification, or delivery | `pt-dev-workflow` |
+| Explicit standalone no-Plan mutation | `pt-dev-workflow` with Plan persistence forbidden |
+| Tracked-work status or handoff projection | `pt-context-anchor` |
+| Small isolated correction | `pt-small-fix-discipline` |
+| Product goal, Journey, visible state, or benchmark decision | `pt-product-design-methodology` |
+| Architecture boundary, ownership, topology, or contract | `pt-architecture-design-methodology` |
+| Accepted architecture needs an execution model | `pt-architecture-execution-methodology` |
+| Accepted plan model needs repository persistence | `pt-plan-and-document` |
+| Goal authoring/review/next slice | `pt-goal-orchestrator` |
+| General PR review | `pt-github-review` |
+| Need to optimize/audit Acceptance Infra | `pt-acceptance-infra-engineering` |
+| Need business Domain Acceptance injection/proof | `pt-acceptance-engineering` |
+| Bug closure with regression protection | `pt-defect-closure` |
+
+When a read-only discussion becomes mutating, reroute to `pt-dev-workflow`
+before the first write or runtime acquisition.
+
+## Resume And Status
+
+- `status` routes to `pt-context-anchor`; God View does not reconstruct state
+  from chat.
+- `continue` or `resume` routes to `pt-dev-workflow`; the workflow verifies
+  current source and resumes the explicit request or selected optional task.
+- A resume must not pause merely to print the Anchor. The workflow emits the
+  read-only projection at the next meaningful report boundary.
+- Ambiguous task progress returns `TASK_SELECTION_REQUIRED` with the
+  minimum identifiers needed to choose.
+
+## Stage Routing
+
+The facade may name the current methodology stage, but stage behavior belongs
+to the owner:
+
+| Stage | Owner |
+|---|---|
+| PRODUCT | `pt-product-design-methodology` |
+| DESIGN | `pt-architecture-design-methodology` |
+| PLAN analysis | `pt-architecture-execution-methodology` |
+| PLAN persistence | `pt-plan-and-document` |
+| EXECUTE through DELIVER | `pt-dev-workflow` |
+
+God View never self-approves a stage gate and never embeds stage procedures.
+The owning workflow invokes the project's agent-led review loop; routine review
+does not route back to the user. Explicit no-Plan work routes directly to
+standalone EXECUTE through DELIVER after sufficient accepted sources are
+confirmed; it never visits PLAN analysis or persistence.
+
+## Output
+
+Use this compact shape:
+
+```text
+Route: <skill>
+Reason: <one sentence>
+Blocked by: <none or one concrete ambiguity>
+```
+
+After dispatch, the owning Skill controls all further output.
+
+## Verification
+
+- Exactly one primary owner is selected.
+- Explicit no-Plan intent is preserved through dispatch.
+- No repository or durable workflow state was mutated by God View.
+- No queue, task, Acceptance, or delivery procedure was copied
+  into the facade.
+- Resume/status routing does not use chat history as truth.
+- Worktree ambiguity is surfaced, never guessed.
+
+## Anti-Patterns
+
+Never:
+
+- become a second complete-development workflow;
+- duplicate plan schemas, Task fields, verifier commands, queue algorithms, or
+  execution policy;
+- update workspace active-work or a Context Anchor;
+- route a non-trivial mutation directly to a late-stage specialist and bypass
+  `pt-dev-workflow`;
+- select a repository from a Skill source path;
+- infer approval, authorization, or completion while routing.
+- override explicit no-Plan intent because work is non-trivial or delivery
+  tooling prefers a Plan.

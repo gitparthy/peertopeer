@@ -1,0 +1,3169 @@
+import { create, fromJson, toBinary } from '@bufbuild/protobuf';
+import { timestampFromMs } from '@bufbuild/protobuf/wkt';
+import { invoke } from '@tauri-apps/api/core';
+import { SearchResponseSchema } from '../gen/proto/domain/search/search_pb';
+import { mobileSearchAcceptanceActions } from './searchActions';
+import { mobileSocialSearchAcceptanceActions } from './socialSearchActions';
+
+import {
+  currentAccessGate,
+  isAccessGranted,
+  submitStationInviteCodeGate,
+  submitStationLoginGate,
+  type AccessDecision,
+} from '../features/auth/authSession';
+import {
+  getMobileLifecycleKernel,
+  type DraftDisposition,
+} from '../app/lifecycle';
+import {
+  applyMobileNavigationIntent,
+  readMobileNavigationProjection,
+  type MobileDetailRoute,
+  type MobileNavigationIntent,
+  type MobileOverlayRoute,
+  type MobilePrimaryRouteId,
+  type MobileSettingDetailId,
+} from '../app/navigation';
+import {
+  verifyStationIdentity,
+  verifyStationRouteIdentity,
+} from '../features/station/stationConnection';
+import {
+  activeStationEntry,
+  activateStationEntry,
+  addStationRoute,
+  emptyStationRegistry,
+  removeStationEntry,
+  stationRoutes,
+  type StoredStationRegistry,
+} from '../features/station/stationRegistry';
+import {
+  readStationRouteBinding,
+  removeStationRouteBinding,
+} from '../services/mobileCommands';
+import {
+  cancelOAuth,
+  readAuthRuntimeSnapshot,
+  refreshOAuthStatus,
+  startOAuth,
+} from '../runtimes/authRuntime';
+import {
+  applyAccessGateRuntimeResult,
+  readAccessRuntimeProjection,
+  startAccessAttemptForActiveStation,
+} from '../runtimes/accessRuntime';
+import {
+  activateNativeSessionRuntime,
+  logoutSessionRuntime,
+  purgeAllNativeSessionState,
+  readActiveSessionProjection,
+  readSessionRuntimeSnapshot,
+} from '../runtimes/sessionRuntime';
+import {
+  readMobileRuntimeScopeProjection,
+} from '../runtimes/runtimeRegistry';
+import {
+  readStationRegistryProjection,
+  replaceStationRegistryProjection,
+  selectStationRouteRuntime,
+  verifyStationEntryRuntime,
+} from '../runtimes/stationRuntime';
+import {
+  checkAllPermissions,
+  checkPermission,
+  fetchNetworkState,
+  readNativeLifecycleBridgeDiagnostic,
+  requestPermission,
+  type PermissionKind,
+} from '../runtimes/nativeLifecycleBridge';
+import { wakeActiveMessagingSession } from '../runtimes/messagingRuntime';
+import { dispatchOpenContactChat } from '../features/social/contactCommands';
+import { mobileCallManager } from '../features/call/callState';
+import { readCallMediaPresentation } from '@peers-touch/client-chat-core';
+import { mobileGroupCallManager } from '../features/call/groupCallRuntime';
+import {
+  openPrivateMomentMedia,
+  publishPrivateMoment,
+  publishPrivateTextMoment,
+  readPrivateComments,
+  readPrivateMoment,
+  readPrivateMomentsSnapshot,
+  readPrivateTextMoment,
+  recoverPrivateMoment,
+  reconcilePrivateMoments,
+  retryPrivateMomentReaction,
+  setPrivateMomentReaction,
+  submitPrivateComment,
+} from '../runtimes/privateMomentsRuntime';
+import { collectMobileDebugSnapshot } from './debug/collectMobileDebugSnapshot';
+import {
+  acceptSocialFriendRequest,
+  applySocialFriendRequestProjectionCheckpoints,
+  readSocialRuntimeProjection,
+  readSocialNotificationProjection,
+  readFederationContexts,
+  readCurrentSocialProfile,
+  reconcileSocialRuntime,
+  searchSocialPeople,
+  sendSocialFriendRequest,
+  submitSocialFriendRequest,
+  updateCurrentSocialProfile,
+} from '../features/social/socialRuntime';
+import type { PeerProfile } from '../features/social/socialTypes';
+import { projectMomentsRuntimeDiagnostics } from './momentsProjection';
+import {
+  ChatDraftPayloadSchema,
+  MobileDraftEnvelopeV2Schema,
+  MobileDraftSurfaceKind,
+  MomentDraftPayloadSchema,
+} from '../gen/proto/domain/mobile/reliability_pb';
+import {
+  Audience_Kind,
+  AudienceSchema,
+  ReactionKind,
+  type Post,
+} from '../gen/proto/domain/social/post_pb';
+import type { Comment } from '../gen/proto/domain/social/comment_pb';
+import {
+  NotificationPreferencePatchSchema,
+  type NotificationPreferencesSnapshot,
+} from '../gen/proto/domain/notification/notification_pb';
+import {
+  applyReliabilityCommandRecoveryAction,
+  discardReliabilityDrafts,
+  getDraftRestorationPort,
+  listReliabilityCommands,
+  listReliabilityProjectionCheckpoints,
+  readReliabilityRuntimeStatus,
+  reconcileReliableFriendRequests,
+  reliabilityCommandRecoveryActions,
+  resetAllLocalReliabilityData,
+  restoreReliabilityDrafts,
+  type CommandProjection,
+  type DraftProjection,
+} from '../runtimes/commandRuntime';
+import {
+  getRecoveryProjection,
+  type RecoveryState,
+} from '../runtimes/recoveryProjection';
+import { mobileChatStorageProjectionRuntime } from '../runtimes/chatStorageRuntime';
+import {
+  MobileMutationAdmissionError,
+  mobileMutationScopeKey,
+  requireMobileMutationAdmission,
+} from '../runtimes/mutationAdmission';
+import {
+  loadDevicePreferences,
+  persistDevicePreferences,
+  readDeviceSettingsRuntimeSnapshot,
+  type DevicePreferences,
+} from '../runtimes/deviceSettingsRuntime';
+import {
+  readCurrentActiveMomentsRuntime,
+  readCurrentActiveProfileRuntime,
+} from '../runtimes/socialProjectionRuntime';
+import {
+  messagingCommandStatus,
+  messagingCreateDirect,
+  messagingCreateGroup,
+  messagingListConversations,
+  messagingListMessages,
+  messagingAttachmentAccess,
+  messagingSendMessage,
+  messagingStageAttachment,
+  messagingStatus,
+  messagingSubmitEdit,
+  messagingSubmitMetadataInteraction,
+  messagingSubmitReadCursor,
+  messagingSubmitTyping,
+  type MessagingMutationScopeInput,
+  type PrivateMomentKind,
+  type PrivateMomentMention,
+  type PrivateSocialAudience,
+  type PrivateSocialMomentIntent,
+} from '../services/mobileCommands';
+import type { CommandOutcome } from '../services/gateways/gatewayTypes';
+import { readSharedBuildIdentity } from './buildIdentity';
+import {
+  isEntrySurfaceFixtureId,
+  setEntrySurfaceFixture,
+} from './entrySurfaceFixture';
+import {
+  chatSurfaceFixtureRouteKind,
+  isChatSurfaceFixtureId,
+  setChatSurfaceFixture,
+} from './chatSurfaceFixture';
+import {
+  contactsSurfaceFixtureRouteKind,
+  isContactsSurfaceFixtureId,
+  setContactsSurfaceFixture,
+} from './contactsSurfaceFixture';
+import {
+  isMomentsSurfaceFixtureId,
+  momentsSurfaceFixtureRouteKind,
+  setMomentsSurfaceFixture,
+} from './momentsSurfaceFixture';
+import {
+  isSettingsSurfaceFixtureId,
+  setSettingsSurfaceFixture,
+  settingsSurfaceFixtureRoute,
+} from './settingsSurfaceFixture';
+import {
+  isRecoverySurfaceFixtureId,
+  setRecoverySurfaceFixture,
+} from './recoverySurfaceFixture';
+import type {
+  LifecycleWaitReadyInput,
+  LifecycleWaitReadyOutput,
+  MobileAcceptanceNamespace,
+  PrivateMomentPublishActionOutput,
+  PrivateMomentReadActionOutput,
+  PrivateMomentSnapshotActionOutput,
+  PublicRecoveryState,
+  PublicReliabilityDraft,
+  PublicReliabilitySnapshot,
+  ReliabilityDraftReadInput,
+} from './contracts';
+import {
+  configureOAuthSecureStorageFault,
+  purgeNativeOAuth,
+  requestCallbackReplayHandle,
+  submitNegativeOAuthCallback,
+} from './negativeOAuth';
+import {
+  configureReliabilityAcceptanceFault,
+  type ReliabilityAcceptanceFaultMode,
+} from './reliabilityFixture';
+import {
+  sanitizeAccessDecision,
+  sanitizeAccessSession,
+  sanitizeMessagingMessages,
+  sanitizeMessagingProjection,
+  sanitizeMobileProjection,
+  sanitizeOAuthProjection,
+  sanitizeSessionRevocation,
+  sanitizeStationRegistry,
+} from './projection';
+
+export const mobileAcceptanceActions: MobileAcceptanceNamespace = {
+  'build.identity': async () => readSharedBuildIdentity(),
+
+  'runtime.prepareActorIdentity': async (input) => {
+    const storageKey = requireString(
+      input?.storageKey,
+      'runtime.prepareActorIdentity.storageKey',
+    );
+    const seedBase64 = requireString(
+      input?.seedBase64,
+      'runtime.prepareActorIdentity.seedBase64',
+    );
+    if (
+      !/^mobile-crypto-identity\.v1\.identity\.[0-9a-f]{32}$/.test(storageKey)
+      || !/^[A-Za-z0-9+/]{43}=$/.test(seedBase64)
+    ) {
+      throw new Error(
+        'acceptance.mobile.invalidInput:runtime.prepareActorIdentity',
+      );
+    }
+    // The identity namespace is Rust-owned; the acceptance-only native command
+    // validates the scoped key and 32-byte seed and verifies persistence. The
+    // generic web storage fence must not be bypassed for this namespace.
+    await invoke('secure_storage_acceptance_seed_identity', {
+      key: storageKey,
+      seedBase64,
+    });
+    return { prepared: true };
+  },
+
+  'station.add': async (input) => {
+    const requestedUrl = requireString(input?.url, 'station.add.url');
+    const routeType = input?.routeType;
+    const verified = routeType
+      ? await verifyStationRouteIdentity(requestedUrl, routeType)
+      : await verifyStationIdentity(requestedUrl);
+    const current = await readStationRegistryProjection();
+    const next = addVerifiedStation(current, verified);
+    if (current.activeStationPeerId !== verified.stationPeerId) {
+      const sessionRevocation = await getMobileLifecycleKernel().transitionScope(
+        'station-replace',
+        async () => {
+          const logout = await cancelAndClearCurrentAuthScope();
+          await replaceStationRegistryProjection(next);
+          return logout;
+        },
+        scopeTransitionOptions(input.draftDisposition),
+      );
+      return {
+        ...stationMutationOutput(next, verified),
+        sessionRevocation: sanitizeSessionRevocation(sessionRevocation),
+      };
+    }
+
+    await replaceStationRegistryProjection(next);
+    return stationMutationOutput(next, verified);
+  },
+
+  'station.replace': async (input) => {
+    const currentStationPeerId = requireString(
+      input?.stationPeerId,
+      'station.replace.stationPeerId',
+    );
+    const requestedUrl = requireString(input?.url, 'station.replace.url');
+    const current = await readStationRegistryProjection();
+    if (!current.entries.some(
+      (entry) => entry.stationPeerId === currentStationPeerId,
+    )) {
+      throw new Error('acceptance.mobile.stationNotFound');
+    }
+
+    const verified = await verifyStationIdentity(requestedUrl);
+    const withoutReplacedStation = removeStationEntry(
+      current,
+      currentStationPeerId,
+    );
+    const next = addVerifiedStation(withoutReplacedStation, verified);
+    const sessionRevocation = await getMobileLifecycleKernel().transitionScope(
+      'station-replace',
+      async () => {
+        const logout = await cancelAndClearCurrentAuthScope();
+        await replaceStationRegistryProjection(next);
+        return logout;
+      },
+      scopeTransitionOptions(input.draftDisposition),
+    );
+    return {
+      ...stationMutationOutput(next, verified),
+      sessionRevocation: sanitizeSessionRevocation(sessionRevocation),
+    };
+  },
+
+  'station.select': async (input) => {
+    const stationPeerId = requireString(
+      input?.stationPeerId,
+      'station.select.stationPeerId',
+    );
+    const current = await readStationRegistryProjection();
+    const station = current.entries.find(
+      (entry) => entry.stationPeerId === stationPeerId,
+    );
+    if (!station) {
+      throw new Error('acceptance.mobile.stationNotFound');
+    }
+    const identity = await verifyStationEntryRuntime(station);
+    const next = activateStationEntry(current, stationPeerId, {
+      checkedAt: identity.verifiedAt,
+      online: true,
+    });
+    const sessionRevocation = current.activeStationPeerId !== next.activeStationPeerId
+      ? await getMobileLifecycleKernel().transitionScope(
+        'station-replace',
+        async () => {
+          const logout = await logoutSessionRuntime();
+          await replaceStationRegistryProjection(next);
+          return logout;
+        },
+        scopeTransitionOptions(input.draftDisposition),
+      )
+      : { remoteRevocation: 'not-required' as const, nativePurge: null };
+    return {
+      ...sanitizeStationRegistry(next),
+      sessionRevocation: sanitizeSessionRevocation(sessionRevocation),
+    };
+  },
+
+  'station.route.select': async (input) => {
+    const stationPeerId = requireString(
+      input?.stationPeerId,
+      'station.route.select.stationPeerId',
+    );
+    const routeId = requireString(
+      input?.routeId,
+      'station.route.select.routeId',
+    );
+    const current = await readStationRegistryProjection();
+    const station = current.entries.find((entry) => entry.stationPeerId === stationPeerId);
+    const route = station ? stationRoutes(station).find((item) => item.routeId === routeId) : null;
+    if (!station || !route) throw new Error('acceptance.mobile.stationRouteNotFound');
+    const next = await selectStationRouteRuntime(stationPeerId, routeId);
+    return {
+      ...sanitizeStationRegistry(next),
+      sessionRevocation: sanitizeSessionRevocation({
+        remoteRevocation: 'not-required',
+        nativePurge: null,
+      }),
+    };
+  },
+
+  'station.route.snapshot': async () => ({
+    ...sanitizeStationRegistry(await readStationRegistryProjection()),
+    binding: await readStationRouteBinding(),
+    sessionRevocation: sanitizeSessionRevocation({
+      remoteRevocation: 'not-required',
+      nativePurge: null,
+    }),
+  }),
+
+  'entry.fixture': async (input) => {
+    const surfaceId = input?.surfaceId;
+    if (surfaceId !== null && !isEntrySurfaceFixtureId(surfaceId)) {
+      throw new Error('acceptance.mobile.invalidInput:entry.fixture.surfaceId');
+    }
+    return setEntrySurfaceFixture(surfaceId);
+  },
+
+  'recovery.fixture': async (input) => {
+    const surfaceId = input?.surfaceId;
+    if (surfaceId !== null && !isRecoverySurfaceFixtureId(surfaceId)) {
+      throw new Error(
+        'acceptance.mobile.invalidInput:recovery.fixture.surfaceId',
+      );
+    }
+    return setRecoverySurfaceFixture(surfaceId);
+  },
+
+  'chat.fixture': async (input) => {
+    const surfaceId = input?.surfaceId;
+    if (surfaceId !== null && !isChatSurfaceFixtureId(surfaceId)) {
+      throw new Error('acceptance.mobile.invalidInput:chat.fixture.surfaceId');
+    }
+    const routeKind = chatSurfaceFixtureRouteKind(surfaceId);
+    applyMobileNavigationIntent({
+      kind: 'messages',
+      pane: 'chats',
+    });
+    applyMobileNavigationIntent({
+      kind: 'messages.search', pane: 'chats',
+      query: surfaceId === 'chat.list-search' ? 'Alice' : surfaceId === 'chat.list-search-empty' ? 'Unknown person' : '',
+      open: surfaceId === 'chat.list-search' || surfaceId === 'chat.list-search-empty',
+    });
+    if (routeKind !== 'list') {
+      applyMobileNavigationIntent({
+        kind: 'detail.push',
+        route: routeKind === 'group'
+          ? {
+              routeId: 'detail:group-conversation',
+              groupUlid: 'acceptance-group',
+            }
+          : {
+              routeId: 'detail:chat-conversation',
+              sessionUlid: 'acceptance-direct',
+            },
+      });
+    }
+    return setChatSurfaceFixture(surfaceId);
+  },
+
+  'contacts.fixture': async (input) => {
+    const surfaceId = input?.surfaceId;
+    if (surfaceId !== null && !isContactsSurfaceFixtureId(surfaceId)) {
+      throw new Error('acceptance.mobile.invalidInput:contacts.fixture.surfaceId');
+    }
+    const routeKind = contactsSurfaceFixtureRouteKind(surfaceId);
+    applyMobileNavigationIntent({
+      kind: 'messages',
+      pane: 'contacts',
+    });
+    applyMobileNavigationIntent({
+      kind: 'messages.search', pane: 'contacts',
+      query: surfaceId === 'contacts.local-search' ? 'Alexandria' : surfaceId === 'contacts.local-search-empty' ? 'Unknown teammate' : '',
+      open: surfaceId === 'contacts.local-search' || surfaceId === 'contacts.local-search-empty',
+    });
+    if (routeKind === 'profile') {
+      applyMobileNavigationIntent({
+        kind: 'detail.push',
+        route: {
+          routeId: 'detail:contact-profile',
+          actorPtid: 'ptid:acceptance-contact',
+        },
+      });
+    } else if (routeKind === 'people') {
+      applyMobileNavigationIntent({
+        kind: 'detail.push',
+        route: { routeId: 'detail:find-people' },
+      });
+    } else if (routeKind === 'group') {
+      applyMobileNavigationIntent({
+        kind: 'overlay.open',
+        route: {
+          routeId: 'overlay:create-group',
+        },
+      });
+    }
+    return setContactsSurfaceFixture(surfaceId);
+  },
+
+  'moments.fixture': async (input) => {
+    const surfaceId = input?.surfaceId;
+    if (surfaceId !== null && !isMomentsSurfaceFixtureId(surfaceId)) {
+      throw new Error('acceptance.mobile.invalidInput:moments.fixture.surfaceId');
+    }
+    const routeKind = momentsSurfaceFixtureRouteKind(surfaceId);
+    applyMobileNavigationIntent({
+      kind: 'primary',
+      routeId: 'tab:moments',
+    });
+    if (routeKind === 'detail') {
+      applyMobileNavigationIntent({
+        kind: 'detail.push',
+        route: {
+          routeId: 'detail:moment',
+          postId: 'acceptance-moment',
+        },
+      });
+    }
+    return setMomentsSurfaceFixture(surfaceId);
+  },
+
+  'settings.fixture': async (input) => {
+    const surfaceId = input?.surfaceId;
+    if (surfaceId !== null && !isSettingsSurfaceFixtureId(surfaceId)) {
+      throw new Error('acceptance.mobile.invalidInput:settings.fixture.surfaceId');
+    }
+    const route = settingsSurfaceFixtureRoute(surfaceId);
+    applyMobileNavigationIntent({
+      kind: 'primary',
+      routeId: 'tab:settings',
+    });
+    if (route.kind === 'detail' && route.settingId) {
+      applyMobileNavigationIntent({
+        kind: 'detail.push',
+        route: {
+          routeId: 'detail:setting',
+          settingId: route.settingId,
+        },
+      });
+    }
+    return setSettingsSurfaceFixture(surfaceId);
+  },
+  'access.submit': async (input) => {
+    if (!input) throw new Error('acceptance.mobile.invalidAccessSubmitInput');
+    const station = requireActiveStation(
+      await readStationRegistryProjection(),
+    );
+
+    if (input.kind === 'start') {
+      beginAccessGateLaunch();
+      const decision = await startAccessAttemptForActiveStation();
+      await completeAccessGateLaunch(decision);
+      return {
+        decision: requirePublicDecision(decision),
+        session: sanitizeAccessSession(
+          readSessionRuntimeSnapshot().session,
+        ),
+      };
+    }
+
+    const attemptId = requireString(
+      input?.attemptId,
+      'access.submit.attemptId',
+    );
+
+    if (input.kind === 'login') {
+      const gate = currentAccessGate(readAccessRuntimeProjection().decision);
+      if (!gate) throw new Error('acceptance.mobile.accessGateNotReady');
+      const result = await submitStationLoginGate({
+        stationPeerId: station.stationPeerId,
+        stationUrl: station.url,
+        attemptId,
+        gate,
+        email: requireString(input.email, 'access.submit.email'),
+        password: requireString(input.password, 'access.submit.password'),
+      });
+      applyAccessGateRuntimeResult(result.decision);
+      if (isAccessGranted(result.decision)) {
+        await activateNativeSessionRuntime(station, result.decision);
+      }
+      await completeAccessGateLaunch(result.decision);
+      return {
+        decision: requirePublicDecision(result.decision),
+        session: sanitizeAccessSession(
+          readSessionRuntimeSnapshot().session,
+        ),
+      };
+    }
+
+    if (input.kind === 'invite-code') {
+      const gate = currentAccessGate(readAccessRuntimeProjection().decision);
+      if (!gate) throw new Error('acceptance.mobile.accessGateNotReady');
+      const result = await submitStationInviteCodeGate({
+        stationPeerId: station.stationPeerId,
+        stationUrl: station.url,
+        attemptId,
+        gate,
+        inviteCode: requireString(
+          input.inviteCode,
+          'access.submit.inviteCode',
+        ),
+      });
+      applyAccessGateRuntimeResult(result.decision);
+      if (isAccessGranted(result.decision)) {
+        await activateNativeSessionRuntime(station, result.decision);
+      }
+      return {
+        decision: requirePublicDecision(result.decision),
+        session: sanitizeAccessSession(
+          readSessionRuntimeSnapshot().session,
+        ),
+      };
+    }
+
+    throw new Error('acceptance.mobile.invalidAccessSubmitKind');
+  },
+
+  'oauth.start': async (input) => {
+    if (!input) throw new Error('acceptance.mobile.invalidOAuthStartInput');
+    const station = requireActiveStation(
+      await readStationRegistryProjection(),
+    );
+    const provider = input?.provider;
+    if (provider !== 'github' && provider !== 'google') {
+      throw new Error('acceptance.mobile.invalidOAuthProvider');
+    }
+    await startOAuth({
+      provider,
+      stationUrl: station.url,
+      accessAttemptId: requireString(
+        input.accessAttemptId,
+        'oauth.start.accessAttemptId',
+      ),
+      gateId: requireString(input.gateId, 'oauth.start.gateId'),
+    });
+    return sanitizeOAuthProjection(readAuthRuntimeSnapshot());
+  },
+
+  'oauth.status': async () => {
+    await refreshOAuthStatus();
+    return sanitizeOAuthProjection(readAuthRuntimeSnapshot());
+  },
+
+  'oauth.cancel': async () => {
+    await cancelOAuth();
+    return sanitizeOAuthProjection(readAuthRuntimeSnapshot());
+  },
+
+  'oauth.replayHandle': async (input) => requestCallbackReplayHandle(input),
+
+  'oauth.negativeCallback': async (input) => (
+    submitNegativeOAuthCallback(input)
+  ),
+
+  'lifecycle.snapshot': async () => (
+    getMobileLifecycleKernel().getSnapshot()
+  ),
+
+  'lifecycle.waitReady': async (input) => waitForLifecycleReady(input),
+
+  'lifecycle.suspend': async () => ({
+    snapshot: await getMobileLifecycleKernel().suspend('acceptance-suspend'),
+  }),
+
+  'lifecycle.resume': async () => ({
+    snapshot: await getMobileLifecycleKernel().resume('acceptance-resume'),
+  }),
+
+  'lifecycle.restart': async () => {
+    await getMobileLifecycleKernel().restartRuntimeGraph('acceptance-restart');
+    return {
+      requested: true,
+      scope: 'webview',
+    };
+  },
+
+  'lifecycle.nativeBridgeDiagnostic': async () => (
+    readNativeLifecycleBridgeDiagnostic()
+  ),
+
+  'lifecycle.secureStorageDeleteFailure': async () => {
+    const kernel = getMobileLifecycleKernel();
+    await configureOAuthSecureStorageFault('fail-next-remove');
+    let errorCode: 'MOBILE_SECURE_STORAGE' | null = null;
+    try {
+      await kernel.transitionScope(
+        'logout',
+        purgeAllNativeSessionState,
+        { restart: false, draftDisposition: 'discard' },
+      );
+    } catch (error) {
+      if (mobileErrorCode(error) !== 'MOBILE_SECURE_STORAGE') throw error;
+      errorCode = 'MOBILE_SECURE_STORAGE';
+    } finally {
+      await configureOAuthSecureStorageFault('none');
+    }
+    if (!errorCode) {
+      throw new Error('acceptance.mobile.secureStorageDeleteFailureNotObserved');
+    }
+
+    const blocked = kernel.getSnapshot();
+    if (blocked.phase !== 'COLD' || blocked.launchState === 'shell') {
+      throw new Error('acceptance.mobile.secureStorageDeleteFailureDidNotBlock');
+    }
+    await kernel.transitionScope(
+      'logout',
+      purgeAllNativeSessionState,
+      { draftDisposition: 'discard' },
+    );
+    return {
+      outcome: 'blocked',
+      errorCode,
+      blocked,
+      recovered: kernel.getSnapshot(),
+    };
+  },
+
+  'lifecycle.scope.read': async () => {
+    const stationRegistry = await readStationRegistryProjection();
+    const lifecycle = getMobileLifecycleKernel().getSnapshot();
+    const runtime = readMobileRuntimeScopeProjection();
+    return {
+      generation: lifecycle.generation,
+      phase: lifecycle.phase,
+      launchState: lifecycle.launchState,
+      activeStationPeerId: stationRegistry.activeStationPeerId,
+      activeActorPtid: runtime.activeActorPtid,
+      runtimeStationPeerId: runtime.activeStationPeerId,
+      deviceId: runtime.deviceId,
+      social: runtime.social,
+      group: runtime.group,
+      navigation: runtime.navigation,
+    };
+  },
+
+  'navigation.snapshot': async () => readMobileNavigationProjection(),
+
+  'navigation.apply': async (input) => applyMobileNavigationIntent(
+    requireNavigationIntent(input),
+  ),
+
+  'platform.permission.check': async (input) => (
+    checkPermission(requirePermissionKind(input?.kind))
+  ),
+
+  'platform.permission.request': async (input) => (
+    requestPermission(requirePermissionKind(input?.kind))
+  ),
+
+  'platform.permission.checkAll': async () => checkAllPermissions(),
+
+  'platform.network.read': async () => fetchNetworkState(),
+
+  'session.logout': async (input) => {
+    const logout = await getMobileLifecycleKernel().transitionScope(
+      'logout',
+      logoutSessionRuntime,
+      scopeTransitionOptions(input?.draftDisposition),
+    );
+    beginAccessGateLaunch();
+    const decision = await startAccessAttemptForActiveStation();
+    await completeAccessGateLaunch(decision);
+    return {
+      logout: sanitizeSessionRevocation(logout),
+      decision: requirePublicDecision(decision),
+      lifecycle: getMobileLifecycleKernel().getSnapshot(),
+      runtime: readMobileRuntimeScopeProjection(),
+    };
+  },
+
+  'native.deliverDeepLink': async (input) => {
+    requireString(input?.url, 'native.deliverDeepLink.url');
+    return {
+      supported: false,
+      reason: 'external-driver-required',
+      owner: 'appium-native-context',
+    };
+  },
+
+  'projection.read': async () => sanitizeMobileProjection({
+    stationRegistry: await readStationRegistryProjection(),
+    access: readAccessRuntimeProjection(),
+    session: readSessionRuntimeSnapshot(),
+    oauth: readAuthRuntimeSnapshot(),
+  }),
+
+  'messaging.createDirect': async (input) => {
+    const account = requireMessagingAccount();
+    return messagingCreateDirect({
+      ...account,
+      peerPtid: requirePtid(input?.peerPtid, 'messaging.createDirect.peerPtid'),
+    });
+  },
+
+  'messaging.createGroup': async (input) => {
+    const account = requireMessagingAccount();
+    return messagingCreateGroup({
+      ...account,
+      conversationId: requireString(
+        input?.conversationId,
+        'messaging.createGroup.conversationId',
+      ),
+      name: requireString(input?.name, 'messaging.createGroup.name'),
+      memberPtids: requirePtidList(
+        input?.memberPtids,
+        'messaging.createGroup.memberPtids',
+      ),
+      federationId: requireString(
+        input?.federationId,
+        'messaging.createGroup.federationId',
+      ),
+    });
+  },
+
+  'messaging.attachment.stage': async (input) => {
+    const account = requireMessagingAccount();
+    const filename = requireString(
+      input?.filename,
+      'messaging.attachment.stage.filename',
+    );
+    const mimeType = requireString(
+      input?.mimeType,
+      'messaging.attachment.stage.mimeType',
+    );
+    const expectedSha256 = requireSha256(
+      input?.sha256,
+      'messaging.attachment.stage.sha256',
+    );
+    const bytes = decodeBoundedBase64(
+      input?.bytesBase64,
+      'messaging.attachment.stage.bytesBase64',
+    );
+    const actualSha256 = await sha256Hex(bytes);
+    if (actualSha256 !== expectedSha256) {
+      throw new Error('acceptance.mobile.attachmentDigestMismatch');
+    }
+    const staged = await messagingStageAttachment({
+      ...account,
+      conversationId: requireString(input?.conversationId, 'messaging.attachment.stage.conversationId'),
+      file: new File([bytes.buffer], filename, { type: mimeType }),
+    });
+    return {
+      stageId: staged.stageId,
+      filename: staged.filename,
+      mimeType: staged.mimeType,
+      plaintextSize: staged.plaintextSize,
+      completed: staged.completed,
+    };
+  },
+
+  'messaging.attachment.open': async (input) => {
+    const account = requireMessagingAccount();
+    const result = await messagingAttachmentAccess({
+      ...account,
+      attachmentId: requireString(
+        input?.attachmentId,
+        'messaging.attachment.open.attachmentId',
+      ),
+    });
+    if (result.accessHandle) {
+      await invoke('messaging_release_attachment', {
+        input: { ...account, accessHandle: result.accessHandle },
+      });
+    }
+    return result.state === 4
+      ? { state: 'ready', available: true }
+      : {
+        state: 'pending',
+        available: false,
+        nextAttemptAtUnixMs: Number(result.nextAttemptAtUnixMs),
+      };
+  },
+
+  'messaging.send': async (input) => {
+    const conversationId = requireString(
+      input?.conversationId,
+      'messaging.send.conversationId',
+    );
+    const result = await messagingSendMessage({
+      ...requireMessagingAccount(),
+      conversationId,
+      plaintext: input?.plaintext ?? '',
+      replyToMessageId: input?.replyToMessageId,
+      threadRootMessageId: input?.threadRootMessageId,
+      attachmentStageIds: input?.attachmentStageIds,
+    });
+    return { conversationId, ...result };
+  },
+
+  'messaging.interact': async (input) => {
+    const conversationId = requireString(
+      input?.conversationId,
+      'messaging.interact.conversationId',
+    );
+    const messageId = requireString(
+      input?.messageId,
+      'messaging.interact.messageId',
+    );
+    if (input.kind === 'edit') {
+      const result = await messagingSubmitEdit({
+        ...requireMessagingAccount(),
+        conversationId,
+        messageId,
+        plaintext: requireString(
+          input.plaintext,
+          'messaging.interact.plaintext',
+        ),
+      });
+      return { conversationId, ...result };
+    }
+    const interaction = input.kind === 'retract'
+      ? { kind: 'retract' as const }
+      : input.kind === 'reaction'
+        ? {
+          kind: 'reaction' as const,
+          reaction: requireString(
+            input.reaction,
+            'messaging.interact.reaction',
+          ),
+          remove: input.remove,
+        }
+        : { kind: 'pin' as const, remove: input.remove };
+    const result = await messagingSubmitMetadataInteraction({
+      ...requireMessagingAccount(),
+      conversationId,
+      messageId,
+      interaction,
+    });
+    return { conversationId, ...result };
+  },
+
+  'messaging.read': async (input) => {
+    const conversationId = requireString(
+      input?.conversationId,
+      'messaging.read.conversationId',
+    );
+    const lastReadSequence = requirePositiveInteger(
+      input?.lastReadSequence,
+      'messaging.read.lastReadSequence',
+    );
+    const result = await messagingSubmitReadCursor({
+      ...requireMessagingAccount(),
+      conversationId,
+      lastReadSequence,
+    });
+    return { conversationId, lastReadSequence, submitted: result.submitted };
+  },
+
+  'messaging.typing': async (input) => {
+    const conversationId = requireString(
+      input?.conversationId,
+      'messaging.typing.conversationId',
+    );
+    if (typeof input?.isTyping !== 'boolean') {
+      throw new Error('acceptance.mobile.invalidInput:messaging.typing.isTyping');
+    }
+    const result = await messagingSubmitTyping({
+      ...requireMessagingAccount(),
+      conversationId,
+      isTyping: input.isTyping,
+    });
+    return { conversationId, isTyping: input.isTyping, submitted: result.submitted };
+  },
+
+  'messaging.reconcile': async () => {
+    return wakeActiveMessagingSession();
+  },
+
+  'messaging.command.read': async (input) => messagingCommandStatus({
+    ...requireMessagingAccount(),
+    commandId: requireString(
+      input?.commandId,
+      'messaging.command.read.commandId',
+    ),
+  }),
+
+  ...mobileSearchAcceptanceActions,
+  ...mobileSocialSearchAcceptanceActions,
+  'messaging.search': async (input) => {
+    const conversationId = requireString(input?.conversationId, 'messaging.search.conversationId');
+    const result = await mobileSearchAcceptanceActions['search.page']({
+      conversationId, query: requireString(input?.query, 'messaging.search.query'),
+      limit: input?.limit === undefined ? 50 : requirePositiveInteger(input.limit, 'messaging.search.limit'),
+    });
+    if (!result.accepted) throw new Error(result.errorCode);
+    const page = fromJson(SearchResponseSchema, result.value);
+    const ids = new Set(page.items.map(item => item.resource?.messageId || item.resource?.id));
+    const messages = await messagingListMessages({ ...requireMessagingAccount(), conversationId });
+    return sanitizeMessagingMessages(messages.filter(message => ids.has(message.messageId)));
+  },
+
+  'messaging.projection.read': async (input) => {
+    const account = requireMessagingAccount();
+    const runtime = await messagingStatus();
+    const conversations = await messagingListConversations(account);
+    const requestedConversationId = input?.conversationId?.trim() ?? '';
+    if (
+      requestedConversationId
+      && !conversations.some(
+        (conversation) => conversation.conversationId === requestedConversationId,
+      )
+    ) {
+      throw new Error('acceptance.mobile.messagingConversationNotFound');
+    }
+    const selected = requestedConversationId
+      ? conversations.filter(
+        (conversation) => conversation.conversationId === requestedConversationId,
+      )
+      : conversations;
+    const messages = Object.fromEntries(await Promise.all(selected.map(async (conversation) => [
+      conversation.conversationId,
+      await messagingListMessages({
+        ...account,
+        conversationId: conversation.conversationId,
+      }),
+    ] as const)));
+    return sanitizeMessagingProjection({ runtime, conversations, messages });
+  },
+
+  'federation.context.read': async () => ({
+    federations: await readFederationContexts(),
+  }),
+
+  'social.people.search': async ({ query, federationId }) => {
+    const contextId = requireString(
+      federationId,
+      'social.people.search.federationId',
+    );
+    const observedContext = (await readFederationContexts()).find(
+      (context) => (
+        context.status === 'active'
+        && context.federationId === contextId
+      ),
+    );
+    if (!observedContext) {
+      throw new Error('acceptance.mobile.federationContextNotObserved');
+    }
+    const results = await searchSocialPeople(
+      requireString(query, 'social.people.search.query'),
+      observedContext.federationId,
+    );
+    const observedResults = results.map((result) => ({
+      ...result,
+      federationId: observedContext.federationId,
+    }));
+    return observedResults.map((result) => ({
+      ptid: result.ptid,
+      federationId: result.federationId,
+      homeStationPeerId: result.homeStationPeerId,
+    }));
+  },
+
+  'reliability.fixture.configure': async (input) => (
+    configureReliabilityAcceptanceFault(
+      requireReliabilityAcceptanceFaultMode(input?.mode),
+    )
+  ),
+
+  'reliability.friendRequest.submit': async (input) => {
+    const submission = await submitSocialFriendRequest(
+      requirePtid(
+        input?.receiverPtid,
+        'reliability.friendRequest.submit.receiverPtid',
+      ),
+      requireString(
+        input?.receiverHomeStationPeerId,
+        'reliability.friendRequest.submit.receiverHomeStationPeerId',
+      ),
+      requireString(
+        input?.federationId,
+        'reliability.friendRequest.submit.federationId',
+      ),
+      input?.message?.trim() || undefined,
+    );
+    return {
+      command: {
+        commandId: submission.command.commandId,
+        requestId: submission.command.requestId,
+        payloadSha256: hexBytes(submission.command.payloadSha256),
+        state: submission.command.state,
+        checkpointReady: submission.command.checkpointReady,
+      },
+      projection: submission.projection,
+    };
+  },
+
+  'reliability.snapshot': async () => readPublicReliabilitySnapshot(),
+
+  'reliability.reconcile': async () => {
+    const account = requireMessagingAccount();
+    const commands = await reconcileReliableFriendRequests(
+      account.stationPeerId,
+      account.actorPtid,
+    );
+    const status = await readReliabilityRuntimeStatus();
+    const appliedCheckpoints =
+      await applySocialFriendRequestProjectionCheckpoints(
+        account.stationPeerId,
+        account.actorPtid,
+        status.runtimeGeneration,
+      );
+    return {
+      commands: commands.map((command) => ({
+        commandId: command.commandId,
+        requestId: command.requestId,
+        payloadSha256: hexBytes(command.payloadSha256),
+        state: command.state,
+        checkpointReady: command.checkpointReady,
+      })),
+      appliedCheckpoints,
+      snapshot: await readPublicReliabilitySnapshot(),
+    };
+  },
+
+  'reliability.command.action': async (input) => {
+    const commandId = requireString(
+      input?.commandId,
+      'reliability.command.action.commandId',
+    );
+    const action = input?.action;
+    if (
+      action !== 'reconcile'
+      && action !== 'cancel'
+      && action !== 'acknowledge'
+      && action !== 'discard-tracking'
+    ) {
+      throw new Error(
+        'acceptance.mobile.invalidInput:reliability.command.action',
+      );
+    }
+    const snapshot = await readReliabilityOwnerState();
+    const command = snapshot.commands.find(
+      (candidate) => candidate.commandId === commandId,
+    );
+    if (!command) {
+      throw new Error('acceptance.mobile.reliabilityCommandNotFound');
+    }
+    if (!reliabilityCommandRecoveryActions(command).includes(action)) {
+      throw new Error('acceptance.mobile.reliabilityCommandActionUnavailable');
+    }
+    await applyReliabilityCommandRecoveryAction(action, [command]);
+    return readPublicReliabilitySnapshot();
+  },
+
+  'reliability.draft.write': async (input) => {
+    const account = requireMessagingAccount();
+    const targetId = requireString(
+      input?.targetId,
+      'reliability.draft.write.targetId',
+    );
+    const text = requireString(
+      input?.text,
+      'reliability.draft.write.text',
+    );
+    const now = Date.now();
+    const envelope = input.kind === 'chat'
+      ? create(MobileDraftEnvelopeV2Schema, {
+          schemaRevision: 2,
+          stationPeerId: account.stationPeerId,
+          actorPtid: account.actorPtid,
+          surfaceKind: MobileDraftSurfaceKind.CHAT_COMPOSER,
+          targetId,
+          updatedAt: timestampFromMs(now),
+          payload: {
+            case: 'chat',
+            value: create(ChatDraftPayloadSchema, {
+              text,
+              replyToMessageId: input.replyToMessageId?.trim() ?? '',
+              attachmentRefs: [],
+            }),
+          },
+        })
+      : input.kind === 'moment'
+        ? create(MobileDraftEnvelopeV2Schema, {
+            schemaRevision: 2,
+            stationPeerId: account.stationPeerId,
+            actorPtid: account.actorPtid,
+            surfaceKind: MobileDraftSurfaceKind.MOMENT_COMPOSER,
+            targetId,
+            updatedAt: timestampFromMs(now),
+            payload: {
+              case: 'moment',
+              value: create(MomentDraftPayloadSchema, {
+                text,
+                audience: create(AudienceSchema, {
+                  kind: requirePositiveInteger(
+                    input.audienceKind,
+                    'reliability.draft.write.audienceKind',
+                  ) as Audience_Kind,
+                }),
+                mediaRefs: [],
+              }),
+            },
+          })
+        : null;
+    if (!envelope) {
+      throw new Error('acceptance.mobile.invalidInput:reliability.draft.write.kind');
+    }
+    const port = getDraftRestorationPort();
+    await port.save(envelope);
+    const persisted = (await port.list(
+      account.stationPeerId,
+      account.actorPtid,
+      envelope.surfaceKind,
+    )).find((draft) => draft.targetId === targetId);
+    if (!persisted) {
+      throw new Error('acceptance.mobile.reliabilityDraftWriteMissing');
+    }
+    return publicReliabilityDraft(persisted);
+  },
+
+  'reliability.draft.read': async (input) => {
+    const snapshot = await readReliabilityOwnerState();
+    return publicReliabilityDrafts(
+      filterReliabilityDrafts(snapshot.drafts, input),
+    );
+  },
+
+  'reliability.draft.action': async (input) => {
+    const snapshot = await readReliabilityOwnerState();
+    const drafts = filterReliabilityDrafts(snapshot.drafts, input);
+    if (drafts.length === 0) {
+      throw new Error('acceptance.mobile.reliabilityDraftNotFound');
+    }
+    if (input.action === 'restore') {
+      await restoreReliabilityDrafts(drafts);
+    } else if (input.action === 'discard') {
+      await discardReliabilityDrafts(drafts);
+      getRecoveryProjection().clearDraftRestore();
+    } else {
+      throw new Error(
+        'acceptance.mobile.invalidInput:reliability.draft.action',
+      );
+    }
+    return readPublicReliabilitySnapshot();
+  },
+
+  'reliability.reset': async (input) => {
+    if (input?.confirmation !== 'reset-all-local-reliability-data') {
+      throw new Error('acceptance.mobile.invalidInput:reliability.reset');
+    }
+    return resetAllLocalReliabilityData();
+  },
+
+  'recovery.snapshot': async () => {
+    const snapshot = getRecoveryProjection().getSnapshot();
+    const session = readSessionRuntimeSnapshot();
+    let writeAdmission: {
+      open: boolean;
+      reason: string | null;
+    };
+    if (!session.session) {
+      writeAdmission = {
+        open: false,
+        reason: `session_${session.phase}`,
+      };
+    } else {
+      try {
+        requireMobileMutationAdmission(
+          mobileMutationScopeKey(
+            session.session.stationPeerId,
+            session.session.actorPtid,
+            session.session.deviceId,
+            session.session.lifecycleGeneration,
+          ),
+        );
+        writeAdmission = { open: true, reason: null };
+      } catch (error) {
+        if (!(error instanceof MobileMutationAdmissionError)) throw error;
+        writeAdmission = { open: false, reason: error.reason };
+      }
+    }
+    return {
+      hasActiveRecovery: snapshot.hasActiveRecovery,
+      isWriteBlocked: snapshot.isWriteBlocked,
+      writeAdmission,
+      updatedAtMs: snapshot.updatedAtMs,
+      states: snapshot.states.map(publicRecoveryState),
+    };
+  },
+
+  'social.request.send': async (input) => sendSocialFriendRequest(
+    requirePtid(input?.receiverPtid, 'social.request.send.receiverPtid'),
+    requireString(
+      input?.receiverHomeStationPeerId,
+      'social.request.send.receiverHomeStationPeerId',
+    ),
+    requireString(input?.federationId, 'social.request.send.federationId'),
+    input?.message?.trim() || undefined,
+  ),
+
+  'social.request.accept': async (input) => acceptSocialFriendRequest(
+    requireString(input?.requestId, 'social.request.accept.requestId'),
+  ),
+
+  'social.contact.open': async (input) => {
+    requireMessagingAccount();
+    // federationId is ignored for Direct: scope is derived server-side.
+    const conversationId = await dispatchOpenContactChat(
+      requirePtid(input?.peerPtid, 'social.contact.open.peerPtid'),
+    );
+    return { conversationId };
+  },
+
+  'social.reconcile': async () => reconcileSocialRuntime(),
+
+  'social.projection.read': async () => ({
+    ...readSocialRuntimeProjection(),
+    moments: projectMomentsRuntimeDiagnostics(readCurrentActiveMomentsRuntime()),
+    notifications: readSocialNotificationProjection(),
+  }),
+
+  'moments.private.acceptance.prepareKeys': async () => {
+    const snapshot = readPrivateMomentsSnapshot();
+    if (
+      !snapshot.active
+      || !snapshot.stationPeerId
+      || !snapshot.actorPtid
+      || !Number.isSafeInteger(snapshot.activationGeneration)
+      || snapshot.activationGeneration <= 0
+    ) {
+      throw new Error(
+        'acceptance.mobile.privateMomentRuntimeUnavailable',
+      );
+    }
+    const report = await invoke<{
+      endpointPrekeysAvailable: number;
+      recoveryPrekeysAvailable: number | null;
+    }>('social_private_acceptance_prepare_keys', {
+      input: {
+        stationPeerId: snapshot.stationPeerId,
+        actorPtid: snapshot.actorPtid,
+        activationGeneration: snapshot.activationGeneration,
+      },
+    });
+    const recoveryPrekeysAvailable =
+      report.recoveryPrekeysAvailable;
+    if (
+      !Number.isSafeInteger(report.endpointPrekeysAvailable)
+      || report.endpointPrekeysAvailable < 1
+      || typeof recoveryPrekeysAvailable !== 'number'
+      || !Number.isSafeInteger(recoveryPrekeysAvailable)
+      || recoveryPrekeysAvailable < 1
+    ) {
+      throw new Error(
+        'acceptance.mobile.privateMomentPrekeysUnavailable',
+      );
+    }
+    return {
+      endpointPrekeysAvailable: report.endpointPrekeysAvailable,
+      recoveryPrekeysAvailable,
+    };
+  },
+
+  'moments.private.publish': async (input) => sanitizePrivateMomentPublish(
+    await publishPrivateMoment(requirePrivateMomentIntent(input)),
+  ),
+
+  'moments.private.publishText': async (input) => sanitizePrivateMomentPublish(
+    await publishPrivateTextMoment({
+      draftId: requireString(
+        input?.draftId,
+        'moments.private.publishText.draftId',
+      ),
+      draftRevision: requirePositiveInteger(
+        input?.draftRevision,
+        'moments.private.publishText.draftRevision',
+      ),
+      text: requireString(input?.text, 'moments.private.publishText.text'),
+      audience: requirePrivateSocialAudience(input?.audience),
+    }),
+  ),
+
+  'moments.private.read': async (input) => sanitizePrivateMomentRead(
+    await readPrivateMoment(requireString(input?.postId, 'moments.private.read.postId')),
+  ),
+
+  'moments.private.readText': async (input) => sanitizePrivateMomentRead(
+    await readPrivateTextMoment(
+      requireString(input?.postId, 'moments.private.readText.postId'),
+    ),
+  ),
+
+  'moments.private.media.open': async (input) => sanitizePrivateMomentRead(
+    await openPrivateMomentMedia(
+      requireString(input?.postId, 'moments.private.media.open.postId'),
+      requireString(input?.objectId, 'moments.private.media.open.objectId'),
+    ),
+  ),
+
+  'moments.private.comment.submit': async (input) => {
+    const result = await submitPrivateComment({
+      draftId: requireString(input?.draftId, 'moments.private.comment.submit.draftId'),
+      draftRevision: requirePositiveInteger(
+        input?.draftRevision,
+        'moments.private.comment.submit.draftRevision',
+      ),
+      postId: requireString(input?.postId, 'moments.private.comment.submit.postId'),
+      replyToCommentId: input?.replyToCommentId?.trim() || undefined,
+      text: requireString(input?.text, 'moments.private.comment.submit.text'),
+      mentions: requirePrivateMentions(input?.mentions),
+    });
+    return sanitizePrivateComment(result.comment, result.draft);
+  },
+
+  'moments.private.comments.read': async (input) => sanitizePrivateCommentPage(
+    await readPrivateComments(
+      requireString(input?.postId, 'moments.private.comments.read.postId'),
+      input?.cursor?.trim() || '',
+      input?.limit === undefined
+        ? 20
+        : requirePositiveInteger(input.limit, 'moments.private.comments.read.limit'),
+    ),
+  ),
+
+  'moments.private.recover': async (input) => {
+    const recoveryEpoch = input?.recoveryEpoch === undefined
+      ? 1
+      : requirePositiveInteger(
+        input.recoveryEpoch,
+        'moments.private.recover.recoveryEpoch',
+      );
+    return sanitizePrivateMomentRead(await recoverPrivateMoment(
+      requireString(input?.postId, 'moments.private.recover.postId'),
+      recoveryEpoch,
+    ));
+  },
+
+  'moments.private.reconcile': async () => {
+    await reconcilePrivateMoments();
+    return sanitizePrivateMomentSnapshot(readPrivateMomentsSnapshot());
+  },
+
+  'moments.private.snapshot': async () => (
+    sanitizePrivateMomentSnapshot(readPrivateMomentsSnapshot())
+  ),
+
+  'moments.private.interaction.replay': async (input) => {
+    const postId = requireString(input?.postId, 'moments.private.interaction.replay.postId');
+    const commentId = input?.commentId?.trim() || '';
+    const initial = readPrivateMomentsSnapshot();
+    const identity = () => {
+      const value = readPrivateMomentsSnapshot();
+      return JSON.stringify([value.active, value.stationPeerId, value.actorPtid,
+        value.deviceId, value.lifecycleGeneration, value.activationGeneration]);
+    };
+    if (!initial.active || !initial.actorPtid || !initial.activationGeneration) {
+      throw new Error('acceptance.mobile.privateInteractionScopeMissing');
+    }
+    const scope = identity();
+    const command = initial.reactionCommands.find(candidate =>
+      candidate.postId === postId && (candidate.commentId || '') === commentId
+      && candidate.operation === 'REACT'
+      && (!commentId || candidate.kind === ReactionKind.REACTION_LIKE));
+    if (!command || command.state !== 'REACTION_COMMITTED') {
+      throw new Error('acceptance.mobile.committedPrivateInteractionMissing');
+    }
+    const replays = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (identity() !== scope) throw new Error('acceptance.mobile.privateInteractionScopeReplaced');
+      const result = await retryPrivateMomentReaction(command.commandId);
+      if (identity() !== scope
+        || result.command.commandId !== command.commandId
+        || result.command.postId !== postId
+        || (result.command.commentId || '') !== commentId
+        || result.command.kind !== command.kind
+        || result.command.operation !== command.operation
+        || result.command.state !== 'REACTION_COMMITTED'
+        || result.command.attemptCount !== command.attemptCount) {
+        throw new Error('acceptance.mobile.privateInteractionReplayMismatch');
+      }
+      replays.push({
+        projectionRevision: result.command.projectionRevision,
+        exactReplay: result.exactReplay,
+        reactionsSha256: await digestText(JSON.stringify(result.reactions)),
+      });
+    }
+    if (JSON.stringify(replays[0]) !== JSON.stringify(replays[1])) {
+      throw new Error('acceptance.mobile.privateInteractionReplayMismatch');
+    }
+    const commandIdSha256 = await digestText(command.commandId);
+    const postIdSha256 = await digestText(postId);
+    const commentIdSha256 = await digestText(JSON.stringify(commentId));
+    if (!commandIdSha256 || !postIdSha256 || !commentIdSha256) {
+      throw new Error('acceptance.mobile.privateInteractionIdentityMissing');
+    }
+    return {
+      commandIdSha256,
+      postIdSha256,
+      commentIdSha256,
+      state: command.state,
+      operation: command.operation,
+      attemptCount: command.attemptCount,
+      nativeRetryCount: replays.length,
+      replays,
+    };
+  },
+
+  'moments.private.interaction.observe': async (input) => {
+    const selector = requireString(input?.selector, 'moments.private.interaction.observe.selector');
+    if (selector.length > 2048 || !selector.startsWith('[data-post-id="')) {
+      throw new Error('acceptance.mobile.privateInteractionSelectorInvalid');
+    }
+    const element = document.querySelector<HTMLElement>(selector);
+    if (!element) return { visible: false, paintFrames: 0, tagName: '' };
+    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    const painted = await new Promise<boolean>(resolve => {
+      let finished = false;
+      const finish = (value: boolean) => {
+        if (!finished) { finished = true; resolve(value); }
+      };
+      const timeout = setTimeout(() => finish(false), 2500);
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        clearTimeout(timeout); finish(true);
+      }));
+    });
+    const rect = element.getBoundingClientRect();
+    let visible = painted && document.querySelector(selector) === element && element.isConnected
+      && rect.width > 0 && rect.height > 0
+      && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight;
+    for (let node: HTMLElement | null = element; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      visible &&= style.display !== 'none' && style.visibility === 'visible'
+        && Number(style.opacity) >= 0.99
+        && !node.getAnimations().some(animation => animation.pending || animation.playState === 'running');
+      if (node !== element) {
+        const box = node.getBoundingClientRect();
+        if (['auto', 'scroll', 'hidden', 'clip'].includes(style.overflowY)) {
+          visible &&= rect.top >= box.top && rect.bottom <= box.bottom;
+        }
+        if (['auto', 'scroll', 'hidden', 'clip'].includes(style.overflowX)) {
+          visible &&= rect.left >= box.left && rect.right <= box.right;
+        }
+      }
+    }
+    for (const [x, y] of [[0.5, 0.5], [0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]]) {
+      const hit = document.elementFromPoint(rect.left + rect.width * x, rect.top + rect.height * y);
+      visible &&= Boolean(hit && (hit === element || element.contains(hit)));
+    }
+    return { visible, paintFrames: painted ? 2 : 0, tagName: element.tagName.toLowerCase() };
+  },
+
+  'moments.feed.read': async () => {
+    const runtime = requireMomentsRuntime();
+    if (!await runtime.intents.refreshPublicFeed()) {
+      throw new Error('acceptance.mobile.momentsFeedUnavailable');
+    }
+    const snapshot = runtime.state().home;
+    return {
+      outcome: snapshot.pageOutcome,
+      hasMore: snapshot.hasMore,
+      nextCursor: snapshot.cursor,
+      posts: snapshot.posts.map(publicMoment),
+    };
+  },
+
+  'moments.publish': async (input) => {
+    const runtime = requireMomentsRuntime();
+    const text = requireString(input?.text, 'moments.publish.text');
+    const audienceKind = requireAudienceKind(input?.audienceKind);
+    if (audienceKind !== Audience_Kind.PUBLIC) {
+      const published = await publishPrivateTextMoment({
+        draftId: globalThis.crypto.randomUUID(),
+        draftRevision: 1,
+        text,
+        audience: requirePrivateSocialAudience(input?.audience),
+      });
+      if (published.state !== 'PUBLISHED' || !published.postId) {
+        throw new Error(`acceptance.mobile.privateMomentPublishFailed:${published.errorCode ?? published.state}`);
+      }
+      return { postId: published.postId, text, deleted: false, reactions: [], authorPtid: runtime.scope.actorPtid };
+    }
+    const result = await runtime.intents.publishMoment({
+      draftId: globalThis.crypto.randomUUID(),
+      draftRevision: 1,
+      draft: {
+        kind: 'text',
+        text,
+        audience: create(AudienceSchema, { kind: audienceKind }),
+      },
+    });
+    if (result.route !== 'PUBLIC') {
+      throw new Error('acceptance.mobile.momentsPublishRouteMismatch');
+    }
+    if (!result.outcome.ok && result.outcome.error.code === 'FEED_SIGNED_WRITE_REQUIRED') {
+      return { rejected: true, code: result.outcome.error.code, text };
+    }
+    const created = requireAcceptanceOutcome(
+      result.outcome,
+      'acceptance.mobile.momentsPublishFailed',
+    );
+    if (!created.post) {
+      throw new Error('acceptance.mobile.momentsPublishMissingPost');
+    }
+    return publicMoment(created.post);
+  },
+
+  'moments.react': async (input) => {
+    const runtime = requireMomentsRuntime();
+    const postId = requireString(input?.postId, 'moments.react.postId');
+    const reactionKind = requireReactionKind(input?.reactionKind);
+    const post = runtime.state().home.posts.find(candidate => candidate.id === postId);
+    if (post?.audience && post.audience.kind !== Audience_Kind.PUBLIC) {
+      const result = await setPrivateMomentReaction(postId, reactionKind, Boolean(input?.active));
+      if (result.command.state !== 'REACTION_COMMITTED') {
+        throw new Error('acceptance.mobile.privateReactionFailed');
+      }
+      return result.reactions;
+    }
+    const result = await runtime.intents.setPublicReaction(
+      postId,
+      reactionKind,
+      Boolean(input?.active),
+    );
+    const updated = requireAcceptanceOutcome(
+      result,
+      'acceptance.mobile.momentsReactionFailed',
+    );
+    return updated.reactions.map((reaction) => ({
+      kind: reaction.kind,
+      count: reaction.count.toString(),
+      reactedByViewer: reaction.reactedByViewer,
+    }));
+  },
+
+  'moments.comment': async (input) => {
+    const runtime = requireMomentsRuntime();
+    const postId = requireString(input?.postId, 'moments.comment.postId');
+    const post = runtime.state().home.posts.find(candidate => candidate.id === postId);
+    if (post?.audience && post.audience.kind !== Audience_Kind.PUBLIC) {
+      const result = await runtime.intents.submitPrivateComment({
+        draftId: globalThis.crypto.randomUUID(), draftRevision: 1, postId,
+        text: requireString(input?.content, 'moments.comment.content'),
+        replyToCommentId: input?.replyToCommentId?.trim() || undefined,
+        mentions: [],
+      });
+      if (result.comment?.state !== 'COMMENT_POSTED') {
+        throw new Error('acceptance.mobile.privateCommentFailed');
+      }
+      return { commentId: result.comment.commentId, postId, authorPtid: result.comment.authorPtid,
+        content: result.comment.text ?? '', replyToCommentId: result.comment.replyToCommentId, deleted: false };
+    }
+    const result = await runtime.intents.createPublicComment(
+      requireString(input?.postId, 'moments.comment.postId'),
+      requireString(input?.content, 'moments.comment.content'),
+      input?.replyToCommentId?.trim() || undefined,
+    );
+    const created = requireAcceptanceOutcome(
+      result,
+      'acceptance.mobile.momentsCommentFailed',
+    );
+    if (!created.comment) {
+      throw new Error('acceptance.mobile.momentsCommentMissing');
+    }
+    return publicMomentComment(created.comment);
+  },
+
+  'moments.comments.read': async (input) => {
+    const runtime = requireMomentsRuntime();
+    const postId = requireString(input?.postId, 'moments.comments.read.postId');
+    const post = runtime.state().home.posts.find(candidate => candidate.id === postId);
+    if (post?.audience && post.audience.kind !== Audience_Kind.PUBLIC) {
+      return (await runtime.intents.readPrivateComments(postId, '', 50)).comments
+        .map(comment => ({ commentId: comment.commentId, postId, content: comment.text ?? '',
+          authorPtid: comment.authorPtid, replyToCommentId: comment.replyToCommentId, deleted: false }));
+    }
+    const result = await runtime.intents.readPublicComments(
+      requireString(input?.postId, 'moments.comments.read.postId'),
+      '',
+      50,
+    );
+    return requireAcceptanceOutcome(
+      result,
+      'acceptance.mobile.momentsCommentsUnavailable',
+    ).comments.map(publicMomentComment);
+  },
+
+  'settings.profile.read': async () => {
+    const current = await readCurrentSocialProfile(true);
+    return publicProfile(current.actorPtid, current.profile);
+  },
+
+  'settings.profile.update': async (input) => {
+    const updated = await updateCurrentSocialProfile({
+      displayName: optionalText(input?.displayName),
+      avatar: optionalText(input?.avatar),
+      header: optionalText(input?.header),
+      note: optionalText(input?.note),
+      region: optionalText(input?.region),
+      timezone: optionalText(input?.timezone),
+      defaultVisibility: optionalText(input?.defaultVisibility),
+      manuallyApprovesFollowers: optionalBoolean(
+        input?.manuallyApprovesFollowers,
+      ),
+      messagePermission: optionalText(input?.messagePermission),
+      autoExpireDays: optionalNonNegativeInteger(input?.autoExpireDays),
+    });
+    return {
+      outcome: updated.result.outcome,
+      profile: publicProfile(updated.actorPtid, updated.result.profile),
+    };
+  },
+
+  'settings.notifications.read': async () => {
+    const runtime = requireProfileRuntime();
+    const result = await runtime.refreshNotificationPreferences();
+    return publicNotificationPreferences(requireAcceptanceOutcome(
+      result,
+      'acceptance.mobile.notificationPreferencesUnavailable',
+    ));
+  },
+
+  'settings.notifications.update': async (input) => {
+    const runtime = requireProfileRuntime();
+    const result = await runtime.updateNotificationPreferences([
+      create(NotificationPreferencePatchSchema, {
+        category: requirePositiveInteger(
+          input?.category,
+          'settings.notifications.update.category',
+        ),
+        enabled: requireBoolean(
+          input?.enabled,
+          'settings.notifications.update.enabled',
+        ),
+        pushEnabled: requireBoolean(
+          input?.pushEnabled,
+          'settings.notifications.update.pushEnabled',
+        ),
+        soundEnabled: requireBoolean(
+          input?.soundEnabled,
+          'settings.notifications.update.soundEnabled',
+        ),
+      }),
+    ]);
+    const updated = requireAcceptanceOutcome(
+      result,
+      'acceptance.mobile.notificationPreferencesUpdateFailed',
+    );
+    return {
+      outcome: updated.outcome,
+      snapshot: publicNotificationPreferences(updated.snapshot),
+    };
+  },
+
+  'storage.cache.seed': async (input) => {
+    const runtime = await messagingStatus();
+    if (!runtime.active || !runtime.stationPeerId || !runtime.actorPtid) {
+      throw new Error('acceptance.mobile.messagingUnavailable');
+    }
+    return invoke<{ sizeBytes: number }>('chat_storage_acceptance_seed_cache', {
+      input: {
+        stationPeerId: runtime.stationPeerId,
+        actorPtid: runtime.actorPtid,
+        sizeBytes: requirePositiveInteger(
+          input?.sizeBytes,
+          'storage.cache.seed.sizeBytes',
+        ),
+      },
+    });
+  },
+
+  'storage.conversation-clear.seed': async (input) => {
+    const runtime = await messagingStatus();
+    if (!runtime.active || !runtime.stationPeerId || !runtime.actorPtid) {
+      throw new Error('acceptance.mobile.messagingUnavailable');
+    }
+    return invoke<{
+      conversationId: string;
+      messageId: string;
+    }>('chat_storage_acceptance_seed_conversation_clear', {
+      input: {
+        stationPeerId: runtime.stationPeerId,
+        actorPtid: runtime.actorPtid,
+        plaintextBytes: requirePositiveInteger(
+          input?.plaintextBytes,
+          'storage.conversation-clear.seed.plaintextBytes',
+        ),
+      },
+    });
+  },
+
+  'storage.batch.scenario': async (input) => {
+    mobileChatStorageProjectionRuntime.configureAcceptanceBatchScenario({
+      delayMs: input?.delayMs,
+      failureConversationId: input?.failureConversationId,
+      scopeChangeConversationId: input?.scopeChangeConversationId,
+    });
+    return { configured: true };
+  },
+
+  'storage.retention.seed': async (input) => {
+    const runtime = await messagingStatus();
+    if (!runtime.active || !runtime.stationPeerId || !runtime.actorPtid) {
+      throw new Error('acceptance.mobile.messagingUnavailable');
+    }
+    return invoke<{
+      conversationId: string;
+      prunedMessageId: string;
+      protectedMessageId: string;
+      recentMessageId: string;
+    }>('chat_storage_acceptance_seed_retention', {
+      input: {
+        stationPeerId: runtime.stationPeerId,
+        actorPtid: runtime.actorPtid,
+        oldPlaintextBytes: requirePositiveInteger(
+          input?.oldPlaintextBytes,
+          'storage.retention.seed.oldPlaintextBytes',
+        ),
+      },
+    });
+  },
+
+  'settings.device.read': async () => {
+    await loadDevicePreferences();
+    const snapshot = readDeviceSettingsRuntimeSnapshot();
+    if (snapshot.status !== 'ready') {
+      throw new Error('acceptance.mobile.deviceSettingsUnavailable');
+    }
+    return { ...snapshot.preferences };
+  },
+
+  'settings.device.update': async (input) => {
+    const preferences = requireDevicePreferences(input);
+    await persistDevicePreferences(preferences);
+    const snapshot = readDeviceSettingsRuntimeSnapshot();
+    if (snapshot.status !== 'ready') {
+      throw new Error('acceptance.mobile.deviceSettingsUnavailable');
+    }
+    return { ...snapshot.preferences };
+  },
+
+  getRealtimeDevice: async () => {
+    const runtime = await messagingStatus();
+    return {
+      actorPtid: runtime.actorPtid ?? '',
+      deviceId: runtime.deviceId ?? '',
+      active: runtime.active && runtime.deviceEnrolled,
+    };
+  },
+
+  initiateCall: async (input) => {
+    if (input.mediaKind !== undefined && input.mediaKind !== 'audio' && input.mediaKind !== 'video') {
+      throw new Error('acceptance.mobile.invalidMediaKind');
+    }
+    const runtime = await messagingStatus();
+    if (
+      input.callerDeviceId
+      && input.callerDeviceId !== runtime.deviceId
+    ) {
+      throw new Error('acceptance.mobile.callDeviceMismatch');
+    }
+    return publicCallSnapshot(await mobileCallManager.startOutgoingCall(
+      requirePtid(input.calleePtid, 'call.calleePtid'),
+      input.mediaKind === 'video' ? 'video' : 'audio',
+    ));
+  },
+
+  callSnapshot: async (input) => {
+    const snapshot = mobileCallManager.getSnapshot();
+    if (snapshot && snapshot.peerPtid !== input.peerPtid) {
+      throw new Error('acceptance.mobile.callPeerMismatch');
+    }
+    const tracks = (stream?: MediaStream) => stream?.getTracks().map((track) => ({
+      kind: track.kind, enabled: track.enabled, muted: track.muted, readyState: track.readyState,
+    })) ?? [];
+    return { snapshot: snapshot ? {
+      callId: snapshot.callId, state: snapshot.state, mediaKind: snapshot.mediaKind,
+      micMuted: snapshot.micMuted ?? false, cameraOff: snapshot.cameraOff ?? false,
+      endReason: snapshot.endReason,
+      localTracks: tracks(snapshot.localStream), remoteTracks: tracks(snapshot.remoteStream),
+    } : null };
+  },
+
+  callMediaStats: async (input) => {
+    const snapshot = mobileCallManager.getSnapshot();
+    if (snapshot?.peerPtid !== input.peerPtid) {
+      throw new Error('acceptance.mobile.callPeerMismatch');
+    }
+    return {
+      ...await mobileCallManager.getMediaStats(),
+      presentation: readCallMediaPresentation(document.querySelector('.mobile-call-surface'), {
+        localVideo: '.mobile-call-local-video',
+        remoteVideo: '.mobile-call-remote-video',
+        remoteAudio: 'audio',
+      }, { local: snapshot.localStream, remote: snapshot.remoteStream }),
+    };
+  },
+
+  callRestartConnection: async (input) => {
+    if (mobileCallManager.getSnapshot()?.peerPtid !== input.peerPtid) {
+      throw new Error('acceptance.mobile.callPeerMismatch');
+    }
+    await mobileCallManager.restartConnection();
+    return { requested: true };
+  },
+
+  callResolutionState: async (input) => {
+    const snapshot = await mobileCallManager.readResolution(
+      requireString(input.callId, 'call.callId'),
+    );
+    return snapshot ? publicCallSnapshot(snapshot) : null;
+  },
+
+  acceptCall: async (input) => {
+    const callId = requireString(input.callId, 'call.callId');
+    const current = mobileCallManager.getSnapshot();
+    if (current?.callId !== callId) {
+      throw new Error('acceptance.mobile.callNotFound');
+    }
+    try {
+      return publicCallSnapshot(
+        await mobileCallManager.acceptCall() ?? current,
+      );
+    } catch (error) {
+      const snapshot = await mobileCallManager.readResolution(callId);
+      if (!snapshot) throw error;
+      return { ...publicCallSnapshot(snapshot), conflict: true };
+    }
+  },
+
+  rejectCall: async (input) => {
+    const callId = requireString(input.callId, 'call.callId');
+    const current = mobileCallManager.getSnapshot();
+    if (current?.callId !== callId) {
+      throw new Error('acceptance.mobile.callNotFound');
+    }
+    try {
+      return publicCallSnapshot(
+        await mobileCallManager.rejectCall() ?? current,
+      );
+    } catch (error) {
+      const snapshot = await mobileCallManager.readResolution(callId);
+      if (!snapshot) throw error;
+      return { ...publicCallSnapshot(snapshot), conflict: true };
+    }
+  },
+
+  groupCallStart: async (input) => {
+    if (input.mediaKind !== 'audio' && input.mediaKind !== 'video') throw new Error('acceptance.mobile.invalidMediaKind');
+    await mobileGroupCallManager.joinGroupCall(requireString(input.groupUlid, 'groupCall.groupUlid'), input.mediaKind);
+    return { actorPtid: readMobileRuntimeScopeProjection().activeActorPtid ?? '', snapshot: mobileGroupCallManager.getSnapshot() };
+  },
+  groupCallLeave: async () => {
+    await mobileGroupCallManager.leaveGroupCall();
+    return { actorPtid: readMobileRuntimeScopeProjection().activeActorPtid ?? '', snapshot: mobileGroupCallManager.getSnapshot() };
+  },
+  groupCallToggleMic: async (input) => {
+    await mobileGroupCallManager.setMicEnabled(input.enabled);
+    return { actorPtid: readMobileRuntimeScopeProjection().activeActorPtid ?? '', snapshot: mobileGroupCallManager.getSnapshot() };
+  },
+  groupCallToggleCamera: async (input) => {
+    await mobileGroupCallManager.setCameraEnabled(input.enabled);
+    return { actorPtid: readMobileRuntimeScopeProjection().activeActorPtid ?? '', snapshot: mobileGroupCallManager.getSnapshot() };
+  },
+  groupCallSnapshot: async () => ({
+    actorPtid: readMobileRuntimeScopeProjection().activeActorPtid ?? '', snapshot: mobileGroupCallManager.getSnapshot(),
+  }),
+  groupCallMediaStats: async () => ({
+    actorPtid: readMobileRuntimeScopeProjection().activeActorPtid ?? '',
+    media: await mobileGroupCallManager.readMediaStats(),
+  }),
+  'debug.snapshot.read': async () => collectMobileDebugSnapshot(),
+
+  cleanup: async () => {
+    setEntrySurfaceFixture(null);
+    setRecoverySurfaceFixture(null);
+    setChatSurfaceFixture(null);
+    let oauthPurge: Awaited<ReturnType<typeof purgeNativeOAuth>> | null = null;
+    await getMobileLifecycleKernel().transitionScope(
+      'logout',
+      async () => {
+        const logout = await logoutSessionRuntime();
+        oauthPurge = logout.nativePurge ?? await purgeNativeOAuth();
+        const registry = await readStationRegistryProjection();
+        await Promise.all(registry.entries.flatMap((entry) => (
+          stationRoutes(entry).map((route) => removeStationRouteBinding({
+            stationPeerId: entry.stationPeerId,
+            routeId: route.routeId,
+            sourceRef: route.sourceRef,
+          }))
+        )));
+        await replaceStationRegistryProjection(emptyStationRegistry());
+      },
+      { restart: false, draftDisposition: 'discard' },
+    );
+    if (!oauthPurge) throw new Error('acceptance.mobile.oauthPurgeMissing');
+    return {
+      oauthPurge,
+      webSessionProjectionCleared: true,
+      stationRegistryCleared: true,
+    };
+  },
+};
+
+export function publicCallSnapshot(snapshot: {
+  callId: string;
+  state: string;
+  endReason?: string;
+  winningDeviceId?: string;
+}) {
+  const state = snapshot.state === 'ended'
+    && (snapshot.endReason === 'rejected' || snapshot.endReason === 'busy')
+    ? 'rejected'
+    : snapshot.state === 'ended' && snapshot.endReason === 'no-answer'
+      ? 'no_answer'
+      : snapshot.state;
+  return {
+    callId: snapshot.callId,
+    state,
+    winningDeviceId: snapshot.winningDeviceId,
+  };
+}
+
+function addVerifiedStation(
+  registry: StoredStationRegistry,
+  verified: Awaited<ReturnType<typeof verifyStationIdentity>>,
+): StoredStationRegistry {
+  const result = addStationRoute(
+    registry,
+    {
+      identity: {
+        stationPeerId: verified.stationPeerId,
+        url: verified.canonicalOrigin,
+      },
+      stationRootPublicKey: verified.route.stationRootPublicKey,
+      route: verified.route,
+    },
+    {
+      checkedAt: verified.verifiedAt,
+      online: true,
+    },
+  );
+  if (!result.ok) throw new Error(result.error);
+  return result.registry;
+}
+
+function stationMutationOutput(
+  registry: StoredStationRegistry,
+  verified: Awaited<ReturnType<typeof verifyStationIdentity>>,
+) {
+  return {
+    ...sanitizeStationRegistry(registry),
+    verifiedStationPeerId: verified.stationPeerId,
+    canonicalOrigin: verified.canonicalOrigin,
+  };
+}
+
+async function readReliabilityOwnerState() {
+  const account = requireMessagingAccount();
+  const status = await readReliabilityRuntimeStatus();
+  if (
+    !status.active
+    || status.stationPeerId !== account.stationPeerId
+    || status.actorPtid !== account.actorPtid
+  ) {
+    throw new Error('acceptance.mobile.reliabilityScopeUnavailable');
+  }
+  const [commands, drafts, checkpoints] = await Promise.all([
+    listReliabilityCommands(
+      account.stationPeerId,
+      account.actorPtid,
+      status.runtimeGeneration,
+    ),
+    getDraftRestorationPort().list(
+      account.stationPeerId,
+      account.actorPtid,
+    ),
+    listReliabilityProjectionCheckpoints(
+      account.stationPeerId,
+      account.actorPtid,
+      status.runtimeGeneration,
+    ),
+  ]);
+  return { status, commands, drafts, checkpoints };
+}
+
+async function readPublicReliabilitySnapshot(): Promise<PublicReliabilitySnapshot> {
+  const { status, commands, drafts, checkpoints } =
+    await readReliabilityOwnerState();
+  return {
+    runtime: { ...status },
+    commands: commands.map((command) => ({
+      commandId: command.commandId,
+      orderingKey: command.orderingKey,
+      payloadSha256: hexBytes(command.envelope.payloadSha256),
+      state: command.state,
+      attemptCount: command.attemptCount,
+      typedLastError: command.typedLastError,
+      createdAtMs: command.createdAtMs,
+      updatedAtMs: command.updatedAtMs,
+      nextAttemptAtMs: command.nextAttemptAtMs,
+    })),
+    drafts: await publicReliabilityDrafts(drafts),
+    checkpoints: await Promise.all(checkpoints.map(async (checkpoint) => ({
+      commandId: checkpoint.commandId,
+      payloadSha256: hexBytes(checkpoint.payloadSha256),
+      authoritativeLookupSha256: await sha256Hex(
+        Uint8Array.from(checkpoint.authoritativeLookupBytes),
+      ),
+      createdAtMs: checkpoint.createdAtMs,
+    }))),
+  };
+}
+
+function filterReliabilityDrafts(
+  drafts: readonly DraftProjection[],
+  input: ReliabilityDraftReadInput | undefined,
+): DraftProjection[] {
+  if (
+    input?.kind !== undefined
+    && input.kind !== 'chat'
+    && input.kind !== 'moment'
+  ) {
+    throw new Error('acceptance.mobile.invalidInput:reliability.draft.kind');
+  }
+  const targetId = input?.targetId?.trim() ?? '';
+  return drafts.filter((draft) => (
+    (!input?.kind || draft.surfaceKind === input.kind)
+    && (!targetId || draft.targetId === targetId)
+  ));
+}
+
+async function publicReliabilityDrafts(
+  drafts: readonly DraftProjection[],
+): Promise<PublicReliabilityDraft[]> {
+  return Promise.all(drafts.map(publicReliabilityDraft));
+}
+
+async function publicReliabilityDraft(
+  draft: DraftProjection,
+): Promise<PublicReliabilityDraft> {
+  return {
+    key: draft.key,
+    kind: draft.kind,
+    surfaceKind: draft.surfaceKind,
+    targetId: draft.targetId,
+    updatedAtMs: draft.updatedAtMs,
+    payloadSha256: await sha256Hex(
+      Uint8Array.from(toBinary(MobileDraftEnvelopeV2Schema, draft.envelope)),
+    ),
+  };
+}
+
+function publicRecoveryState(state: RecoveryState): PublicRecoveryState {
+  switch (state.kind) {
+    case 'draft-restore-pending':
+      return {
+        kind: state.kind,
+        count: state.drafts.length,
+        actions: ['restore', 'discard'],
+        detail: {
+          draftKeys: state.drafts.map((draft) => draft.key),
+        },
+      };
+    case 'command-recovery':
+      return {
+        kind: state.kind,
+        count: state.commands.length,
+        actions: [...new Set(state.commands.flatMap(
+          reliabilityCommandRecoveryActions,
+        ))],
+        detail: {
+          commandIds: state.commands.map((command) => command.commandId),
+        },
+      };
+    case 'capacity-read-only':
+      return {
+        kind: state.kind,
+        detail: {
+          currentDepth: state.currentDepth,
+          maxCapacity: state.maxCapacity,
+        },
+      };
+    case 'legacy-reliability-recovery':
+      return {
+        kind: state.kind,
+        actions: ['retain', 'discard-legacy', 'reset-all'],
+        detail: {
+          archivedLegacyFiles: state.archivedLegacyFiles,
+          retainedReadOnly: state.retainedReadOnly,
+        },
+      };
+    case 'reliability-reset-recovery':
+      return {
+        kind: state.kind,
+        actions: ['finish-reset'],
+      };
+    case 'write-revocation':
+      return {
+        kind: state.kind,
+        detail: state.admission.open
+          ? {}
+          : {
+              reason: state.admission.reason,
+              closedAt: state.admission.closedAt,
+              ...(state.admission.detail
+                ? { handlerError: state.admission.detail }
+                : {}),
+            },
+      };
+    case 'session-mismatch':
+      return {
+        kind: state.kind,
+        actions: ['re-authenticate', 'switch-station'],
+        detail: {
+          expectedStationPeerId: state.expectedStationPeerId,
+          actualStationPeerId: state.actualStationPeerId,
+          detectedAtMs: state.detectedAtMs,
+        },
+      };
+    case 'actor-identity-recovery':
+      return {
+        kind: state.kind,
+        actions: ['recover', 'switch-station'],
+        detail: {
+          detectedAtMs: state.detectedAtMs,
+        },
+      };
+    case 'event-overflow-reconcile':
+      return {
+        kind: state.kind,
+        detail: {
+          staleDomains: state.staleDomains.map((entry) => entry.domain),
+        },
+      };
+    case 'deferred-capability':
+      return {
+        kind: state.kind,
+        detail: {
+          runtimeIds: state.unavailableRuntimes.map(
+            (runtime) => runtime.runtimeId,
+          ),
+        },
+      };
+    case 'device-local-flag':
+      return {
+        kind: state.kind,
+        actions: ['retry', 'switch-station'],
+        detail: {
+          reason: state.reason,
+          since: state.since,
+        },
+      };
+  }
+}
+
+function hexBytes(value: ArrayLike<number>): string {
+  return Array.from(
+    value,
+    (byte) => byte.toString(16).padStart(2, '0'),
+  ).join('');
+}
+
+function requireReliabilityAcceptanceFaultMode(
+  value: unknown,
+): ReliabilityAcceptanceFaultMode {
+  if (
+    value === 'none'
+    || value === 'hold-before-dispatch'
+    || value === 'lose-dispatch-response-and-readback'
+    || value === 'fail-checkpoint-acknowledgement'
+  ) {
+    return value;
+  }
+  throw new Error(
+    'acceptance.mobile.invalidInput:reliability.fixture.mode',
+  );
+}
+
+function requireActiveStation(registry: StoredStationRegistry) {
+  const station = activeStationEntry(registry);
+  if (!station) throw new Error('acceptance.mobile.activeStationRequired');
+  return station;
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return value.trim();
+}
+
+function requirePtid(value: unknown, field: string): string {
+  const ptid = requireString(value, field);
+  if (!ptid.startsWith('ptid:')) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return ptid;
+}
+
+function requirePtidList(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return value.map((item, index) => requirePtid(item, `${field}.${index}`));
+}
+
+function requirePrivateMentions(value: unknown): PrivateMomentMention[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 256) {
+    throw new Error('acceptance.mobile.invalidInput:moments.private.mentions');
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object') {
+      throw new Error(`acceptance.mobile.invalidInput:moments.private.mentions.${index}`);
+    }
+    const mention = item as Record<string, unknown>;
+    const offset = Number(mention.offset);
+    const length = Number(mention.length);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length <= 0) {
+      throw new Error(`acceptance.mobile.invalidInput:moments.private.mentions.${index}.range`);
+    }
+    return {
+      actorPtid: requirePtid(
+        mention.actorPtid,
+        `moments.private.mentions.${index}.actorPtid`,
+      ),
+      offset,
+      length,
+      display: requireString(
+        mention.display,
+        `moments.private.mentions.${index}.display`,
+      ),
+    };
+  });
+}
+
+function requirePrivateMomentKind(value: unknown): PrivateMomentKind {
+  const kind = requireString(value ?? 'TEXT', 'moments.private.publish.momentKind');
+  if (!['TEXT', 'IMAGE', 'VIDEO', 'LINK', 'REPOST', 'LOCATION'].includes(kind)) {
+    throw new Error('acceptance.mobile.invalidInput:moments.private.publish.momentKind');
+  }
+  return kind as PrivateMomentKind;
+}
+
+function requirePrivateMomentIntent(value: unknown): PrivateSocialMomentIntent {
+  if (!value || typeof value !== 'object') {
+    throw new Error('acceptance.mobile.invalidInput:moments.private.publish');
+  }
+  const input = value as Record<string, unknown>;
+  const momentKind = requirePrivateMomentKind(input.momentKind);
+  const files = input.files === undefined
+    ? []
+    : Array.isArray(input.files)
+      ? input.files.map((item, index) => {
+        if (!item || typeof item !== 'object') {
+          throw new Error(`acceptance.mobile.invalidInput:moments.private.publish.files.${index}`);
+        }
+        const file = item as Record<string, unknown>;
+        return {
+          handle: requireString(file.handle, `moments.private.publish.files.${index}.handle`),
+          attachmentId: requireString(
+            file.attachmentId,
+            `moments.private.publish.files.${index}.attachmentId`,
+          ),
+          width: file.width === undefined ? undefined : requireNonNegativeInteger(file.width),
+          height: file.height === undefined ? undefined : requireNonNegativeInteger(file.height),
+          durationMs: file.durationMs === undefined
+            ? undefined
+            : requireNonNegativeInteger(file.durationMs),
+          altText: typeof file.altText === 'string' ? file.altText : undefined,
+        };
+      })
+      : (() => { throw new Error('acceptance.mobile.invalidInput:moments.private.publish.files'); })();
+  const result: PrivateSocialMomentIntent = {
+    draftId: requireString(input.draftId, 'moments.private.publish.draftId'),
+    draftRevision: requirePositiveInteger(
+      input.draftRevision,
+      'moments.private.publish.draftRevision',
+    ),
+    text: requireString(input.text, 'moments.private.publish.text'),
+    audience: requirePrivateSocialAudience(input.audience),
+    momentKind,
+    mentions: requirePrivateMentions(input.mentions),
+    files,
+  };
+  if (momentKind === 'LINK') {
+    const link = input.link as Record<string, unknown> | undefined;
+    if (!link) throw new Error('acceptance.mobile.invalidInput:moments.private.publish.link');
+    result.link = {
+      url: requireString(link.url, 'moments.private.publish.link.url'),
+      title: requireString(link.title, 'moments.private.publish.link.title'),
+      description: typeof link.description === 'string' ? link.description : undefined,
+      imageUrl: typeof link.imageUrl === 'string' ? link.imageUrl : undefined,
+      siteName: typeof link.siteName === 'string' ? link.siteName : undefined,
+      faviconUrl: typeof link.faviconUrl === 'string' ? link.faviconUrl : undefined,
+    };
+  } else if (momentKind === 'LOCATION') {
+    const location = input.location as Record<string, unknown> | undefined;
+    if (!location || !Number.isFinite(location.latitude) || !Number.isFinite(location.longitude)) {
+      throw new Error('acceptance.mobile.invalidInput:moments.private.publish.location');
+    }
+    result.location = {
+      name: requireString(location.name, 'moments.private.publish.location.name'),
+      latitude: Number(location.latitude),
+      longitude: Number(location.longitude),
+      address: typeof location.address === 'string' ? location.address : undefined,
+      placeId: typeof location.placeId === 'string' ? location.placeId : undefined,
+    };
+  } else if (momentKind === 'REPOST') {
+    const repost = input.repost as Record<string, unknown> | undefined;
+    if (!repost) throw new Error('acceptance.mobile.invalidInput:moments.private.publish.repost');
+    result.repost = {
+      sourcePostId: requireString(
+        repost.sourcePostId,
+        'moments.private.publish.repost.sourcePostId',
+      ),
+    };
+  }
+  return result;
+}
+
+function requirePrivateSocialAudienceFields(
+  audience: Record<string, unknown>,
+  allowedFields: readonly string[],
+): void {
+  const allowed = new Set(['kind', ...allowedFields]);
+  const unexpected = Object.keys(audience).find((field) => !allowed.has(field));
+  if (unexpected) {
+    throw new Error(
+      `acceptance.mobile.invalidInput:moments.private.audience.${unexpected}`,
+    );
+  }
+}
+
+function requireCircleId(value: unknown): string {
+  const field = 'moments.private.audience.circleId';
+  if (
+    typeof value !== 'string'
+    || !/^[1-9]\d*$/.test(value)
+    || BigInt(value) > 18_446_744_073_709_551_615n
+  ) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return value;
+}
+
+function requireGroupConversationId(value: unknown): string {
+  const field = 'moments.private.audience.groupConversationId';
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.trim() !== value
+    || value.includes('\0')
+  ) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return value;
+}
+
+function requirePrivateSocialAudience(value: unknown): PrivateSocialAudience {
+  if (!value || typeof value !== 'object') {
+    throw new Error('acceptance.mobile.invalidInput:moments.private.audience');
+  }
+  const audience = value as Record<string, unknown>;
+  const kind = requireString(
+    audience.kind,
+    'moments.private.audience.kind',
+  );
+  if (kind === 'FOLLOWERS' || kind === 'FRIENDS' || kind === 'SELF') {
+    requirePrivateSocialAudienceFields(audience, []);
+    return { kind };
+  }
+  if (kind === 'CIRCLE') {
+    requirePrivateSocialAudienceFields(audience, ['circleId']);
+    return {
+      kind,
+      circleId: requireCircleId(audience.circleId),
+    };
+  }
+  if (kind === 'GROUP') {
+    requirePrivateSocialAudienceFields(audience, ['groupConversationId']);
+    return {
+      kind,
+      groupConversationId: requireGroupConversationId(
+        audience.groupConversationId,
+      ),
+    };
+  }
+  if (kind === 'CUSTOM_ALLOW') {
+    requirePrivateSocialAudienceFields(audience, ['actorPtids']);
+    return {
+      kind,
+      actorPtids: requirePtidList(
+        audience.actorPtids,
+        'moments.private.audience.actorPtids',
+      ),
+    };
+  }
+  if (kind === 'CUSTOM_DENY') {
+    requirePrivateSocialAudienceFields(audience, ['actorPtids', 'baseKind']);
+    const baseKind = requireString(
+      audience.baseKind,
+      'moments.private.audience.baseKind',
+    );
+    if (baseKind !== 'FOLLOWERS' && baseKind !== 'PUBLIC') {
+      throw new Error(
+        'acceptance.mobile.invalidInput:moments.private.audience.baseKind',
+      );
+    }
+    return {
+      kind,
+      baseKind,
+      actorPtids: requirePtidList(
+        audience.actorPtids,
+        'moments.private.audience.actorPtids',
+      ),
+    };
+  }
+  throw new Error('acceptance.mobile.invalidInput:moments.private.audience.kind');
+}
+
+function requirePositiveInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return Number(value);
+}
+
+function requireNonNegativeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error('acceptance.mobile.invalidInput:moments.private.nonNegativeInteger');
+  }
+  return Number(value);
+}
+
+function requireSha256(value: unknown, field: string): string {
+  const digest = requireString(value, field).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return digest;
+}
+
+function requirePermissionKind(value: unknown): PermissionKind {
+  if (
+    value === 'camera'
+    || value === 'microphone'
+    || value === 'storage'
+    || value === 'notifications'
+  ) {
+    return value;
+  }
+  throw new Error('acceptance.mobile.invalidInput:platform.permission.kind');
+}
+
+async function digestText(value: string | undefined): Promise<string | undefined> {
+  return value === undefined
+    ? undefined
+    : sha256Hex(new TextEncoder().encode(value));
+}
+
+async function sanitizePrivateMomentPublish(
+  value: Awaited<ReturnType<typeof publishPrivateTextMoment>>,
+): Promise<PrivateMomentPublishActionOutput> {
+  return {
+    draftId: value.draftId,
+    draftRevision: value.draftRevision,
+    generation: value.generation,
+    audienceKind: value.audienceKind,
+    state: value.state,
+    ...(value.postId ? { postId: value.postId } : {}),
+    ...(value.text ? { textSha256: await digestText(value.text) } : {}),
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+  };
+}
+
+async function sanitizePrivateMomentRead(
+  value: Awaited<ReturnType<typeof readPrivateTextMoment>>,
+): Promise<PrivateMomentReadActionOutput> {
+  const contentText = value.content?.kind === 'REPOST'
+    ? value.content.comment
+    : value.content?.text;
+  const mediaStates = value.content && 'media' in value.content
+    ? value.content.media.map((media) => media.state)
+    : undefined;
+  return {
+    postId: value.postId,
+    contentId: value.contentId,
+    generation: value.generation,
+    authorPtid: value.authorPtid,
+    audienceKind: value.audienceKind,
+    state: value.state,
+    ...(value.content
+      ? {
+        contentKind: value.content.kind,
+        ...(contentText ? { textSha256: await digestText(contentText) } : {}),
+        ...(mediaStates ? { mediaStates } : {}),
+      }
+      : {}),
+    mentionCount: value.mentions?.length ?? 0,
+    reactions: (value.reactions ?? []).map((reaction) => ({
+      kind: reaction.kind,
+      count: reaction.count,
+      reactedByViewer: reaction.reactedByViewer,
+    })),
+    reactionsHydrated: value.reactionsHydrated ?? false,
+    ...(value.errorCode ? { errorCode: value.errorCode } : {}),
+    ...(value.retryAfterSeconds === undefined
+      ? {}
+      : { retryAfterSeconds: value.retryAfterSeconds }),
+  };
+}
+
+async function sanitizePrivateComment(
+  comment: Awaited<ReturnType<typeof submitPrivateComment>>['comment'],
+  draft: Awaited<ReturnType<typeof submitPrivateComment>>['draft'],
+) {
+  return {
+    ...(comment?.commentId ? { commentId: comment.commentId } : {}),
+    ...(comment?.contentId ? { contentId: comment.contentId } : {}),
+    postId: comment?.postId ?? draft.postId,
+    state: comment?.state ?? draft.state,
+    ...(comment?.text ? { textSha256: await digestText(comment.text) } : {}),
+    mentionCount: comment?.mentions.length ?? draft.mentions.length,
+    ...(draft.errorCode ? { errorCode: draft.errorCode } : {}),
+    ...(draft.retryAfterSeconds === undefined
+      ? {}
+      : { retryAfterSeconds: draft.retryAfterSeconds }),
+  };
+}
+
+async function sanitizePrivateCommentPage(
+  page: Awaited<ReturnType<typeof readPrivateComments>>,
+) {
+  return {
+    postId: page.postId,
+    comments: await Promise.all(page.comments.map(async (comment) => ({
+      commentId: comment.commentId,
+      contentId: comment.contentId,
+      postId: comment.postId,
+      state: comment.state,
+      ...(comment.text ? { textSha256: await digestText(comment.text) } : {}),
+      mentionCount: comment.mentions.length,
+    }))),
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+  };
+}
+
+function sanitizePrivateMomentSnapshot(
+  value: ReturnType<typeof readPrivateMomentsSnapshot>,
+): Promise<PrivateMomentSnapshotActionOutput> {
+  return Promise.all([
+    Promise.all(value.projections.map(sanitizePrivateMomentPublish)),
+    Promise.all(Object.values(value.postsById).map(sanitizePrivateMomentRead)),
+    Promise.all(value.commentDrafts.map(async (draft) => {
+      const draftIdSha256 = await digestText(draft.draftId);
+      const textSha256 = await digestText(draft.text);
+      if (!draftIdSha256 || !textSha256) {
+        throw new Error('acceptance.mobile.invalidPrivateCommentDraft');
+      }
+      return {
+        draftIdSha256,
+        postId: draft.postId,
+        textSha256,
+        state: draft.state,
+        ...(draft.errorCode ? { errorCode: draft.errorCode } : {}),
+        ...(draft.retryAfterSeconds === undefined
+          ? {}
+          : { retryAfterSeconds: draft.retryAfterSeconds }),
+      };
+    })),
+    Promise.all(value.reactionCommands.map(async (command) => {
+      const commandIdSha256 = await digestText(command.commandId);
+      if (!commandIdSha256) {
+        throw new Error('acceptance.mobile.invalidPrivateReactionCommand');
+      }
+      return {
+        commandIdSha256,
+        postId: command.postId,
+        kind: command.kind,
+        operation: command.operation,
+        state: command.state,
+        attemptCount: command.attemptCount,
+        projectionRevision: command.projectionRevision,
+        ...(command.errorCode ? { errorCode: command.errorCode } : {}),
+        ...(command.retryAfterSeconds === undefined
+          ? {}
+          : { retryAfterSeconds: command.retryAfterSeconds }),
+        ...(command.retryNotBeforeUnixMs === undefined
+          ? {}
+          : { retryNotBeforeUnixMs: command.retryNotBeforeUnixMs }),
+      };
+    })),
+  ]).then(([publish, reads, commentDrafts, reactionCommands]) => ({
+    active: value.active,
+    reconciling: value.reconciling,
+    stationPeerId: value.stationPeerId,
+    actorPtid: value.actorPtid,
+    publish,
+    reads,
+    commentDrafts,
+    reactionCommands,
+    publishStateHistory: [...value.publishStateHistory],
+    readStateHistoryByPostId: Object.fromEntries(
+      Object.entries(value.readStateHistoryByPostId)
+        .map(([postId, states]) => [postId, [...states]]),
+    ),
+    report: value.lastReport
+      ? {
+        endpointPrekeysAvailable: value.lastReport.endpointPrekeysAvailable,
+        recoveryPrekeysAvailable: value.lastReport.recoveryPrekeysAvailable,
+        submissionsProcessed: value.lastReport.submissionsProcessed,
+        submissionsUnknown: value.lastReport.submissionsUnknown,
+        submissionsTerminal: value.lastReport.submissionsTerminal,
+      }
+      : null,
+    errorPresent: value.errorMessage !== null,
+  }));
+}
+
+function requireNavigationIntent(value: unknown): MobileNavigationIntent {
+  if (!value || typeof value !== 'object') {
+    throw new Error('acceptance.mobile.invalidInput:navigation.intent');
+  }
+  const input = value as Record<string, unknown>;
+  switch (input.kind) {
+    case 'moments':
+      if (input.pane !== 'feed' && input.pane !== 'circles') {
+        throw new Error('acceptance.mobile.invalidInput:navigation.moments.pane');
+      }
+      return { kind: 'moments', pane: input.pane };
+    case 'moments.search':
+      if ((input.pane !== 'feed' && input.pane !== 'circles') ||
+          typeof input.query !== 'string' || typeof input.open !== 'boolean') {
+        throw new Error('acceptance.mobile.invalidInput:navigation.moments.search');
+      }
+      return { kind: 'moments.search', pane: input.pane, query: input.query, open: input.open };
+    case 'messages.search':
+      if ((input.pane !== 'chats' && input.pane !== 'contacts') ||
+          typeof input.query !== 'string' || typeof input.open !== 'boolean') {
+        throw new Error('acceptance.mobile.invalidInput:navigation.messages.search');
+      }
+      return { kind: 'messages.search', pane: input.pane, query: input.query, open: input.open };
+    case 'messages':
+      if (input.pane !== 'chats' && input.pane !== 'contacts') {
+        throw new Error('acceptance.mobile.invalidInput:navigation.messages.pane');
+      }
+      return { kind: 'messages', pane: input.pane };
+    case 'primary':
+      return {
+        kind: 'primary',
+        routeId: requirePrimaryRouteId(input.routeId),
+      };
+    case 'detail.push':
+      return {
+        kind: 'detail.push',
+        route: requireDetailRoute(input.route),
+      };
+    case 'detail.pop':
+    case 'overlay.close':
+    case 'reset':
+      return { kind: input.kind };
+    case 'overlay.open':
+      return {
+        kind: 'overlay.open',
+        route: requireOverlayRoute(input.route),
+      };
+    default:
+      throw new Error('acceptance.mobile.invalidInput:navigation.intent.kind');
+  }
+}
+
+function requirePrimaryRouteId(value: unknown): MobilePrimaryRouteId {
+  if (
+    value === 'tab:chat'
+    || value === 'tab:moments'
+    || value === 'tab:settings'
+  ) {
+    return value;
+  }
+  throw new Error('acceptance.mobile.invalidInput:navigation.primary.routeId');
+}
+
+function requireDetailRoute(value: unknown): MobileDetailRoute {
+  if (!value || typeof value !== 'object') {
+    throw new Error('acceptance.mobile.invalidInput:navigation.detail.route');
+  }
+  const route = value as Record<string, unknown>;
+  switch (route.routeId) {
+    case 'detail:chat-conversation':
+      return {
+        routeId: route.routeId,
+        sessionUlid: requireString(
+          route.sessionUlid,
+          'navigation.detail.sessionUlid',
+        ),
+      };
+    case 'detail:group-conversation':
+      return {
+        routeId: route.routeId,
+        groupUlid: requireString(
+          route.groupUlid,
+          'navigation.detail.groupUlid',
+        ),
+      };
+    case 'detail:contact-profile':
+      return {
+        routeId: route.routeId,
+        actorPtid: requirePtid(
+          route.actorPtid,
+          'navigation.detail.actorPtid',
+        ),
+      };
+    case 'detail:moment':
+      return {
+        routeId: route.routeId,
+        postId: requireString(
+          route.postId,
+          'navigation.detail.postId',
+        ),
+      };
+    case 'detail:social-search':
+    case 'detail:find-people':
+    case 'detail:social-circles':
+      return { routeId: route.routeId };
+    case 'detail:social-profile':
+      return {
+        routeId: route.routeId,
+        actorPtid: requirePtid(
+          route.actorPtid,
+          'navigation.detail.actorPtid',
+        ),
+        federationId: requireString(
+          route.federationId,
+          'navigation.detail.federationId',
+        ),
+      };
+    case 'detail:social-circle':
+    case 'detail:social-circle-members':
+      return {
+        routeId: route.routeId,
+        circleId: requireString(
+          route.circleId,
+          'navigation.detail.circleId',
+        ),
+      };
+    case 'detail:setting':
+      return {
+        routeId: route.routeId,
+        settingId: requireSettingDetailId(route.settingId),
+      };
+    default:
+      throw new Error('acceptance.mobile.invalidInput:navigation.detail.routeId');
+  }
+}
+
+function requireOverlayRoute(value: unknown): MobileOverlayRoute {
+  if (!value || typeof value !== 'object') {
+    throw new Error('acceptance.mobile.invalidInput:navigation.overlay.route');
+  }
+  const routeId = (value as Record<string, unknown>).routeId;
+  if (routeId === 'overlay:create-group' || routeId === 'overlay:notifications') {
+    return { routeId };
+  }
+  throw new Error('acceptance.mobile.invalidInput:navigation.overlay.routeId');
+}
+
+function requireSettingDetailId(value: unknown): MobileSettingDetailId {
+  if (
+    value === 'account-info'
+    || value === 'credentials'
+    || value === 'notifications'
+    || value === 'privacy-security'
+    || value === 'safety-number'
+    || value === 'blocked-users'
+    || value === 'chat-settings'
+    || value === 'chat-background'
+    || value === 'station-connection'
+    || value === 'encryption'
+    || value === 'language'
+    || value === 'about'
+  ) {
+    return value;
+  }
+  throw new Error('acceptance.mobile.invalidInput:navigation.detail.settingId');
+}
+
+function decodeBoundedBase64(value: unknown, field: string): Uint8Array<ArrayBuffer> {
+  const encoded = requireString(value, field);
+  if (encoded.length > 1_398_104) {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  try {
+    const decoded = globalThis.atob(encoded);
+    const buffer = new ArrayBuffer(decoded.length);
+    const bytes = new Uint8Array(buffer);
+    for (let index = 0; index < decoded.length; index += 1) {
+      bytes[index] = decoded.charCodeAt(index);
+    }
+    return bytes;
+  } catch {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+}
+
+async function sha256Hex(value: Uint8Array<ArrayBuffer>): Promise<string> {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', value));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function mobileErrorCode(error: unknown): string | null {
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string') return code;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return message.match(/\bMOBILE_[A-Z_]+\b/)?.[0] ?? null;
+}
+
+async function waitForLifecycleReady(
+  input: LifecycleWaitReadyInput | undefined,
+  timeoutMs = 10_000,
+): Promise<LifecycleWaitReadyOutput> {
+  const kernel = getMobileLifecycleKernel();
+  const minimumGeneration = input?.minimumGeneration ?? 0;
+  if (!Number.isSafeInteger(minimumGeneration) || minimumGeneration < 0) {
+    throw new Error('acceptance.mobile.invalidLifecycleGeneration');
+  }
+  const settled = () => {
+    const snapshot = kernel.getSnapshot();
+    return snapshot.phase === 'ACTIVE'
+      && snapshot.generation >= minimumGeneration
+      && snapshot.runtimes.every(
+        (runtime) => runtime.status === 'ready' || runtime.status === 'failed',
+      )
+      ? snapshot
+      : null;
+  };
+  const project = (
+    snapshot: ReturnType<typeof kernel.getSnapshot>,
+  ): LifecycleWaitReadyOutput => {
+    if (!input?.includeDiagnostics) return snapshot;
+    return {
+      ...snapshot,
+      runtimeErrors: kernel.getDiagnosticRuntimeErrors(),
+    };
+  };
+  const current = settled();
+  if (current) return Promise.resolve(project(current));
+
+  return new Promise<LifecycleWaitReadyOutput>((resolve) => {
+    let unsubscribe: () => void = () => undefined;
+    const timer = setTimeout(() => {
+      unsubscribe();
+      resolve(project(kernel.getSnapshot()));
+    }, timeoutMs);
+    const check = () => {
+      const snapshot = settled();
+      if (!snapshot) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(project(snapshot));
+    };
+    unsubscribe = kernel.subscribe(check);
+    check();
+  });
+}
+
+function requireMomentsRuntime() {
+  const runtime = readCurrentActiveMomentsRuntime();
+  if (!runtime) {
+    throw new Error('acceptance.mobile.activeMomentsRuntimeRequired');
+  }
+  return runtime;
+}
+
+function requireProfileRuntime() {
+  const runtime = readCurrentActiveProfileRuntime();
+  if (!runtime) {
+    throw new Error('acceptance.mobile.activeProfileRuntimeRequired');
+  }
+  return runtime;
+}
+
+function requireAcceptanceOutcome<T>(
+  result: CommandOutcome<T>,
+  errorKey: string,
+): T {
+  if (!result.ok) throw new Error(`${errorKey}:${result.error.code}`);
+  return result.data;
+}
+
+function publicMoment(post: Post) {
+  const text = post.content.case === 'textPost'
+    || post.content.case === 'imagePost'
+    || post.content.case === 'videoPost'
+    || post.content.case === 'locationPost'
+    ? post.content.value.text
+    : post.content.case === 'repostPost'
+      ? post.content.value.comment
+      : '';
+  return {
+    postId: post.id,
+    authorPtid: post.authorPtid,
+    text,
+    deleted: post.isDeleted,
+    reactions: post.reactions.map((reaction) => ({
+      kind: reaction.kind,
+      count: reaction.count.toString(),
+      reactedByViewer: reaction.reactedByViewer,
+    })),
+  };
+}
+
+function publicMomentComment(comment: Comment) {
+  return {
+    commentId: comment.id,
+    postId: comment.postId,
+    authorPtid: comment.authorPtid,
+    content: comment.content,
+    replyToCommentId: comment.replyToCommentId,
+    deleted: comment.isDeleted,
+  };
+}
+
+function publicProfile(actorPtid: string, profile: PeerProfile) {
+  return {
+    actorPtid,
+    profileRevision: profile.profileRevision.toString(),
+    avatar: profile.avatar,
+    header: profile.header,
+    displayName: profile.displayName,
+    note: profile.note,
+    region: profile.region,
+    timezone: profile.timezone,
+    defaultVisibility: profile.defaultVisibility,
+    manuallyApprovesFollowers: profile.manuallyApprovesFollowers,
+    messagePermission: profile.messagePermission,
+    autoExpireDays: profile.autoExpireDays,
+  };
+}
+
+function publicNotificationPreferences(
+  snapshot: NotificationPreferencesSnapshot,
+) {
+  return {
+    revision: snapshot.notificationPreferencesRevision.toString(),
+    preferences: snapshot.preferences.map((preference) => ({
+      category: preference.category,
+      enabled: preference.enabled,
+      pushEnabled: preference.pushEnabled,
+      soundEnabled: preference.soundEnabled,
+    })),
+  };
+}
+
+function requireAudienceKind(value: unknown): Audience_Kind {
+  if (!Number.isSafeInteger(value) || Number(value) < 1 || Number(value) > 8) {
+    throw new Error('acceptance.mobile.invalidInput:moments.publish.audienceKind');
+  }
+  return Number(value) as Audience_Kind;
+}
+
+function requireReactionKind(value: unknown): ReactionKind {
+  if (
+    !Number.isSafeInteger(value)
+    || Number(value) < ReactionKind.REACTION_LIKE
+    || Number(value) > ReactionKind.REACTION_HEART_HANDS
+  ) {
+    throw new Error('acceptance.mobile.invalidInput:moments.react.reactionKind');
+  }
+  return Number(value) as ReactionKind;
+}
+
+function requireBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`acceptance.mobile.invalidInput:${field}`);
+  }
+  return value;
+}
+
+function optionalText(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') {
+    throw new Error('acceptance.mobile.invalidInput:settings.profile.text');
+  }
+  return value;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  return requireBoolean(value, 'settings.profile.boolean');
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error('acceptance.mobile.invalidInput:settings.profile.integer');
+  }
+  return Number(value);
+}
+
+function requireDevicePreferences(value: unknown): DevicePreferences {
+  if (!value || typeof value !== 'object') {
+    throw new Error('acceptance.mobile.invalidInput:settings.device');
+  }
+  const input = value as Record<string, unknown>;
+  if (
+    !['system', 'light', 'dark'].includes(String(input.theme))
+    || !['small', 'medium', 'large'].includes(String(input.fontSize))
+  ) {
+    throw new Error('acceptance.mobile.invalidInput:settings.device');
+  }
+  return {
+    theme: input.theme as DevicePreferences['theme'],
+    fontSize: input.fontSize as DevicePreferences['fontSize'],
+    compactMode: requireBoolean(
+      input.compactMode,
+      'settings.device.compactMode',
+    ),
+    mediaAutoDownload: requireBoolean(
+      input.mediaAutoDownload,
+      'settings.device.mediaAutoDownload',
+    ),
+  };
+}
+
+function requireMessagingAccount(): MessagingMutationScopeInput {
+  const session = readActiveSessionProjection();
+  if (!session?.stationPeerId || !session.actorPtid) {
+    throw new Error('acceptance.mobile.activeMessagingSessionRequired');
+  }
+  return {
+    stationPeerId: session.stationPeerId,
+    actorPtid: session.actorPtid,
+    deviceId: session.deviceId,
+    lifecycleGeneration: session.lifecycleGeneration,
+  };
+}
+
+function requirePublicDecision(
+  decision: Parameters<typeof sanitizeAccessDecision>[0],
+) {
+  const sanitized = sanitizeAccessDecision(decision);
+  if (!sanitized) throw new Error('acceptance.mobile.accessDecisionMissing');
+  return sanitized;
+}
+
+async function cancelAndClearCurrentAuthScope() {
+  return logoutSessionRuntime();
+}
+
+function scopeTransitionOptions(
+  value: unknown,
+): { readonly draftDisposition?: DraftDisposition } {
+  if (value === undefined) return {};
+  if (value === 'retain' || value === 'discard') {
+    return { draftDisposition: value };
+  }
+  throw new Error('acceptance.mobile.invalidInput:draftDisposition');
+}
+
+function beginAccessGateLaunch(): void {
+  const kernel = getMobileLifecycleKernel();
+  if (kernel.getSnapshot().launchState === 'station-selection') {
+    kernel.transitionLaunchState('station-handshake');
+  }
+}
+
+async function completeAccessGateLaunch(
+  decision: AccessDecision,
+): Promise<void> {
+  const kernel = getMobileLifecycleKernel();
+  if (isAccessGranted(decision)) {
+    await kernel.reconcileLaunchState('access-granted');
+    return;
+  }
+  if (kernel.getSnapshot().launchState === 'station-handshake') {
+    kernel.transitionLaunchState('access-gate-chain');
+  }
+}

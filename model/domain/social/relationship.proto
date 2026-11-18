@@ -1,0 +1,446 @@
+syntax = "proto3";
+
+package peers_touch.model.social.v1;
+
+import "domain/actor/actor.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model;model";
+
+// ============================================================================
+// Follow/Relationship API Messages
+// ============================================================================
+
+message FollowRequest {
+  string target_actor_ptid = 1;
+}
+
+message FollowResponse {
+  bool success = 1;
+  Relationship relationship = 2;
+}
+
+message UnfollowRequest {
+  string target_actor_ptid = 1;
+}
+
+message UnfollowResponse {
+  bool success = 1;
+}
+
+message GetRelationshipRequest {
+  string target_actor_ptid = 1;
+}
+
+message GetRelationshipResponse {
+  Relationship relationship = 1;
+}
+
+message GetRelationshipsRequest {
+  repeated string target_actor_ptids = 1;
+}
+
+message GetRelationshipsResponse {
+  repeated Relationship relationships = 1;
+}
+
+message Relationship {
+  string id = 1;
+  string target_actor_ptid = 2;
+  bool following = 3;
+  bool followed_by = 4;
+  google.protobuf.Timestamp followed_at = 5;
+}
+
+message GetFollowersRequest {
+  string actor_ptid = 1;
+  string cursor = 2;
+  int32 limit = 3;
+}
+
+message GetFollowersResponse {
+  repeated Follower followers = 1;
+  string next_cursor = 2;
+  int32 total = 3;
+}
+
+message GetFollowingRequest {
+  string actor_ptid = 1;
+  string cursor = 2;
+  int32 limit = 3;
+}
+
+message GetFollowingResponse {
+  repeated Following following = 1;
+  string next_cursor = 2;
+  int32 total = 3;
+}
+
+message Follower {
+  string actor_ptid = 1;
+  string username = 2;
+  string display_name = 3;
+  string avatar_url = 4;
+  google.protobuf.Timestamp followed_at = 5;
+
+  // Federation identity (Tier B social-graph extension). See PostAuthor
+  // in post.proto for the contract — both fields are additive, empty
+  // for pre-backfill rows, and ignored by older clients.
+  string federated_handle = 6 [json_name = "federated_handle"];
+  string home_station_domain = 7 [json_name = "home_station_domain"];
+  string home_station_peer_id = 8 [json_name = "home_station_peer_id"];
+}
+
+message Following {
+  string actor_ptid = 1;
+  string username = 2;
+  string display_name = 3;
+  string avatar_url = 4;
+  google.protobuf.Timestamp followed_at = 5;
+
+  // Federation identity (Tier B social-graph extension). See PostAuthor
+  // in post.proto for the contract.
+  string federated_handle = 6 [json_name = "federated_handle"];
+  string home_station_domain = 7 [json_name = "home_station_domain"];
+  string home_station_peer_id = 8 [json_name = "home_station_peer_id"];
+}
+
+enum FriendRequestAction {
+  FRIEND_REQUEST_ACTION_UNSPECIFIED = 0;
+  FRIEND_REQUEST_ACTION_SEND = 1;
+  FRIEND_REQUEST_ACTION_ACCEPT = 2;
+  FRIEND_REQUEST_ACTION_REJECT = 3;
+}
+
+enum FriendRequestState {
+  FRIEND_REQUEST_STATE_UNSPECIFIED = 0;
+  FRIEND_REQUEST_STATE_PENDING = 1;
+  FRIEND_REQUEST_STATE_ACCEPTED = 2;
+  FRIEND_REQUEST_STATE_REJECTED = 3;
+  FRIEND_REQUEST_STATE_EXPIRED = 4;
+}
+
+message SocialFriendRequest {
+  string request_id = 1;
+  peers_touch.model.actor.v1.ActorRef sender = 2;
+  peers_touch.model.actor.v1.ActorRef receiver = 3;
+  string message = 4;
+  FriendRequestState state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp responded_at = 7;
+  string sender_display_name = 8;
+  string sender_avatar = 9;
+  string receiver_display_name = 10;
+  string receiver_avatar = 11;
+  string federation_id = 12;
+  string sender_home_station_peer_id = 13;
+  string receiver_home_station_peer_id = 14;
+}
+
+message SendSocialFriendRequestRequest {
+  reserved 1, 2, 3;
+  reserved "receiver", "message", "federation_id";
+  FriendRequestCommand command = 4;
+}
+
+message SendSocialFriendRequestResponse {
+  SocialFriendRequest request = 1;
+}
+
+message AcceptSocialFriendRequestRequest {
+  reserved 1;
+  reserved "request_id";
+  FriendRequestCommand command = 2;
+}
+
+message AcceptSocialFriendRequestResponse {
+  SocialFriendRequest request = 1;
+}
+
+message RejectSocialFriendRequestRequest {
+  reserved 1;
+  reserved "request_id";
+  FriendRequestCommand command = 2;
+}
+
+message RejectSocialFriendRequestResponse {
+  SocialFriendRequest request = 1;
+}
+
+message ListSocialFriendRequestsRequest {
+  FriendRequestState state = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+}
+
+message ListSocialFriendRequestsResponse {
+  repeated SocialFriendRequest requests = 1;
+  int32 total = 2;
+}
+
+message FriendRequestCommandBody {
+  uint32 format_version = 1;
+  string command_id = 2;
+  string request_id = 3;
+  FriendRequestAction action = 4;
+  peers_touch.model.actor.v1.ActorRef sender = 5;
+  peers_touch.model.actor.v1.ActorRef receiver = 6;
+  string sender_home_station_peer_id = 7;
+  string receiver_home_station_peer_id = 8;
+  string message = 9;
+  FriendRequestState observed_request_state = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp expires_at = 12;
+  peers_touch.model.actor.v1.ActorDeviceRef authorizing_device = 13;
+  string federation_id = 14;
+}
+
+message FriendRequestCommandSigningInput {
+  FriendRequestCommandBody body = 1;
+  string signing_key_id = 2;
+}
+
+message FriendRequestCommand {
+  FriendRequestCommandBody body = 1;
+  string signing_key_id = 2;
+  bytes actor_device_signature = 3;
+}
+
+message FriendRequestEvent {
+  string event_id = 1;
+  string request_id = 2;
+  string command_id = 3;
+  string authority_station_peer_id = 4;
+  FriendRequestState state = 5;
+  peers_touch.model.actor.v1.ActorRef sender = 6;
+  peers_touch.model.actor.v1.ActorRef receiver = 7;
+  string sender_home_station_peer_id = 8;
+  string receiver_home_station_peer_id = 9;
+  int64 sequence = 10;
+  google.protobuf.Timestamp committed_at = 11;
+  bytes previous_hash = 12;
+  bytes event_hash = 13;
+  string federation_id = 14;
+}
+
+enum FriendRequestCommandResultKind {
+  FRIEND_REQUEST_COMMAND_RESULT_KIND_UNSPECIFIED = 0;
+  FRIEND_REQUEST_COMMAND_RESULT_KIND_COMMITTED = 1;
+  FRIEND_REQUEST_COMMAND_RESULT_KIND_DUPLICATE = 2;
+  FRIEND_REQUEST_COMMAND_RESULT_KIND_REJECTED = 3;
+  FRIEND_REQUEST_COMMAND_RESULT_KIND_CONFLICT = 4;
+}
+
+enum FriendRequestCommandErrorCode {
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_UNSPECIFIED = 0;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_INVALID = 1;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_UNAUTHORIZED = 2;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_BLOCKED = 3;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_NOT_FOUND = 4;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_ALREADY_FRIENDS = 5;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_STATE_CONFLICT = 6;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_IDEMPOTENCY_CONFLICT = 7;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_EXPIRED = 8;
+  FRIEND_REQUEST_COMMAND_ERROR_CODE_RETRY_LATER = 9;
+}
+
+message FriendRequestCommandResult {
+  string command_id = 1;
+  string request_id = 2;
+  bytes command_payload_sha256 = 3;
+  FriendRequestCommandResultKind kind = 4;
+  FriendRequestEvent event = 5;
+  FriendRequestCommandErrorCode error_code = 6;
+  bool retryable = 7;
+}
+
+enum FriendRequestCommandLookupState {
+  FRIEND_REQUEST_COMMAND_LOOKUP_STATE_UNSPECIFIED = 0;
+  FRIEND_REQUEST_COMMAND_LOOKUP_STATE_NOT_FOUND = 1;
+  FRIEND_REQUEST_COMMAND_LOOKUP_STATE_ACCEPTED_PENDING = 2;
+  FRIEND_REQUEST_COMMAND_LOOKUP_STATE_TERMINAL_RESULT = 3;
+  FRIEND_REQUEST_COMMAND_LOOKUP_STATE_UNRESOLVED = 4;
+}
+
+message LookupFriendRequestCommandResultRequest {
+  string command_id = 1;
+  bytes command_payload_sha256 = 2;
+}
+
+message LookupFriendRequestCommandResultResponse {
+  FriendRequestCommandLookupState state = 1;
+  string command_id = 2;
+  bytes command_payload_sha256 = 3;
+  FriendRequestCommandResult terminal_result = 4;
+}
+
+enum SocialRelationshipAction {
+  SOCIAL_RELATIONSHIP_ACTION_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_ACTION_BLOCK = 1;
+  SOCIAL_RELATIONSHIP_ACTION_UNBLOCK = 2;
+}
+
+enum SocialRelationshipAllowedAction {
+  SOCIAL_RELATIONSHIP_ALLOWED_ACTION_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_ALLOWED_ACTION_FOLLOW = 1;
+  SOCIAL_RELATIONSHIP_ALLOWED_ACTION_FRIEND_REQUEST = 2;
+  SOCIAL_RELATIONSHIP_ALLOWED_ACTION_DIRECT_CONVERSATION = 3;
+  SOCIAL_RELATIONSHIP_ALLOWED_ACTION_PRIVATE_CONTENT = 4;
+}
+
+enum SocialRelationshipDeniedReason {
+  SOCIAL_RELATIONSHIP_DENIED_REASON_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_DENIED_REASON_NONE = 1;
+  SOCIAL_RELATIONSHIP_DENIED_REASON_INTERACTION_DENIED = 2;
+}
+
+enum SocialRelationshipInvalidationClass {
+  SOCIAL_RELATIONSHIP_INVALIDATION_CLASS_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_INVALIDATION_CLASS_FOLLOW = 1;
+  SOCIAL_RELATIONSHIP_INVALIDATION_CLASS_FRIEND_REQUEST_ELIGIBILITY = 2;
+  SOCIAL_RELATIONSHIP_INVALIDATION_CLASS_PRIVATE_CONTENT_GRANT = 3;
+  SOCIAL_RELATIONSHIP_INVALIDATION_CLASS_CONVERSATION_ENTRY = 4;
+}
+
+message SocialRelationshipCommandBody {
+  uint32 format_version = 1;
+  string command_id = 2;
+  SocialRelationshipAction action = 3;
+  peers_touch.model.actor.v1.ActorRef actor = 4;
+  peers_touch.model.actor.v1.ActorRef target_actor = 5;
+  string actor_home_station_peer_id = 6;
+  string target_home_station_peer_id = 7;
+  int64 observed_revision = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  peers_touch.model.actor.v1.ActorDeviceRef authorizing_device = 11;
+}
+
+message SocialRelationshipCommandSigningInput {
+  SocialRelationshipCommandBody body = 1;
+  string signing_key_id = 2;
+}
+
+message SocialRelationshipCommand {
+  SocialRelationshipCommandBody body = 1;
+  string signing_key_id = 2;
+  bytes actor_device_signature = 3;
+}
+
+message SocialRelationshipProjection {
+  peers_touch.model.actor.v1.ActorRef target_actor = 1;
+  bool following = 2;
+  bool followed_by = 3;
+  bool blocked_by_viewer = 4;
+  bool interaction_allowed = 5;
+  SocialRelationshipDeniedReason denied_reason = 6;
+  repeated SocialRelationshipAllowedAction allowed_actions = 7;
+  int64 revision = 8;
+  string target_home_station_peer_id = 9;
+}
+
+message BlockedActorProjection {
+  peers_touch.model.actor.v1.ActorRef actor = 1;
+  int64 revision = 2;
+  google.protobuf.Timestamp blocked_at = 3;
+  string home_station_peer_id = 4;
+}
+
+message SocialRelationshipEvent {
+  string event_id = 1;
+  string command_id = 2;
+  SocialRelationshipAction action = 3;
+  peers_touch.model.actor.v1.ActorRef actor = 4;
+  peers_touch.model.actor.v1.ActorRef target_actor = 5;
+  string actor_home_station_peer_id = 6;
+  string target_home_station_peer_id = 7;
+  int64 revision = 8;
+  bool blocked = 9;
+  repeated SocialRelationshipInvalidationClass invalidation_classes = 10;
+  google.protobuf.Timestamp committed_at = 11;
+  bytes previous_hash = 12;
+  bytes event_hash = 13;
+}
+
+enum SocialRelationshipCommandResultKind {
+  SOCIAL_RELATIONSHIP_COMMAND_RESULT_KIND_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_COMMAND_RESULT_KIND_COMMITTED = 1;
+  SOCIAL_RELATIONSHIP_COMMAND_RESULT_KIND_DUPLICATE = 2;
+  SOCIAL_RELATIONSHIP_COMMAND_RESULT_KIND_REJECTED = 3;
+  SOCIAL_RELATIONSHIP_COMMAND_RESULT_KIND_CONFLICT = 4;
+}
+
+enum SocialRelationshipCommandErrorCode {
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_INVALID = 1;
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_UNAUTHORIZED = 2;
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_STALE_REVISION = 3;
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_IDEMPOTENCY_CONFLICT = 4;
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_EXPIRED = 5;
+  SOCIAL_RELATIONSHIP_COMMAND_ERROR_CODE_RETRY_LATER = 6;
+}
+
+message SocialRelationshipCommandResult {
+  string command_id = 1;
+  bytes command_payload_sha256 = 2;
+  SocialRelationshipCommandResultKind kind = 3;
+  SocialRelationshipEvent event = 4;
+  SocialRelationshipProjection projection = 5;
+  SocialRelationshipCommandErrorCode error_code = 6;
+  bool retryable = 7;
+}
+
+enum SocialRelationshipCommandLookupState {
+  SOCIAL_RELATIONSHIP_COMMAND_LOOKUP_STATE_UNSPECIFIED = 0;
+  SOCIAL_RELATIONSHIP_COMMAND_LOOKUP_STATE_NOT_FOUND = 1;
+  SOCIAL_RELATIONSHIP_COMMAND_LOOKUP_STATE_ACCEPTED_PENDING = 2;
+  SOCIAL_RELATIONSHIP_COMMAND_LOOKUP_STATE_TERMINAL_RESULT = 3;
+  SOCIAL_RELATIONSHIP_COMMAND_LOOKUP_STATE_UNRESOLVED = 4;
+}
+
+message BlockSocialActorRequest {
+  SocialRelationshipCommand command = 1;
+}
+
+message BlockSocialActorResponse {
+  SocialRelationshipCommandResult result = 1;
+}
+
+message UnblockSocialActorRequest {
+  SocialRelationshipCommand command = 1;
+}
+
+message UnblockSocialActorResponse {
+  SocialRelationshipCommandResult result = 1;
+}
+
+message LookupSocialRelationshipCommandResultRequest {
+  string command_id = 1;
+  bytes command_payload_sha256 = 2;
+}
+
+message LookupSocialRelationshipCommandResultResponse {
+  SocialRelationshipCommandLookupState state = 1;
+  string command_id = 2;
+  bytes command_payload_sha256 = 3;
+  SocialRelationshipCommandResult terminal_result = 4;
+}
+
+message ListBlockedActorsRequest {
+  string cursor = 1;
+  int32 limit = 2;
+}
+
+message ListBlockedActorsResponse {
+  repeated BlockedActorProjection items = 1;
+  string next_cursor = 2;
+  int64 revision = 3;
+}
+
+message GetSocialRelationshipStatusRequest {
+  string target_actor_ptid = 1;
+}
+
+message GetSocialRelationshipStatusResponse {
+  SocialRelationshipProjection relationship = 1;
+}

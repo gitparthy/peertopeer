@@ -1,0 +1,144 @@
+package usecase
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/peers-labs/peers-touch/oauth2-client/internal/application/oauth/port"
+	"github.com/peers-labs/peers-touch/oauth2-client/internal/domain/oauth/entity"
+	"github.com/peers-labs/peers-touch/oauth2-client/internal/domain/oauth/repository"
+	"github.com/peers-labs/peers-touch/oauth2-client/internal/domain/oauth/valueobject"
+)
+
+type StartAuthInput struct {
+	SiteID   string
+	Provider valueobject.Provider
+	ReturnTo string
+}
+
+type StartAuthUseCase struct {
+	Sites     SiteRegistry
+	Store     repository.OAuthStore
+	Providers map[valueobject.Provider]port.ProviderGateway
+	Clock     Clock
+}
+
+func (u StartAuthUseCase) Execute(ctx context.Context, input StartAuthInput) (string, error) {
+	site, ok := u.Sites.Get(input.SiteID)
+	if !ok {
+		return "", errors.New("unknown_site")
+	}
+	providerCfg, ok := site.Providers[input.Provider]
+	if !ok {
+		return "", errors.New("provider_not_enabled")
+	}
+	gw, ok := u.Providers[input.Provider]
+	if !ok {
+		return "", errors.New("provider_gateway_missing")
+	}
+	state, err := randomURLSafe(32)
+	if err != nil {
+		return "", err
+	}
+	verifier, err := randomURLSafe(48)
+	if err != nil {
+		return "", err
+	}
+	now := u.Clock.Now()
+	returnTo := sanitizeReturnTo(input.ReturnTo, site.AllowedReturnTo)
+	if site.OperatorLogin != nil {
+		returnTo = sanitizeOperatorReturnTo(
+			input.ReturnTo,
+			site.OperatorLogin.CallbackURL,
+		)
+		if returnTo == "" {
+			return "", repository.ErrOperatorHandoffBinding
+		}
+	}
+	session := entity.AuthSession{
+		State:     state,
+		SiteID:    input.SiteID,
+		Provider:  input.Provider,
+		ReturnTo:  returnTo,
+		Verifier:  verifier,
+		CreatedAt: now,
+		ExpiresAt: now.Add(10 * time.Minute),
+	}
+	if err := u.Store.CreateAuthorization(ctx, session); err != nil {
+		return "", err
+	}
+	return gw.AuthorizeURL(state, verifier, providerCfg)
+}
+
+func sanitizeOperatorReturnTo(raw string, callbackURL string) string {
+	if _, _, err := operatorReceiverBinding(raw, callbackURL); err != nil {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.String()
+}
+
+func randomURLSafe(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(base64.RawURLEncoding.EncodeToString(buf), "="), nil
+}
+
+func sanitizeReturnTo(raw string, allowed []string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return ""
+	}
+	if u.User != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	for _, candidate := range allowed {
+		approved, err := url.Parse(strings.TrimSpace(candidate))
+		if err != nil || approved.User != nil {
+			continue
+		}
+		if isNativeLoopbackTemplate(approved) {
+			port, portErr := strconv.ParseUint(u.Port(), 10, 16)
+			if portErr == nil &&
+				port > 0 &&
+				u.Scheme == "http" &&
+				u.Hostname() == "127.0.0.1" &&
+				u.EscapedPath() == approved.EscapedPath() &&
+				u.Fragment == "" {
+				return u.String()
+			}
+			continue
+		}
+		if strings.EqualFold(u.Scheme, approved.Scheme) &&
+			strings.EqualFold(u.Host, approved.Host) &&
+			u.EscapedPath() == approved.EscapedPath() {
+			u.Fragment = ""
+			return u.String()
+		}
+	}
+	return ""
+}
+
+func isNativeLoopbackTemplate(candidate *url.URL) bool {
+	return candidate.Scheme == "http" &&
+		candidate.Hostname() == "127.0.0.1" &&
+		candidate.Port() == "" &&
+		candidate.EscapedPath() == "/callback" &&
+		candidate.RawQuery == "" &&
+		candidate.Fragment == ""
+}

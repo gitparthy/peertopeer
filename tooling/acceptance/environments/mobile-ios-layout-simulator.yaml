@@ -1,0 +1,82 @@
+{
+  "id": "mobile-ios-layout-simulator",
+  "profile": {
+    "required": false,
+    "identity_match": false
+  },
+  "base_environment": "mobile-simulator",
+  "source_identity": {
+    "commit_required": true,
+    "workspace_digest_required": true
+  },
+  "selectors": {
+    "ios": {
+      "selection_policy": "Explicit Profile/name references; device_name is a layout hint, never a machine allocation key",
+      "runtime": "iOS 26.5"
+    }
+  },
+  "services": {},
+  "fixtures": [],
+  "credentials": [],
+  "clients": [
+    {
+      "id": "sim-ios-current",
+      "platform": "ios",
+      "role": "current-layout",
+      "runtime": "tauri-ios-simulator",
+      "device_name": "iPhone 17",
+      "viewport_role": "current",
+      "port_roles": [
+        "wda-local",
+        "mjpeg",
+        "webview"
+      ],
+      "storage_root": "<runtime-home>/acceptance/mobile-ios-layout-simulator/<run-id>/sim-ios-current"
+    }
+  ],
+  "harness": {
+    "namespace": "__PEERS_MOBILE_ACCEPTANCE__",
+    "build_flag": "VITE_ACCEPTANCE_HARNESS=1",
+    "required_actions": [
+      "projection.read"
+    ],
+    "policy": "production actions only; direct Store mutation and simulated success are forbidden"
+  },
+  "proof_scope": {
+    "proves": [
+      "iPhone 17 Simulator launch-surface layout",
+      "portrait and landscape bounds",
+      "keyboard avoidance",
+      "English and Chinese localization",
+      "native accessible naming",
+      "deterministic session cleanup"
+    ],
+    "does_not_prove": [
+      "authenticated Shell surfaces",
+      "Android",
+      "older iPhone generations and alternate viewport sizes",
+      "physical display behavior",
+      "VoiceOver or TalkBack",
+      "physical-device performance"
+    ]
+  },
+  "cleanup": {
+    "resources": [
+      "appium-process",
+      "owned-appium-sessions",
+      "ports",
+      "storage",
+      "machine-resource-leases",
+      "environment-lease"
+    ],
+    "order": [
+      "appium-process",
+      "owned-appium-sessions",
+      "ports",
+      "storage",
+      "machine-resource-leases",
+      "environment-lease"
+    ],
+    "deterministic": true
+  }
+}

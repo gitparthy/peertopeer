@@ -1,0 +1,88 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { invoke } from '@tauri-apps/api/core';
+import { AuthCommandException, api, DESKTOP_TAURI_CONTRACT_VERSION } from '../services/desktop_api';
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(),
+}));
+
+describe('TS ↔ Rust command contract', () => {
+  const invokeMock = vi.mocked(invoke);
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('调用 access_start 并透传统一错误', async () => {
+    invokeMock.mockResolvedValue({
+      ok: false,
+      error: {
+        code: 'NOT_IMPLEMENTED',
+        message: 'access_start is not implemented',
+      },
+    });
+
+    let rejectedError: unknown;
+    let resolvedValue: unknown;
+    try {
+      resolvedValue = await api.accessStart();
+    } catch (error) {
+      rejectedError = error;
+    }
+
+    expect(invokeMock).toHaveBeenCalledWith('access_start', undefined);
+    if (rejectedError) {
+      expect(rejectedError).toBeInstanceOf(AuthCommandException);
+      return;
+    }
+    expect(resolvedValue).toMatchObject({
+      ok: false,
+      error: {
+        code: 'NOT_IMPLEMENTED',
+      },
+    });
+  });
+
+  it('无 input 的命令不传入参数对象', async () => {
+    invokeMock.mockResolvedValue({
+      ok: true,
+      data: {
+        command: 'admin_health',
+        status: 'stub',
+      },
+    });
+
+    const result = await api.adminHealth();
+
+    expect(invokeMock).toHaveBeenCalledWith('admin_health', undefined);
+    expect(result.ok).toBe(true);
+  });
+
+  it('invoke 异常时映射为统一错误码', async () => {
+    invokeMock.mockRejectedValue(new Error('bridge failure'));
+
+    const result = await api.timelineList({ limit: 10 });
+
+    expect(invokeMock).toHaveBeenCalledWith('timeline_list', {
+      input: { limit: 10 },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('INTERNAL_ERROR');
+    expect(result.error?.message).toContain('bridge failure');
+  });
+
+  it('读取 Rust 契约版本并与前端常量对齐', async () => {
+    invokeMock.mockResolvedValue({
+      ok: true,
+      data: {
+        command: 'meta_contract_version',
+        status: JSON.stringify({ version: DESKTOP_TAURI_CONTRACT_VERSION }),
+      },
+    });
+
+    const result = await api.getContractVersion();
+
+    expect(invokeMock).toHaveBeenCalledWith('meta_contract_version', undefined);
+    expect(result.version).toBe(DESKTOP_TAURI_CONTRACT_VERSION);
+  });
+});

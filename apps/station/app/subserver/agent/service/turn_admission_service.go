@@ -1,0 +1,1377 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/domain"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/errcode"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/infrastructure/persistence"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/model"
+	"github.com/peers-labs/peers-touch/station/frame/core/store"
+)
+
+const (
+	turnQueueCapacity    = uint32(8)
+	queueStatusPending   = "pending"
+	queueStatusAdmitted  = "admitted"
+	queueStatusCancelled = "cancelled"
+)
+
+type TurnAdmissionService struct {
+	db               *gorm.DB
+	now              func() time.Time
+	requestPreflight func(context.Context, string, *model.ExecuteTurnRequest) error
+}
+
+type AdmittedTurn struct {
+	Admission *model.TurnAdmission
+	Request   *model.ExecuteTurnRequest
+}
+
+type PendingTurnConversation struct {
+	ActorID        string
+	ConversationID string
+}
+
+type NewConversationAdmission struct {
+	ConversationID string
+	Title          string
+	ProviderID     string
+	ModelName      string
+}
+
+func NewTurnAdmissionService() *TurnAdmissionService {
+	return &TurnAdmissionService{
+		now: func() time.Time { return time.Now().UTC() },
+	}
+}
+
+func newTurnAdmissionServiceWithDB(db *gorm.DB) *TurnAdmissionService {
+	return &TurnAdmissionService{
+		db:  db,
+		now: func() time.Time { return time.Now().UTC() },
+		requestPreflight: func(
+			context.Context,
+			string,
+			*model.ExecuteTurnRequest,
+		) error {
+			return nil
+		},
+	}
+}
+
+func (s *TurnAdmissionService) SetRequestPreflight(
+	preflight func(context.Context, string, *model.ExecuteTurnRequest) error,
+) {
+	s.requestPreflight = preflight
+}
+
+// AdmitNewConversation atomically creates a Conversation and its first
+// admitted Turn. The caller must provide a deterministic conversation ID so a
+// repeated actor-scoped Home command can recover the original result.
+func (s *TurnAdmissionService) AdmitNewConversation(
+	ctx context.Context,
+	actorID string,
+	request *model.ExecuteTurnRequest,
+	spec NewConversationAdmission,
+	commandPayloadHash string,
+) (*model.TurnAdmission, bool, error) {
+	actorID = strings.TrimSpace(actorID)
+	spec.ConversationID = strings.TrimSpace(spec.ConversationID)
+	if actorID == "" || request == nil ||
+		spec.ConversationID == "" ||
+		strings.TrimSpace(request.GetAgentId()) == "" ||
+		strings.TrimSpace(request.GetUserInput()) == "" ||
+		strings.TrimSpace(request.GetClientIdempotencyKey()) == "" {
+		return nil, false, errcode.New(
+			errcode.AgentInvalidRequest,
+			http.StatusBadRequest,
+			"actor, conversation_id, agent_id, user_input, and client_idempotency_key are required",
+			nil,
+		)
+	}
+	request.ConversationId = spec.ConversationID
+	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(request)
+	if err != nil {
+		return nil, false, admissionInternal("encode first turn admission payload", err)
+	}
+	payloadHash := sha256BytesHex(payload)
+	if strings.TrimSpace(commandPayloadHash) != "" {
+		payloadHash = strings.TrimSpace(commandPayloadHash)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if replay, found, replayErr := findNewConversationAdmissionReplay(
+		db.WithContext(ctx),
+		actorID,
+		request,
+		payloadHash,
+	); replayErr != nil || found {
+		return replay, false, replayErr
+	}
+	if s.requestPreflight == nil {
+		return nil, false, errcode.New(
+			errcode.AgentInvalidSourceState,
+			http.StatusConflict,
+			"turn admission preflight is unavailable",
+			nil,
+		)
+	}
+	if err := s.requestPreflight(ctx, actorID, request); err != nil {
+		return nil, false, err
+	}
+
+	var admission *model.TurnAdmission
+	created := false
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		replay, found, replayErr := findNewConversationAdmissionReplay(
+			tx,
+			actorID,
+			request,
+			payloadHash,
+		)
+		if replayErr != nil || found {
+			admission = replay
+			return replayErr
+		}
+
+		now := s.now()
+		if _, err := getVisibleAgentForConversationTx(tx, actorID, strings.TrimSpace(request.GetAgentId())); err != nil {
+			return err
+		}
+		title := strings.TrimSpace(spec.Title)
+		if title == "" {
+			title = "New Chat"
+		}
+		conversation := &persistence.Conversation{
+			ID:         spec.ConversationID,
+			AgentID:    strings.TrimSpace(request.GetAgentId()),
+			ActorPTID:  actorID,
+			Title:      title,
+			ProviderID: strings.TrimSpace(spec.ProviderID),
+			Status:     string(domain.ConversationStatusActive),
+			Version:    2,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		if modelName := strings.TrimSpace(spec.ModelName); modelName != "" {
+			conversation.ModelName = &modelName
+		}
+		if err := tx.Create(conversation).Error; err != nil {
+			return admissionInternal("create admitted Home conversation", err)
+		}
+
+		key := request.GetClientIdempotencyKey()
+		turn := &persistence.AgentTurn{
+			ID:                   NewTurnID(),
+			ConversationID:       conversation.ID,
+			AgentID:              request.GetAgentId(),
+			ClientIdempotencyKey: &key,
+			AdmissionPayloadHash: payloadHash,
+			UserInput:            stringPointerValue(request.GetUserInput()),
+			Status:               string(domain.TurnStatusRunning),
+			StartedAt:            now,
+		}
+		if err := tx.Create(turn).Error; err != nil {
+			return admissionInternal("create admitted Home turn", err)
+		}
+		admission = &model.TurnAdmission{
+			Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_STARTED,
+			TurnId:              turn.ID,
+			QueueCapacity:       turnQueueCapacity,
+			ConversationVersion: conversation.Version,
+		}
+		created = true
+		return nil
+	})
+	if err != nil {
+		replay, found, replayErr := findNewConversationAdmissionReplay(
+			db.WithContext(ctx),
+			actorID,
+			request,
+			payloadHash,
+		)
+		if replayErr == nil && found {
+			return replay, false, nil
+		}
+		return nil, false, err
+	}
+	return admission, created, nil
+}
+
+func (s *TurnAdmissionService) Admit(
+	ctx context.Context,
+	actorID string,
+	request *model.ExecuteTurnRequest,
+	preferredTurnID ...string,
+) (*model.TurnAdmission, error) {
+	actorID = strings.TrimSpace(actorID)
+	if actorID == "" || request == nil ||
+		strings.TrimSpace(request.GetConversationId()) == "" ||
+		strings.TrimSpace(request.GetAgentId()) == "" ||
+		strings.TrimSpace(request.GetUserInput()) == "" ||
+		strings.TrimSpace(request.GetClientIdempotencyKey()) == "" {
+		return nil, errcode.New(
+			errcode.AgentInvalidRequest,
+			http.StatusBadRequest,
+			"actor, conversation_id, agent_id, user_input, and client_idempotency_key are required",
+			nil,
+		)
+	}
+	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(request)
+	if err != nil {
+		return nil, errcode.New(
+			errcode.AgentInternal,
+			http.StatusInternalServerError,
+			"encode turn admission payload",
+			err,
+		)
+	}
+	payloadHash := sha256BytesHex(payload)
+	now := s.now()
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var existing *model.TurnAdmission
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		conversation, lockErr := lockAdmissionConversation(
+			tx,
+			actorID,
+			request.GetConversationId(),
+			request.GetAgentId(),
+		)
+		if lockErr != nil {
+			return lockErr
+		}
+		replay, replayErr := findAdmissionReplay(
+			tx,
+			conversation,
+			request.GetClientIdempotencyKey(),
+			payloadHash,
+		)
+		existing = replay
+		return replayErr
+	})
+	if err != nil || existing != nil {
+		return existing, err
+	}
+	if s.requestPreflight == nil {
+		return nil, errcode.New(
+			errcode.AgentInvalidSourceState,
+			http.StatusConflict,
+			"turn admission preflight is unavailable",
+			nil,
+		)
+	}
+	if err := s.requestPreflight(ctx, actorID, request); err != nil {
+		return nil, err
+	}
+
+	var admission *model.TurnAdmission
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		conversation, lockErr := lockAdmissionConversation(
+			tx,
+			actorID,
+			request.GetConversationId(),
+			request.GetAgentId(),
+		)
+		if lockErr != nil {
+			return lockErr
+		}
+		if replay, replayErr := findAdmissionReplay(
+			tx,
+			conversation,
+			request.GetClientIdempotencyKey(),
+			payloadHash,
+		); replayErr != nil || replay != nil {
+			admission = replay
+			return replayErr
+		}
+
+		var activeCount int64
+		if countErr := tx.Model(&persistence.AgentTurn{}).
+			Where(
+				"conversation_id = ? AND status IN ?",
+				conversation.ID,
+				[]string{
+					string(domain.TurnStatusRunning),
+					string(domain.TurnStatusWaitingLocalTool),
+				},
+			).
+			Count(&activeCount).Error; countErr != nil {
+			return admissionInternal("count active conversation turns", countErr)
+		}
+
+		nextVersion := conversation.Version + 1
+		if activeCount == 0 {
+			key := request.GetClientIdempotencyKey()
+			turnID := ""
+			if len(preferredTurnID) > 0 {
+				turnID = strings.TrimSpace(preferredTurnID[0])
+			}
+			if turnID == "" {
+				turnID = NewTurnID()
+			}
+			turn := &persistence.AgentTurn{
+				ID:                   turnID,
+				ConversationID:       conversation.ID,
+				AgentID:              request.GetAgentId(),
+				ClientIdempotencyKey: &key,
+				AdmissionPayloadHash: payloadHash,
+				UserInput:            stringPointerValue(request.GetUserInput()),
+				Status:               string(domain.TurnStatusRunning),
+				StartedAt:            now,
+			}
+			if createErr := tx.Create(turn).Error; createErr != nil {
+				return admissionInternal("create admitted turn", createErr)
+			}
+			if updateErr := tx.Model(conversation).Updates(map[string]interface{}{
+				"version":    nextVersion,
+				"updated_at": now,
+			}).Error; updateErr != nil {
+				return admissionInternal("advance conversation admission version", updateErr)
+			}
+			admission = &model.TurnAdmission{
+				Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_STARTED,
+				TurnId:              turn.ID,
+				QueueCapacity:       turnQueueCapacity,
+				ConversationVersion: nextVersion,
+			}
+			return nil
+		}
+
+		var pendingCount int64
+		if countErr := tx.Model(&persistence.TurnQueueEntry{}).
+			Where("conversation_id = ? AND status = ?", conversation.ID, queueStatusPending).
+			Count(&pendingCount).Error; countErr != nil {
+			return admissionInternal("count queued turns", countErr)
+		}
+		if pendingCount >= int64(turnQueueCapacity) {
+			return errcode.NewQueueFull(conversation.ID, turnQueueCapacity)
+		}
+		// TW-D2: a single Running Turn that has not crossed its irreversible
+		// dispatch fence accepts the request as an amendment. The empty-queue
+		// condition is enforced inside the attempt so amendments can never
+		// jump a queued Turn.
+		amended, amendErr := amendActiveTurnTx(
+			tx,
+			conversation,
+			request,
+			payloadHash,
+			payload,
+			pendingCount,
+			now,
+		)
+		if amendErr != nil {
+			return amendErr
+		}
+		if amended != nil {
+			admission = amended
+			return nil
+		}
+		var maxSequence uint64
+		if sequenceErr := tx.Model(&persistence.TurnQueueEntry{}).
+			Where("conversation_id = ?", conversation.ID).
+			Select("COALESCE(MAX(queue_sequence), 0)").
+			Scan(&maxSequence).Error; sequenceErr != nil {
+			return admissionInternal("allocate turn queue sequence", sequenceErr)
+		}
+		// The Turn identity exists from enqueue time on; admission only flips
+		// its status. Clients hold the turn id while the request is still
+		// queued and can tail its event stream before execution starts, so
+		// promoting a queue entry never needs a separate identity-resolution
+		// handshake.
+		queuedTurnID := NewTurnID()
+		queuedKey := request.GetClientIdempotencyKey()
+		queuedTurn := &persistence.AgentTurn{
+			ID:                   queuedTurnID,
+			ConversationID:       conversation.ID,
+			AgentID:              request.GetAgentId(),
+			ClientIdempotencyKey: &queuedKey,
+			AdmissionPayloadHash: payloadHash,
+			UserInput:            stringPointerValue(request.GetUserInput()),
+			Status:               string(domain.TurnStatusQueued),
+			StartedAt:            now,
+		}
+		if createErr := tx.Create(queuedTurn).Error; createErr != nil {
+			return admissionInternal("enqueue pre-created turn", createErr)
+		}
+		entry := &persistence.TurnQueueEntry{
+			ID:                        generateID("queue"),
+			ConversationID:            conversation.ID,
+			AgentID:                   request.GetAgentId(),
+			Ptid:                      actorID,
+			ClientIdempotencyKey:      request.GetClientIdempotencyKey(),
+			AdmissionPayloadHash:      payloadHash,
+			RequestPayload:            payload,
+			QueueSequence:             maxSequence + 1,
+			Status:                    queueStatusPending,
+			AdmittedTurnID:            queuedTurnID,
+			ClientCapabilitySessionID: strings.TrimSpace(request.GetClientCapabilitySessionId()),
+			CreatedAt:                 now,
+			UpdatedAt:                 now,
+		}
+		if createErr := tx.Create(entry).Error; createErr != nil {
+			return admissionInternal("enqueue turn", createErr)
+		}
+		if updateErr := tx.Model(conversation).Updates(map[string]interface{}{
+			"queued_turn_count": pendingCount + 1,
+			"version":           nextVersion,
+			"updated_at":        now,
+		}).Error; updateErr != nil {
+			return admissionInternal("update queued turn projection", updateErr)
+		}
+		admission = &model.TurnAdmission{
+			Status: model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_QUEUED,
+			TurnId: queuedTurnID,
+			QueueEntry: queueEntryToProto(
+				entry,
+				uint32(pendingCount+1),
+			),
+			QueueCapacity:       turnQueueCapacity,
+			ConversationVersion: nextVersion,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return admission, nil
+}
+
+// ResolveAdmission resolves a stable client idempotency key to its current
+// Turn or queued entry. Channel uses it to recover an ACKed provider event
+// after the request process or Station restarts.
+func (s *TurnAdmissionService) ResolveAdmission(
+	ctx context.Context,
+	actorID, conversationID, idempotencyKey string,
+) (*model.TurnAdmission, error) {
+	actorID = strings.TrimSpace(actorID)
+	conversationID = strings.TrimSpace(conversationID)
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if actorID == "" || conversationID == "" || idempotencyKey == "" {
+		return nil, errcode.New(
+			errcode.AgentInvalidRequest,
+			http.StatusBadRequest,
+			"actor, conversation_id and idempotency_key are required",
+			nil,
+		)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var conversation persistence.Conversation
+	if err := db.WithContext(ctx).
+		Where("id = ? AND actor_ptid = ?", conversationID, actorID).
+		First(&conversation).Error; err != nil {
+		return nil, errcode.New(
+			errcode.AgentNotFound, http.StatusNotFound,
+			"conversation not found", err,
+		)
+	}
+	var turn persistence.AgentTurn
+	err = db.WithContext(ctx).
+		Where("conversation_id = ? AND client_idempotency_key = ?",
+			conversationID, idempotencyKey).
+		Order("started_at DESC").First(&turn).Error
+	if err == nil {
+		if turn.Status == string(domain.TurnStatusQueued) {
+			queued, queuedErr := queuedEntryReplayTx(
+				db.WithContext(ctx),
+				&conversation,
+				idempotencyKey,
+				"",
+			)
+			if queuedErr != nil {
+				return nil, queuedErr
+			}
+			if queued != nil {
+				return queued, nil
+			}
+		}
+		return &model.TurnAdmission{
+			Status: model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_REPLAYED,
+			TurnId: turn.ID, QueueCapacity: turnQueueCapacity,
+			ConversationVersion: conversation.Version,
+		}, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, admissionInternal("resolve admitted turn", err)
+	}
+	if amended, amendErr := amendedReplayTx(db.WithContext(ctx), &conversation, idempotencyKey, ""); amendErr != nil || amended != nil {
+		return amended, amendErr
+	}
+	var entry persistence.TurnQueueEntry
+	err = db.WithContext(ctx).
+		Where("conversation_id = ? AND client_idempotency_key = ?",
+			conversationID, idempotencyKey).
+		Order("created_at DESC").First(&entry).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errcode.New(
+				errcode.AgentNotFound, http.StatusNotFound,
+				"turn admission not found", err,
+			)
+		}
+		return nil, admissionInternal("resolve queued turn", err)
+	}
+	if strings.TrimSpace(entry.AdmittedTurnID) != "" {
+		return &model.TurnAdmission{
+			Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_REPLAYED,
+			TurnId:              entry.AdmittedTurnID,
+			QueueEntry:          queueEntryToProto(&entry, 0),
+			QueueCapacity:       turnQueueCapacity,
+			ConversationVersion: conversation.Version,
+		}, nil
+	}
+	return &model.TurnAdmission{
+		Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_QUEUED,
+		QueueEntry:          queueEntryToProto(&entry, 0),
+		QueueCapacity:       turnQueueCapacity,
+		ConversationVersion: conversation.Version,
+	}, nil
+}
+
+func (s *TurnAdmissionService) List(
+	ctx context.Context,
+	actorID string,
+	conversationID string,
+) (*model.ListQueuedTurnsResponse, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var conversation persistence.Conversation
+	if err := db.WithContext(ctx).
+		Where("id = ? AND actor_ptid = ?", strings.TrimSpace(conversationID), strings.TrimSpace(actorID)).
+		First(&conversation).Error; err != nil {
+		return nil, errcode.New(errcode.AgentNotFound, http.StatusNotFound, "conversation not found", err)
+	}
+	var records []persistence.TurnQueueEntry
+	if err := db.WithContext(ctx).
+		Where("conversation_id = ? AND status = ?", conversation.ID, queueStatusPending).
+		Order("queue_sequence ASC").
+		Find(&records).Error; err != nil {
+		return nil, admissionInternal("list queued turns", err)
+	}
+	entries := make([]*model.TurnQueueEntry, 0, len(records))
+	for index := range records {
+		entries = append(entries, queueEntryToProto(&records[index], uint32(index+1)))
+	}
+	return &model.ListQueuedTurnsResponse{
+		Entries:             entries,
+		QueueCapacity:       turnQueueCapacity,
+		ConversationVersion: conversation.Version,
+	}, nil
+}
+
+func (s *TurnAdmissionService) Cancel(
+	ctx context.Context,
+	actorID string,
+	request *model.CancelQueuedTurnRequest,
+) (*model.CancelQueuedTurnResponse, error) {
+	if request == nil || strings.TrimSpace(request.GetIdempotencyKey()) == "" {
+		return nil, errcode.New(
+			errcode.AgentInvalidRequest,
+			http.StatusBadRequest,
+			"cancel queue idempotency_key is required",
+			nil,
+		)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	var response *model.CancelQueuedTurnResponse
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		conversation, lockErr := lockAdmissionConversation(
+			tx,
+			actorID,
+			request.GetConversationId(),
+			"",
+		)
+		if lockErr != nil {
+			return lockErr
+		}
+		var entry persistence.TurnQueueEntry
+		if findErr := tx.Where(
+			"id = ? AND conversation_id = ? AND ptid = ?",
+			request.GetQueueEntryId(),
+			conversation.ID,
+			actorID,
+		).First(&entry).Error; findErr != nil {
+			return errcode.New(errcode.AgentNotFound, http.StatusNotFound, "queued turn not found", findErr)
+		}
+		if entry.Status == queueStatusCancelled {
+			if entry.CancelIdempotencyKey != request.GetIdempotencyKey() {
+				return errcode.New(
+					errcode.AgentIdempotencyConflict,
+					http.StatusConflict,
+					"queued turn cancellation idempotency conflict",
+					nil,
+				)
+			}
+			response = &model.CancelQueuedTurnResponse{
+				Entry:               queueEntryToProto(&entry, 0),
+				ConversationVersion: conversation.Version,
+				Replayed:            true,
+			}
+			return nil
+		}
+		if conversation.Version != request.GetExpectedConversationVersion() {
+			return errcode.New(
+				errcode.AgentVersionConflict,
+				http.StatusConflict,
+				"conversation version conflict",
+				nil,
+			)
+		}
+		if entry.Status != queueStatusPending {
+			return errcode.New(
+				errcode.AgentInvalidSourceState,
+				http.StatusConflict,
+				"queued turn is no longer pending",
+				nil,
+			)
+		}
+		entry.Status = queueStatusCancelled
+		entry.CancelIdempotencyKey = request.GetIdempotencyKey()
+		entry.CancelledAt = &now
+		entry.UpdatedAt = now
+		if cancelErr := cancelBoundQueuedTurnTx(tx, &entry, now, "queued turn cancelled by actor"); cancelErr != nil {
+			return cancelErr
+		}
+		if updateErr := tx.Save(&entry).Error; updateErr != nil {
+			return admissionInternal("cancel queued turn", updateErr)
+		}
+		nextVersion := conversation.Version + 1
+		if updateErr := tx.Model(conversation).Updates(map[string]interface{}{
+			"queued_turn_count": gorm.Expr(
+				"CASE WHEN queued_turn_count > 0 THEN queued_turn_count - 1 ELSE 0 END",
+			),
+			"version":    nextVersion,
+			"updated_at": now,
+		}).Error; updateErr != nil {
+			return admissionInternal("update cancelled queue projection", updateErr)
+		}
+		response = &model.CancelQueuedTurnResponse{
+			Entry:               queueEntryToProto(&entry, 0),
+			ConversationVersion: nextVersion,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (s *TurnAdmissionService) AdmitNext(
+	ctx context.Context,
+	actorID string,
+	conversationID string,
+) (*AdmittedTurn, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	var admitted *AdmittedTurn
+	var rejected error
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		conversation, lockErr := lockAdmissionConversation(tx, actorID, conversationID, "")
+		if lockErr != nil {
+			return lockErr
+		}
+		var activeCount int64
+		if countErr := tx.Model(&persistence.AgentTurn{}).
+			Where(
+				"conversation_id = ? AND status IN ?",
+				conversation.ID,
+				[]string{
+					string(domain.TurnStatusRunning),
+					string(domain.TurnStatusWaitingLocalTool),
+				},
+			).
+			Count(&activeCount).Error; countErr != nil {
+			return admissionInternal("count active turns before dequeue", countErr)
+		}
+		if activeCount > 0 {
+			return nil
+		}
+		var entry persistence.TurnQueueEntry
+		if findErr := tx.Where(
+			"conversation_id = ? AND status = ?",
+			conversation.ID,
+			queueStatusPending,
+		).Order("queue_sequence ASC").First(&entry).Error; findErr != nil {
+			if errors.Is(findErr, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return admissionInternal("load next queued turn", findErr)
+		}
+		var request model.ExecuteTurnRequest
+		if decodeErr := proto.Unmarshal(entry.RequestPayload, &request); decodeErr != nil {
+			return admissionInternal("decode queued turn request", decodeErr)
+		}
+		if s.requestPreflight == nil {
+			rejected = errcode.New(
+				errcode.AgentInvalidSourceState,
+				http.StatusConflict,
+				"turn admission preflight is unavailable",
+				nil,
+			)
+		} else {
+			rejected = s.requestPreflight(ctx, actorID, &request)
+		}
+		if rejected != nil {
+			if rejectErr := cancelBoundQueuedTurnTx(tx, &entry, now, "queued turn rejected at admission"); rejectErr != nil {
+				return rejectErr
+			}
+			entry.Status = queueStatusCancelled
+			entry.CancelledAt = &now
+			entry.UpdatedAt = now
+			if updateErr := tx.Save(&entry).Error; updateErr != nil {
+				return admissionInternal("reject invalid queued turn", updateErr)
+			}
+			return tx.Model(conversation).Updates(map[string]interface{}{
+				"queued_turn_count": gorm.Expr(
+					"CASE WHEN queued_turn_count > 0 THEN queued_turn_count - 1 ELSE 0 END",
+				),
+				"version":    conversation.Version + 1,
+				"updated_at": now,
+			}).Error
+		}
+		turnID := strings.TrimSpace(entry.AdmittedTurnID)
+		if turnID == "" {
+			// Legacy rows enqueued before the Turn identity existed at enqueue
+			// time: mint the Turn at admission as before.
+			key := entry.ClientIdempotencyKey
+			turn := &persistence.AgentTurn{
+				ID:                   NewTurnID(),
+				ConversationID:       conversation.ID,
+				AgentID:              entry.AgentID,
+				ClientIdempotencyKey: &key,
+				AdmissionPayloadHash: entry.AdmissionPayloadHash,
+				UserInput:            stringPointerValue(request.GetUserInput()),
+				Status:               string(domain.TurnStatusRunning),
+				StartedAt:            now,
+			}
+			if createErr := tx.Create(turn).Error; createErr != nil {
+				return admissionInternal("create legacy dequeued turn", createErr)
+			}
+			turnID = turn.ID
+			entry.AdmittedTurnID = turnID
+		} else {
+			// Promotion only flips the pre-created Turn. The conditional
+			// update guards against double admission under the conversation
+			// lock; StartedAt resets so runtime budgets measure execution, not
+			// queue wait.
+			flip := tx.Model(&persistence.AgentTurn{}).
+				Where("id = ? AND conversation_id = ? AND status = ?",
+					turnID, conversation.ID, string(domain.TurnStatusQueued)).
+				Updates(map[string]interface{}{
+					"status":     string(domain.TurnStatusRunning),
+					"started_at": now,
+					"ended_at":   nil,
+				})
+			if flip.Error != nil {
+				return admissionInternal("promote queued turn", flip.Error)
+			}
+			if flip.RowsAffected != 1 {
+				return admissionInternal("promote queued turn", gorm.ErrRecordNotFound)
+			}
+		}
+		entry.Status = queueStatusAdmitted
+		entry.UpdatedAt = now
+		if updateErr := tx.Save(&entry).Error; updateErr != nil {
+			return admissionInternal("mark queued turn admitted", updateErr)
+		}
+		nextVersion := conversation.Version + 1
+		if updateErr := tx.Model(conversation).Updates(map[string]interface{}{
+			"queued_turn_count": gorm.Expr(
+				"CASE WHEN queued_turn_count > 0 THEN queued_turn_count - 1 ELSE 0 END",
+			),
+			"version":    nextVersion,
+			"updated_at": now,
+		}).Error; updateErr != nil {
+			return admissionInternal("update dequeued turn projection", updateErr)
+		}
+		admitted = &AdmittedTurn{
+			Admission: &model.TurnAdmission{
+				Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_STARTED,
+				TurnId:              turnID,
+				QueueEntry:          queueEntryToProto(&entry, 0),
+				QueueCapacity:       turnQueueCapacity,
+				ConversationVersion: nextVersion,
+			},
+			Request: &request,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if rejected != nil {
+		return nil, rejected
+	}
+	return admitted, nil
+}
+
+func (s *TurnAdmissionService) PendingConversations(
+	ctx context.Context,
+	limit int,
+) ([]PendingTurnConversation, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		Ptid           string
+		ConversationID string
+	}
+	if err := db.WithContext(ctx).
+		Model(&persistence.TurnQueueEntry{}).
+		Select("ptid, conversation_id").
+		Where("status = ?", queueStatusPending).
+		Group("ptid, conversation_id").
+		Order("MIN(queue_sequence) ASC").
+		Limit(limit).
+		Scan(&rows).Error; err != nil {
+		return nil, admissionInternal("list pending turn conversations", err)
+	}
+	result := make([]PendingTurnConversation, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, PendingTurnConversation{
+			ActorID:        row.Ptid,
+			ConversationID: row.ConversationID,
+		})
+	}
+	return result, nil
+}
+
+func findNewConversationAdmissionReplay(
+	db *gorm.DB,
+	actorID string,
+	request *model.ExecuteTurnRequest,
+	payloadHash string,
+) (*model.TurnAdmission, bool, error) {
+	var conversation persistence.Conversation
+	err := db.Where("id = ?", request.GetConversationId()).First(&conversation).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, admissionInternal("load Home conversation replay", err)
+	}
+	if conversation.ActorPTID != actorID ||
+		conversation.AgentID != strings.TrimSpace(request.GetAgentId()) {
+		return nil, true, errcode.NewAdmissionDuplicateConflict(
+			request.GetClientIdempotencyKey(),
+			conversation.ID,
+		)
+	}
+	replay, replayErr := findAdmissionReplay(
+		db,
+		&conversation,
+		request.GetClientIdempotencyKey(),
+		payloadHash,
+	)
+	if replayErr != nil {
+		return nil, true, replayErr
+	}
+	if replay == nil {
+		return nil, true, errcode.NewAdmissionDuplicateConflict(
+			request.GetClientIdempotencyKey(),
+			conversation.ID,
+		)
+	}
+	return replay, true, nil
+}
+
+func findAdmissionReplay(
+	tx *gorm.DB,
+	conversation *persistence.Conversation,
+	idempotencyKey string,
+	payloadHash string,
+) (*model.TurnAdmission, error) {
+	var turn persistence.AgentTurn
+	turnErr := tx.Where(
+		"conversation_id = ? AND client_idempotency_key = ?",
+		conversation.ID,
+		idempotencyKey,
+	).First(&turn).Error
+	if turnErr == nil {
+		if turn.Status == string(domain.TurnStatusQueued) {
+			// While the request is still waiting, its command identity is the
+			// queue entry: duplicate conflicts report the entry id and replays
+			// carry the live FIFO position plus the pre-bound turn id.
+			queued, queuedErr := queuedEntryReplayTx(
+				tx,
+				conversation,
+				idempotencyKey,
+				payloadHash,
+			)
+			if queuedErr != nil {
+				return nil, queuedErr
+			}
+			if queued != nil {
+				return queued, nil
+			}
+		}
+		if turn.AdmissionPayloadHash != payloadHash {
+			return nil, errcode.NewAdmissionDuplicateConflict(
+				idempotencyKey,
+				turn.ID,
+			)
+		}
+		return &model.TurnAdmission{
+			Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_REPLAYED,
+			TurnId:              turn.ID,
+			QueueCapacity:       turnQueueCapacity,
+			ConversationVersion: conversation.Version,
+		}, nil
+	}
+	if !errors.Is(turnErr, gorm.ErrRecordNotFound) {
+		return nil, admissionInternal("load admitted turn replay", turnErr)
+	}
+
+	if amended, amendErr := amendedReplayTx(tx, conversation, idempotencyKey, payloadHash); amendErr != nil || amended != nil {
+		return amended, amendErr
+	}
+
+	var entry persistence.TurnQueueEntry
+	queueErr := tx.Where(
+		"conversation_id = ? AND client_idempotency_key = ?",
+		conversation.ID,
+		idempotencyKey,
+	).First(&entry).Error
+	if queueErr == nil {
+		if entry.AdmissionPayloadHash != payloadHash {
+			return nil, errcode.NewAdmissionDuplicateConflict(
+				idempotencyKey,
+				entry.ID,
+			)
+		}
+		var position int64
+		if entry.Status == queueStatusPending {
+			if err := tx.Model(&persistence.TurnQueueEntry{}).
+				Where(
+					"conversation_id = ? AND status = ? AND queue_sequence <= ?",
+					conversation.ID,
+					queueStatusPending,
+					entry.QueueSequence,
+				).Count(&position).Error; err != nil {
+				return nil, admissionInternal("resolve queued turn replay position", err)
+			}
+		}
+		return &model.TurnAdmission{
+			Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_REPLAYED,
+			TurnId:              entry.AdmittedTurnID,
+			QueueEntry:          queueEntryToProto(&entry, uint32(position)),
+			QueueCapacity:       turnQueueCapacity,
+			ConversationVersion: conversation.Version,
+		}, nil
+	}
+	if !errors.Is(queueErr, gorm.ErrRecordNotFound) {
+		return nil, admissionInternal("load queued turn replay", queueErr)
+	}
+	return nil, nil
+}
+
+func lockAdmissionConversation(
+	tx *gorm.DB,
+	actorID string,
+	conversationID string,
+	agentID string,
+) (*persistence.Conversation, error) {
+	query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND actor_ptid = ?", strings.TrimSpace(conversationID), strings.TrimSpace(actorID))
+	if strings.TrimSpace(agentID) != "" {
+		query = query.Where("agent_id = ?", strings.TrimSpace(agentID))
+	}
+	var conversation persistence.Conversation
+	if err := query.First(&conversation).Error; err != nil {
+		return nil, errcode.New(errcode.AgentNotFound, http.StatusNotFound, "conversation not found", err)
+	}
+	if conversation.Status != string(domain.ConversationStatusActive) {
+		return nil, errcode.New(
+			errcode.AgentInvalidSourceState,
+			http.StatusConflict,
+			"conversation is not active",
+			nil,
+		)
+	}
+	return &conversation, nil
+}
+
+// cancelBoundQueuedTurnTx settles the Turn pre-created at enqueue time when
+// its queue entry leaves the queue without execution (actor cancel or
+// admission rejection). Only a Turn still in the queued state is affected.
+func cancelBoundQueuedTurnTx(
+	tx *gorm.DB,
+	entry *persistence.TurnQueueEntry,
+	now time.Time,
+	reason string,
+) error {
+	turnID := strings.TrimSpace(entry.AdmittedTurnID)
+	if turnID == "" {
+		return nil
+	}
+	result := tx.Model(&persistence.AgentTurn{}).
+		Where("id = ? AND conversation_id = ? AND status = ?",
+			turnID, entry.ConversationID, string(domain.TurnStatusQueued)).
+		Updates(map[string]interface{}{
+			"status":          string(domain.TurnStatusCancelled),
+			"ended_at":        now,
+			"terminal_reason": reason,
+		})
+	if result.Error != nil {
+		return admissionInternal("cancel bound queued turn", result.Error)
+	}
+	return nil
+}
+
+// queuedEntryReplayTx maps a Turn still waiting in the queue to its QUEUED
+// admission, including the current FIFO position and pre-bound turn id. It
+// returns nil admission when the pending entry no longer exists (concurrent
+// cancel or legacy rows), letting the caller fall back to the Turn row. A
+// non-empty payloadHash enables the idempotency duplicate-conflict check.
+func queuedEntryReplayTx(
+	db *gorm.DB,
+	conversation *persistence.Conversation,
+	idempotencyKey string,
+	payloadHash string,
+) (*model.TurnAdmission, error) {
+	var entry persistence.TurnQueueEntry
+	err := db.
+		Where(
+			"conversation_id = ? AND client_idempotency_key = ? AND status = ?",
+			conversation.ID,
+			idempotencyKey,
+			queueStatusPending,
+		).
+		First(&entry).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, admissionInternal("load pending queue entry", err)
+	}
+	if payloadHash != "" && entry.AdmissionPayloadHash != payloadHash {
+		return nil, errcode.NewAdmissionDuplicateConflict(idempotencyKey, entry.ID)
+	}
+	var position int64
+	if err := db.Model(&persistence.TurnQueueEntry{}).
+		Where(
+			"conversation_id = ? AND status = ? AND queue_sequence <= ?",
+			conversation.ID,
+			queueStatusPending,
+			entry.QueueSequence,
+		).Count(&position).Error; err != nil {
+		return nil, admissionInternal("resolve queued turn position", err)
+	}
+	return &model.TurnAdmission{
+		Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_QUEUED,
+		TurnId:              entry.AdmittedTurnID,
+		QueueEntry:          queueEntryToProto(&entry, uint32(position)),
+		QueueCapacity:       turnQueueCapacity,
+		ConversationVersion: conversation.Version,
+	}, nil
+}
+
+func queueEntryToProto(
+	entry *persistence.TurnQueueEntry,
+	position uint32,
+) *model.TurnQueueEntry {
+	if entry == nil {
+		return nil
+	}
+	status := model.TurnQueueStatus_TURN_QUEUE_STATUS_UNSPECIFIED
+	switch entry.Status {
+	case queueStatusPending:
+		status = model.TurnQueueStatus_TURN_QUEUE_STATUS_PENDING
+	case queueStatusAdmitted:
+		status = model.TurnQueueStatus_TURN_QUEUE_STATUS_ADMITTED
+	case queueStatusCancelled:
+		status = model.TurnQueueStatus_TURN_QUEUE_STATUS_CANCELLED
+	}
+	return &model.TurnQueueEntry{
+		QueueEntryId:              entry.ID,
+		ConversationId:            entry.ConversationID,
+		AgentId:                   entry.AgentID,
+		ClientIdempotencyKey:      entry.ClientIdempotencyKey,
+		Status:                    status,
+		QueueSequence:             entry.QueueSequence,
+		QueuePosition:             position,
+		AdmittedTurnId:            entry.AdmittedTurnID,
+		CreatedAt:                 timestamppb.New(entry.CreatedAt),
+		UpdatedAt:                 timestamppb.New(entry.UpdatedAt),
+		UserInput:                 queuedUserInput(entry.RequestPayload),
+		ClientCapabilitySessionId: entry.ClientCapabilitySessionID,
+	}
+}
+
+func queuedUserInput(payload []byte) string {
+	var request model.ExecuteTurnRequest
+	if err := proto.Unmarshal(payload, &request); err != nil {
+		return ""
+	}
+	return request.GetUserInput()
+}
+
+// amendActiveTurnTx merges the request into the conversation's unique
+// pre-dispatch Running Turn as a TW-D2 amendment. It returns nil admission
+// when the request must queue instead: the fence is already crossed, the
+// Turn is waiting on a local tool, zero/multiple eligible Turns exist, or
+// the FIFO queue is non-empty.
+func amendActiveTurnTx(
+	tx *gorm.DB,
+	conversation *persistence.Conversation,
+	request *model.ExecuteTurnRequest,
+	payloadHash string,
+	payload []byte,
+	pendingQueueCount int64,
+	now time.Time,
+) (*model.TurnAdmission, error) {
+	if pendingQueueCount > 0 {
+		return nil, nil
+	}
+	var unfencedCount int64
+	if err := tx.Model(&persistence.AgentTurn{}).
+		Where(
+			"conversation_id = ? AND status = ? AND dispatch_fenced_at IS NULL",
+			conversation.ID,
+			string(domain.TurnStatusRunning),
+		).
+		Count(&unfencedCount).Error; err != nil {
+		return nil, admissionInternal("count unfenced turns for amendment", err)
+	}
+	if unfencedCount != 1 {
+		return nil, nil
+	}
+	var candidate persistence.AgentTurn
+	if err := tx.
+		Where(
+			"conversation_id = ? AND status = ? AND dispatch_fenced_at IS NULL",
+			conversation.ID,
+			string(domain.TurnStatusRunning),
+		).
+		Order("started_at ASC, id ASC").
+		First(&candidate).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, admissionInternal("load amendable turn", err)
+	}
+
+	key := request.GetClientIdempotencyKey()
+	var maxSeq uint32
+	if err := tx.Model(&persistence.AgentTurnAmendment{}).
+		Where("turn_id = ?", candidate.ID).
+		Select("COALESCE(MAX(seq), 0)").
+		Scan(&maxSeq).Error; err != nil {
+		return nil, admissionInternal("allocate amendment sequence", err)
+	}
+
+	nextVersion := conversation.Version + 1
+	row := &persistence.AgentTurnAmendment{
+		TurnID:               candidate.ID,
+		ConversationID:       conversation.ID,
+		AgentID:              strings.TrimSpace(request.GetAgentId()),
+		Ptid:                 conversation.ActorPTID,
+		Seq:                  maxSeq + 1,
+		ClientIdempotencyKey: key,
+		AdmissionPayloadHash: payloadHash,
+		RequestPayload:       payload,
+		CreatedAt:            now,
+	}
+	if err := tx.Create(row).Error; err != nil {
+		return nil, admissionInternal("persist turn amendment", err)
+	}
+	if err := tx.Model(&persistence.Conversation{}).
+		Where("id = ?", conversation.ID).
+		Updates(map[string]interface{}{
+			"version":    nextVersion,
+			"updated_at": now,
+		}).Error; err != nil {
+		return nil, admissionInternal("advance conversation amendment version", err)
+	}
+	return &model.TurnAdmission{
+		Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_AMENDED,
+		TurnId:              candidate.ID,
+		AmendedCount:        row.Seq,
+		QueueCapacity:       turnQueueCapacity,
+		ConversationVersion: nextVersion,
+	}, nil
+}
+
+// amendedReplayTx resolves a client idempotency key that was admitted as an
+// amendment. A non-empty payloadHash enforces the duplicate-conflict check.
+func amendedReplayTx(
+	db *gorm.DB,
+	conversation *persistence.Conversation,
+	idempotencyKey string,
+	payloadHash string,
+) (*model.TurnAdmission, error) {
+	var amendment persistence.AgentTurnAmendment
+	err := db.
+		Where("conversation_id = ? AND client_idempotency_key = ?",
+			conversation.ID, idempotencyKey).
+		First(&amendment).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, admissionInternal("load turn amendment replay", err)
+	}
+	if payloadHash != "" && amendment.AdmissionPayloadHash != payloadHash {
+		return nil, errcode.NewAdmissionDuplicateConflict(
+			idempotencyKey,
+			amendment.TurnID,
+		)
+	}
+	var count int64
+	if err := db.Model(&persistence.AgentTurnAmendment{}).
+		Where("turn_id = ?", amendment.TurnID).
+		Count(&count).Error; err != nil {
+		return nil, admissionInternal("count amendment replay", err)
+	}
+	return &model.TurnAdmission{
+		Status:              model.TurnAdmissionStatus_TURN_ADMISSION_STATUS_AMENDED,
+		TurnId:              amendment.TurnID,
+		AmendedCount:        uint32(count),
+		QueueCapacity:       turnQueueCapacity,
+		ConversationVersion: conversation.Version,
+	}, nil
+}
+
+// ClaimTurnAmendments crosses the Turn's irreversible-dispatch fence and
+// returns the amendments admitted up to that instant, in FIFO sequence.
+// It is idempotent: a Turn already fenced returns no requests so a retried
+// execution never merges the same amendment twice.
+func (s *TurnAdmissionService) ClaimTurnAmendments(
+	ctx context.Context,
+	actorID string,
+	agentID string,
+	conversationID string,
+	turnID string,
+) ([]*model.ExecuteTurnRequest, error) {
+	actorID = strings.TrimSpace(actorID)
+	agentID = strings.TrimSpace(agentID)
+	conversationID = strings.TrimSpace(conversationID)
+	turnID = strings.TrimSpace(turnID)
+	if actorID == "" || agentID == "" || conversationID == "" || turnID == "" {
+		return nil, errcode.New(
+			errcode.AgentInvalidRequest,
+			http.StatusBadRequest,
+			"actor, agent_id, conversation_id and turn_id are required",
+			nil,
+		)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	requests := make([]*model.ExecuteTurnRequest, 0)
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		conversation, lockErr := lockAdmissionConversation(tx, actorID, conversationID, agentID)
+		if lockErr != nil {
+			return lockErr
+		}
+		var turn persistence.AgentTurn
+		if findErr := tx.
+			Where("id = ? AND conversation_id = ?", turnID, conversation.ID).
+			First(&turn).Error; findErr != nil {
+			if errors.Is(findErr, gorm.ErrRecordNotFound) {
+				return errcode.New(
+					errcode.AgentInvalidSourceState,
+					http.StatusConflict,
+					"turn not found for amendment claim",
+					findErr,
+				)
+			}
+			return admissionInternal("load turn for amendment claim", findErr)
+		}
+		if turn.DispatchFencedAt != nil {
+			return nil
+		}
+		result := tx.Model(&persistence.AgentTurn{}).
+			Where("id = ? AND dispatch_fenced_at IS NULL", turnID).
+			Update("dispatch_fenced_at", s.now())
+		if result.Error != nil {
+			return admissionInternal("cross turn dispatch fence", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		var rows []persistence.AgentTurnAmendment
+		if findErr := tx.
+			Where("turn_id = ?", turnID).
+			Order("seq ASC").
+			Find(&rows).Error; findErr != nil {
+			return admissionInternal("load claimed turn amendments", findErr)
+		}
+		for _, row := range rows {
+			var request model.ExecuteTurnRequest
+			if unmarshalErr := proto.Unmarshal(row.RequestPayload, &request); unmarshalErr != nil {
+				return admissionInternal("decode claimed turn amendment", unmarshalErr)
+			}
+			requests = append(requests, &request)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return requests, nil
+}
+
+func (s *TurnAdmissionService) getDB(ctx context.Context) (*gorm.DB, error) {
+	if s.db != nil {
+		return s.db.WithContext(ctx), nil
+	}
+	db, err := store.GetRDS(ctx, store.WithRDSDBName("agent"))
+	if err != nil {
+		return nil, admissionInternal("open Agent database", err)
+	}
+	return db, nil
+}
+
+func admissionInternal(operation string, cause error) error {
+	return errcode.New(
+		errcode.AgentInternal,
+		http.StatusInternalServerError,
+		operation,
+		cause,
+	)
+}
+
+func sha256BytesHex(value []byte) string {
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
+func stringPointerValue(value string) *string {
+	return &value
+}

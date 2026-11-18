@@ -1,0 +1,568 @@
+use reqwest::Method;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
+
+use crate::application::station_runtime::client::{
+    self as station_client, StationClient, StationClientError,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationProvider {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_proto_i64")]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationModel {
+    pub id: String,
+    pub actor_ptid: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub context_window: i32,
+    #[serde(default)]
+    pub capabilities: Option<Value>,
+    #[serde(deserialize_with = "deserialize_proto_i64")]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialStatus {
+    pub provider_id: String,
+    pub configured: bool,
+    pub status: String,
+    #[serde(deserialize_with = "deserialize_proto_i64")]
+    pub version: i64,
+}
+
+fn deserialize_proto_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| D::Error::custom("integer is outside the i64 range")),
+        Value::String(value) => value
+            .parse::<i64>()
+            .map_err(|error| D::Error::custom(format!("invalid protobuf int64: {error}"))),
+        value => Err(D::Error::custom(format!(
+            "expected protobuf int64 number or string, got {value}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StationApiError {
+    VersionConflict { current: i64, submitted: i64 },
+    NotFound(String),
+    Unauthorized,
+    Network(String),
+    Internal(String),
+}
+
+impl From<StationClientError> for StationApiError {
+    fn from(e: StationClientError) -> Self {
+        match e.kind {
+            station_client::StationClientErrorKind::SessionRevoked => StationApiError::Unauthorized,
+            station_client::StationClientErrorKind::HttpStatus(409) => {
+                StationApiError::VersionConflict {
+                    current: -1,
+                    submitted: -1,
+                }
+            }
+            station_client::StationClientErrorKind::HttpStatus(404) => {
+                StationApiError::NotFound(e.message)
+            }
+            station_client::StationClientErrorKind::HttpStatus(401) => {
+                StationApiError::Unauthorized
+            }
+            station_client::StationClientErrorKind::Network
+            | station_client::StationClientErrorKind::Unavailable => {
+                StationApiError::Network(e.message)
+            }
+            _ => StationApiError::Internal(e.message),
+        }
+    }
+}
+
+pub fn list_providers(
+    station_client: &StationClient,
+    token: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/list",
+        token,
+        None,
+        Some(&json!({})),
+    )?)
+}
+
+pub fn get_provider(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/get",
+        token,
+        None,
+        Some(&json!({"provider_id": provider_id})),
+    )?)
+}
+
+pub fn get_provider_record(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<StationProvider, StationApiError> {
+    parse_provider_from_response(get_personal_provider(station_client, token, provider_id)?)
+}
+
+pub fn list_available_models(
+    station_client: &StationClient,
+    token: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/model/available",
+        token,
+        None,
+        Some(&json!({})),
+    )?)
+}
+
+pub fn check_provider(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/check",
+        token,
+        None,
+        Some(&json!({"provider_id": provider_id})),
+    )?)
+}
+
+pub fn provider_policy(
+    station_client: &StationClient,
+    token: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/policy",
+        token,
+        None,
+        Some(&json!({})),
+    )?)
+}
+
+pub fn list_personal_providers(
+    station_client: &StationClient,
+    token: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/personal/list",
+        token,
+        None,
+        Some(&json!({})),
+    )?)
+}
+
+pub fn get_personal_provider(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/personal/get",
+        token,
+        None,
+        Some(&json!({ "provider_id": provider_id })),
+    )?)
+}
+
+pub fn discover_provider_models(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<Value, StationApiError> {
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/model/discover",
+        token,
+        None,
+        Some(&json!({"provider_id": provider_id})),
+    )?)
+}
+
+pub fn update_provider_full(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    enabled: bool,
+    config_json: Option<&str>,
+    runtime_config: Option<&Value>,
+    version: i64,
+) -> Result<Value, StationApiError> {
+    let mut body = json!({
+        "provider_id": provider_id,
+        "version": version,
+        "enabled": enabled,
+    });
+    if let Some(cfg) = config_json {
+        if let Ok(v) = serde_json::from_str::<Value>(cfg) {
+            if let Some(base_url) = v.get("base_url").and_then(|u| u.as_str()) {
+                body["base_url"] = json!(base_url);
+            }
+        }
+    }
+    if let Some(runtime_config) = runtime_config {
+        body["runtime_config"] = runtime_config.clone();
+    }
+
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/update",
+        token,
+        None,
+        Some(&body),
+    )?)
+}
+
+pub fn create_model(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    model_id: &str,
+    display_name: &str,
+    enabled: bool,
+    context_window: i32,
+    capabilities: Option<&Value>,
+) -> Result<Value, StationApiError> {
+    let mut body = json!({
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "display_name": display_name,
+        "enabled": enabled,
+        "context_window": context_window,
+    });
+    if let Some(value) = capabilities {
+        body["capabilities"] = value.clone();
+    }
+    Ok(station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/model/create",
+        token,
+        None,
+        Some(&body),
+    )?)
+}
+
+pub fn create_provider(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    display_name: &str,
+    base_url: &str,
+    protocol: &str,
+    config: Option<&Value>,
+) -> Result<StationProvider, StationApiError> {
+    let mut body = json!({
+        "provider_id": provider_id,
+        "display_name": display_name,
+        "base_url": base_url,
+        "protocol": protocol,
+    });
+    if let Some(cfg) = config {
+        body["config_json"] = cfg.clone();
+    }
+
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/create",
+        token,
+        None,
+        Some(&body),
+    )?;
+
+    parse_provider_from_response(resp)
+}
+
+pub fn update_provider(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    version: i64,
+    display_name: Option<&str>,
+    base_url: Option<&str>,
+    enabled: Option<bool>,
+    config: Option<&Value>,
+) -> Result<StationProvider, StationApiError> {
+    let mut body = json!({
+        "provider_id": provider_id,
+        "version": version,
+    });
+    if let Some(v) = display_name {
+        body["display_name"] = json!(v);
+    }
+    if let Some(v) = base_url {
+        body["base_url"] = json!(v);
+    }
+    if let Some(v) = enabled {
+        body["enabled"] = json!(v);
+    }
+    if let Some(v) = config {
+        body["config_json"] = v.clone();
+    }
+
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/update",
+        token,
+        None,
+        Some(&body),
+    )?;
+
+    parse_provider_from_response(resp)
+}
+
+pub fn delete_provider(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    version: i64,
+) -> Result<(), StationApiError> {
+    station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/delete",
+        token,
+        None,
+        Some(&json!({
+            "provider_id": provider_id,
+            "version": version,
+        })),
+    )?;
+    Ok(())
+}
+
+pub fn list_models(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<Vec<StationModel>, StationApiError> {
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/model/personal/list",
+        token,
+        None,
+        Some(&json!({"provider_id": provider_id})),
+    )?;
+
+    let models: Vec<StationModel> =
+        serde_json::from_value(resp.get("models").cloned().unwrap_or(Value::Array(vec![])))
+            .unwrap_or_default();
+
+    Ok(models)
+}
+
+pub fn update_model(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    model_id: &str,
+    version: i64,
+    display_name: Option<&str>,
+    enabled: Option<bool>,
+    context_window: Option<i32>,
+    capabilities: Option<&Value>,
+) -> Result<StationModel, StationApiError> {
+    let mut body = json!({
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "version": version,
+    });
+    if let Some(v) = display_name {
+        body["display_name"] = json!(v);
+    }
+    if let Some(v) = enabled {
+        body["enabled"] = json!(v);
+    }
+    if let Some(v) = context_window {
+        body["context_window"] = json!(v);
+    }
+    if let Some(value) = capabilities {
+        body["capabilities"] = value.clone();
+    }
+
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/model/update",
+        token,
+        None,
+        Some(&body),
+    )?;
+
+    let model: StationModel =
+        serde_json::from_value(resp.get("model").cloned().unwrap_or_default())
+            .map_err(|e| StationApiError::Internal(format!("decode model: {}", e)))?;
+
+    Ok(model)
+}
+
+pub fn set_credential(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    api_key: &str,
+) -> Result<CredentialStatus, StationApiError> {
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/credential/set",
+        token,
+        None,
+        Some(&json!({
+            "provider_id": provider_id,
+            "api_key": api_key,
+        })),
+    )?;
+
+    serde_json::from_value(resp.get("status").cloned().unwrap_or_default())
+        .map_err(|e| StationApiError::Internal(format!("decode credential status: {}", e)))
+}
+
+pub fn delete_credential(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    version: i64,
+) -> Result<(), StationApiError> {
+    station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/credential/delete",
+        token,
+        None,
+        Some(&json!({
+            "provider_id": provider_id,
+            "version": version,
+        })),
+    )?;
+    Ok(())
+}
+
+pub fn credential_status(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<CredentialStatus, StationApiError> {
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/credential/status",
+        token,
+        None,
+        Some(&json!({"provider_id": provider_id})),
+    )?;
+
+    serde_json::from_value(resp.get("status").cloned().unwrap_or_default())
+        .map_err(|e| StationApiError::Internal(format!("decode credential status: {}", e)))
+}
+
+fn parse_provider_from_response(resp: Value) -> Result<StationProvider, StationApiError> {
+    serde_json::from_value(resp.get("provider").cloned().unwrap_or_default())
+        .map_err(|e| StationApiError::Internal(format!("decode provider: {}", e)))
+}
+
+pub fn hide_model(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<(), StationApiError> {
+    station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/model/hide",
+        token,
+        None,
+        Some(&json!({ "provider_id": provider_id, "model_id": model_id })),
+    )?;
+    Ok(())
+}
+
+pub fn get_hidden_models(
+    station_client: &StationClient,
+    token: &str,
+    provider_id: &str,
+) -> Result<Vec<String>, StationApiError> {
+    let resp = station_client.request_json_auth(
+        Method::POST,
+        "/sub-agent/agent/provider/model/hidden",
+        token,
+        None,
+        Some(&json!({ "provider_id": provider_id })),
+    )?;
+
+    let hidden: Vec<String> = serde_json::from_value(
+        resp.get("hidden_models")
+            .cloned()
+            .unwrap_or(Value::Array(vec![])),
+    )
+    .unwrap_or_default();
+
+    Ok(hidden)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CredentialStatus, StationModel, StationProvider};
+
+    #[test]
+    fn provider_wire_types_accept_protojson_and_numeric_versions() {
+        for version in [serde_json::json!("2"), serde_json::json!(2)] {
+            let status: CredentialStatus = serde_json::from_value(serde_json::json!({
+                "provider_id": "ark",
+                "configured": true,
+                "status": "active",
+                "version": version.clone(),
+            }))
+            .expect("decode credential status");
+
+            assert_eq!(status.version, 2);
+
+            let provider: StationProvider = serde_json::from_value(serde_json::json!({
+                "id": "ark",
+                "name": "Ark",
+                "enabled": true,
+                "version": version.clone(),
+            }))
+            .expect("decode provider");
+            assert_eq!(provider.id, "ark");
+            assert_eq!(provider.name, "Ark");
+            assert!(provider.enabled);
+            assert_eq!(provider.version, 2);
+
+            let model: StationModel = serde_json::from_value(serde_json::json!({
+                "id": "model-record",
+                "actor_ptid": "ptid:v1:actor",
+                "provider_id": "ark",
+                "model_id": "model-id",
+                "display_name": "Model",
+                "enabled": true,
+                "version": version,
+            }))
+            .expect("decode model");
+            assert_eq!(model.version, 2);
+        }
+    }
+}

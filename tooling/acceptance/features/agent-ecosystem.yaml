@@ -1,0 +1,41 @@
+{
+  "id": "agent-ecosystem",
+  "status": "active",
+  "product_area": "agent",
+  "owners": [
+    "apps/station/app/subserver/agent/handler/ecosystem_handler.go",
+    "apps/station/app/subserver/agent/service/ecosystem_service.go",
+    "apps/desktop/src/store/agent.ts",
+    "apps/desktop/src/services/desktop_api.ts"
+  ],
+  "truth_sources": [
+    "running Station agent API",
+    "agent_ecosystem_groups table",
+    "agent_ecosystem_comments table"
+  ],
+  "visible_surfaces": [
+    {"type": "api", "route": "/agent/ecosystem/groups"},
+    {"type": "api", "route": "/agent/ecosystem/groups/:id"},
+    {"type": "api", "route": "/agent/ecosystem/groups/create"},
+    {"type": "api", "route": "/agent/ecosystem/groups/:id/update"},
+    {"type": "api", "route": "/agent/ecosystem/groups/:id/delete"},
+    {"type": "api", "route": "/agent/ecosystem/comments"},
+    {"type": "api", "route": "/agent/ecosystem/comments/create"},
+    {"type": "api", "route": "/agent/ecosystem/comments/:id/delete"}
+  ],
+  "required_gates": ["agent-ecosystem-e2e"],
+  "acceptance": {
+    "service": [
+      "group CRUD manages collections of agents for discovery and organization",
+      "comment CRUD allows users to leave feedback on shared agents"
+    ],
+    "visible": [
+      "Discover is reachable from Settings > AI without a primary-rail entry",
+      "Desktop Discover shows ecosystem groups",
+      "comments appear under shared agent profiles"
+    ]
+  },
+  "negative": [
+    "deleting a group must not delete the agents within it"
+  ]
+}

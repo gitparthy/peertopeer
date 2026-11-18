@@ -1,0 +1,26 @@
+package persistence
+
+import "time"
+
+type AgentKnowledgeBinding struct {
+	ID         string    `gorm:"primaryKey;type:varchar(36)"`
+	AgentID    string    `gorm:"not null;type:varchar(36);index:idx_kb_agent_id"`
+	ResourceID string    `gorm:"not null;type:varchar(36)"`
+	Policy     string    `gorm:"not null;type:varchar(20);default:'auto'"`
+	Enabled    bool      `gorm:"not null;default:true"`
+	CreatedAt  time.Time `gorm:"not null;autoCreateTime"`
+	UpdatedAt  time.Time `gorm:"not null;autoUpdateTime"`
+}
+
+func (AgentKnowledgeBinding) TableName() string { return "agent_knowledge_bindings" }
+
+type AgentSkillBinding struct {
+	ID        string    `gorm:"primaryKey;type:varchar(36)"`
+	AgentID   string    `gorm:"not null;type:varchar(36);index:idx_skill_binding_agent_id"`
+	SkillID   string    `gorm:"not null;type:varchar(36)"`
+	Enabled   bool      `gorm:"not null;default:true"`
+	CreatedAt time.Time `gorm:"not null;autoCreateTime"`
+	UpdatedAt time.Time `gorm:"not null;autoUpdateTime"`
+}
+
+func (AgentSkillBinding) TableName() string { return "agent_skill_bindings" }

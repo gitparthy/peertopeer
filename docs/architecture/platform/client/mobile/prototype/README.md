@@ -1,0 +1,727 @@
+# Mobile Prototype
+
+> **Status**: pending-review（当前消息布局修正；既有确认范围保留）
+> **Version**: v1.2
+> **Created**: 2026-07-08 | **Updated**: 2026-11-08
+> **Owner**: Mobile Product Team
+> **Module**: `packages/prototypes/mobile/chat/`
+
+## 2026-11-08 Station Access Gate Contract Alignment
+
+Owner 指出首启后的登录环节缺少真机访问门禁（Access Gate）：原型曾用一个自造的
+「本机身份 + 通行密钥」表单，点「登录并继续」即无条件翻牌，与真机业务完全不符。
+本次把原型门禁替换为与真机同构的 AccessDecision 状态机。
+
+真机来源（逐行核对）：
+
+- 合同：`model/domain/access_gate/access_gate.proto`（gate type 1–100、decision
+  state 1–5、Station-owned `input_schema_json`）。
+- 判定与提交：`apps/mobile/src/features/auth/authSession.ts`
+  （`currentAccessGate` / `isLoginGate` / `isInviteCodeGate` /
+  `isSchemaDrivenGate` / `advertisedCredentialChoices` / `parseGateFields` /
+  `hasSchemaValue` / invite、login、schema 三类 submit）。
+- 渲染分支顺序：`apps/mobile/src/features/auth/AccessGateHost.tsx`
+  （recovery-only → invite → schema → login（广告驱动 quick/email tab）→
+  unavailable）。
+- 编排：`apps/mobile/src/runtimes/accessRuntime.ts`、`authRuntime.ts`
+  （handshake、attempt、OAuth phase、recovery）。
+- 真机 entry fixture 场景目录：`apps/mobile/src/App.tsx`。
+
+原型实现（无 RPC，decision 用确定性 fixture 模拟，合同不模拟）：
+
+- 新增 `src/app/accessGate.ts`：proto 同构常量与类型、全部判定纯函数、
+  Station 绑定的 gate profile fixture、提交状态迁移、OAuth phase 序列、
+  Station 隔离的 remembered email（localStorage，上限 12）。
+- 新增 `src/app/AccessGateView.tsx`：分支顺序与真机一致，控件全部使用
+  peers-ui（Button/Field/TextField/PasswordField/Checkbox/Select/NumberField/
+  Segmented/BrandMark/Alert/Icon）。
+- `Station.gateProfile` 按 Station 绑定门禁策略；松绿书屋=邮箱+OAuth，
+  江边中继=邀请码→登录链，新增 Station 默认 full 凭据。
+- 准入围栏：只有 GRANTED decision 能进入 shell；扫码关联走独立
+  device-link 授权（`device-link/grant`），不经门禁链。无条件翻牌动作
+  `auth/signIn` 已删除。
+- 邀请码错误保留 decision 并内联报错（不切 recovery 面）；演示码
+  `PEERS-2026` 推进到链上登录 gate，本身不授权。
+- OAuth 本地相位机（starting → awaiting_provider → callback_received →
+  exchanging → credential_delivery → active_session）与 cancel/restart/
+  check-status 恢复；用户未启动时证据场景相位冻结。
+
+14 个门禁场景可经 `?scenario=` 深链（与真机 entry fixture 词汇对齐）：
+gate-login / gate-login-email / gate-login-oauth / gate-invite / gate-terms /
+gate-custom / gate-unavailable / gate-blocked / gate-failed / gate-pending /
+gate-session-expired / gate-login-failed / gate-oauth-progress /
+gate-oauth-failed。新增 handshake（模拟 800ms decision 往返）。
+
+证据：
+
+- `check-layout.mjs` 新增门禁记录（handshake 后挂载、tabbar 不穿透、
+  canLogin 空禁用/填齐启用、GRANTED 才进 shell、凭据广告差异、邀请码错误
+  停留与推进、schema required 围栏、unavailable 零输入、recovery 三态零
+  提交控件、session-expired 通知、login-failed 内联错误、OAuth 相位与取消、
+  冻结相位跨定时器窗口不漂移）。
+- 9 项变异验证（gate 根标记、canLogin 围栏、GRANTED 围栏、凭据广告、
+  邀请码拒绝、schema required、unavailable 输入、recovery 提交控件、
+  OAuth 冻结）均证明探针能拦，恢复后三视图口零缺陷。
+- L2 截图 17 张（15 个门禁面 @390 + login @554/@1440），零横向溢出：
+  `apps/mobile/src-tauri/target/prototype-layout/gates/`。
+- boards `mobile-signout-signin` finalizer 改为完整门禁链（continue →
+  handshake → 邮箱 tab → 填邮箱密码 → 授权），场景 OBSERVED。
+- i18n：新增 60+ `mobile.auth.*` / `mobile.launch.continue` 词条，
+  zh/en 对等，沿用真机词典原文；删除自造的 launch.identity/passkey 等 7 个
+  孤儿键。
+
+已知差异 / UNPROVEN：无真实浏览器跳转（OAuth 相位本地定时模拟）；无
+secure storage（remembered email 用 localStorage）；无真实 Station RPC 与
+schema 下发（字段由 fixture 提供）；不做 federation mesh 背景（移动 launch
+面无此元素）；device-trust(6)/maintenance(7) 按真机事实走 unavailable，无
+交互入口；PIN 不属移动门禁 gate，未造。原型只表达合同与交互，不构成 Native
+准入验收。
+
+## 当前消息布局与文件卡片
+
+文件详情已同步分页预览设计样本，PDF/文本/Office 显示页内导航，工作表显示
+工作表与行列页；模拟字节和系统操作不构成产品证明。沿用当前详情关闭/卸载策略，
+验证范围与未证明项见
+[文件查看原型入口](../../../../domains/chat/lifecycle/prototype/README.md)。
+
+当前待审范围为 Chat 消息阅读布局。左右使用等宽的 34px 头像列和 8px 列间距，
+12px 视口内边距保持镜像；首条正文与头像顶边对齐，群聊名称占独立行。
+连续消息行间隔 8px，消息组间隔 16px。正文、时间、回复和失败动作各自保留
+所属区域，隐藏头像不会改变正文宽度。自己的头像与 Me 复用同一身份数据。
+文件卡片移除浏览器默认边框，长文件名换行；键盘焦点显示 2px 品牌环。
+详情关闭通过组件关闭生命周期恢复卡片焦点，关闭动画完成后卸载。
+
+合同与证据：
+
+- [消息布局合同](../../../../domains/chat/lifecycle/prototype/README.md)
+- [截图对比](./evidence/20261025-message-layout/comparison.png)
+- [几何与交互记录](./evidence/20261025-message-layout/message-layout.json)
+- `evidence/20261025-message-layout/` 包含全部 42 张截图及六张视口/主题联系图。
+
+现有 `check-layout.mjs` 增加消息布局检查模式。修正前的 18 个样本均出现几何
+缺陷；当前 1440x1100、554x954、390x844 × 亮/暗主题共 42 个渲染样本通过，
+覆盖单行、多行、连续消息、回复、文件、失败、unknown、恢复和长内容。
+长文件名是明确标注的 CSS stress 注入，不能视为真实附件或完整本地化证明。
+六组 touch/keyboard 路径通过文件打开、下载取消/重试、保存取消反馈、
+Escape、关闭卸载、焦点恢复、键盘品牌环、消息 Retry 和 Check status。
+故意移动正文 4px、破坏视口镜像内边距都会使同一几何检查失败。
+
+页面异常与产品 console error 为零；Portal 的独立 `favicon.ico` 404 单列记录。
+Mobile Vite 构建通过，TypeScript 整包检查仍被共享 ReactionChip/ReactionPicker
+既有 `react/jsx-runtime` 与 `lucide-react` 解析错误阻塞，不能声明整包类型检查通过。
+
+Frontend Tree Review：MessageContent 为 `virtualized content`，上限 200 行，
+稳定 key 与 Shell-owned list memory 保留；详情为 `on-visit + none`。
+没有新增页面、隐藏树、runtime 或缓存 owner，registry 无需改变生命周期。
+L1/L2/L3 为当前原型证据；物理设备 touch、VoiceOver/TalkBack、200% 动态字号、
+全 Shell 本地化、真实键盘、Native 文件操作和性能基准保持 `UNPROVEN`。
+当前原型运行在本 worktree 的 `make run-prototype` / localhost:3200，供本次查看。
+本修正尚未 Owner 确认，也不建立 Native 产品或文件验收结论。
+
+重跑：
+
+```bash
+PROTOTYPE_MESSAGE_LAYOUT_ONLY=1 PROTOTYPE_BROWSER_CHANNEL=chrome \
+PROTOTYPE_EVIDENCE_DIR=/tmp/pt-message-layout \
+node packages/prototypes/mobile/chat/scripts/check-layout.mjs
+```
+
+## 2026-10-12 Interaction Review Reset
+
+Current rendered review found blocking inconsistencies in avatar identity,
+Chat loading, message anatomy, error ownership, touch geometry, Design Tokens,
+and cross-module visual continuity. The prototype has therefore returned to
+`drafting`; prior `pending-review` evidence remains historical and does not
+authorize further production implementation.
+
+The active gap register and proposed confirmation decisions are:
+
+- [interaction-gap-register.md](./interaction-gap-register.md)
+
+The Owner confirmed the revised executable prototype on 2026-10-12
+(`USER-DECISION-20261012-MOBILE-PROTOTYPE-CONFIRMED`). Production
+implementation must still run through the mounted production Plan and its
+declared worktree; this confirmation does not authorize cross-worktree writes.
+
+## 2026-10-12 Confirmed Interaction Revision
+
+The accepted interaction baseline is now implemented in the executable
+prototype:
+
+- one shared semantic token source drives Mobile CSS variables and the antd
+  adapter; `#667eea` is the authoritative light-theme action accent;
+- light and dark review modes are available beside the evidence selector;
+- people use circular image/fallback avatars and groups use rounded-square
+  deterministic initials; loading and failed-source states keep stable
+  geometry;
+- the clean default journey contains no synthetic delivery failure;
+- conversation first-load, cached-refresh, cached-error, empty, long-content,
+  avatar-loading, avatar-fallback, thread first-load, older-history, route
+  unavailable, failed delivery, and unknown-outcome states are directly
+  addressable;
+- one failed message owns one local Retry action; unknown delivery owns
+  `Check status` and never offers blind Retry;
+- incoming messages use sender clusters, one final `MetaRow`, and one avatar
+  per cluster;
+- pinned content uses one compact thread banner and a dedicated pinned-message
+  page;
+- Chat, Moments, Contacts, and Me now share the same header, row, avatar,
+  surface, separator, and touch-target language.
+
+Rendered evidence is under:
+
+`docs/architecture/platform/client/mobile/prototype/evidence/20261012-interaction-revision/`
+
+The evidence set contains 23 device captures and `visual-check.json`.
+The agent opened and inspected the list/theme/loading/error contact sheet, the
+thread/loading/history/unknown/pinned contact sheet, Moments, Contacts, Me,
+conversation details, and both completed recovery captures.
+
+Observed evidence:
+
+- device geometry is 390 x 844 in every capture;
+- visible prototype actions in the covered Chat paths meet the 44 px Mobile
+  target; the machine output only reports antd's hidden 12 px input-clear
+  implementation detail;
+- default and recovery states contain zero legacy page-level delivery banners;
+- failed delivery has exactly one message-local Retry owner;
+- unknown delivery has exactly one message-local `Check status` owner;
+- Retry and Check status both converge to delivered state and append the peer
+  acknowledgement;
+- light uses `#667eea`; dark uses the shared dark token projection;
+- first-load skeletons preserve seven conversation rows; cached refresh/error
+  retain all projected rows;
+- the evidence run produced no page or console errors.
+
+Frontend tree review:
+
+- Surface: Mobile primary tabs, descriptor detail, message list, sheets.
+- Alive policy: unchanged from the registry: primary tabs and details are
+  `on-visit + none`; large content remains bounded/virtualized.
+- Store/runtime ownership: unchanged; prototype evidence state is scaffolding
+  outside the product tree.
+- Registry update: not required because no lifetime, cache, or runtime owner
+  changed.
+
+The Owner accepted the interaction baseline with the remaining evidence cells
+explicitly deferred:
+
+- full-shell Chinese localization and one additional expansion locale;
+- 200% dynamic type and VoiceOver/TalkBack order;
+- real software keyboard, emoji/attachment/voice panel clearance and focus
+  restoration;
+- attachment/media failure recovery;
+- native iOS/Android and production runtime evidence;
+- the separate Call gaps recorded in MUX-12.
+
+This confirmation establishes the production interaction reference. It does
+not replace production implementation, exact-source runtime proof, or the
+mounted Plan's execution controls.
+
+## Scope
+
+`mobile-chat` is the Mobile Shell baseline prototype. It is intentionally aligned with the current `apps/mobile` implementation instead of the removed single-page mobile chat mock.
+
+The prototype covers:
+
+- `MobileShell` primary tabs: Chat, Moments, Contacts, Settings.
+- Access gate / station session context before the shell, including GitHub and
+  Google OAuth progress.
+- Chat list projection for Friend and Group conversations.
+- Chat thread mode where the bottom tabbar is hidden and the composer owns the bottom safe area.
+- Direct-conversation audio/video actions and a shell-owned call surface for
+  outgoing, incoming, active audio/video, reconnecting, handled-elsewhere, and
+  ended states.
+- Contacts toolbar actions: create group and find people, matching `ContactsPage`.
+- Group creation with initial members and friend request search/send affordances.
+- Moments feed/composer/reaction/comment surfaces.
+- Me/profile and selected-only settings details.
+- Evidence scenarios for Station identity mismatch, OAuth expiry, session
+  revocation, unknown write outcome, ledger capacity, and restored drafts.
+- The Mobile Social Desktop Parity amendment: Home/Explore, Search/Profile,
+  Circles, full Audience selection, Feed-local comments, temporary media overlays,
+  composer and private trust/recovery states.
+- Cross-platform `CHAT-CRAFT-J01` delivery failure and recovery, backed by the
+  shared fixture at `packages/prototypes/shared/chat-journey.ts`.
+
+## 2026-10-08 Station Entry Amendment
+
+The Owner rejected the oversized logo, framed Station card, detached add
+button, and dominant offline recovery card on the physical Android entry
+surface. The confirmed Station entry contract is now:
+
+```yaml
+surface: mobile.station.entry
+scenario: compact-station-selection
+given:
+  - the app is in station-selection
+  - Station history may be empty
+  - device connectivity may be offline
+when:
+  - the user enters or selects one Station
+then:
+  - one composite address field owns protocol, host and add
+  - one primary action opens the selected Station
+  - offline recovery remains actionable without becoming a second page
+visual_invariants:
+  - brand mark is 52px and does not create a hero region
+  - no outer Station card frames the task
+  - address field and primary action share one content rail
+  - offline recovery is at most 112px tall and does not overlap the task
+forbidden:
+  - oversized centered logo
+  - nested card treatment
+  - independently bordered protocol control
+  - detached square add button
+  - recovery surface occupying the lower third of the viewport
+evidence:
+  - prototype layout captures
+  - physical Android screenshot
+```
+
+`?scenario=station-offline` exposes the compact recovery state. Production and
+prototype keep the pre-shell tree `on-visit + none`; no page lifetime or
+runtime owner changes.
+
+## 2026-10-06 Mobile Social Parity Amendment
+
+The previously confirmed Mobile Shell baseline remains historical evidence. The
+material Social amendment was confirmed by the Owner on 2026-10-06 and may now
+serve as the UI/interaction reference for implementation planning.
+
+Design source:
+
+- `../social-parity/README.md`
+- `../social-parity/prototype/README.md`
+
+The amendment adds direct scenarios:
+
+- `social-parity`
+- `social-content-types`
+- `social-private-pending`
+- `social-recovery-required`
+- `social-source-unavailable`
+- `social-revoked`
+
+Portal build and Mobile prototype build pass. L2/L3 captured 35 inspected Social
+states and 6 density/continuity assertions at 390x844 and 1440x1100 with zero geometry,
+overflow, unexpected clipping, continuity or console defects. Evidence lives under
+`../social-parity/prototype/evidence-l2/`. Prototype evidence does not establish
+Native, Station, crypto, lifecycle or cross-platform readiness.
+
+Owner confirmation covers the current Social UI and interaction behavior only.
+
+## Source Alignment
+
+| Prototype surface | Product source |
+|---|---|
+| Shell tabs and tabbar badge behavior | `apps/mobile/src/components/MobileShell.tsx` |
+| Chat list, thread, action surface boundaries | `apps/mobile/src/pages/ChatPage.tsx` |
+| Friend conversation projection | `apps/mobile/src/features/social/socialProjection.ts` |
+| Group conversation projection | `apps/mobile/src/features/group/groupProjection.ts` |
+| Find people and create group | `apps/mobile/src/pages/ContactsPage.tsx` |
+| Access gate launch state | `apps/mobile/src/App.tsx`, `apps/mobile/src/features/auth/AccessGateHost.tsx` |
+| OAuth progress and recovery | MS-C03 / MS-J01 / MS-PA03 / MS-PA25 |
+| Moments feed and composer | MS-C08 / MS-J05 / MS-PA11 / MS-PA20 / MS-PA23 |
+| Me and settings details | MS-C09 / MS-J06 / MS-PA12 / MS-PA21 |
+| Runtime recovery sheets | MS-C10 / MS-J07 / MS-PA08 / MS-PA23 / MS-PA26 |
+| One-to-one call surface | MS-C12 / MS-J03 / MS-PA30 / MS-PA31 |
+| Deferred/local-only affordances | MS-C11, MS-C13, MS-C14 / MS-PA22 / MS-PA27 |
+
+## Run
+
+Use the unified Prototype Portal:
+
+```bash
+make run-prototype
+```
+
+Then switch the Portal site selector to `mobile` and open `Mobile Shell`.
+
+For parallel prototype development in another worktree:
+
+```bash
+make -w run-prototype
+```
+
+## Evidence Controls
+
+The out-of-device `Evidence scenario` selector exposes:
+
+- default journey;
+- Chat delivery recovery;
+- Station removal confirmation;
+- Station identity mismatch;
+- OAuth expired;
+- session revoked;
+- unknown write outcome;
+- command ledger full;
+- restored draft.
+- one-to-one call states: outgoing audio, incoming video, active audio/video,
+  reconnecting, handled elsewhere, and ended.
+
+These controls are Prototype Portal scaffolding. Each selected state renders a
+realistic product recovery surface inside the device frame.
+Each state is also directly reproducible from the standalone prototype with
+`?scenario=<scenario-id>`.
+The default journey also includes Station removal confirmation, enabled Direct
+audio/video call actions, disabled WeChat, and device-only message flag copy.
+
+### 2026-10-12 One-To-One Call Contract Sync
+
+Mobile Call is no longer represented as a disabled future affordance. Direct
+conversation headers expose separate labeled audio and video actions. The call
+surface is mounted by `MobileShell`, outside the Chat page tree, so navigation
+cannot silently destroy its state. The underlying conversation remains the
+context owner while the modal call surface owns focus and controls.
+
+State evidence is directly addressable:
+
+- `?scenario=call-outgoing-audio`
+- `?scenario=call-incoming-video`
+- `?scenario=call-active-audio`
+- `?scenario=call-active-video`
+- `?scenario=call-reconnecting`
+- `?scenario=call-handled-elsewhere`
+- `?scenario=call-ended`
+
+Verification:
+
+- TypeScript `--noEmit` passes for the Mobile prototype package.
+- `scripts/check-call-states.py` passes all seven states at 430px, the active
+  video state at 1440px, and four L3 paths: cancel, accept/control/end,
+  handled-elsewhere dismissal, and Default journey -> Direct -> audio call.
+- Ten screenshots and the machine-readable result are under
+  `apps/mobile/src-tauri/target/prototype-call-states/`; the agent opened and
+  inspected outgoing, incoming, active video, reconnecting,
+  handled-elsewhere, ended, and Direct-entry captures.
+- Prototype Portal at `http://localhost:3200/` discovered the current
+  `pending-review` manifest, rendered `call-active-video` inside Mobile Shell,
+  kept the call surface inside the device bounds, and accepted the Mute
+  interaction without horizontal overflow.
+- The existing Portal layout regression produced 54 captures across 1440px,
+  554px, and 390px with zero geometry defects.
+- Call controls meet the prototype's 44px target check, the overlay remains
+  inside the device shell, no horizontal overflow or new page/console error is
+  present. The existing antd `List` deprecation warning is recorded separately.
+
+This amendment is `pending-review`. It proves browser interaction intent only.
+Native iOS media, production styling/i18n, permission and device selection,
+direct/TURN routing, reconnect/cleanup, cross-Station behavior, and exact-source
+Desktop/Mobile arbitration remain `UNPROVEN` under MS-PA30/MS-PA31.
+
+### 2026-10-11 Chat Delivery Recovery
+
+`?scenario=chat-delivery-recovery` opens the shared `CHAT-CRAFT-J01` Release
+Room directly inside the standard `ChatThread`. The failed outgoing message
+remains in context, the recovery surface explains that the encrypted payload is
+stored locally, and Retry moves the message through sending to delivered before
+appending the peer acknowledgement. The recovery path reuses the existing
+thread; it does not replace the action sheet, composer, pinned tab, details
+panel, or any other Chat feature.
+
+Craft evidence:
+
+- Positive calibration: touch-first recovery, preserved conversation context,
+  local feedback, and no false delivery success.
+- Negative calibration: no phone-width right drawer, global error page,
+  decorative motion, or color-only state.
+- L2: 1440px Portal frame and 430px Chinese direct render were opened; content,
+  composer, recovery action, and device frame do not overlap or overflow.
+- L3: touch/click Retry completes failed → sending → delivered and peer
+  acknowledgement; reduced-motion mode remains understandable.
+- L4: new controls have accessible names, the primary recovery target is
+  44px high, no console/page errors were observed, and local lab metrics were
+  `CLS=0.0128`, `LCP=188ms`.
+- Evidence root:
+  `~/.peers-touch/dev/workspaces/48035cb460a725a5/evidence/chat-craft/20261011/`.
+- `UNPROVEN`: native iOS/Android, VoiceOver/TalkBack device proof, real
+  Station/Relay delivery, and production field performance.
+
+This amendment is `pending-review`. Earlier confirmed prototype history does
+not confer confirmation on the changed Chat Journey.
+
+### 2026-11-01 Reaction Emoji Action Sheet Fit (increment 36)
+
+The message action-sheet reaction surfaces had a clipping defect: the quick
+reaction row used fixed 40px cells inside a hidden horizontal scroll, so the
+last quick emoji was pushed under the more (···) button and the eighth sat
+off-sheet; the full grid's internal `max-height: 200px` scroll cap also hid
+rows. Contract after the fix:
+
+- Quick row: eight reactions + the fixed ··· button all visible at every
+  device width. Cells `flex: 1 1 0; min-width: 0` (no fixed width, no internal
+  scroll); the ··· tile keeps its fixed 40px. Cells never overlap ··· and stay
+  at or above the 24px touch floor.
+- Full grid (`···`): all 40 emojis lay out in 8 columns × 5 rows with no
+  internal scroll — the action sheet (`max-height: 85vh`) remains the only
+  scroll container.
+- Gate: `PROTOTYPE_EMOJI_ACTION_SHEET_ONLY=1 node packages/prototypes/mobile/chat/scripts/check-layout.mjs`
+  (`emoji-action-sheet.mjs`), three viewports (1440/554/390), zero defects;
+  evidence `emoji-action-sheet.json`.
+
+### 2026-09-19 Message Action Semantics
+
+The confirmed Mobile Chat action sheet now keeps the four MS-D20 actions
+distinct: Forward, Recall, Delete for me, and role-gated Remove for group.
+Forward retains the bounded destination picker; Delete for me removes only the
+current actor's mock projection; moderation leaves an explicit shared
+tombstone. This is prototype behavior only and does not establish native or
+Station proof.
+
+The prototype package build passes. Fresh L2/L3 visual evidence for these
+action-sheet states remains `UNPROVEN` until the Portal render checks are run.
+
+### 2026-10-08 Settings Owner Parity
+
+The confirmed Me/Settings prototype mirrors the selected-only Mobile Settings
+tree and its existing owners: Station Profile/privacy and Notification
+preferences, Social blocked users, device appearance/language/storage, Station
+selection, and session logout. Summary and detail identity now remain
+human-readable; raw PTIDs and Station URLs are not used as primary identity.
+Ownerless Safety Number, Chat Background, and Encryption surfaces are explicitly
+unavailable instead of presenting invented configuration or an "Active" claim.
+
+Editable owner-backed details expose one local dirty/save surface. Storage,
+Station change, cache clearing, and logout use explicit confirmation surfaces.
+This is product/prototype alignment only; native foreground proof remains owned
+by `MWPU-07-SETTINGS`.
+
+Evidence captured on 2026-08-27 at the Portal mobile preview:
+
+| Layer | Scenario | Evidence |
+|---|---|---|
+| L2 | Station identity mismatch | `tmp/evidence/mobile-shell/prototype/20260827/station-identity-mismatch.jpg` |
+| L2 | OAuth expired | `tmp/evidence/mobile-shell/prototype/20260827/oauth-expired.jpg` |
+| L2 | Session revoked | `tmp/evidence/mobile-shell/prototype/20260827/session-revoked.jpg` |
+| L2 | Unknown write outcome | `tmp/evidence/mobile-shell/prototype/20260827/unknown-write.jpg` |
+| L2 | Command ledger full | `tmp/evidence/mobile-shell/prototype/20260827/ledger-full.jpg` |
+| L2 | Draft restored | `tmp/evidence/mobile-shell/prototype/20260827/draft-restored.jpg` |
+| L2 | Station removal confirmation | `tmp/evidence/mobile-shell/prototype/20260827/station-removal.jpg` |
+| L3 | Recovery actions | Scenario selector reached every state; Station/OAuth recovery returned to the correct pre-shell surface; unknown/ledger actions returned to readable Shell; Continue editing opened the conversation thread |
+| L3 | Deferred/local-only actions | Chat thread contains Chat/Pinned only; Direct call is enabled, WeChat/Docs remain disabled or absent, and message action reads “Flag on this device” |
+
+### 2026-09-12 Social And Recovery Samples
+
+The previously confirmed baseline is unchanged. The following additions express
+the accepted MS-J03/MS-J04/MS-J07 failure and relationship semantics; they are
+not newly confirmed or landed by this source update.
+
+| Scenario ID | Sample |
+|---|---|
+| `social-unavailable` | Unavailable Chat/Contacts, lifecycle Retry with explicit pending and failure outcomes, and independently accessible Me |
+| `social-detail-unavailable` | Conversation route keeps Back and one centered lifecycle Retry without stacked global notices |
+| `find-people-no-membership` | Separate handle and Federation fields; no active membership disables Send Request |
+| `find-people-member` | Request admission, pending/unknown outcome, and accepted contact without implicit conversation creation |
+| `contact-direct` | Contact-to-Message preparation, failure/Retry, and explicit Direct readiness opening an empty thread |
+| `request-unknown` | One retained intent; Check Status does not admit another Send |
+
+The out-of-device `Controlled Social demo transitions` panel resolves pending
+prototype actions. It never simulates a network callback automatically or
+provides Station evidence. State is in memory and resets with the scenario.
+
+Integrator verification:
+
+- `make run-prototype` served the bound `peers-social` worktree; the Portal's
+  selected Live Preview was `Mobile Shell`.
+- `pnpm --dir packages/prototypes/mobile/chat build --configLoader runner`
+  built successfully; the existing large-chunk warning remains.
+- L3 browser interaction at a 554 x 954 viewport verified unavailable/Retry
+  failure and Me navigation, no-membership Send suppression, a single request
+  progressing through unknown/Check Status/pending/accepted, Friends rather than
+  Sent after acceptance, and Message/preparing/failure/Retry/ready/empty thread.
+- Unavailable Chat/Contacts now own one centered route recovery surface. The
+  lifecycle Retry moved into that surface; unrelated tabs and background
+  reconciliation no longer receive a second stacked global notice.
+- The IDE screenshot tool remained unavailable. Local Playwright subsequently
+  captured the actual Portal and removed that tooling blocker.
+- Inspected screenshots exposed compressed preview width, clipped Contact Info
+  after Direct failure, and the fixed scenario label covering the preview.
+  Portal responsive layout, Mobile detail flex sizing, narrow workbench padding,
+  and normal-flow scenario labels correct those issues without changing any
+  page lifetime or production behavior.
+- The repeatable render check passes 48 states at 1440x1100, 554x954, and
+  390x844. Phone previews measure 390px, 390px, and 324px respectively.
+  It checks geometry, page overflow, unclipped Info rows, scenario non-overlap,
+  tab geometry, sheet focus containment/Escape, retained request intent, and
+  explicit Direct success/failure. Screenshots under
+  `apps/mobile/src-tauri/target/prototype-layout-final/` were opened and
+  inspected, including `390-member.png` and `390-direct-info-scrolled.png`.
+- The current prototype is light-only; there is no dark-theme implementation
+  to claim tested. Portal type-check/build and Mobile prototype build pass;
+  existing large-chunk warnings remain.
+
+Run the prototype-only regression against an already running Portal:
+
+```bash
+PROTOTYPE_URL=http://localhost:3200 \
+node packages/prototypes/mobile/chat/scripts/check-layout.mjs
+```
+
+The script uses the repository's existing Playwright dependency installed with
+the Desktop development toolchain. It creates and closes its own headless
+browser; it never connects to Station or native apps. `PROTOTYPE_EVIDENCE_DIR`
+optionally selects output; the default is ignored Mobile target output.
+It is a render regression, not an Acceptance product Gate.
+
+Known Social-transition sample limits: one Federation and one mutable request;
+multi-scope selection, inbound Accept/Reject, and durable restart recovery are
+not covered. The separate long-list samples below add read-only request
+collections, not more command owners. The older
+`unknown-write` message sample is unchanged. Shared UI Identity and its Social
+module contract govern these samples; native Mobile behavior remains separately
+unproven. Render verification does not confirm the additions or establish full
+pixel parity with native Mobile.
+
+### 2026-10-08 Auth Entry Density
+
+Desktop/shared Auth is the visual source for Mobile Auth. The prototype and
+production now share the exact Desktop 512x512 icon, one dominant 400px-wide
+card with 8px radius, a compact 44x44 horizontal brand header, segmented login
+mode, and the same GitHub/Google action hierarchy. Login modes render their
+actual content height instead of reserving the tallest form height. The
+Mobile-only wordmark and `PEERS TOUCH MOBILE` kicker remain removed. Station
+context uses a friendly label instead of a raw host/URL, and known login gates
+use localized client copy instead of unlocalized Station descriptions.
+
+`?scenario=session-revoked` renders the expired-session notice inside the Auth
+card. It does not mount a second recovery panel or cover the sign-in controls.
+`check-layout.mjs` now asserts one Auth card, brand containment, exact logo
+geometry, zero brand-to-card gap, no duplicate recovery, no Mobile kicker, no
+raw Station address, no vertical overflow, and a card height no greater than
+76% of the available Auth viewport.
+
+Current-source verification:
+
+- all 57 captures pass at 1440x1100, 554x954, and 390x844 with zero defects;
+- 390x844 expired-session geometry proves one card at 514px high inside a
+  720px Auth viewport, a 44x44 logo, zero gap/overlap, no kicker, no raw
+  Station address, and no viewport overflow;
+- the physical Android build must preserve the same compact hierarchy at its
+  320 CSS px viewport before Auth entry work is considered complete.
+
+The native expired-session state was not recreated by mutating retained client
+state. Its production composition is covered by focused tests and the direct
+prototype scenario. Android and iOS lifecycle proof remains separate from
+prototype evidence under MS-D26.
+
+### 2026-09-12 Long-List Sample
+
+`?scenario=long-lists` adds 240 conversations, 240 contacts, and 480
+variable-height messages. The selected page alone mounts; Shell-owned bounded
+presentation metadata restores queries and identity/offset anchors.
+Previous/Next traverse overlapping windows, Latest returns to the tail, and
+submitted sample search pages through history before materializing a selected
+older message. This expresses the accepted W6A traversal contract; it does
+not supply Station data or native indexed-search evidence.
+
+Integrator checks:
+
+- `node packages/prototypes/mobile/chat/scripts/check-long-lists.mjs` passes
+  at 1440x1100, 554x954, and 390x844 against the existing Make Portal.
+  Each run reaches all 240 conversations, 240 contacts, and 480 messages and
+  search results with bounded mounted rows. Return anchors, older-reader
+  stability, live-tail following, selected-only pages, empty search, and the
+  inherited Social/recovery scenarios pass without browser errors or overflow.
+- The Mobile prototype build passes with its existing large-chunk warning.
+- Light-theme images in ignored
+  `apps/mobile/src-tauri/target/prototype-long-lists/` were opened:
+  `1440-conversations.png`, `1440-older-target.png`, `390-search.png`, and
+  `390-empty.png`. Search text remains within the narrow rail; the older target
+  is visible above the composer; empty/list content does not overlap the
+  tabbar. These images do not establish full pixel parity.
+
+The added sample is not Owner-confirmed or landed. The next subsection extends
+its request/member and controlled-search coverage. Native search,
+full production pixel parity, and physical-device performance remain
+outside this prototype evidence.
+
+### 2026-09-12 Request, Member, And Search Samples
+
+`long-lists` now also contains 240 pending requests with explicit incoming or
+outgoing direction and 240 group members. Both reuse `PrototypeListWindow`,
+mount at most 100 rows, and restore query/window/identity anchors after tab or
+detail return. Sample-only group mutations remain unavailable.
+
+`search-controlled` exposes explicit loading, error, same-query Retry, results,
+and empty outcomes through controls outside the device. One current ticket and
+one discarded ticket carry owner/revision identity; completion from an edited,
+cleared, closed, or previous search instance cannot publish into the active
+view. Query and result anchors use the existing bounded Shell presentation
+memory. There is no timer-driven response, Station call, or native traffic.
+
+Integrator verification against the retained Make Portal:
+
+- `check-residual-parity.mjs`: 40 assertions pass at 390x844 and 1440x1100;
+  every request/member row is reachable, with at most 100 mounted rows.
+  `apps/mobile/src-tauri/target/prototype-residual-parity/results.json`,
+  produced at `2026-09-12T14:27:37Z`, records 26 light-theme captures, no browser
+  errors, and no prohibited traffic.
+- `check-layout.mjs`: all 48 captures at 390x844, 554x954, and 1440x1100 have
+  zero geometry defects in
+  `apps/mobile/src-tauri/target/prototype-layout-post-sync/captures.json`
+  (`2026-09-12T14:27:33Z`). The runner now avoids clicking an already-selected
+  Portal site, which previously stole sheet focus. Both Tab containment
+  assertions and Escape behavior remain checked.
+- `check-long-lists.mjs`: a post-integration rerun passes at all three
+  viewports, traversing 240 conversations, 240 contacts, 480 messages, and 480
+  search results with the existing return-anchor and live-tail assertions.
+- Mobile prototype build passes; its existing large-chunk warning remains.
+  Each browser runner closes its own browser and retains the Make Portal.
+- Opened L2 images include residual-parity `1440-members-first.png`,
+  `1440-search-loading.png`, and `390-search-error.png`, plus post-sync
+  `390-member.png`. The member list remains scrollable, search retains its
+  query during loading/failure, Retry is visible, and the narrow sheet keeps
+  its fields and primary action inside the preview.
+
+Frontend tree review: the existing Mobile bounded-content registry row still
+governs these surfaces. Only the active tab/detail/search tree mounts
+(`on-visit + none` plus bounded content); Shell memory retains presentation
+metadata, not business freshness. No production lifetime or registry status
+changed. Native timing, retained-history memory bounds, full pixel parity, and
+Owner confirmation remain gaps.
+
+Run the added regression against an already running Portal:
+
+```bash
+PROTOTYPE_URL=http://localhost:3262 \
+node packages/prototypes/mobile/chat/scripts/check-residual-parity.mjs
+```
+
+## Acceptance Notes
+
+- **Unified device Search, 2026-10-23:** four primary header actions and Chat
+  History Search enter one full-height Shell detail. Message/attachment-name/
+  function filters, explicit conversation scope, original message/thread focus
+  and returning input are represented in `src/pages/SearchPage.tsx`. Portal
+  touch checks cover these routes plus dark/narrow, loading and error/retry.
+  Shell owns the sample message snapshot used by Chat, thread replies and
+  Search. Sending, editing and hiding survive selected-page unmounts; search
+  entry/exit fences controlled tickets. A thread entered manually from a
+  Search-opened message returns to that message before returning to Search.
+  The migrated long-list script traverses all 480 scoped results at three
+  viewports, retains original-reader/live-tail anchors, and checks sent-message
+  remount, scope isolation, cross-conversation original opening, hide
+  revalidation and thread-reply remount. The residual script passes 40 checks
+  at two viewports, including discarded query/close/remount completions.
+  Approved generated portraits are blocked offline in the residual check and
+  reported separately from prohibited business/external traffic.
+  Fresh touch screenshots and seven-group result:
+  `/tmp/mobile-search-prototype-continuity-20261023/`; long-list and residual
+  screenshots remain in their external runtime target directories.
+  Native Android/iOS behavior, account fencing and complete localization remain
+  unproven; sample rendering does not establish production readiness.
+- **W6A long-list sample: source/render synchronized for the covered subset.**
+  Previous/Next, search paging, older-history anchors, large request/member
+  collections, and controlled search loading/failure/retry now have repeatable
+  prototype evidence above. These sample gaps are no longer `UNSYNCED`;
+  native search and full production parity remain unproven. The existing
+  baseline remains confirmed; these additions are not self-confirmed or landed.
+  Prototype evidence is not native communication or AS-14 proof.
+- The previously confirmed happy-path interaction remains the baseline.
+- The recovery-state amendment has fresh L2/L3 evidence and was confirmed by
+  the Owner on 2026-08-27.
+- Prototype confirmation covers the intended flow and UI behavior only.
+- Real `apps/mobile` iOS/Android runtime acceptance remains `UNPROVEN` and is
+  required by `../acceptance-matrix.md` before production readiness.
+- The prototype must not introduce a phone-width right drawer for conversation actions. Mobile action surfaces use bottom sheets or dedicated pages.

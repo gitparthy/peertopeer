@@ -1,0 +1,702 @@
+"""Bounded SSH command and tunnel lifecycle for remote Acceptance cells."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path, PureWindowsPath
+from typing import Mapping, Sequence
+
+from tooling.acceptance.core.errors import BlockedError, ProvisioningError
+from tooling.acceptance.core.resource_diagnostic import ResourceDiagnostic
+from tooling.acceptance.remote_platform import RemotePlatform
+
+
+_HOST_PATTERN = re.compile(r"^[A-Za-z0-9._:%-]+$")
+_USER_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+_REMOTE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._/-]+$")
+_WINDOWS_PATH_PATTERN = re.compile(r"^[A-Za-z]:/[A-Za-z0-9._ /-]+$")
+SSH_CONNECTIONS_ENV = "PT_ACCEPTANCE_SSH_CONNECTIONS"
+
+
+def ssh_target_identity(target: "SshTarget") -> dict[str, object]:
+    return {
+        "host": target.host,
+        "user": target.user,
+        "port": target.port,
+        "knownHostsFile": (
+            str(Path(target.known_hosts_file).expanduser().resolve())
+            if target.known_hosts_file else ""
+        ),
+        "platform": target.remote_platform.value,
+    }
+
+
+def _validate_atom(
+    value: str,
+    name: str,
+    pattern: re.Pattern[str],
+) -> str:
+    normalized = value.strip()
+    if not normalized or not pattern.fullmatch(normalized):
+        raise ProvisioningError(f"SSH {name} is missing or invalid")
+    return normalized
+
+
+def available_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+@dataclass(frozen=True)
+class SshTarget:
+    host: str
+    user: str
+    port: int = 22
+    known_hosts_file: str = ""
+    remote_platform: RemotePlatform = RemotePlatform.POSIX
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "host",
+            _validate_atom(self.host, "host", _HOST_PATTERN),
+        )
+        object.__setattr__(
+            self,
+            "user",
+            _validate_atom(self.user, "user", _USER_PATTERN),
+        )
+        if self.port < 1 or self.port > 65535:
+            raise ProvisioningError("SSH port must be between 1 and 65535")
+        if self.known_hosts_file and not Path(
+            self.known_hosts_file
+        ).expanduser().is_file():
+            raise ProvisioningError(
+                f"SSH known-hosts file does not exist: {self.known_hosts_file}"
+            )
+
+    @property
+    def destination(self) -> str:
+        return f"{self.user}@{self.host}"
+
+
+class SshTunnel:
+    def __init__(self, process: subprocess.Popen[bytes], local_port: int) -> None:
+        self._process = process
+        self.local_port = local_port
+
+    @property
+    def process_id(self) -> int:
+        process = self._process
+        return process.pid if process is not None else 0
+
+    def is_alive(self) -> bool:
+        process = self._process
+        return process is not None and process.poll() is None
+
+    def failure_detail(self) -> dict[str, object] | None:
+        process = self._process
+        if process is None or process.poll() is None:
+            return None
+        detail = (
+            process.stderr.read().decode("utf-8", errors="replace").strip()
+            if process.stderr is not None
+            else ""
+        )
+        return {
+            "exitCode": process.returncode,
+            "stderr": detail[-4000:],
+        }
+
+    def stop(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        self._process = None
+        try:
+            if process.poll() is None:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.wait(timeout=5)
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+
+    def __enter__(self) -> "SshTunnel":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
+
+
+class SshTransport:
+    """SSH transport with strict host verification and bounded operations."""
+
+    def __init__(
+        self,
+        target: SshTarget,
+        *,
+        connect_timeout: int = 10,
+        connection_environment: Mapping[str, str] | None = None,
+    ) -> None:
+        if connect_timeout <= 0:
+            raise ProvisioningError("SSH connect timeout must be positive")
+        self.target = target
+        self.connect_timeout = connect_timeout
+        self._connection_environment = connection_environment
+
+    def _connection_options(self, *, timeout: float = 2) -> list[str]:
+        environment = (
+            os.environ if self._connection_environment is None
+            else self._connection_environment
+        )
+        raw = environment.get(SSH_CONNECTIONS_ENV, "")
+        if not raw:
+            return ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+        resource = f"ssh-connection:{self.target.destination}:{self.target.port}"
+        expected = ssh_target_identity(self.target)
+        observed: dict[str, object] = {}
+        try:
+            if len(raw) > 65536 or os.name != "posix":
+                raise ValueError("owned SSH connection descriptors are invalid or unsupported")
+            connections = json.loads(raw)
+            if not isinstance(connections, list) or not connections:
+                raise ValueError("owned SSH connection descriptors are invalid")
+            matches = [
+                entry for entry in connections
+                if isinstance(entry, dict) and entry.get("target") == expected
+            ]
+            if len(matches) != 1:
+                raise ValueError("owned SSH connection target is missing or ambiguous")
+            entry = matches[0]
+            pid = entry.get("pid")
+            path = entry.get("controlPath")
+            if (
+                isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+                or not isinstance(path, str) or not Path(path).is_absolute()
+                or not isinstance(entry.get("resource"), str)
+                or not entry["resource"]
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", entry["resource"])
+                or not isinstance(entry.get("owner"), str)
+                or not entry["owner"]
+                or self.target.remote_platform != RemotePlatform.POSIX
+            ):
+                raise ValueError("owned SSH connection identity is invalid")
+            observed["ownerProcessId"] = pid
+            control = Path(path)
+            directory = control.parent
+            metadata = directory.lstat()
+            if (
+                directory.is_symlink()
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+                or control.is_symlink()
+                or not control.is_socket()
+            ):
+                raise ValueError("owned SSH connection socket is unavailable or unsafe")
+            check = subprocess.run(
+                ["ssh", "-S", path, "-O", "check", self.target.destination],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            observed["checkExitCode"] = check.returncode
+            actual = re.fullmatch(r"Master running \(pid=(\d+)\)", check.stderr.strip())
+            if check.returncode != 0 or actual is None or int(actual[1]) != pid:
+                raise ValueError("owned SSH connection owner is no longer live")
+        except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+            detail = (
+                "owned SSH connection check timed out"
+                if isinstance(error, subprocess.TimeoutExpired)
+                else error.strerror if isinstance(error, OSError)
+                else str(error)
+            )
+            observed["errorType"] = type(error).__name__
+            observed["error"] = detail
+            raise BlockedError(
+                reason=f"Owned SSH connection rejected: {detail}",
+                resource=resource,
+                diagnostic=ResourceDiagnostic.observed(
+                    owner="tooling.acceptance.transports.ssh:SshTransport",
+                    recovery_action=(
+                        "Release this Environment's source leases and reacquire "
+                        "the same reviewed targets in a new bounded attempt."
+                    ),
+                    resource=resource,
+                    expected={"target": expected, "liveOwnedConnection": True},
+                    observed=observed,
+                ),
+            ) from error
+        # A lost master must never fall back to a new TCP/authentication session.
+        return [
+            "-o", "ControlMaster=no", "-S", path,
+            "-o", "ProxyCommand=false",
+        ]
+
+    def _source_guarded_argv(self, argv: Sequence[str]) -> Sequence[str]:
+        from tooling.acceptance.core.lease import source_lease_guarded_argv
+
+        environment = (
+            os.environ if self._connection_environment is None
+            else self._connection_environment
+        )
+        raw = environment.get(SSH_CONNECTIONS_ENV, "")
+        if not raw:
+            return argv
+        # command_prefix has already checked this operation's exact live owner.
+        entry = next(
+            entry for entry in json.loads(raw)
+            if isinstance(entry, dict) and entry.get("target") == ssh_target_identity(self.target)
+        )
+        return source_lease_guarded_argv(entry["resource"], entry["owner"], argv)
+
+    def command_prefix(
+        self, *, timeout: float = 2, control_master: Path | None = None,
+    ) -> list[str]:
+        command = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout}",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-p",
+            str(self.target.port),
+        ]
+        if self.target.known_hosts_file:
+            command.extend(
+                [
+                    "-o",
+                    "UserKnownHostsFile="
+                    + str(Path(self.target.known_hosts_file).expanduser()),
+                ]
+            )
+        if control_master is not None:
+            return [
+                *command, "-o", "ControlMaster=yes", "-o", "ControlPersist=no",
+                "-S", str(control_master),
+            ]
+        return [*command, *self._connection_options(timeout=timeout)]
+
+    def git_ssh_command(self) -> str:
+        return shlex.join(self.command_prefix())
+
+    def render_remote_argv(self, argv: Sequence[str]) -> str:
+        if self.target.remote_platform == RemotePlatform.POSIX:
+            return shlex.join(str(argument) for argument in argv)
+        encoded_argv = base64.b64encode(
+            json.dumps(
+                [str(argument) for argument in argv],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).decode("ascii")
+        bootstrap = (
+            "import base64,json,subprocess,sys;"
+            "argv=json.loads(base64.b64decode(sys.argv[1]));"
+            "raise SystemExit(subprocess.run(argv).returncode)"
+        )
+        script = (
+            "$ErrorActionPreference='Stop'; "
+            "$utf8=[System.Text.UTF8Encoding]::new($false); "
+            "$OutputEncoding=$utf8; "
+            "[Console]::OutputEncoding=$utf8; "
+            f"& 'python' '-c' '{bootstrap}' '{encoded_argv}'; "
+            "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }"
+        )
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        return (
+            "powershell.exe -NoProfile -NonInteractive "
+            f"-EncodedCommand {encoded}"
+        )
+
+    def run_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        check: bool = False,
+        environment: Mapping[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if not argv:
+            raise ProvisioningError("remote SSH command is required")
+        if timeout <= 0:
+            raise ProvisioningError("remote SSH command timeout must be positive")
+        started = time.monotonic()
+        prefix = self.command_prefix(timeout=min(timeout, 2))
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(prefix, timeout)
+        completed = subprocess.run(
+            [
+                *prefix,
+                self.target.destination,
+                self.render_remote_argv(self._source_guarded_argv(argv)),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            input=input_text,
+            timeout=remaining,
+            check=False,
+            env=dict(environment) if environment is not None else None,
+        )
+        if completed.returncode == 74 and "PT_SOURCE_LEASE_NOT_HELD" in completed.stderr:
+            resource = f"ssh-source-lease:{self.target.destination}:{self.target.port}"
+            raise BlockedError(
+                reason="Remote source lease is no longer held by the owned connection",
+                resource=resource,
+                diagnostic=ResourceDiagnostic.observed(
+                    owner="tooling.acceptance.core.lease:RemoteGitSourceLease",
+                    recovery_action="Release the Environment and reacquire its reviewed source leases in a new bounded attempt.",
+                    resource=resource,
+                    expected={"sourceLeaseHeldByOwner": True},
+                    observed={"sourceLeaseHeldByOwner": False, "guardExitCode": 74},
+                ),
+            )
+        if check and completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise ProvisioningError(
+                f"remote SSH command failed with exit {completed.returncode}: "
+                f"{detail[-4000:]}"
+            )
+        return completed
+
+    def copy_file(
+        self,
+        source: Path,
+        remote_path: str | Path,
+        *,
+        timeout: float = 30,
+    ) -> None:
+        local_source = source.expanduser().resolve()
+        remote_destination = str(remote_path).replace("\\", "/")
+        if not local_source.is_file():
+            raise ProvisioningError(
+                f"SSH copy source is missing or not a file: {local_source}"
+            )
+        valid_destination = (
+            bool(_REMOTE_PATH_PATTERN.fullmatch(remote_destination))
+            if self.target.remote_platform == RemotePlatform.POSIX
+            else self._valid_windows_path(remote_destination)
+        )
+        if not valid_destination:
+            raise ProvisioningError("SSH copy destination is invalid")
+        if timeout <= 0:
+            raise ProvisioningError("SSH copy timeout must be positive")
+
+        started = time.monotonic()
+        connection_options = self._connection_options(timeout=min(timeout, 2))
+        if "-S" in connection_options:
+            self.run_argv(("true",), timeout=max(0.001, timeout - (time.monotonic() - started)), check=True)
+        # scp takes the socket through -o, whereas ssh accepts -S.
+        if "-S" in connection_options:
+            index = connection_options.index("-S")
+            connection_options[index:index + 2] = [
+                "-o", f"ControlPath={connection_options[index + 1]}",
+            ]
+        command = [
+            "scp",
+            "-q",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout}",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-P",
+            str(self.target.port),
+            *connection_options,
+        ]
+        if self.target.known_hosts_file:
+            command.extend(
+                [
+                    "-o",
+                    "UserKnownHostsFile="
+                    + str(Path(self.target.known_hosts_file).expanduser()),
+                ]
+            )
+        command.extend(
+            (
+                str(local_source),
+                f"{self.target.destination}:{remote_destination}",
+            )
+        )
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(0.001, timeout - (time.monotonic() - started)),
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise ProvisioningError(
+                "SSH file copy failed with exit "
+                f"{completed.returncode}: {detail[-4000:]}"
+            )
+
+    def start_local_forward(
+        self,
+        *,
+        remote_port: int,
+        remote_host: str = "127.0.0.1",
+        local_port: int | None = None,
+        timeout: float = 10,
+    ) -> SshTunnel:
+        if remote_port < 1 or remote_port > 65535:
+            raise ProvisioningError("remote forward port is invalid")
+        selected_remote_host = _validate_atom(
+            remote_host,
+            "forward host",
+            _HOST_PATTERN,
+        )
+        selected_local_port = local_port or available_local_port()
+        if selected_local_port < 1 or selected_local_port > 65535:
+            raise ProvisioningError("local forward port is invalid")
+        if not self.remote_endpoint_listening(
+            selected_remote_host,
+            remote_port,
+            timeout=timeout,
+        ):
+            raise ProvisioningError(
+                "remote endpoint "
+                f"{selected_remote_host}:{remote_port} is not listening "
+                "before SSH local forward"
+            )
+        forward_host = (
+            f"[{selected_remote_host}]"
+            if ":" in selected_remote_host
+            else selected_remote_host
+        )
+        return self._start_forward(
+            direction="-L",
+            specification=(
+                f"127.0.0.1:{selected_local_port}:"
+                f"{forward_host}:{remote_port}"
+            ),
+            local_probe_port=selected_local_port,
+            remote_probe_port=None,
+            timeout=timeout,
+        )
+
+    def start_reverse_forward(
+        self,
+        *,
+        local_port: int,
+        remote_port: int,
+        timeout: float = 10,
+    ) -> SshTunnel:
+        for name, port in (("local", local_port), ("remote", remote_port)):
+            if port < 1 or port > 65535:
+                raise ProvisioningError(f"{name} reverse-forward port is invalid")
+        return self._start_forward(
+            direction="-R",
+            specification=(
+                f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}"
+            ),
+            local_probe_port=None,
+            remote_probe_port=remote_port,
+            timeout=timeout,
+        )
+
+    def remote_loopback_port_listening(
+        self,
+        port: int,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        return self.remote_endpoint_listening(
+            "127.0.0.1",
+            port,
+            timeout=timeout,
+        )
+
+    def remote_endpoint_listening(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        selected_host = _validate_atom(
+            host,
+            "endpoint host",
+            _HOST_PATTERN,
+        )
+        if port < 1 or port > 65535:
+            raise ProvisioningError("remote endpoint probe port is invalid")
+        probe_timeout = (
+            timeout
+            if timeout is not None
+            else (
+                5.0
+                if self.target.remote_platform == RemotePlatform.WINDOWS
+                else 2.0
+            )
+        )
+        try:
+            probe = self.run_argv(
+                (
+                    (
+                        "python"
+                        if self.target.remote_platform == RemotePlatform.WINDOWS
+                        else "python3"
+                    ),
+                    "-c",
+                    (
+                        "import socket,sys;"
+                        "connection=socket.create_connection("
+                        "(sys.argv[1],int(sys.argv[2])),0.5);"
+                        "connection.close()"
+                    ),
+                    selected_host,
+                    str(port),
+                ),
+                timeout=probe_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return probe.returncode == 0
+
+    def available_remote_port(self, *, timeout: float = 10) -> int:
+        executable = (
+            "python"
+            if self.target.remote_platform == RemotePlatform.WINDOWS
+            else "python3"
+        )
+        completed = self.run_argv(
+            (
+                executable,
+                "-c",
+                (
+                    "import socket;"
+                    "listener=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+                    "listener.bind(('127.0.0.1',0));"
+                    "print(listener.getsockname()[1]);"
+                    "listener.close()"
+                ),
+            ),
+            timeout=timeout,
+            check=True,
+        )
+        value = completed.stdout.strip()
+        if not value.isdecimal():
+            raise ProvisioningError("remote port allocation returned invalid output")
+        port = int(value)
+        if port < 1 or port > 65535:
+            raise ProvisioningError("remote port allocation returned invalid port")
+        return port
+
+    @staticmethod
+    def _valid_windows_path(value: str) -> bool:
+        if not _WINDOWS_PATH_PATTERN.fullmatch(value):
+            return False
+        path = PureWindowsPath(value)
+        if not path.is_absolute() or value.startswith(("//", "\\\\")):
+            return False
+        return all(
+            part not in {".", ".."} and not part.endswith((" ", "."))
+            for part in path.parts[1:]
+        )
+
+    def _start_forward(
+        self,
+        *,
+        direction: str,
+        specification: str,
+        local_probe_port: int | None,
+        remote_probe_port: int | None,
+        timeout: float,
+    ) -> SshTunnel:
+        # A tunnel's forwards belong to its own process, not to a borrowed master.
+        standalone = SshTransport(
+            self.target, connect_timeout=self.connect_timeout,
+            connection_environment={},
+        )
+        deadline = time.monotonic() + timeout
+        self._connection_options(timeout=min(timeout, 2))
+        process = subprocess.Popen(
+            [
+                *standalone.command_prefix(),
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=10",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "TCPKeepAlive=yes",
+                "-N",
+                direction,
+                specification,
+                self.target.destination,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        tunnel = SshTunnel(process, local_probe_port or 0)
+        try:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    detail = (
+                        process.stderr.read().decode("utf-8", errors="replace").strip()
+                        if process.stderr is not None else ""
+                    )
+                    raise ProvisioningError(
+                        "SSH forward exited before readiness: "
+                        f"{detail[-4000:]}"
+                    )
+                if remote_probe_port is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if self.remote_loopback_port_listening(
+                        remote_probe_port, timeout=remaining,
+                    ):
+                        return tunnel
+                    time.sleep(0.05)
+                elif local_probe_port is not None:
+                    try:
+                        with socket.create_connection(
+                            ("127.0.0.1", local_probe_port), timeout=0.2,
+                        ):
+                            return tunnel
+                    except OSError:
+                        time.sleep(0.05)
+        except BaseException:
+            tunnel.stop()
+            raise
+        tunnel.stop()
+        raise ProvisioningError(
+            f"SSH forward did not become ready within {timeout}s"
+        )

@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package peers_touch.model.common.v1;
+
+import "google/protobuf/any.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/core/types;types";
+
+// PageQuery: API请求中的分页参数
+message PageQuery {
+  int32 page_number = 1; // The page number to retrieve, 1-based.
+  int32 page_size = 2;   // The number of items to retrieve per page.
+}
+
+// PageData: 通用列表响应
+message PageData {
+  int64 total = 1;
+  int32 no = 2;
+}
+
+// PeersResponse: 通用API成功响应外层结构
+message PeersResponse {
+  string code = 1; // e.g., "200"
+  string msg = 2;
+  google.protobuf.Any data = 3; // data or error
+}
+
+// Error: 标准化错误信息
+message Error {
+  string code = 1;    // e.g., "t10001"
+  string message = 2;
+}
+
+// EncryptedMediaDescriptor describes client-side media encryption for
+// chat attachments and Moment media. The descriptor is metadata only:
+// clients MUST protect key material by carrying this message inside the
+// surface-specific E2EE envelope when the audience is private. Public
+// plaintext metadata fields on legacy attachment messages are deprecated
+// compatibility mirrors and must not be treated as authoritative.
+message EncryptedMediaDescriptor {
+  bool encrypted = 1;
+  uint32 version = 2;
+  string suite = 3;
+  string key_b64 = 4;
+  string nonce_b64 = 5;
+  string plaintext_sha256_b64 = 6;
+  string ciphertext_sha256_b64 = 7;
+  int64 plaintext_size = 8;
+  int64 ciphertext_size = 9;
+  string chunking = 10;
+  uint32 chunk_size = 11;
+  uint32 chunk_count = 12;
+  uint32 tag_size = 13;
+  string nonce_strategy = 14;
+}

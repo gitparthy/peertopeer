@@ -1,0 +1,638 @@
+import { invoke } from '@tauri-apps/api/core';
+import { ActorDeviceStatus } from '../../gen/proto/domain/actor/actor_pb';
+import { identityRuntime } from '../../kernel/identityRuntime';
+import { momentsRuntime } from '../../runtimes/momentsRuntime';
+import { api } from '../../services/desktop_api';
+import { imServiceV1 } from '../../services/im-service';
+import { messagingRecoveryService } from '../../services/messaging-recovery-service';
+import { usePrivateMomentsStore } from '../../store/privateMoments';
+import { useSessionStore } from '../../store/session';
+import { registerAcceptanceHarness } from '../registry';
+
+interface AccountFixtureInput {
+  secondaryAccount: string;
+  password: string;
+  pin: string;
+}
+
+interface SessionRestoreInput {
+  account: string;
+  password: string;
+}
+
+interface AccountSwitchInput {
+  primaryAccountId: string;
+  primaryActorPtid: string;
+  primaryStorageIdentitySha256: string;
+  primaryLoginId: string;
+  secondaryAccountId: string;
+  secondaryActorPtid: string;
+  secondaryStorageIdentitySha256: string;
+  secondaryLoginId: string;
+  pin: string;
+  password: string;
+}
+
+interface PreparedAccountSwitchInput {
+  accountId: string;
+  actorPtid: string;
+  storageIdentitySha256: string;
+  outgoingActorPtid: string;
+  outgoingSessionEpoch: number;
+  pin: string;
+}
+
+interface StationFixtureInput {
+  secondaryStationUrl: string;
+}
+
+interface StationSwitchInput {
+  account: string;
+  password: string;
+  primaryStationUrl: string;
+  secondaryStationUrl: string;
+}
+
+interface RecoveryAdvanceInput {
+  expectedEpoch: number;
+}
+
+interface DeviceRevokeInput {
+  deviceId: string;
+  observedProfileVersion: string;
+}
+
+interface RecoveryPreKeyMaintenanceResult {
+  ok: boolean;
+  data?: {
+    recoveryEpoch?: unknown;
+    recoveryPreKeyAvailable?: unknown;
+  };
+}
+
+interface NativeRuntimeIdentityResult {
+  ok: boolean;
+  data?: {
+    accountStorageIdentitySha256?: unknown;
+  };
+  error?: {
+    message?: unknown;
+    details?: {
+      native_error_code?: unknown;
+      state?: unknown;
+    };
+  };
+}
+
+// Diagnostics identify fixed Native refusal branches without exposing dynamic
+// errors, filesystem paths, credentials or account data from a failed command.
+const identityRefusalReasons = new Map<string, string>([
+  ['secure content supervisor is not active', 'PRIVATE_RUNTIME_INACTIVE'],
+  ['secure content supervisor lock poisoned', 'PRIVATE_RUNTIME_LOCK_FAILED'],
+  ['secure content Station binding changed during identity capture', 'STATION_BINDING_CHANGED'],
+  ['secure content Station binding is not complete', 'STATION_BINDING_INCOMPLETE'],
+  ['secure content active Station peer ID is unavailable', 'STATION_IDENTITY_UNAVAILABLE'],
+  ['secure content active Station peer ID is invalid', 'STATION_IDENTITY_INVALID'],
+  ['secure content active Station URL is invalid', 'STATION_ENDPOINT_INVALID'],
+  ['secure content bound Station identity is unavailable', 'BOUND_STATION_IDENTITY_UNAVAILABLE'],
+  ['secure content bound Station route is unavailable', 'BOUND_STATION_ROUTE_UNAVAILABLE'],
+  ['secure content Station binding identity is inconsistent', 'STATION_BINDING_INCONSISTENT'],
+]);
+
+function requireText(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`secureContentFixture.${field}Missing`);
+  }
+  return value.trim();
+}
+
+function requireCurrentActor(): string {
+  return requireText(
+    useSessionStore.getState().currentUser?.actorPtid,
+    'actorIdentity',
+  );
+}
+
+function accountOwnsActor(
+  account: { provider_user_id?: string },
+  actorPtid: string,
+): boolean {
+  return account.provider_user_id?.trim() === actorPtid;
+}
+
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function completeLogin(): Promise<void> {
+  await identityRuntime.completeCurrentSession();
+  if (!useSessionStore.getState().authenticated) {
+    throw new Error('secureContentFixture.authenticationIncomplete');
+  }
+}
+
+async function unlockOrReauth(
+  accountId: string,
+  loginId: string,
+  pin: string,
+  password: string,
+): Promise<void> {
+  try {
+    await identityRuntime.unlockWithPin(accountId, pin);
+    await completeLogin();
+  } catch {
+    await replaceSessionWithPassword(loginId, password);
+  }
+}
+
+async function replaceSessionWithPassword(
+  account: string,
+  password: string,
+): Promise<void> {
+  await identityRuntime.loginWithPassword(account, password);
+  await completeLogin();
+}
+
+async function maintainRecoveryPreKeys(expectedEpoch: number): Promise<number> {
+  const actorPtid = requireCurrentActor();
+  const rendererGeneration = usePrivateMomentsStore.getState().scope.rendererGeneration;
+  const result = await invoke<RecoveryPreKeyMaintenanceResult>(
+    'social_private_moments_acceptance_maintain_prekeys',
+    {
+      input: {
+        actor_ptid: actorPtid,
+        renderer_generation: rendererGeneration,
+      },
+    },
+  );
+  const recoveryEpoch = result.data?.recoveryEpoch;
+  const recoveryPreKeyAvailable = result.data?.recoveryPreKeyAvailable;
+  if (
+    result.ok !== true
+    || recoveryEpoch !== expectedEpoch
+    || typeof recoveryPreKeyAvailable !== 'number'
+    || !Number.isSafeInteger(recoveryPreKeyAvailable)
+    || recoveryPreKeyAvailable < 1
+  ) {
+    throw new Error('secureContentFixture.recoveryPreKeyUnavailable');
+  }
+  return recoveryPreKeyAvailable;
+}
+
+// After an account switch the Station identity can settle a few beats after
+// the session is unlocked. Each late identity event advances the Moments
+// renderer generation, and the new generation's native Secure Content lease
+// activates asynchronously. Capturing the lease against a generation whose
+// lease is still activating transiently returns AUTHENTICATION_REQUIRED.
+// Retry with a fresh bootstrap + the latest scope generation until the
+// projection converges and the native lease attests.
+const NATIVE_IDENTITY_SETTLE_TIMEOUT_MS = 30_000;
+const NATIVE_IDENTITY_SETTLE_INTERVAL_MS = 400;
+
+// Refusals that mean "the lease for the current generation is not ready yet"
+// rather than a permanent identity/integrity failure.
+const TRANSIENT_IDENTITY_STATES = new Set([
+  'AUTHENTICATION_REQUIRED',
+  'PRIVATE_RUNTIME_INACTIVE',
+]);
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { window.setTimeout(resolve, ms); });
+}
+
+async function captureNativeRuntimeIdentity(
+  actorPtid: string,
+): Promise<NativeRuntimeIdentityResult> {
+  // Re-bootstrap on every attempt so a late Station identity advances the
+  // projection queue and the read uses the settled generation, not a stale one.
+  await momentsRuntime.bootstrap(actorPtid);
+  const { actorPtid: projectedActorPtid, rendererGeneration } =
+    usePrivateMomentsStore.getState().scope;
+  if (requireCurrentActor() !== actorPtid || projectedActorPtid !== actorPtid
+    || !Number.isSafeInteger(rendererGeneration) || rendererGeneration < 1) {
+    throw new Error('secureContentFixture.accountStorageScopeMismatch');
+  }
+  return invoke<NativeRuntimeIdentityResult>(
+    'social_private_moments_acceptance_runtime_identity',
+    {
+      input: {
+        actor_ptid: actorPtid,
+        renderer_generation: rendererGeneration,
+      },
+    },
+  );
+}
+
+function identityResultState(result: NativeRuntimeIdentityResult): string | undefined {
+  const raw = result.error?.details?.state;
+  return typeof raw === 'string' ? raw : undefined;
+}
+
+async function accountStorageIdentitySha256(): Promise<string> {
+  return captureAccountStorageIdentitySha256(false);
+}
+
+// After switching back to the primary account the Station identity can settle
+// a few beats after unlock and advance the Moments renderer generation while
+// the new generation's native lease activates asynchronously. The restore
+// proof waits for that convergence; first-time captures (before any switch)
+// must fail immediately on a real supervisor/integrity refusal.
+async function restoredAccountStorageIdentitySha256(): Promise<string> {
+  return captureAccountStorageIdentitySha256(true);
+}
+
+async function captureAccountStorageIdentitySha256(allowSettle: boolean): Promise<string> {
+  const actorPtid = requireCurrentActor();
+  const deadline = performance.now() + NATIVE_IDENTITY_SETTLE_TIMEOUT_MS;
+  let result = await captureNativeRuntimeIdentity(actorPtid);
+  while (
+    allowSettle
+    && result.ok !== true
+    && TRANSIENT_IDENTITY_STATES.has(identityResultState(result) ?? '')
+    && performance.now() < deadline
+  ) {
+    await delay(NATIVE_IDENTITY_SETTLE_INTERVAL_MS);
+    result = await captureNativeRuntimeIdentity(actorPtid);
+  }
+  if (result.ok !== true) {
+    const code = result.error?.details?.native_error_code;
+    const state = result.error?.details?.state;
+    const message = result.error?.message;
+    const reason = typeof message === 'string' ? identityRefusalReasons.get(message) : undefined;
+    const diagnostic = [
+      typeof state === 'string' && /^[A-Z][A-Z0-9_]+$/.test(state) ? state : undefined,
+      reason,
+    ].filter((value): value is string => value !== undefined);
+    throw new Error(`secureContentFixture.accountStorageIdentityRejected:${
+      typeof code === 'string' && /^[A-Z][A-Z0-9_]+$/.test(code)
+        ? code : 'NATIVE_IDENTITY_UNAVAILABLE'}${
+      diagnostic.length ? `:${diagnostic.join(':')}` : ''}`);
+  }
+  const digest = requireText(result.data?.accountStorageIdentitySha256, 'accountStorageIdentity');
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    throw new Error('secureContentFixture.accountStorageIdentityInvalid');
+  }
+  return digest;
+}
+
+async function boundStation() {
+  const registry = await api.stationList();
+  const active = registry.entries.find(
+    (entry) => entry.station_peer_id === registry.active_station_peer_id,
+  );
+  const peerId = requireText(active?.station_peer_id, 'stationPeerId');
+  const route = active?.routes.find(
+    (candidate) => candidate.route_id === active.active_route_id,
+  );
+  const activeUrl = requireText(route?.endpoint_origin, 'activeStationUrl')
+    .replace(/\/+$/, '');
+  if (
+    registry.binding?.phase !== 'bound'
+    || registry.binding.station_peer_id !== peerId
+    || registry.binding.active_route_id !== route?.route_id
+    || !Number.isSafeInteger(registry.binding.lifecycle_generation)
+  ) {
+    throw new Error('secureContentFixture.stationBindingIncomplete');
+  }
+  return {
+    generation: registry.binding.lifecycle_generation,
+    peerId,
+    routeId: requireText(route?.route_id, 'stationRouteId'),
+    url: activeUrl,
+  };
+}
+
+export function installAcceptanceHarness(): void {
+  registerAcceptanceHarness('secure-content-fixture', {
+    async restoreSessionWithPassword(input: SessionRestoreInput) {
+      await replaceSessionWithPassword(
+        requireText(input.account, 'account'),
+        requireText(input.password, 'password'),
+      );
+      return {
+        actorPtid: requireCurrentActor(),
+        authenticated: useSessionStore.getState().authenticated,
+      };
+    },
+
+    async prepareAccountSwitch(input: AccountFixtureInput) {
+      const primaryActorPtid = requireCurrentActor();
+      const primaryAccount = await api.accountGetActive();
+      if (
+        !primaryAccount?.id
+        || !accountOwnsActor(primaryAccount, primaryActorPtid)
+      ) {
+        throw new Error('secureContentFixture.primaryAccountMissing');
+      }
+      const primaryStorageIdentitySha256 = await accountStorageIdentitySha256();
+      await api.accountSetPin(primaryAccount.id, requireText(input.pin, 'pin'));
+      let prepared: {
+        secondaryAccountId: string;
+        secondaryActorPtid: string;
+        secondaryStorageIdentitySha256: string;
+      } | undefined;
+      let preparationFailure: unknown;
+      try {
+        await replaceSessionWithPassword(
+          requireText(input.secondaryAccount, 'secondaryAccount'),
+          requireText(input.password, 'password'),
+        );
+        const secondaryActorPtid = requireCurrentActor();
+        const secondaryAccount = await api.accountGetActive();
+        if (!secondaryAccount?.id || !accountOwnsActor(secondaryAccount, secondaryActorPtid)
+          || secondaryAccount.id === primaryAccount.id || secondaryActorPtid === primaryActorPtid) {
+          throw new Error('secureContentFixture.secondaryAccountMissing');
+        }
+        const secondaryStorageIdentitySha256 = await accountStorageIdentitySha256();
+        if (secondaryStorageIdentitySha256 === primaryStorageIdentitySha256) {
+          throw new Error('secureContentFixture.accountStorageIdentityCollision');
+        }
+        await api.accountSetPin(secondaryAccount.id, input.pin);
+        prepared = { secondaryAccountId: secondaryAccount.id, secondaryActorPtid,
+          secondaryStorageIdentitySha256 };
+      } catch (error) {
+        preparationFailure = error;
+      }
+      try {
+        await identityRuntime.unlockWithPin(primaryAccount.id, input.pin);
+        await completeLogin();
+        if (requireCurrentActor() !== primaryActorPtid) {
+          throw new Error('secureContentFixture.primaryAccountRestoreFailed');
+        }
+        if (await restoredAccountStorageIdentitySha256() !== primaryStorageIdentitySha256) {
+          throw new Error('secureContentFixture.primaryStorageRestoreFailed');
+        }
+      } catch (restoreFailure) {
+        if (preparationFailure !== undefined) {
+          throw Object.assign(new Error('secureContentFixture.accountPreparationAndRestoreFailed'),
+            { errors: [preparationFailure, restoreFailure] });
+        }
+        throw restoreFailure;
+      }
+      if (preparationFailure !== undefined) throw preparationFailure;
+      if (!prepared) throw new Error('secureContentFixture.accountPreparationMissing');
+      return {
+        primaryAccountId: primaryAccount.id,
+        primaryActorPtid,
+        primaryStorageIdentitySha256,
+        ...prepared,
+        sessionGeneration: useSessionStore.getState().sessionEpoch,
+      };
+    },
+
+    async switchPreparedAccount(input: PreparedAccountSwitchInput) {
+      const before = useSessionStore.getState();
+      const beforeGeneration = before.sessionEpoch;
+      const stationPeerId = before.stationPeerId;
+      if (!before.authenticated || requireCurrentActor() !== input.outgoingActorPtid
+        || before.sessionEpoch !== input.outgoingSessionEpoch || !/^\d{6}$/.test(input.pin)) {
+        throw new Error('secureContentFixture.accountSwitchScopeMismatch');
+      }
+      await identityRuntime.unlockWithPin(requireText(input.accountId, 'accountId'), input.pin);
+      await completeLogin();
+      const account = await api.accountGetActive();
+      const actorPtid = requireCurrentActor();
+      const storageIdentitySha256 = await accountStorageIdentitySha256();
+      const after = useSessionStore.getState();
+      if (account?.id !== input.accountId || !accountOwnsActor(account, actorPtid)
+        || actorPtid !== input.actorPtid || storageIdentitySha256 !== input.storageIdentitySha256
+        || after.sessionEpoch <= beforeGeneration || after.stationPeerId !== stationPeerId) {
+        throw new Error('secureContentFixture.preparedAccountSwitchFailed');
+      }
+      return { actorPtidSha256: await sha256(actorPtid), storageIdentitySha256,
+        beforeGeneration, afterGeneration: after.sessionEpoch };
+    },
+
+    async roundTripAccountSwitch(input: AccountSwitchInput) {
+      const beforeGeneration = useSessionStore.getState().sessionEpoch;
+      await unlockOrReauth(
+        requireText(input.secondaryAccountId, 'secondaryAccountId'),
+        requireText(input.secondaryLoginId, 'secondaryLoginId'),
+        requireText(input.pin, 'pin'),
+        requireText(input.password, 'password'),
+      );
+      const secondaryActorPtid = requireCurrentActor();
+      if (secondaryActorPtid !== input.secondaryActorPtid) {
+        throw new Error('secureContentFixture.secondaryAccountMismatch');
+      }
+      const secondaryStorageIdentitySha256 = await accountStorageIdentitySha256();
+      const clearedProjectionCount = Object.keys(
+        usePrivateMomentsStore.getState().postsById,
+      ).length;
+      await unlockOrReauth(
+        requireText(input.primaryAccountId, 'primaryAccountId'),
+        requireText(input.primaryLoginId, 'primaryLoginId'),
+        input.pin,
+        input.password,
+      );
+      const primaryActorPtid = requireCurrentActor();
+      const afterGeneration = useSessionStore.getState().sessionEpoch;
+      const primaryStorageIdentitySha256 = await accountStorageIdentitySha256();
+      if (
+        primaryActorPtid !== input.primaryActorPtid
+        || primaryStorageIdentitySha256 !== input.primaryStorageIdentitySha256
+        || secondaryStorageIdentitySha256 !== input.secondaryStorageIdentitySha256
+        || afterGeneration <= beforeGeneration
+      ) {
+        throw new Error('secureContentFixture.accountRoundTripFailed');
+      }
+      return {
+        afterGeneration,
+        beforeGeneration,
+        primaryActorPtidSha256: await sha256(primaryActorPtid),
+        primaryStorageIdentitySha256,
+        secondaryActorPtidSha256: await sha256(secondaryActorPtid),
+        secondaryStorageIdentitySha256,
+        staleProjectionCleared: clearedProjectionCount === 0,
+      };
+    },
+
+    async prepareStationSwitch(input: StationFixtureInput) {
+      const primary = await boundStation();
+      const secondaryUrl = requireText(
+        input.secondaryStationUrl,
+        'secondaryStationUrl',
+      ).replace(/\/+$/, '');
+      if (secondaryUrl === primary.url) {
+        throw new Error('secureContentFixture.secondaryStationMustDiffer');
+      }
+      const discovered = await api.stationAdd(secondaryUrl);
+      const secondary = discovered.entries.find((entry) => (
+        entry.routes.some(
+          (route) => route.endpoint_origin.replace(/\/+$/, '') === secondaryUrl,
+        )
+      ));
+      const secondaryRoute = secondary?.routes.find(
+        (route) => route.endpoint_origin.replace(/\/+$/, '') === secondaryUrl,
+      );
+      const secondaryPeerId = requireText(secondary?.station_peer_id, 'secondaryStationPeerId');
+      return {
+        primaryStationUrl: primary.url,
+        primaryStationPeerId: primary.peerId,
+        secondaryStationUrl: requireText(
+          secondaryRoute?.endpoint_origin,
+          'secondaryStationUrl',
+        ).replace(/\/+$/, ''),
+        secondaryStationPeerId: secondaryPeerId,
+      };
+    },
+
+    async roundTripStationSwitch(input: StationSwitchInput) {
+      const before = await boundStation();
+      const registry = await api.stationList();
+      const secondarySelection = stationRouteForEndpoint(
+        registry.entries,
+        requireText(input.secondaryStationUrl, 'secondaryStationUrl'),
+      );
+      const primarySelection = stationRouteForEndpoint(
+        registry.entries,
+        requireText(input.primaryStationUrl, 'primaryStationUrl'),
+      );
+      await api.stationSetActive(
+        secondarySelection.stationPeerId,
+        secondarySelection.routeId,
+      );
+      await replaceSessionWithPassword(
+        requireText(input.account, 'account'),
+        requireText(input.password, 'password'),
+      );
+      const secondary = await boundStation();
+      await api.stationSetActive(
+        primarySelection.stationPeerId,
+        primarySelection.routeId,
+      );
+      await replaceSessionWithPassword(input.account, input.password);
+      const restored = await boundStation();
+      if (
+        secondary.url !== input.secondaryStationUrl.replace(/\/+$/, '')
+        || restored.url !== input.primaryStationUrl.replace(/\/+$/, '')
+        || restored.generation <= before.generation
+      ) {
+        throw new Error('secureContentFixture.stationRoundTripFailed');
+      }
+      return {
+        generationAfter: restored.generation,
+        generationBefore: before.generation,
+        primaryStationIdentitySha256: await sha256(
+          `${restored.peerId}:${restored.url}`,
+        ),
+        secondaryStationIdentitySha256: await sha256(
+          `${secondary.peerId}:${secondary.url}`,
+        ),
+      };
+    },
+
+    async preparePublisherDeviceRevocation() {
+      const actorPtid = requireCurrentActor();
+      const endpoint = await api.messagingAcceptanceCurrentEndpoint(actorPtid);
+      const deviceId = requireText(endpoint?.device_id, 'publisherDeviceId');
+      const devices = await imServiceV1.device.list();
+      const current = devices.find(
+        (candidate) => candidate.ref?.deviceId === deviceId,
+      );
+      if (
+        !current
+        || current.status !== ActorDeviceStatus.ACTIVE
+        || current.profileVersion <= 0n
+      ) {
+        throw new Error('secureContentFixture.publisherDeviceUnavailable');
+      }
+      return {
+        actorPtid,
+        deviceId,
+        observedProfileVersion: current.profileVersion.toString(),
+      };
+    },
+
+    async revokePublisherDevice(input: DeviceRevokeInput) {
+      const actorPtid = requireCurrentActor();
+      const observedProfileVersion = BigInt(
+        requireText(input.observedProfileVersion, 'observedProfileVersion'),
+      );
+      const revoked = await imServiceV1.device.revoke(
+        requireText(input.deviceId, 'deviceId'),
+        observedProfileVersion,
+      );
+      if (
+        revoked.ref?.deviceId !== input.deviceId
+        || revoked.status !== ActorDeviceStatus.REVOKED
+        || revoked.profileVersion !== observedProfileVersion
+      ) {
+        throw new Error('secureContentFixture.publisherDeviceRevokeFailed');
+      }
+      return {
+        actorPtidSha256: await sha256(actorPtid),
+        deviceIdSha256: await sha256(input.deviceId),
+        observedProfileVersion: observedProfileVersion.toString(),
+        committedProfileVersion: revoked.profileVersion.toString(),
+        revoked: true,
+      };
+    },
+
+    async maintainCurrentRecoveryPreKeys(input: RecoveryAdvanceInput) {
+      if (!Number.isSafeInteger(input.expectedEpoch) || input.expectedEpoch < 1) {
+        throw new Error('secureContentFixture.recoveryEpochInvalid');
+      }
+      const recoveryPreKeyAvailable = await maintainRecoveryPreKeys(input.expectedEpoch);
+      return { recoveryEpoch: input.expectedEpoch, recoveryPreKeyAvailable };
+    },
+
+    async prepareHistoricalRecoveryEpoch() {
+      const revision = await messagingRecoveryService.createAcceptanceRevision();
+      if (!Number.isSafeInteger(revision.recoveryEpoch) || revision.recoveryEpoch < 1) {
+        throw new Error('secureContentFixture.recoveryEpochInvalid');
+      }
+      const recoveryPreKeyAvailable = await maintainRecoveryPreKeys(
+        revision.recoveryEpoch,
+      );
+      return {
+        actorPtid: requireCurrentActor(),
+        backupId: revision.backup.backupId,
+        recoveryEpoch: revision.recoveryEpoch,
+        recoveryPreKeyAvailable,
+      };
+    },
+
+    async advanceHistoricalRecoveryEpoch(input: RecoveryAdvanceInput) {
+      const revision = await messagingRecoveryService.createAcceptanceRevision();
+      if (revision.recoveryEpoch !== input.expectedEpoch + 1) {
+        throw new Error('secureContentFixture.recoveryEpochDidNotAdvance');
+      }
+      const recoveryPreKeyAvailable = await maintainRecoveryPreKeys(
+        revision.recoveryEpoch,
+      );
+      return {
+        actorPtidSha256: await sha256(requireCurrentActor()),
+        backupIdSha256: await sha256(revision.backup.backupId),
+        previousEpoch: input.expectedEpoch,
+        currentEpoch: revision.recoveryEpoch,
+        recoveryPreKeyAvailable,
+      };
+    },
+  });
+}
+
+function stationRouteForEndpoint(
+  entries: Awaited<ReturnType<typeof api.stationList>>['entries'],
+  endpoint: string,
+): { stationPeerId: string; routeId: string } {
+  const normalized = endpoint.replace(/\/+$/, '');
+  for (const entry of entries) {
+    const route = entry.routes.find(
+      (candidate) => candidate.endpoint_origin.replace(/\/+$/, '') === normalized,
+    );
+    if (route) {
+      return {
+        stationPeerId: entry.station_peer_id,
+        routeId: route.route_id,
+      };
+    }
+  }
+  throw new Error('secureContentFixture.stationRouteMissing');
+}

@@ -1,0 +1,298 @@
+# Relay Attachment Lifecycle - Integration
+
+> **Status**: active
+> **Version**: v1.0
+> **Created**: 2026-10-14 | **Updated**: 2026-10-15
+> **Owner**: Node Connectivity
+
+---
+
+## 1. Current Source Mapping
+
+| Current source | Retained responsibility | Target delta |
+|---|---|---|
+| `native/subserver/relay/handler_admin.go` | invitation/enrollment operator actions | generated contract, pagination, observation and idempotency |
+| `native/subserver/relay/handler_station.go` | challenge/register/credential rotation | typed errors and attachment operation readback |
+| Relay `application/service.go` | identity proof, atomic invite consumption, generation | preserve authority; expose unambiguous readback |
+| Relay repository | durable invite/enrollment truth | remains the only enrollment/generation authority |
+| `native/relay/attachment_controller.go` | durable Station attachment intent | single desired-state owner and runtime projection |
+| `native/relay/station_control.go` | enroll, rotate, self-retire and signed route publication | consumes Controller-owned dynamic targets |
+| `native/relay/reservation.go` | independent Circuit v2 reservations | one cancellable worker per Relay target |
+| `native/relay/config.go` | boot-time Relay pool target config | bootstrap import only; Controller state wins afterward |
+| Station Dashboard | Station operator shell | authenticated list/import/delete/retry API and page |
+| Relay role composition | minimal Relay plugin only | embedded Relay Console; no Station application subserver |
+| `access_endpoint.proto` | route/grant/endpoint contracts | consumed unchanged |
+| `station_identity.proto` | logical Station/node proof | consumed unchanged |
+
+## 2. Retained Boundaries
+
+- Relay remains standard Circuit v2, opaque to application payload.
+- Station root/node identity and signed route contracts remain upstream.
+- Relay repository remains the only enrollment/generation authority.
+- Station Access remains the route binding/selection owner for ordinary clients.
+- Direct and Circuit route candidates retain transport-independent Station scope.
+- Relay A and Relay B state remain independent.
+
+Public Social composes its existing two-Station Suite with one reviewed Relay.
+The parent prepares the signed-route observer once, using the canonical
+`peer.VerifyStationRouteAttestation` implementation. At capture start and end,
+it independently verifies both public Circuit routes, Node identities,
+generations, destination SPKI and addresses. The operator-protected Relay stats
+projection exposes only libp2p connection IDs, authenticated Node IDs and local/
+remote multiaddresses. The Relay still has no business route or payload parser.
+
+The source-bound `social-relay-opaque` capability owns a unique capture process
+and directory in the prepared Relay network namespace. Its BPF filter matches
+the actual four-tuples of all authenticated TCP legs for both Nodes, including distinct
+source ports behind a shared NAT. The namespace listener is resolved from the
+reviewed published TCP port through
+the same source/PID-verified container's Docker bindings. Require one container
+port and one to four authenticated connections per Node on that listener; the published
+host port is not a container packet-filter port.
+libp2p may retain simultaneous-dial connections and place streams on either.
+Capture the complete bounded connection set in deterministic identity order,
+never an arbitrary first connection. Both sets must remain identical through
+finish. Every captured tuple is decoded and scanned for plaintext. Each Node
+must have at least one individual tuple with positive payload bytes in both
+directions; idle siblings need not carry traffic, and two opposite one-way
+siblings cannot substitute for a bidirectional leg.
+Immediate packet delivery and complete snapshots avoid an empty kernel-buffer
+readback. Time and file-size limits,
+Linux parent-death signaling, exact PID/start-time checks, SIGINT flush, zero
+kernel drops and child extinction are required; forced, partial, empty or
+single-leg capture cannot pass. Capture artifacts retain the original bytes.
+The original provisioner passes its bound evidence run's environment through
+`SocialRelayFixture.capture_handler` to the parent handler's existing artifact
+writer. The handler snapshots that environment for both pcap and observation
+refs; it does not depend on child-only run variables or mutate the parent's
+process environment. Provisioning identity remains the separate capture scope.
+Capture failures retain an owner-produced stage observation through the
+existing resource-diagnostic boundary. Worker startup diagnostics use a closed
+category projection and the original owned cleanup inventory; arbitrary
+command output, credentials and packet bytes are excluded.
+A missing or over-bound TCP set retains that failing sample: Station/Node identity
+hashes, the exact candidate count, at most four connection/address hashes and
+numeric ports, plus an explicit truncation flag. This diagnostic does not select
+a candidate or retry a snapshot to hide connection churn.
+
+The original Public Suite publishes namespaced content and confirms a
+bilateral comment through real UI. Verified author head, painted receiver
+content, unchanged route/connection identity, positive traffic in both
+directions on both legs and absent exact plaintext markers are one assertion.
+Transport-only qualification and source checks cannot replace that Journey.
+The scenario assigns distinct actor labels to both screenshot/DOM pairs before
+capture finish; the evidence store continues to reject conflicting bytes at
+an existing path.
+
+## 3. Replaced Boundaries
+
+The target state removes these limitations rather than preserving parallel owners:
+
+- boot-only `InviteToken` as the sole attachment setup path;
+- raw credential file path as the Dashboard-facing lifecycle model;
+- Relay JSON DTOs as cross-runtime semantic truth;
+- operator inference from separate enrollment, reservation and route screens;
+- generic fleet/PKI/backup operations product scope.
+
+Configuration files may import initial intents, but runtime and UI read one
+Station Attachment Controller projection afterward.
+
+## 4. Station Dashboard Integration
+
+Allowed:
+
+- list current Node attachments and route candidates;
+- parse/verify invitation package;
+- submit accept/retry/migrate/detach commands;
+- render lifecycle and owner readback.
+
+Forbidden:
+
+- call Relay repository or libp2p objects directly from web code;
+- store invitation/credential plaintext in browser persistence;
+- create Relay invitations with Station admin authority;
+- claim active before runtime projection.
+
+The Dashboard backend talks only to the local Station Attachment Controller.
+
+## 5. Relay Console Integration
+
+Allowed:
+
+- call operator-protected Relay plugin endpoints;
+- issue/list/revoke invitations;
+- list/revoke admitted attachments;
+- render capacity and current observation.
+
+Forbidden:
+
+- mount Station Dashboard application backend;
+- load Actor/Session/Federation/business routes;
+- mutate Station desired state or route visibility;
+- expose application data.
+
+Static console assets are an interface of the Relay plugin's operator listener,
+not a new subserver or runtime role.
+
+## 6. Invitation Handoff
+
+The Relay returns one invitation package with:
+
+- exact Relay identity/origin/dial addresses;
+- intended Station identity;
+- bounded quota;
+- one-time secret.
+
+Transfer may be copy/paste or deep link. The secret belongs in the fragment or
+opaque body, not query/server logs. The invitation remains active until consumed
+or explicitly deleted. Station verifies metadata, completes enrollment and
+persists the short-lived credential before committing desired attachment state.
+The invitation secret is never stored in the Station attachment table.
+
+The invitation does not authorize a client, Session, Federation membership or
+business action.
+
+## 7. Migration And Detach Integration
+
+Migration:
+
+- creates destination attachment B;
+- waits for B active readback;
+- leaves Access route selection unchanged until verified candidates update;
+- retires source A only after explicit operator confirmation.
+
+Detach:
+
+- first disables local reconcile and withdraws route;
+- closes reservation and clears in-memory credential state;
+- invokes Relay self-retire when reachable;
+- persists retirement confirmation before removing the scoped credential file;
+- records remote cleanup pending without reactivating local use.
+
+The control target is removed before the retirement network request. Remote
+cleanup reads the durable target directly without registering it as a dial
+candidate. A pending cleanup retains the scoped credential file for retirement
+only and removes it after remote acknowledgement.
+Cleanup sends the persisted credential before attempting rotation. An expired
+signed credential can confirm the exact already-revoked predecessor; an active
+enrollment requires live authority and one fresh proof-based recovery on 401.
+The conditional retirement cannot revoke a newer enrollment.
+Confirmed cleanup can finish local removal after restart without the deleted
+credential or another Relay request. Repeated deletion of a completed tombstone
+remains detached.
+
+Relay revoke:
+
+- advances generation in Relay repository;
+- invalidates route/grant projections and admission;
+- Station observes terminal reason and destroys local credential.
+
+## 8. Prototype Integration
+
+The canonical `station-dashboard` prototype is replaced in place:
+
+- one Portal card;
+- Station and Relay role surfaces in one demonstration package;
+- no generic Fleet, Trust, Policies, Backup or Operations Service pages;
+- no fake Messaging/Federation management;
+- RAL capability/Journey/state IDs in docs and test selectors;
+- production Dashboard component stack and shared UI Identity.
+
+## 9. Verification
+
+Relay runtime preparation uses the shared
+`tooling/acceptance/provisioners/relay_attachment.py` owner. The original Relay,
+Mobile and public Social provisioners compose it directly and register cleanup
+in their own Suite lifetime. Preparation occurs under already retained service/source
+leases; exact-source equipment still completes before those leases.
+
+The public Social parent selects the declared optional `relay` service through
+its reviewed `fedlab-a` Profile. `SocialRelayFixture` invokes the canonical
+deployment pipeline before the original Station preparation retains leases.
+It then retains the Relay deployment/source leases through the original parent,
+rechecks exact source, protocol and executable identity, and attaches the two
+already prepared Stations. Each Station's container and peer identity is checked
+around attachment preparation. The original joined route generation and public
+dial metadata are retained in an immutable preparation inventory. Private
+Social composes the same Relay equipment and attachment owner, preserving its
+canonical physical schema preparation before actor resolution. Only Public
+Social prepares the opaque capture capability. Federation lifecycle retains
+its original Station-only preparation. This inventory is equipment evidence; it cannot establish actual
+Social traffic, receiver convergence or Relay opacity.
+
+CA additions use unique run-scoped paths, exclusive partial writes and atomic
+no-clobber publication. Cleanup is registered before writing, admits empty
+partial writes, verifies file type/mode/owner and final certificate digest, and
+rejects a replaced Compose container before mutation. It removes only its own
+paths and restarts that same container to retire cached trust. An attempted
+import remains pending in the shared fixture until its original detach callback
+confirms absence. CA removal for that Station and Social notification-runtime
+restoration refuse to destroy retirement dependencies while it is pending.
+The Social parent retains this fixture before equipment can partially fail.
+
+Existing active attachments with the exact Relay origin are reused without
+cleanup ownership. Existing recovering, disabled-but-live or foreign-origin
+attachments remain untouched and prevent replacement. Newly issued invitations
+and imported attachments acquire cleanup before their respective API calls,
+including unknown outcomes. Cleanup verifies the Station identity and unique
+invitation label/origin, detaches through the original Controller, and closes
+unused invitations through the original Relay API with readback. Consumed
+one-use invitations carry no remaining enrollment authority.
+
+These preparation checks do not prove a deployed Circuit journey or Relay
+payload opacity; those remain required product observations.
+
+Source checks:
+
+- role allowlists and prohibited imports;
+- generated contract ownership;
+- no custom mount/forwarding data plane;
+- no browser secret persistence;
+- no attachment mutation of business domains.
+
+Functional checks:
+
+- targeted invitation and mismatch denial;
+- current generation registration/renewal;
+- joined active readback;
+- two-Relay overlap;
+- local detach and Relay revoke;
+- restart/recovery.
+
+Formal proof:
+
+- RAL-G01..RAL-G08;
+- NCP-G07/NCP-G08;
+- native client Direct/Circuit route verification;
+- secret/log/evidence scan and cleanup.
+
+## 10. Proof Status
+
+Implemented source and focused tests prove:
+
+- permanent one-use invitation schema and delete/consume fencing;
+- dynamic per-Relay reservation worker add/remove/retry;
+- credential-before-intent persistence;
+- local-disable-before-remote-cleanup detach ordering;
+- cleanup-pending retry;
+- Station-authenticated idempotent self-retire;
+- Station Dashboard API/build and embedded Relay Console packaging.
+
+The defect regression checks cover:
+
+- registered typed Dashboard path-ID binding;
+- lossless browser JSON invitation-ID create/list/delete;
+- same-Station multiple-Node and cross-Station attachment isolation;
+- transactional primary-key migration on SQLite and temporary PostgreSQL;
+- expired credential and expired delegation recovery through registered HTTP
+  wrappers, real Station/Node signatures and the persisted Station control client;
+- stale JTI, wrong Node and revoked enrollment denial;
+- offline detach removing control targets while preserving other Node intent;
+- preservation of binary Host key bytes.
+
+Still unproven:
+
+- exact-source two-Relay migration through real Station and Relay processes;
+- restart recovery against deployed PostgreSQL and credential storage;
+- native client Direct/Circuit route continuity;
+- production SLOs and browser accessibility/performance evidence.

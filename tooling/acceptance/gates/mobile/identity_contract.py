@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Mechanical W1 PTID and Station identity hard-cut Gate."""
+
+from __future__ import annotations
+
+import os
+import re
+from collections.abc import Iterator
+from pathlib import Path
+
+from tooling.acceptance.core import AcceptanceGate, GateError
+
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+ACTOR_PROTO = REPO_ROOT / "model" / "domain" / "actor" / "actor.proto"
+STATION_IDENTITY_PROTO = (
+    REPO_ROOT / "model" / "domain" / "peer" / "station_identity.proto"
+)
+MOBILE_STATION_COMMAND = (
+    REPO_ROOT / "apps" / "mobile" / "src-tauri" / "src" / "commands" / "station.rs"
+)
+IDENTITY_SOURCE_ROOTS = (
+    REPO_ROOT / "apps" / "mobile" / "src",
+    REPO_ROOT / "apps" / "mobile" / "src-tauri" / "src",
+    REPO_ROOT / "apps" / "desktop" / "src",
+    REPO_ROOT / "apps" / "desktop" / "src-tauri" / "src",
+    REPO_ROOT / "apps" / "station",
+    REPO_ROOT / "packages",
+)
+SOURCE_SUFFIXES = {".go", ".rs", ".ts", ".tsx"}
+EXCLUDED_SOURCE_DIRECTORIES = {
+    ".git", ".next", "__pycache__", "dist", "node_modules", "target",
+}
+PROTO_NON_ACTOR_ID_ALLOWLIST = {
+    Path("model/domain/applet/applet.proto"): {"owner_id"},
+    # Channel envelopes and requester authorization retain external provider
+    # identities. They do not address a Peers Actor or expose its storage ID.
+    Path("model/domain/channel/channel.proto"): {
+        "user_id",
+        "sender_id",
+        "sender_user_id",
+        "provider_user_id",
+        "owner_provider_user_id",
+    },
+    Path("model/domain/oauth/oauth.proto"): {"provider_user_id"},
+    Path("model/domain/oauth/broker_bridge.proto"): {
+        "provider_user_id",
+        "receiver_id",
+    },
+}
+LEGACY_MIGRATION_ALLOWLIST = {
+    Path("apps/station/frame/touch/model/db/automigrate.go"): {
+        "did",
+        "actor_did",
+        "member_did",
+        "sender_did",
+    },
+    Path("apps/station/frame/touch/model/db/automigrate_identity_test.go"): {
+        "actor_did",
+        "member_did",
+        "sender_did",
+    },
+    Path(
+        "apps/station/app/subserver/presence/infrastructure/repo.go"
+    ): {
+        "actor_did",
+        "participant_a_did",
+        "participant_b_did",
+    },
+    Path(
+        "apps/station/app/subserver/presence/infrastructure/"
+        "identity_column_migration_test.go"
+    ): {
+        "actor_did",
+        "member_did",
+    },
+    Path(
+        "apps/station/app/subserver/presence/infrastructure/repo_test.go"
+    ): {
+        "actor_did",
+        "participant_a_did",
+        "participant_b_did",
+    },
+    Path("apps/station/app/subserver/conversation/subserver.go"): {
+        "actor_did",
+    },
+    Path(
+        "apps/station/app/subserver/key_exchange/infrastructure/repo.go"
+    ): {
+        "actor_did",
+    },
+    Path(
+        "apps/station/app/subserver/key_exchange/infrastructure/canonical_store.go"
+    ): {
+        "actor_did",
+    },
+    Path(
+        "apps/station/app/subserver/social/infrastructure/repo_test.go"
+    ): {
+        "actor_did",
+        "ActorDID",
+    },
+    Path(
+        "apps/station/app/subserver/social/infrastructure/"
+        "relationship_schema_test.go"
+    ): {
+        "actor_did",
+        "peer_did",
+    },
+    Path(
+        "apps/station/app/subserver/social/infrastructure/relationship_schema.go"
+    ): {
+        "actor_did",
+        "peer_did",
+    },
+    Path(
+        "apps/station/app/subserver/social/infrastructure/identity_migration.go"
+    ): {
+        "actor_did",
+        "member_did",
+        "sender_did",
+        "receiver_did",
+        "peer_did",
+    },
+    Path(
+        "apps/station/app/subserver/social/infrastructure/"
+        "identity_migration_test.go"
+    ): {
+        "actor_did",
+        "member_did",
+        "sender_did",
+        "receiver_did",
+        "peer_did",
+    },
+}
+FORBIDDEN_DID_ALIAS = re.compile(
+    r"\b(?:actor|subject|sender|receiver|participant_[ab]|participant|target|"
+    r"owner|inviter|invitee|next_owner|member|mentioned|uploader|author|reader|"
+    r"current_user|peer)_dids?\b|"
+    r"\b(?:actor|subject|sender|receiver|participantA|participantB|participant|"
+    r"target|owner|inviter|invitee|nextOwner|member|mentioned|uploader|author|"
+    r"reader|currentUser|peer)Dids?\b",
+    re.IGNORECASE,
+)
+
+
+def fail(message: str) -> None:
+    raise GateError(f"mobile identity contract failed: {message}")
+
+
+def _source_files(root: Path) -> Iterator[Path]:
+    # Prune before descending: build caches and third-party packages are not
+    # first-party identity sources and can contain millions of entries.
+    for directory, children, filenames in os.walk(root):
+        children[:] = sorted(set(children) - EXCLUDED_SOURCE_DIRECTORIES)
+        for filename in sorted(filenames):
+            path = Path(directory) / filename
+            if path.suffix in SOURCE_SUFFIXES:
+                yield path
+
+
+def validate_identity_contract() -> None:
+    actor_proto = ACTOR_PROTO.read_text(encoding="utf-8")
+    actor_ref = re.search(
+        r"message ActorRef \{(?P<body>.*?)\n\}",
+        actor_proto,
+        re.DOTALL,
+    )
+    if actor_ref is None:
+        return fail("ActorRef is missing")
+    body = actor_ref.group("body")
+    if "reserved 1;" not in body or 'reserved "actor_id";' not in body:
+        return fail("ActorRef must reserve former actor_id field 1")
+    if re.search(r"\bactor_id\b\s*=", body):
+        return fail("ActorRef still exposes actor_id")
+    if not re.search(r"\bstring\s+ptid\s*=\s*2\s*;", body):
+        return fail("ActorRef.ptid field 2 is missing")
+
+    forbidden_proto_fields: list[str] = []
+    for path in sorted((REPO_ROOT / "model" / "domain").rglob("*.proto")):
+        relative = path.relative_to(REPO_ROOT)
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            identity_id = re.search(
+                r"\b(?P<type>u?int(?:32|64)|string)\s+"
+                r"([a-z_]*(?:actor|user|sender|recipient|owner|author|"
+                r"member|mentioned|participant|subject|receiver|inviter|"
+                r"invitee|uploader|reader)_ids?)\b",
+                line,
+            )
+            if identity_id and not (
+                identity_id.group("type") == "string"
+                and identity_id.group(2) in PROTO_NON_ACTOR_ID_ALLOWLIST.get(relative, set())
+            ):
+                forbidden_proto_fields.append(f"{relative}:{line_number}")
+            elif re.search(
+                r"\b(?:string|repeated\s+string)\s+[a-z_]*_dids?\b",
+                line,
+            ) or re.search(
+                r"\b(?:string|repeated\s+string)\s+dids?\b",
+                line,
+            ):
+                forbidden_proto_fields.append(f"{relative}:{line_number}")
+    if forbidden_proto_fields:
+        return fail(
+            "public actor_id fields remain: "
+            + ", ".join(forbidden_proto_fields)
+        )
+
+    forbidden_source_aliases: list[str] = []
+    for root in IDENTITY_SOURCE_ROOTS:
+        for path in _source_files(root):
+            relative = path.relative_to(REPO_ROOT)
+            if path.name.endswith(".pb.go") or path.name.endswith("_pb.ts"):
+                continue
+            if relative.parts[:5] == (
+                "apps",
+                "desktop",
+                "src-tauri",
+                "src",
+                "model",
+            ):
+                continue
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(),
+                start=1,
+            ):
+                if FORBIDDEN_DID_ALIAS.search(line):
+                    allowed_tokens = LEGACY_MIGRATION_ALLOWLIST.get(relative, set())
+                    if any(f'"{token}"' in line or token in line for token in allowed_tokens):
+                        continue
+                    forbidden_source_aliases.append(
+                        f"{relative}:{line_number}"
+                    )
+    if forbidden_source_aliases:
+        sample = forbidden_source_aliases[:50]
+        remaining = len(forbidden_source_aliases) - len(sample)
+        suffix = f" (+{remaining} more)" if remaining else ""
+        return fail(
+            "non-canonical DID actor aliases remain: "
+            + ", ".join(sample)
+            + suffix
+        )
+
+    identity_proto = STATION_IDENTITY_PROTO.read_text(encoding="utf-8")
+    required_tokens = (
+        "message StationIdentityRequest",
+        "bytes challenge = 1;",
+        "message StationIdentityStatement",
+        "string station_peer_id = 2;",
+        "string canonical_origin = 3;",
+        "repeated string capabilities = 4;",
+        "int64 issued_at_unix_ms = 5;",
+        "int64 expires_at_unix_ms = 6;",
+        "bytes node_authorization_digest = 7;",
+        "message StationNodeAuthorizationStatement",
+        "string node_peer_id = 2;",
+        "bytes node_public_key = 3;",
+        "uint64 authorization_epoch = 4;",
+        "message StationNodeAuthorization",
+        "bytes station_root_public_key = 2;",
+        "bytes root_signature = 3;",
+        "message StationIdentityResponse",
+        "bytes statement_bytes = 1;",
+        "reserved 2, 3;",
+        "bytes node_signature = 4;",
+        "StationNodeAuthorization node_authorization = 5;",
+    )
+    missing_tokens = [
+        token for token in required_tokens if token not in identity_proto
+    ]
+    if missing_tokens:
+        return fail(
+            "Station identity Proto is incomplete: "
+            + ", ".join(missing_tokens)
+        )
+
+    station_command = MOBILE_STATION_COMMAND.read_text(encoding="utf-8")
+    verifier_tokens = (
+        "verify_station_identity_response_bytes",
+        "verified.station_peer_id",
+        "verified.node_peer_id",
+        "verified.station_root_public_key",
+        "verified.authorization_digest",
+        "verified.authorization_epoch",
+        "verified.capabilities",
+    )
+    missing_verifier_tokens = [
+        token for token in verifier_tokens if token not in station_command
+    ]
+    if missing_verifier_tokens:
+        return fail(
+            "Mobile Rust Station verifier is incomplete: "
+            + ", ".join(missing_verifier_tokens)
+        )
+
+class MobileIdentityContractGate(AcceptanceGate):
+    gate_id = "mobile-identity-contract"
+    phase = "W1 Unified ActorRef identity and Station trust"
+    bom = ("W1",)
+    spec = ("MS-AG01", "MS-AG02")
+
+    def run(self) -> dict[str, object]:
+        validate_identity_contract()
+        self.assert_condition(
+            "mobile_identity_contract",
+            True,
+            "PTID-only ActorRef and signed Station identity contracts are valid",
+        )
+        return {
+            "proven_scope": [
+                "PTID-only ActorRef and signed Station identity contract structure",
+            ],
+            "unproven_scope": [
+                "native Station and session behavior",
+            ],
+        }
+
+
+def main() -> int:
+    return MobileIdentityContractGate().execute()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

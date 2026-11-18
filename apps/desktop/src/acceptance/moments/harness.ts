@@ -1,0 +1,1823 @@
+import { create } from '@bufbuild/protobuf';
+import { invoke } from '@tauri-apps/api/core';
+import {
+  AudienceSchema,
+  Audience_Kind,
+  MentionSchema,
+  ReactionKind,
+  type Audience,
+  type Post,
+} from '../../gen/proto/domain/social/post_pb';
+import type {
+  PrivateMomentMention,
+  PrivateMomentMediaProjection,
+  PrivateMomentProjection,
+  PrivateMomentPublishIntent,
+} from '../../services/privateMomentsNative';
+import { privateMomentsNative } from '../../services/privateMomentsNative';
+import { api } from '../../services/desktop_api';
+import {
+  socialBlockActor,
+  socialFollow,
+  socialUnfollow,
+  socialGetRelationshipStatus,
+  socialGetRelationship,
+  socialUnblockActor,
+  type MomentDraft,
+} from '../../services/social_api';
+import {
+  FriendRequestState,
+  SocialRelationshipCommandResultKind,
+} from '../../gen/proto/domain/social/relationship_pb';
+import { useMomentsStore, type MomentComposerDraft } from '../../store/moments';
+import {
+  selectPrivateCommentThread,
+  usePrivateCommentsStore,
+} from '../../store/privateComments';
+import { usePrivateMomentsStore } from '../../store/privateMoments';
+import { decideComposerImageAttachments } from '../../components/moments/composerMediaDecision';
+import { useSessionStore } from '../../store/session';
+import { useFederationStore } from '../../store/federation';
+import { federationRuntime } from '../../runtimes/federationRuntime';
+import { registerAcceptanceHarness } from '../registry';
+import {
+  beginCommentReadReconcile, clearCommentReadReconcile, commentReadReconcileStatus,
+  feedSearchIdentities, reconcileFeedProjection, releaseCommentReadReconcile,
+} from './feedObservation';
+
+declare const __PT_SOURCE_COMMIT__: string;
+
+let rendererArtifactSha256Promise: Promise<string> | null = null;
+const MAX_PROTO_UINT64 = 18_446_744_073_709_551_615n;
+
+interface StagePrivateDraftInput {
+  draftId: string;
+  revision: number;
+  text: string;
+  audienceKind?: keyof typeof PRIVATE_AUDIENCE_BY_NAME;
+  circleId?: string;
+  groupConversationId?: string;
+  baseKind?: 'PUBLIC' | 'FOLLOWERS';
+  actorPtids?: string[];
+  momentKind?: 'TEXT' | 'IMAGE' | 'VIDEO' | 'LINK' | 'REPOST' | 'LOCATION';
+  mentions?: PrivateMomentPublishIntent['mentions'];
+  files?: Array<{
+    intentId: string;
+    filePath: string;
+  }>;
+  link?: PrivateMomentPublishIntent['link'];
+  location?: PrivateMomentPublishIntent['location'];
+  repost?: PrivateMomentPublishIntent['repost'];
+}
+
+const PRIVATE_AUDIENCE_BY_NAME = {
+  FRIENDS: Audience_Kind.FRIENDS,
+  FOLLOWERS: Audience_Kind.FOLLOWERS,
+  CIRCLE: Audience_Kind.CIRCLE,
+  GROUP: Audience_Kind.GROUP,
+  SELF: Audience_Kind.SELF,
+  CUSTOM_ALLOW: Audience_Kind.CUSTOM_ALLOW,
+  CUSTOM_DENY: Audience_Kind.CUSTOM_DENY,
+} as const;
+
+const PRIVATE_REACTION_BY_NAME = {
+  LIKE: ReactionKind.REACTION_LIKE,
+  LOVE: ReactionKind.REACTION_LOVE,
+  LAUGH: ReactionKind.REACTION_LAUGH,
+  WOW: ReactionKind.REACTION_WOW,
+  CELEBRATE: ReactionKind.REACTION_CELEBRATE,
+} as const;
+
+const PRIVATE_COMMENT_RECONCILING_PUBLICATION_STATES = new Set([
+  'PENDING_PUBLICATION',
+  'UNKNOWN_COMMIT',
+  'COMMITTED_PENDING_READBACK',
+]);
+const PRIVATE_COMMENT_RECONCILING_ERROR_CODES = new Set([
+  'SOCIAL_PRIVATE_DEPENDENCY_FAILURE',
+  'COMMENT_READBACK_PENDING',
+]);
+const PRIVATE_COMMENT_RECONCILE_ATTEMPTS = 30;
+
+function audienceName(kind: Audience_Kind): string {
+  return Object.entries(PRIVATE_AUDIENCE_BY_NAME)
+    .find(([, value]) => value === kind)?.[0] ?? 'OTHER';
+}
+
+function privateAudience(input: StagePrivateDraftInput) {
+  const kindName = input.audienceKind ?? 'FRIENDS';
+  const kind = PRIVATE_AUDIENCE_BY_NAME[kindName];
+  let target: Audience['target'];
+  if (kindName === 'CIRCLE') {
+    const circleId = input.circleId;
+    if (
+      !circleId
+      || input.groupConversationId !== undefined
+      || !/^[1-9]\d*$/.test(circleId)
+      || BigInt(circleId) > MAX_PROTO_UINT64
+    ) {
+      throw new Error('moments.acceptance.invalidAudience');
+    }
+    target = { case: 'circleId', value: BigInt(circleId) };
+  } else if (kindName === 'GROUP') {
+    const groupConversationId = input.groupConversationId;
+    if (
+      input.circleId !== undefined
+      || !groupConversationId
+      || groupConversationId.trim() !== groupConversationId
+      || groupConversationId.includes('\0')
+    ) {
+      throw new Error('moments.acceptance.invalidAudience');
+    }
+    target = { case: 'groupConversationId', value: groupConversationId };
+  } else {
+    if (input.circleId !== undefined || input.groupConversationId !== undefined) {
+      throw new Error('moments.acceptance.invalidAudience');
+    }
+    target = { case: undefined };
+  }
+  const baseKind = input.baseKind === 'PUBLIC'
+    ? Audience_Kind.PUBLIC
+    : input.baseKind === 'FOLLOWERS'
+      ? Audience_Kind.FOLLOWERS
+      : Audience_Kind.KIND_UNSPECIFIED;
+  return create(AudienceSchema, {
+    kind,
+    target,
+    baseKind,
+    actorPtids: input.actorPtids ?? [],
+  });
+}
+
+interface PrivateMomentInput {
+  postId: string;
+  openMedia?: boolean;
+}
+
+interface PublicMomentInput {
+  text: string;
+  filePath?: string;
+}
+
+interface ResolveFederatedActorIdentityInput {
+  federationId: string;
+  federatedHandle: string;
+}
+
+interface FederationBindingInput {
+  federationId: string;
+}
+
+interface JoinAcceptanceFederationInput extends FederationBindingInput {
+  federationEndpoint: string;
+}
+
+interface CreateAcceptanceFederationInput {
+  name: string;
+  description: string;
+}
+
+interface LeaveAcceptanceFederationInput extends FederationBindingInput {
+  reason: string;
+}
+
+interface RuntimeIdentityResult {
+  ok: boolean;
+  data?: {
+    bootIdentitySha256?: unknown;
+    sessionGeneration?: unknown;
+    sourceCommit?: unknown;
+    executableSha256?: unknown;
+    stationRuntimeIdentitySha256?: unknown;
+    stationEndpointSha256?: unknown;
+  };
+}
+
+interface AcceptanceCommandResult<T> {
+  ok: boolean;
+  data?: T;
+  error?: { code?: string; message?: string };
+}
+
+interface FederationFixtureStation {
+  stationPeerId: string;
+  stationName: string;
+  stationUrl: string;
+  status: string;
+}
+
+interface FederationFixtureContext {
+  federationId: string;
+  name: string;
+  status: string;
+  policyType: string;
+  headSeq: number;
+  headHash: number[];
+  sequencerStationPeerId: string;
+  myRole: string;
+  capability?: {
+    canInvite: boolean;
+    canApproveJoin: boolean;
+    canUpdatePolicy: boolean;
+    canViewLedger: boolean;
+    canRemoveStation: boolean;
+    canGrantAdmin: boolean;
+    canLeave: boolean;
+    canArchive: boolean;
+  };
+  members: FederationFixtureStation[];
+}
+
+interface FederationFixtureSnapshot {
+  actorPtid: string;
+  federatedHandle: string;
+  homeStationPeerId: string;
+  homeStationDomain: string;
+  federations: FederationFixtureContext[];
+}
+
+async function invokeFederationFixture<T>(
+  command: string,
+  input?: Record<string, unknown>,
+): Promise<T> {
+  const result = await invoke<AcceptanceCommandResult<T>>(
+    command,
+    input === undefined ? undefined : { input },
+  );
+  if (!result.ok || result.data === undefined) {
+    const message = result.error?.message || `${command} failed`;
+    const code = result.error?.code?.trim();
+    throw new Error(code ? `${code}:${message}` : message);
+  }
+  return result.data;
+}
+
+const readFederationFixtureSnapshot = () =>
+  invokeFederationFixture<FederationFixtureSnapshot>(
+    'acceptance_federation_fixture_snapshot',
+  );
+
+async function sha256(value: string | ArrayBuffer): Promise<string> {
+  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function activeSessionIdentity() {
+  const session = useSessionStore.getState();
+  const actorPtid = session.currentUser?.actorPtid?.trim() || undefined;
+  if (
+    !Number.isSafeInteger(session.sessionEpoch)
+    || session.sessionEpoch < 0
+  ) {
+    throw new Error('moments.acceptance.sessionIdentityMissing');
+  }
+  const authenticationState = actorPtid ? 'AUTHENTICATED' : 'ANONYMOUS';
+  return {
+    actorPtid,
+    authenticationState,
+    sessionIdentitySha256: await sha256(JSON.stringify({
+      schemaVersion: 1,
+      authenticationState,
+      actorPtid: actorPtid ?? null,
+      sessionEpoch: session.sessionEpoch,
+    })),
+  };
+}
+
+function rendererArtifactSha256(): Promise<string> {
+  if (rendererArtifactSha256Promise) return rendererArtifactSha256Promise;
+  rendererArtifactSha256Promise = (async () => {
+    const candidates = new Set<string>();
+    for (const script of Array.from(document.scripts)) {
+      if (script.src) {
+        const url = new URL(script.src, window.location.href);
+        if (url.origin === window.location.origin) candidates.add(url.href);
+      }
+    }
+    for (const entry of performance.getEntriesByType('resource')) {
+      const resource = entry as PerformanceResourceTiming;
+      if (resource.initiatorType === 'script' && resource.name) {
+        const url = new URL(resource.name, window.location.href);
+        if (url.origin === window.location.origin) candidates.add(url.href);
+      }
+    }
+    if (candidates.size === 0) {
+      throw new Error('moments.acceptance.rendererArtifactMissing');
+    }
+    const artifacts = await Promise.all(
+      [...candidates].sort().map(async (url) => {
+        const parsed = new URL(url);
+        const response = await fetch(url, {
+          cache: 'no-store',
+          credentials: 'same-origin',
+        });
+        if (!response.ok) {
+          throw new Error('moments.acceptance.rendererArtifactFetchFailed');
+        }
+        return {
+          path: parsed.pathname,
+          sha256: await sha256(await response.arrayBuffer()),
+        };
+      }),
+    );
+    return sha256(JSON.stringify({
+      schemaVersion: 1,
+      sourceCommit: __PT_SOURCE_COMMIT__,
+      artifacts,
+    }));
+  })();
+  return rendererArtifactSha256Promise;
+}
+
+async function nativeRuntimeIdentitySha256(
+  scope: {
+    actorPtid: string | null;
+    rendererGeneration: number;
+  },
+): Promise<{
+  bootIdentitySha256: string;
+  sessionGeneration: number;
+  nativeRuntimeIdentitySha256?: string;
+  stationRuntimeIdentitySha256: string;
+  stationEndpointSha256: string;
+  clientArtifactSha256: string;
+}> {
+  if (
+    !scope.actorPtid
+    || !Number.isSafeInteger(scope.rendererGeneration)
+    || scope.rendererGeneration < 1
+  ) {
+    throw new Error('moments.acceptance.nativeRuntimeIdentityMissing');
+  }
+  const result = await invoke<RuntimeIdentityResult>(
+    'social_private_moments_acceptance_runtime_identity',
+    {
+      input: {
+        actor_ptid: scope.actorPtid,
+        renderer_generation: scope.rendererGeneration,
+      },
+    },
+  );
+  const bootIdentitySha256 = result.data?.bootIdentitySha256;
+  const sessionGeneration = result.data?.sessionGeneration;
+  const sourceCommit = result.data?.sourceCommit;
+  const executableSha256 = result.data?.executableSha256;
+  const stationRuntimeIdentitySha256 =
+    result.data?.stationRuntimeIdentitySha256;
+  const stationEndpointSha256 = result.data?.stationEndpointSha256;
+  if (
+    result.ok !== true
+    || typeof bootIdentitySha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(bootIdentitySha256)
+    || typeof sessionGeneration !== 'number'
+    || !Number.isSafeInteger(sessionGeneration)
+    || sessionGeneration < 1
+    || sourceCommit !== __PT_SOURCE_COMMIT__
+    || typeof executableSha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(executableSha256)
+    || typeof stationRuntimeIdentitySha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(stationRuntimeIdentitySha256)
+    || typeof stationEndpointSha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(stationEndpointSha256)
+  ) {
+    throw new Error('moments.acceptance.nativeRuntimeIdentityMissing');
+  }
+  return {
+    bootIdentitySha256,
+    sessionGeneration,
+    nativeRuntimeIdentitySha256: bootIdentitySha256,
+    stationRuntimeIdentitySha256,
+    stationEndpointSha256,
+    clientArtifactSha256: await sha256(JSON.stringify({
+      schemaVersion: 1,
+      executableSha256,
+      rendererArtifactSha256: await rendererArtifactSha256(),
+      sourceCommit: __PT_SOURCE_COMMIT__,
+    })),
+  };
+}
+
+async function draftEvidence(draft: MomentComposerDraft | null) {
+  if (!draft) {
+    return {
+      present: false,
+      fileCount: 0,
+      files: [],
+    };
+  }
+  return {
+    present: true,
+    draftIdSha256: await sha256(draft.draftId),
+    revision: draft.revision,
+    textSha256: await sha256(draft.text),
+    textByteLength: new TextEncoder().encode(draft.text).byteLength,
+    audienceKind: audienceName(draft.audience.kind),
+    fileCount: draft.files.length,
+    files: await Promise.all(draft.files.map(async (file) => ({
+      intentIdSha256: await sha256(file.intentId),
+      filePathSha256: await sha256(file.filePath),
+    }))),
+  };
+}
+
+async function mediaEvidence(media: PrivateMomentMediaProjection) {
+  let plaintextSha256: string | undefined;
+  let byteLength: number | undefined;
+  if (media.state === 'MEDIA_READY') {
+    if (!media.renderUrl) {
+      throw new Error('moments.acceptance.readyMediaUrlMissing');
+    }
+    if (!media.plaintextSha256 || !/^[0-9a-f]{64}$/.test(media.plaintextSha256)) {
+      throw new Error('moments.acceptance.readyMediaDigestMissing');
+    }
+    if (!Number.isSafeInteger(media.plaintextSize) || (media.plaintextSize ?? 0) <= 0) {
+      throw new Error('moments.acceptance.readyMediaLengthMissing');
+    }
+    plaintextSha256 = media.plaintextSha256;
+    byteLength = media.plaintextSize;
+  }
+  return {
+    objectIdSha256: await sha256(media.objectId),
+    state: media.state,
+    mimeType: media.mimeType,
+    plaintextSha256,
+    byteLength,
+  };
+}
+
+async function privateProjectionEvidence(
+  projection: PrivateMomentProjection,
+) {
+  const content = projection.content;
+  const mentions = projection.mentions ?? [];
+  const text = content?.kind === 'REPOST'
+    ? content.comment
+    : content?.text ?? '';
+  let subtypeEvidence: Record<string, unknown> | undefined;
+  if (content?.kind === 'LINK') {
+    subtypeEvidence = {
+      urlSha256: await sha256(content.url),
+      titleSha256: await sha256(content.title),
+    };
+  } else if (content?.kind === 'REPOST') {
+    subtypeEvidence = {
+      commentSha256: await sha256(content.comment),
+      sourcePostIdSha256: await sha256(content.sourcePostId),
+      sourceAuthorPtidSha256: await sha256(content.sourceAuthorPtid),
+      sourceKind: content.sourceKind,
+      sourceTextSha256: await sha256(content.sourceText),
+    };
+  } else if (content?.kind === 'LOCATION') {
+    subtypeEvidence = {
+      nameSha256: await sha256(content.name),
+      latitudeSha256: await sha256(content.latitude),
+      longitudeSha256: await sha256(content.longitude),
+      addressSha256: await sha256(content.address),
+    };
+  }
+  return {
+    platform: usePrivateMomentsStore.getState().platform,
+    state: projection.state,
+    errorCode: projection.errorCode,
+    remoteDeliveryState: projection.remoteDeliveryState,
+    postIdSha256: await sha256(projection.postId),
+    contentIdSha256: await sha256(projection.contentId),
+    authorPtidSha256: projection.authorPtid
+      ? await sha256(projection.authorPtid)
+      : undefined,
+    generationSha256: await sha256(projection.generation),
+    audienceKind: projection.audienceKind,
+    contentKind: content?.kind,
+    textSha256: content ? await sha256(text) : undefined,
+    textByteLength: content
+      ? new TextEncoder().encode(text).byteLength
+      : undefined,
+    media: content?.kind === 'IMAGE' || content?.kind === 'VIDEO'
+      ? await Promise.all(content.media.map(mediaEvidence))
+      : [],
+    reactions: (projection.reactions ?? []).map((reaction) => ({
+      kind: reaction.kind,
+      count: Number(reaction.count),
+      reactedByViewer: reaction.reactedByViewer,
+    })),
+    reactionsHydrated: projection.reactionsHydrated ?? false,
+    mentionCount: mentions.length,
+    mentionedActorPtidsSha256: await Promise.all(
+      mentions.map((mention) => sha256(mention.actorPtid)),
+    ),
+    subtypeEvidence,
+  };
+}
+
+function publicPostText(post: Post): string {
+  switch (post.content.case) {
+    case 'textPost':
+    case 'imagePost':
+    case 'videoPost':
+    case 'linkPost':
+    case 'locationPost':
+      return post.content.value.text;
+    case 'repostPost':
+      return post.content.value.comment;
+    default:
+      return '';
+  }
+}
+
+async function publicPostEvidence(post: Post) {
+  const text = publicPostText(post);
+  const images = post.content.case === 'imagePost'
+    ? post.content.value.images
+    : [];
+  const media = await Promise.all(images.map(async (image) => {
+    const resolved = await api.ossResolveUrl(image.url);
+    const source = resolved?.data_url || resolved?.url;
+    if (!source) {
+      throw new Error('moments.acceptance.publicMediaResolveFailed');
+    }
+    const response = await fetch(source, {
+      cache: 'no-store',
+      credentials: 'omit',
+    });
+    if (!response.ok) {
+      throw new Error('moments.acceptance.publicMediaFetchFailed');
+    }
+    const bytes = await response.arrayBuffer();
+    return {
+      plaintextSha256: await sha256(bytes),
+      byteLength: bytes.byteLength,
+    };
+  }));
+  return {
+    found: true,
+    postIdSha256: await sha256(post.id),
+    textSha256: await sha256(text),
+    textByteLength: new TextEncoder().encode(text).byteLength,
+    media,
+  };
+}
+
+async function privateCommentEvidence(comment: {
+  authorPtid: string;
+  commentId: string;
+  contentId: string;
+  mentions: PrivateMomentMention[];
+  postId: string;
+  state: string;
+  text: string;
+}) {
+  return {
+    authorPtidSha256: await sha256(comment.authorPtid),
+    commentIdSha256: await sha256(comment.commentId),
+    contentIdSha256: await sha256(comment.contentId),
+    mentionCount: comment.mentions.length,
+    mentionedActorPtidsSha256: await Promise.all(
+      comment.mentions.map((mention) => sha256(mention.actorPtid)),
+    ),
+    postIdSha256: await sha256(comment.postId),
+    state: comment.state,
+    textByteLength: new TextEncoder().encode(comment.text).byteLength,
+    textSha256: await sha256(comment.text),
+  };
+}
+
+async function stagePrivateDraft(input: StagePrivateDraftInput) {
+  if (
+    !input
+    || !input.draftId?.trim()
+    || !Number.isSafeInteger(input.revision)
+    || input.revision < 1
+    || !input.text?.trim()
+  ) {
+    throw new Error('moments.acceptance.invalidDraft');
+  }
+  useMomentsStore.getState().setComposerDraft({
+    draftId: input.draftId,
+    revision: input.revision,
+    text: input.text,
+    audience: privateAudience(input),
+    mentions: (input.mentions ?? []).map(mention => create(MentionSchema, mention)),
+    files: (input.files ?? []).map((file) => ({
+      intentId: file.intentId,
+      filePath: file.filePath,
+      previewSrc: '',
+    })),
+  });
+  return draftEvidence(useMomentsStore.getState().composerDraft);
+}
+
+async function publishPrivateDraft() {
+  const moments = useMomentsStore.getState();
+  const draft = moments.composerDraft;
+  if (!draft) {
+    throw new Error('moments.acceptance.draftMissing');
+  }
+  let transientPostId: string | undefined;
+  let errorMessage: string | undefined;
+  try {
+    const result = await publishTypedPrivateMoment({
+      momentKind: draft.files.length > 0 ? 'IMAGE' : 'TEXT',
+      text: draft.text,
+      files: draft.files,
+      audienceKind: audienceName(draft.audience.kind) as StagePrivateDraftInput['audienceKind'],
+      circleId: draft.audience.target.case === 'circleId' ? String(draft.audience.target.value) : undefined,
+      groupConversationId: draft.audience.target.case === 'groupConversationId' ? draft.audience.target.value : undefined,
+      actorPtids: draft.audience.actorPtids,
+      baseKind: draft.audience.baseKind === Audience_Kind.FOLLOWERS ? 'FOLLOWERS'
+        : draft.audience.baseKind === Audience_Kind.PUBLIC ? 'PUBLIC' : undefined,
+      draftId: draft.draftId,
+      revision: draft.revision,
+      mentions: draft.mentions,
+    });
+    transientPostId = result.transientPostId;
+  } catch (error) {
+    // The production store owns the typed failure projection.
+    errorMessage = error instanceof Error ? error.message : String(error);
+  }
+  const publish = usePrivateMomentsStore.getState().publish;
+  return {
+    platform: usePrivateMomentsStore.getState().platform,
+    state: publish.state,
+    errorCode: publish.errorCode,
+    ...(errorMessage ? { errorMessage } : {}),
+    ...(publish.rejectionEvidence
+      ? { rejectionEvidence: publish.rejectionEvidence }
+      : {}),
+    ...(transientPostId
+      ? {
+          postIdSha256: await sha256(transientPostId),
+          transientPostId,
+        }
+      : {}),
+    draft: await draftEvidence(useMomentsStore.getState().composerDraft),
+  };
+}
+
+async function admitPrivateTextDraft() {
+  const draft = useMomentsStore.getState().composerDraft;
+  const { platform, scope } = usePrivateMomentsStore.getState();
+  if (!draft || draft.files.length || draft.mentions.length) {
+    throw new Error('moments.acceptance.textAdmissionDraftMissing');
+  }
+  if (platform !== 'native' || !scope.actorPtid || scope.rendererGeneration < 1) {
+    throw new Error('moments.acceptance.nativeScopeMissing');
+  }
+  const audience = draft.audience.kind === Audience_Kind.FRIENDS
+    ? { kind: 'FRIENDS' as const }
+    : draft.audience.kind === Audience_Kind.CUSTOM_ALLOW
+      ? { kind: 'CUSTOM_ALLOW' as const, actorPtids: [...draft.audience.actorPtids] }
+      : undefined;
+  if (!audience) throw new Error('moments.acceptance.textAdmissionAudienceUnsupported');
+  const result = await privateMomentsNative.admit({
+    actorPtid: scope.actorPtid,
+    rendererGeneration: scope.rendererGeneration,
+    draftId: draft.draftId,
+    draftRevision: draft.revision,
+    audience,
+    momentKind: 'TEXT',
+    text: draft.text,
+    mentions: [],
+    files: [],
+  });
+  return { state: result.state, draft: await draftEvidence(draft) };
+}
+
+async function publishUnsupportedCustomDenyPublic(
+  input: StagePrivateDraftInput,
+) {
+  if (
+    input.audienceKind !== 'CUSTOM_DENY'
+    || input.baseKind !== 'PUBLIC'
+    || !input.draftId?.trim()
+    || !Number.isSafeInteger(input.revision)
+    || input.revision < 1
+    || !input.text?.trim()
+    || !input.actorPtids?.length
+  ) {
+    throw new Error('moments.acceptance.invalidUnsupportedAudienceProbe');
+  }
+  const privateState = usePrivateMomentsStore.getState();
+  const { actorPtid, rendererGeneration } = privateState.scope;
+  if (
+    privateState.platform !== 'native'
+    || !actorPtid
+    || rendererGeneration < 1
+  ) {
+    throw new Error('moments.acceptance.nativeScopeMissing');
+  }
+
+  // This cast is deliberately confined to the build-gated Acceptance harness:
+  // production callers cannot construct CUSTOM_DENY(PUBLIC).
+  const intent = {
+    actorPtid,
+    rendererGeneration,
+    draftId: input.draftId,
+    draftRevision: input.revision,
+    audience: {
+      kind: 'CUSTOM_DENY',
+      actorPtids: [...input.actorPtids],
+      baseKind: 'PUBLIC',
+    },
+    momentKind: 'TEXT',
+    text: input.text,
+    mentions: [],
+    files: [],
+  } as unknown as PrivateMomentPublishIntent;
+  const result = await privateMomentsNative.publish(intent);
+  if (result.state !== 'PRIVATE_UNSUPPORTED') {
+    throw new Error('moments.acceptance.unsupportedAudienceWasAccepted');
+  }
+  return {
+    platform: privateState.platform,
+    state: result.state,
+    errorCode: result.errorCode,
+    stationErrorCode: result.stationErrorCode,
+    rejectionEvidence: result.evidence,
+  };
+}
+
+async function publishTypedPrivateMoment(input: StagePrivateDraftInput) {
+  if (
+    !input?.draftId?.trim()
+    || !Number.isSafeInteger(input.revision)
+    || input.revision < 1
+    || !input.text?.trim()
+    || !input.momentKind
+  ) {
+    throw new Error('moments.acceptance.invalidTypedPrivateMoment');
+  }
+  const privateState = usePrivateMomentsStore.getState();
+  const { actorPtid, rendererGeneration } = privateState.scope;
+  if (
+    privateState.platform !== 'native'
+    || !actorPtid
+    || rendererGeneration < 1
+  ) {
+    throw new Error('moments.acceptance.nativeScopeMissing');
+  }
+  const base = {
+    audience: privateAudience(input),
+    draftId: input.draftId,
+    draftRevision: input.revision,
+    mentions: (input.mentions ?? []).map((mention) => create(MentionSchema, {
+      actorPtid: mention.actorPtid,
+      offset: mention.offset,
+      length: mention.length,
+      display: mention.display,
+    })),
+  };
+  const localFiles = (input.files ?? []).map((file) => ({
+      intentId: file.intentId,
+      filePath: file.filePath,
+      previewSrc: '',
+  }));
+  let draft: MomentDraft;
+  switch (input.momentKind) {
+    case 'TEXT':
+      draft = { ...base, kind: 'text', text: input.text };
+      break;
+    case 'IMAGE':
+      draft = {
+        ...base,
+        kind: 'image',
+        text: input.text,
+        imageIds: [],
+        localFiles,
+      };
+      break;
+    case 'VIDEO':
+      draft = {
+        ...base,
+        kind: 'video',
+        text: input.text,
+        localFiles,
+      };
+      break;
+    case 'LINK':
+      if (!input.link) throw new Error('moments.acceptance.linkMissing');
+      draft = { ...base, kind: 'link', text: input.text, link: input.link };
+      break;
+    case 'REPOST':
+      if (!input.repost) throw new Error('moments.acceptance.repostMissing');
+      draft = {
+        ...base,
+        kind: 'repost',
+        originalPostId: input.repost.sourcePostId,
+        comment: input.text,
+      };
+      break;
+    case 'LOCATION':
+      if (!input.location) throw new Error('moments.acceptance.locationMissing');
+      draft = {
+        ...base,
+        kind: 'location',
+        text: input.text,
+        location: input.location,
+      };
+      break;
+  }
+  const transientPostId = await useMomentsStore.getState().createPost(draft);
+  const publish = usePrivateMomentsStore.getState().publish;
+  return {
+    platform: privateState.platform,
+    state: publish.state,
+    ...(publish.errorCode ? { errorCode: publish.errorCode } : {}),
+    ...(transientPostId
+      ? {
+          postIdSha256: await sha256(transientPostId),
+          transientPostId,
+        }
+      : {}),
+  };
+}
+
+export function installAcceptanceHarness(): void {
+  rendererArtifactSha256Promise = null;
+  registerAcceptanceHarness('moments', {
+    feedSearchIdentities,
+    reconcileFeedProjection,
+    beginCommentReadReconcile,
+    commentReadReconcileStatus,
+    releaseCommentReadReconcile,
+    clearCommentReadReconcile,
+    async snapshot() {
+      const privateState = usePrivateMomentsStore.getState();
+      const sessionIdentity = await activeSessionIdentity();
+      const runtimeIdentity = await nativeRuntimeIdentitySha256(privateState.scope);
+      return {
+        platform: privateState.platform,
+        sourceCommit: __PT_SOURCE_COMMIT__,
+        authenticationState: sessionIdentity.authenticationState,
+        sessionIdentitySha256: sessionIdentity.sessionIdentitySha256,
+        ...(sessionIdentity.actorPtid
+          ? { actorPtidSha256: await sha256(sessionIdentity.actorPtid) }
+          : {}),
+        ...runtimeIdentity,
+        draft: await draftEvidence(useMomentsStore.getState().composerDraft),
+        publishState: privateState.publish.state,
+        privateProjectionCount: Object.keys(privateState.postsById).length,
+      };
+    },
+
+    async stagePrivateDraft(input: StagePrivateDraftInput) {
+      return stagePrivateDraft(input);
+    },
+
+    async admitPrivateTextDraft() {
+      return admitPrivateTextDraft();
+    },
+
+    async acceptanceActorIdentity() {
+      const actorPtid = useSessionStore.getState().currentUser?.actorPtid?.trim();
+      if (!actorPtid) {
+        throw new Error('moments.acceptance.actorIdentityMissing');
+      }
+      return { actorPtid };
+    },
+
+    async federatedActorIdentity() {
+      const actorPtid = useSessionStore.getState().currentUser?.actorPtid?.trim();
+      const self = await api.profileGet();
+      const federatedHandle = self.federated_handle.trim();
+      const homeStationPeerId = self.home_station_peer_id.trim();
+      if (!actorPtid || !federatedHandle || !homeStationPeerId) {
+        throw new Error('moments.acceptance.federatedActorIdentityMissing');
+      }
+      return { actorPtid, federatedHandle, homeStationPeerId };
+    },
+
+    async resolveFederatedActorIdentity(
+      input: ResolveFederatedActorIdentityInput,
+    ) {
+      const federationId = input.federationId?.trim();
+      const federatedHandle = input.federatedHandle?.trim();
+      if (!federationId) {
+        throw new Error('moments.acceptance.federationIdMissing');
+      }
+      if (!federatedHandle) {
+        throw new Error('moments.acceptance.federatedHandleMissing');
+      }
+      const resolved = await api.federationResolve(federationId, federatedHandle);
+      const actorPtid = resolved.profile?.ref?.ptid.trim();
+      const homeStationPeerId = resolved.homeStationPeerId.trim();
+      const resolvedHandle = resolved.federatedHandle.trim();
+      if (!actorPtid || !homeStationPeerId || !resolvedHandle) {
+        throw new Error('moments.acceptance.federatedActorResolveIncomplete');
+      }
+      return {
+        actorPtid,
+        federatedHandle: resolvedHandle,
+        homeStationPeerId,
+      };
+    },
+
+    async friendshipAuthority() {
+      const [self, federationProjection] = await Promise.all([
+        api.profileGet(),
+        api.federationListContexts(),
+      ]);
+      const homeStationPeerId = self.home_station_peer_id.trim();
+      const federationId = federationProjection.contexts
+        .filter(
+          (federation) => federation.status.trim().toLowerCase() === 'active',
+        )
+        .map((federation) => federation.federationId.trim())
+        .find(Boolean);
+      if (!homeStationPeerId || !federationId) {
+        throw new Error('moments.acceptance.friendshipAuthorityMissing');
+      }
+      return { federationId, homeStationPeerId };
+    },
+
+    async federationFixtureSnapshot() {
+      return readFederationFixtureSnapshot();
+    },
+
+    async reconcileFederationProjection() {
+      const authoritative = await api.federationListContexts();
+      await federationRuntime.reconcile?.('acceptance-federation-lifecycle');
+      const projected = useFederationStore.getState().federations;
+      const authoritativeProjection = authoritative.contexts
+        .map((context) => ({
+          federationId: context.federationId.trim(),
+          name: context.name.trim(),
+          status: context.status.trim(),
+        }))
+        .sort((left, right) =>
+          left.federationId.localeCompare(right.federationId));
+      const currentProjection = projected
+        .map((context) => ({
+          federationId: context.federationId.trim(),
+          name: context.name.trim(),
+          status: context.status.trim(),
+        }))
+        .sort((left, right) =>
+          left.federationId.localeCompare(right.federationId));
+      if (
+        JSON.stringify(currentProjection)
+        !== JSON.stringify(authoritativeProjection)
+      ) {
+        throw new Error('moments.acceptance.federationReconcileIncomplete');
+      }
+      return {
+        reconciled: true,
+        contextCount: currentProjection.length,
+      };
+    },
+
+    async createAcceptanceFederation(input: CreateAcceptanceFederationInput) {
+      const name = input.name?.trim();
+      if (!name) {
+        throw new Error('moments.acceptance.federationNameMissing');
+      }
+      const response = await invokeFederationFixture<{
+        federationId: string;
+      }>('acceptance_federation_fixture_create', {
+        name,
+        description: input.description?.trim() ?? '',
+      });
+      const federationId = response.federationId.trim();
+      if (!federationId) {
+        throw new Error('moments.acceptance.federationCreateIncomplete');
+      }
+      return { federationId };
+    },
+
+    async federationJoinAuthority() {
+      let federationProjection = await readFederationFixtureSnapshot();
+      const homeStationPeerId = federationProjection.homeStationPeerId.trim();
+      if (!homeStationPeerId) {
+        throw new Error('moments.acceptance.friendshipAuthorityMissing');
+      }
+      for (const federation of federationProjection.federations) {
+        const federationId = federation.federationId.trim();
+        const sequencerStationPeerId =
+          federation.sequencerStationPeerId.trim();
+        if (
+          !federationId
+          || !sequencerStationPeerId
+          || federation.status.trim().toLowerCase() !== 'active'
+        ) {
+          continue;
+        }
+        const sequencer = federation.members.find(
+          (station) =>
+            station.stationPeerId.trim() === sequencerStationPeerId
+            && station.status.trim().toLowerCase() === 'active'
+            && Boolean(station.stationUrl.trim()),
+        );
+        if (sequencer) {
+          return {
+            federationEndpoint: sequencer.stationUrl.trim(),
+            federationId,
+            homeStationPeerId,
+          };
+        }
+      }
+      const created = await invokeFederationFixture<{ federationId: string }>(
+        'acceptance_federation_fixture_create',
+        {
+        name: 'Secure Content W8 Fixture',
+        description: 'Acceptance-owned cross-Station Social fixture',
+        },
+      );
+      const federationId = created.federationId.trim();
+      if (!federationId) {
+        throw new Error('moments.acceptance.federationJoinAuthorityMissing');
+      }
+      federationProjection = await readFederationFixtureSnapshot();
+      const createdFederation = federationProjection.federations.find(
+        (federation) => federation.federationId.trim() === federationId,
+      );
+      const sequencer = createdFederation?.members.find(
+        (station) =>
+          station.stationPeerId.trim() === homeStationPeerId
+          && station.status.trim().toLowerCase() === 'active'
+          && Boolean(station.stationUrl.trim()),
+      );
+      if (!sequencer) {
+        throw new Error('moments.acceptance.federationJoinAuthorityMissing');
+      }
+      return {
+        federationEndpoint: sequencer.stationUrl.trim(),
+        federationId,
+        homeStationPeerId,
+      };
+    },
+
+    async federationMemberStations(input: FederationBindingInput) {
+      const federationId = input.federationId?.trim();
+      if (!federationId) {
+        throw new Error('moments.acceptance.federationIdMissing');
+      }
+      const response = await readFederationFixtureSnapshot();
+      const federation = response.federations.find(
+        (candidate) => candidate.federationId.trim() === federationId,
+      );
+      const stationPeerIds = Array.from(new Set(
+        (federation?.members ?? [])
+          .filter((station) => station.status.trim().toLowerCase() === 'active')
+          .map((station) => station.stationPeerId.trim())
+          .filter(Boolean),
+      )).sort();
+      if (stationPeerIds.length === 0) {
+        throw new Error('moments.acceptance.federationMembersMissing');
+      }
+      return { federationId, stationPeerIds };
+    },
+
+    async joinAcceptanceFederation(input: JoinAcceptanceFederationInput) {
+      const federationId = input.federationId?.trim();
+      const federationEndpoint = input.federationEndpoint?.trim();
+      if (!federationId || !federationEndpoint) {
+        throw new Error('moments.acceptance.federationJoinMissing');
+      }
+      const response = await invokeFederationFixture<{
+        status: string;
+        proposalId: string;
+      }>('acceptance_federation_fixture_join', {
+        federation_endpoint: federationEndpoint,
+        federation_id: federationId,
+        message: 'secure-content-w8 remote recipient fixture',
+      });
+      const status = response.status.trim().toLowerCase();
+      if (status !== 'active') {
+        throw new Error('moments.acceptance.federationJoinIncomplete');
+      }
+      return {
+        federationId,
+        status,
+        proposalId: response.proposalId.trim(),
+      };
+    },
+
+    async leaveAcceptanceFederation(input: LeaveAcceptanceFederationInput) {
+      const federationId = input.federationId?.trim();
+      if (!federationId) {
+        throw new Error('moments.acceptance.federationIdMissing');
+      }
+      const response = await invokeFederationFixture<{
+        federationId: string;
+        success: boolean;
+      }>('acceptance_federation_fixture_leave', {
+        federation_id: federationId,
+        reason: input.reason?.trim() ?? '',
+      });
+      if (response.success !== true) {
+        throw new Error('moments.acceptance.federationLeaveIncomplete');
+      }
+      return { federationId, success: true };
+    },
+
+    async deleteAcceptanceFederation(input: FederationBindingInput) {
+      const federationId = input.federationId?.trim();
+      if (!federationId) {
+        throw new Error('moments.acceptance.federationIdMissing');
+      }
+      const response = await invokeFederationFixture<{
+        federationId: string;
+        success: boolean;
+      }>('acceptance_federation_fixture_delete', {
+        federation_id: federationId,
+      });
+      if (response.success !== true) {
+        throw new Error('moments.acceptance.federationDeleteIncomplete');
+      }
+      return { federationId, success: true };
+    },
+
+    async sendFriendRequest(input: {
+      actorPtid: string;
+      federationId: string;
+      homeStationPeerId: string;
+    }) {
+      if (
+        !input.actorPtid?.trim()
+        || !input.federationId?.trim()
+        || !input.homeStationPeerId?.trim()
+      ) {
+        throw new Error('moments.acceptance.actorIdentityMissing');
+      }
+      const response = await api.socialFriendRequestSend({
+        receiverPtid: input.actorPtid,
+        receiverHomeStationPeerId: input.homeStationPeerId,
+        federationId: input.federationId,
+        message: 'secure-content-w7 friendship',
+      });
+      const requestId = response.request?.requestId.trim();
+      if (!requestId) {
+        throw new Error('moments.acceptance.friendRequestMissing');
+      }
+      return { requestId };
+    },
+
+    async acceptFriendRequest(input: { actorPtid: string }) {
+      if (!input.actorPtid?.trim()) {
+        throw new Error('moments.acceptance.actorIdentityMissing');
+      }
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const response = await api.socialFriendRequestList(1, 200, 0);
+        const request = response.requests.find(
+          (candidate) => candidate.sender?.ptid === input.actorPtid,
+        );
+        if (request) {
+          const requestId = request.requestId.trim();
+          const senderHomeStationPeerId =
+            request.senderHomeStationPeerId.trim();
+          const federationId = request.federationId.trim();
+          if (!requestId || !senderHomeStationPeerId || !federationId) {
+            throw new Error('moments.acceptance.friendRequestInvalid');
+          }
+          await api.socialFriendRequestAccept({
+            requestId,
+            senderPtid: input.actorPtid,
+            senderHomeStationPeerId,
+            federationId,
+            message: '',
+          });
+          return { accepted: true, requestId };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      throw new Error('moments.acceptance.friendRequestMissing');
+    },
+
+    async friendshipProjection(input: { actorPtid: string }) {
+      const actorPtid = input?.actorPtid?.trim();
+      if (!actorPtid) {
+        throw new Error('moments.acceptance.actorIdentityMissing');
+      }
+      const session = await activeSessionIdentity();
+      const currentActorPtid = session.actorPtid;
+      if (!currentActorPtid) {
+        throw new Error('moments.acceptance.sessionIdentityMissing');
+      }
+      const response = await api.socialFriendRequestList(
+        FriendRequestState.ACCEPTED,
+        100,
+        0,
+      );
+      const accepted = response.requests.some((request) => {
+        if (request.state !== FriendRequestState.ACCEPTED) return false;
+        const senderPtid = request.sender?.ptid.trim();
+        const receiverPtid = request.receiver?.ptid.trim();
+        return (
+          senderPtid === currentActorPtid
+          && receiverPtid === actorPtid
+        ) || (
+          receiverPtid === currentActorPtid
+          && senderPtid === actorPtid
+        );
+      });
+      return {
+        actorPtidSha256: await sha256(actorPtid),
+        accepted,
+      };
+    },
+
+    async followActor(input: { actorPtid: string }) {
+      const actorPtid = input?.actorPtid?.trim();
+      if (!actorPtid) {
+        throw new Error('moments.acceptance.actorIdentityMissing');
+      }
+      const response = await socialFollow(actorPtid);
+      if (
+        response.success !== true
+        || response.relationship?.following !== true
+        || response.relationship.targetActorPtid !== actorPtid
+      ) {
+        throw new Error('moments.acceptance.followProjectionMismatch');
+      }
+      return {
+        followed: true,
+        actorPtidSha256: await sha256(actorPtid),
+      };
+    },
+
+    async unfollowActor(input: { actorPtid: string }) {
+      const actorPtid = input?.actorPtid?.trim();
+      if (!actorPtid) throw new Error('moments.acceptance.actorIdentityMissing');
+      const response = await socialUnfollow(actorPtid);
+      const current = await socialGetRelationship(actorPtid);
+      if (!response.success || current.relationship?.following !== false) {
+        throw new Error('moments.acceptance.unfollowProjectionMismatch');
+      }
+      return { following: false, actorPtidSha256: await sha256(actorPtid) };
+    },
+
+    async publicFeedFault(input: {
+      action: 'read' | 'clear' | 'arm';
+      id?: string;
+      kind?: string;
+      target_actor_ptid?: string;
+    }) {
+      return invoke('social_public_feed_acceptance_fault', { input });
+    },
+
+    async publicFeedStatus() {
+      const session = useSessionStore.getState();
+      const identity = {
+        epoch: session.sessionEpoch, actor: session.currentUser?.actorPtid,
+        station: session.stationPeerId,
+      };
+      const status = await invoke<{ pending?: unknown[]; sequence?: unknown }>('social_public_feed_status');
+      const sequence = status.sequence;
+      if (sequence !== undefined && (typeof sequence !== 'string'
+        || !/^(0|[1-9]\d*)$/.test(sequence) || BigInt(sequence) > 18446744073709551615n)) {
+        throw new Error('FEED_HEAD_INVALID');
+      }
+      const current = useSessionStore.getState();
+      if (current.sessionEpoch !== identity.epoch
+        || current.currentUser?.actorPtid !== identity.actor
+        || current.stationPeerId !== identity.station) {
+        throw new Error('MOMENTS_SESSION_STALE');
+      }
+      return { pendingCount: status.pending?.length ?? 0, verifiedSequence: sequence ?? null };
+    },
+
+    async circleProjection() {
+      const session = useSessionStore.getState();
+      const actorPtid = session.currentUser?.actorPtid?.trim();
+      if (!actorPtid) throw new Error('moments.acceptance.actorIdentityMissing');
+      const state = useMomentsStore.getState();
+      const circles = state.circles.map(circle => ({
+        id: String(circle.id),
+        name: circle.name,
+        description: circle.description,
+        memberCount: Number(circle.memberCount),
+        memberPtids: (state.circleMembers[String(circle.id)] ?? []).map(member => member.actorPtid),
+        membersLoaded: Object.prototype.hasOwnProperty.call(state.circleMembers, String(circle.id)),
+        membersError: state.circleMembersErrors[String(circle.id)] ?? null,
+      }));
+      const actorPtidSha256 = await sha256(actorPtid);
+      const current = useSessionStore.getState();
+      if (current.sessionEpoch !== session.sessionEpoch
+        || current.currentUser?.actorPtid?.trim() !== actorPtid
+        || current.stationPeerId !== session.stationPeerId) {
+        throw new Error('MOMENTS_SESSION_STALE');
+      }
+      return { actorPtidSha256, sessionEpoch: session.sessionEpoch, circles };
+    },
+
+    async createAudienceCircle(input: { name: string }) {
+      if (!input.name?.trim()) {
+        throw new Error('moments.acceptance.circleNameMissing');
+      }
+      const circleId = await useMomentsStore.getState().createCircle(input.name);
+      return { circleId };
+    },
+
+    async addAudienceCircleMember(input: {
+      circleId: string;
+      actorPtid: string;
+    }) {
+      if (!input.circleId?.trim() || !input.actorPtid?.trim()) {
+        throw new Error('moments.acceptance.circleMemberInvalid');
+      }
+      await useMomentsStore.getState().addCircleMember(
+        input.circleId,
+        input.actorPtid,
+      );
+      return { added: true };
+    },
+
+    async stageFriendsDraft(input: StagePrivateDraftInput) {
+      return stagePrivateDraft({ ...input, audienceKind: 'FRIENDS' });
+    },
+
+    async publishPrivateDraft() {
+      return publishPrivateDraft();
+    },
+
+    async publishUnsupportedCustomDenyPublic(input: StagePrivateDraftInput) {
+      return publishUnsupportedCustomDenyPublic(input);
+    },
+
+    async publishTypedPrivateMoment(input: StagePrivateDraftInput) {
+      return publishTypedPrivateMoment(input);
+    },
+
+    async probeTypedPrivateMomentRejection(input: StagePrivateDraftInput) {
+      try {
+        const result = await publishTypedPrivateMoment(input);
+        return {
+          rejected: false,
+          state: result.state,
+          errorCode: result.errorCode,
+          transientPostId: result.transientPostId,
+        };
+      } catch {
+        const publish = usePrivateMomentsStore.getState().publish;
+        return {
+          rejected: true,
+          state: publish.state,
+          errorCode: publish.errorCode,
+          transientPostId: publish.postId,
+        };
+      }
+    },
+
+    async publishFriendsDraft() {
+      return publishPrivateDraft();
+    },
+
+    async readPrivateMoment(input: PrivateMomentInput) {
+      if (!input?.postId?.trim()) {
+        throw new Error('moments.acceptance.postIdMissing');
+      }
+      const store = usePrivateMomentsStore.getState();
+      await store.readMoment(input.postId);
+      let projection = usePrivateMomentsStore.getState().postsById[input.postId];
+      if (!projection) {
+        throw new Error('moments.acceptance.privateProjectionMissing');
+      }
+      if (
+        input.openMedia
+        && (
+          projection.content?.kind === 'IMAGE'
+          || projection.content?.kind === 'VIDEO'
+        )
+      ) {
+        for (const media of projection.content.media) {
+          await usePrivateMomentsStore.getState().openMedia(
+            input.postId,
+            media.objectId,
+          );
+        }
+        projection = usePrivateMomentsStore.getState().postsById[input.postId];
+      }
+      if (!projection) {
+        throw new Error('moments.acceptance.privateProjectionMissing');
+      }
+      return privateProjectionEvidence(projection);
+    },
+
+    async reactToPrivateMoment(input: {
+      postId: string;
+      kind: keyof typeof PRIVATE_REACTION_BY_NAME;
+    }) {
+      if (!input?.postId?.trim()) {
+        throw new Error('moments.acceptance.postIdMissing');
+      }
+      const kind = PRIVATE_REACTION_BY_NAME[input.kind];
+      if (kind === undefined) {
+        throw new Error('moments.acceptance.reactionKindInvalid');
+      }
+      const store = useMomentsStore.getState();
+      await store.reactToPost(input.postId, kind);
+      return {
+        reactions: (useMomentsStore.getState().reactions[input.postId] ?? [])
+          .map((reaction) => ({
+            kind: reaction.kind,
+            count: Number(reaction.count),
+            reactedByViewer: reaction.reactedByViewer,
+          })),
+      };
+    },
+
+    async unreactToPrivateMoment(input: {
+      postId: string;
+      kind: keyof typeof PRIVATE_REACTION_BY_NAME;
+    }) {
+      if (!input?.postId?.trim()) {
+        throw new Error('moments.acceptance.postIdMissing');
+      }
+      const kind = PRIVATE_REACTION_BY_NAME[input.kind];
+      if (kind === undefined) {
+        throw new Error('moments.acceptance.reactionKindInvalid');
+      }
+      const store = useMomentsStore.getState();
+      await store.unreactToPost(input.postId, kind);
+      return {
+        reactions: (useMomentsStore.getState().reactions[input.postId] ?? [])
+          .map((reaction) => ({
+            kind: reaction.kind,
+            count: Number(reaction.count),
+            reactedByViewer: reaction.reactedByViewer,
+          })),
+      };
+    },
+
+    async deletePrivateMoment(input: { postId: string }) {
+      if (!input?.postId?.trim()) {
+        throw new Error('moments.acceptance.postIdMissing');
+      }
+      await useMomentsStore.getState().deletePost(input.postId);
+      return {
+        deleted: true,
+        localProjectionPresent: Boolean(
+          usePrivateMomentsStore.getState().postsById[input.postId],
+        ),
+      };
+    },
+
+    async relationshipStatus(input: { actorPtid: string }) {
+      if (!input?.actorPtid?.trim()) {
+        throw new Error('moments.acceptance.relationshipInputInvalid');
+      }
+      const response = await socialGetRelationshipStatus(input.actorPtid);
+      const projection = response.relationship;
+      if (
+        !projection
+        || projection.targetActor?.ptid !== input.actorPtid
+        || projection.revision < 0n
+        || projection.revision > BigInt(Number.MAX_SAFE_INTEGER)
+      ) {
+        throw new Error('moments.acceptance.relationshipStatusInvalid');
+      }
+      return {
+        blockedByViewer: projection.blockedByViewer,
+        revision: Number(projection.revision),
+        interactionAllowed: projection.interactionAllowed,
+        targetActorPtidSha256: await sha256(input.actorPtid),
+      };
+    },
+
+    async blockActor(input: {
+      actorPtid: string;
+      homeStationPeerId: string;
+      observedRevision: number;
+    }) {
+      if (
+        !input?.actorPtid?.trim()
+        || !input?.homeStationPeerId?.trim()
+        || !Number.isSafeInteger(input.observedRevision)
+        || input.observedRevision < 0
+      ) {
+        throw new Error('moments.acceptance.relationshipInputInvalid');
+      }
+      const response = await socialBlockActor({
+        targetActorPtid: input.actorPtid,
+        targetHomeStationPeerId: input.homeStationPeerId,
+        observedRevision: input.observedRevision,
+      });
+      const result = response.result;
+      if (
+        !result
+        || (
+          result.kind
+          !== SocialRelationshipCommandResultKind.COMMITTED
+          && result.kind
+          !== SocialRelationshipCommandResultKind.DUPLICATE
+        )
+        || result.projection?.blockedByViewer !== true
+      ) {
+        throw new Error('moments.acceptance.relationshipBlockFailed');
+      }
+      return {
+        state: 'BLOCKED',
+        revision: Number(result.projection.revision),
+        interactionAllowed: result.projection.interactionAllowed,
+        targetActorPtidSha256: await sha256(input.actorPtid),
+      };
+    },
+
+    async unblockActor(input: {
+      actorPtid: string;
+      homeStationPeerId: string;
+      observedRevision: number;
+    }) {
+      if (
+        !input?.actorPtid?.trim()
+        || !input?.homeStationPeerId?.trim()
+        || !Number.isSafeInteger(input.observedRevision)
+        || input.observedRevision < 0
+      ) {
+        throw new Error('moments.acceptance.relationshipInputInvalid');
+      }
+      const response = await socialUnblockActor({
+        targetActorPtid: input.actorPtid,
+        targetHomeStationPeerId: input.homeStationPeerId,
+        observedRevision: input.observedRevision,
+      });
+      const result = response.result;
+      if (
+        !result
+        || (
+          result.kind
+          !== SocialRelationshipCommandResultKind.COMMITTED
+          && result.kind
+          !== SocialRelationshipCommandResultKind.DUPLICATE
+        )
+        || result.projection?.blockedByViewer !== false
+      ) {
+        throw new Error('moments.acceptance.relationshipUnblockFailed');
+      }
+      return {
+        state: 'UNBLOCKED',
+        revision: Number(result.projection.revision),
+        interactionAllowed: result.projection.interactionAllowed,
+        targetActorPtidSha256: await sha256(input.actorPtid),
+      };
+    },
+
+    async recoverPrivateMoment(input: PrivateMomentInput) {
+      if (!input?.postId?.trim()) {
+        throw new Error('moments.acceptance.postIdMissing');
+      }
+      const store = usePrivateMomentsStore.getState();
+      await store.recoverMoment(input.postId);
+      const projection = usePrivateMomentsStore.getState().postsById[input.postId];
+      if (!projection) {
+        throw new Error('moments.acceptance.privateProjectionMissing');
+      }
+      return privateProjectionEvidence(projection);
+    },
+
+    async submitPrivateComment(input: {
+      postId: string;
+      text: string;
+      mentions?: PrivateMomentMention[];
+    }) {
+      if (!input?.postId?.trim() || !input?.text?.trim()) {
+        throw new Error('moments.acceptance.privateCommentInvalid');
+      }
+      const store = usePrivateCommentsStore.getState();
+      await store.submitComment(input.postId, input.text, undefined, input.mentions ?? []);
+      const thread = selectPrivateCommentThread(
+        usePrivateCommentsStore.getState(),
+        input.postId,
+      );
+      const comment = [...thread.comments]
+        .reverse()
+        .find((candidate) => candidate.text === input.text);
+      if (!comment) {
+        throw new Error('moments.acceptance.privateCommentProjectionMissing');
+      }
+      return privateCommentEvidence(comment);
+    },
+
+    async submitPrivateCommentWithRetry(input: {
+      postId: string;
+      text: string;
+      mentions?: PrivateMomentMention[];
+    }) {
+      if (!input?.postId?.trim() || !input?.text?.trim()) {
+        throw new Error('moments.acceptance.privateCommentInvalid');
+      }
+      let lastError: unknown;
+      for (let attempt = 0; attempt < PRIVATE_COMMENT_RECONCILE_ATTEMPTS; attempt += 1) {
+        const store = usePrivateCommentsStore.getState();
+        try {
+          if (attempt === 0) {
+            await store.submitComment(
+              input.postId,
+              input.text,
+              undefined,
+              input.mentions ?? [],
+            );
+          } else {
+            await store.retryComment(input.postId);
+          }
+        } catch (error) {
+          lastError = error;
+        }
+        const current = usePrivateCommentsStore.getState();
+        const thread = selectPrivateCommentThread(current, input.postId);
+        const comment = [...thread.comments]
+          .reverse()
+          .find((candidate) => candidate.text === input.text);
+        if (comment) {
+          return privateCommentEvidence(comment);
+        }
+        const draftId = current.activeDraftByPost[input.postId];
+        const draft = draftId ? current.draftsById[draftId] : undefined;
+        if (
+          !draft
+          || (
+            !PRIVATE_COMMENT_RECONCILING_PUBLICATION_STATES.has(
+              draft.publicationState ?? '',
+            )
+            && !PRIVATE_COMMENT_RECONCILING_ERROR_CODES.has(
+              draft.errorCode ?? '',
+            )
+          )
+        ) {
+          if (lastError instanceof Error) throw lastError;
+          throw new Error('moments.acceptance.privateCommentProjectionMissing');
+        }
+        if (attempt < PRIVATE_COMMENT_RECONCILE_ATTEMPTS - 1) {
+          await new Promise((resolve) => globalThis.setTimeout(resolve, 1_000));
+        }
+      }
+      if (lastError instanceof Error) throw lastError;
+      throw new Error('moments.acceptance.privateCommentReconcileTimeout');
+    },
+
+    async readPrivateComments(input: {
+      postId: string;
+      refresh?: boolean;
+    }) {
+      if (!input?.postId?.trim()) {
+        throw new Error('moments.acceptance.postIdMissing');
+      }
+      const store = usePrivateCommentsStore.getState();
+      try {
+        await store.loadComments(input.postId, input.refresh !== false);
+      } catch {
+        // The production store owns the typed failure projection.
+      }
+      const thread = selectPrivateCommentThread(
+        usePrivateCommentsStore.getState(),
+        input.postId,
+      );
+      return {
+        comments: await Promise.all(thread.comments.map(privateCommentEvidence)),
+        errorCode: thread.errorCode,
+        hasMore: thread.hasMore,
+        loaded: thread.loaded,
+        state: thread.state,
+      };
+    },
+
+    async replayPrivateCommentLike(input: { postId: string; commentId: string }) {
+      if (!input.postId?.trim() || !input.commentId?.trim()) {
+        throw new Error('moments.acceptance.privateCommentInvalid');
+      }
+      const scope = usePrivateMomentsStore.getState().scope;
+      if (!scope.actorPtid) throw new Error('moments.acceptance.sessionIdentityMissing');
+      const snapshot = await privateMomentsNative.bootstrap({
+        actorPtid: scope.actorPtid,
+        rendererGeneration: scope.rendererGeneration,
+      });
+      const command = snapshot.reactionCommands.find(candidate =>
+        candidate.postId === input.postId && candidate.commentId === input.commentId
+        && candidate.kind === ReactionKind.REACTION_LIKE);
+      if (!command || command.state !== 'REACTION_COMMITTED') {
+        throw new Error('moments.acceptance.committedReactionMissing');
+      }
+      const replays = [];
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (usePrivateMomentsStore.getState().scope !== scope) {
+          throw new Error('moments.acceptance.sessionReplaced');
+        }
+        const result = await privateMomentsNative.retryReaction({
+          actorPtid: scope.actorPtid,
+          rendererGeneration: scope.rendererGeneration,
+          commandId: command.commandId,
+        });
+        if (usePrivateMomentsStore.getState().scope !== scope
+          || result.command.commandId !== command.commandId
+          || result.command.postId !== input.postId
+          || result.command.commentId !== input.commentId
+          || result.command.kind !== command.kind
+          || result.command.operation !== command.operation
+          || result.command.state !== 'REACTION_COMMITTED'
+          || result.command.attemptCount !== command.attemptCount) {
+          throw new Error('moments.acceptance.reactionReplayMismatch');
+        }
+        const like = result.reactions.find(summary => summary.kind === ReactionKind.REACTION_LIKE);
+        replays.push({
+          count: Number(like?.count ?? 0n),
+          liked: like?.reactedByViewer ?? false,
+          projectionRevision: result.projectionRevision,
+        });
+      }
+      if (JSON.stringify(replays[0]) !== JSON.stringify(replays[1])) {
+        throw new Error('moments.acceptance.reactionReplayMismatch');
+      }
+      return {
+        commandIdSha256: await sha256(command.commandId),
+        commentIdSha256: await sha256(input.commentId),
+        state: command.state,
+        operation: command.operation,
+        attemptCount: command.attemptCount,
+        nativeRetryCount: replays.length,
+        replays,
+      };
+    },
+
+    async findPublicMoment(input: PublicMomentInput) {
+      if (!input?.text?.trim()) {
+        throw new Error('moments.acceptance.publicTextMissing');
+      }
+      const store = useMomentsStore.getState();
+      await store.loadFeed('explore', { refresh: true, sort: 'recent' });
+      const current = useMomentsStore.getState();
+      const post = current.feeds.explore.postIds
+        .map((postId) => current.postsById[postId])
+        .find((candidate) => candidate && publicPostText(candidate) === input.text);
+      if (!post) {
+        return {
+          found: false,
+          textSha256: await sha256(input.text),
+          media: [],
+        };
+      }
+      return publicPostEvidence(post);
+    },
+
+    async publishPublicMoment(input: PublicMomentInput) {
+      if (!input?.text?.trim()) {
+        throw new Error('moments.acceptance.publicTextMissing');
+      }
+      const audience = create(AudienceSchema, { kind: Audience_Kind.PUBLIC });
+      let postId: string;
+      if (input.filePath) {
+        // Drive the production composer decision rather than calling a
+        // plaintext uploader directly: if PUBLIC routing ever regresses
+        // to the encryption wrapper, this harness fails too.
+        const decision = await decideComposerImageAttachments({
+          audience,
+          files: [{ filePath: input.filePath }],
+          uploader: (filePath) => api.ossUploadAttachmentSocial(filePath),
+        });
+        if (decision.kind !== 'public-attachments') {
+          throw new Error('moments.acceptance.publicMediaDecisionInvalid');
+        }
+        postId = await useMomentsStore.getState().createPost({
+          kind: 'image',
+          text: input.text,
+          imageIds: decision.imageIds,
+          images: decision.attachments,
+          audience,
+        });
+      } else {
+        postId = await useMomentsStore.getState().createPost({
+          kind: 'text',
+          text: input.text,
+          audience,
+        });
+      }
+      return {
+        published: true,
+        mediaCount: input.filePath ? 1 : 0,
+        transientPostId: postId,
+        postIdSha256: await sha256(postId),
+        textSha256: await sha256(input.text),
+      };
+    },
+
+    async submitPublicComment(input: { postId: string; text: string }) {
+      if (!input?.postId?.trim() || !input?.text?.trim()) {
+        throw new Error('moments.acceptance.publicCommentInvalid');
+      }
+      await useMomentsStore.getState().createComment(input.postId, input.text);
+      const comment = useMomentsStore.getState().comments[input.postId]
+        ?.find(candidate => candidate.content === input.text);
+      if (!comment) throw new Error('moments.acceptance.publicCommentMissing');
+      return { commentId: comment.id, postId: input.postId };
+    },
+
+    async deletePublicMoment(input: { postId: string }) {
+      if (!input?.postId?.trim()) throw new Error('moments.acceptance.postIdMissing');
+      await useMomentsStore.getState().deletePost(input.postId);
+      return { postId: input.postId };
+    },
+
+    async clearLocalState() {
+      const moments = useMomentsStore.getState();
+      moments.clearComposerDraft();
+      const privateMoments = usePrivateMomentsStore.getState();
+      privateMoments.clearPublishState();
+      return {
+        draftPresent: useMomentsStore.getState().composerDraft !== null,
+        publishState: usePrivateMomentsStore.getState().publish.state,
+      };
+    },
+
+  });
+}

@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import urllib.error
+import urllib.request
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable, Dict, Tuple
+
+from ._paths import REPO_ROOT
+from .errors import BlockedError, ProvisioningError
+from .resource_diagnostic import ResourceDiagnostic
+from .evidence_store import (
+    current_artifact_ref,
+    write_current_artifact,
+)
+from .provisioning import ServiceAttestation, utc_now
+
+
+_GENERATED_COVERAGE_REPORT = (
+    "docs/architecture/engineering/acceptance/coverage-report.md"
+)
+PROTOCOL_SOURCE_PATHS = (
+    ":(glob)model/domain/**/*.proto",
+    ":(glob)apps/desktop/src/gen/proto/**/*.ts",
+    ":(glob)apps/station/**/*.pb.go",
+)
+RemoteSourceIdentityProvider = Callable[[str], Tuple[str, str, str]]
+RuntimeVersionProvider = Callable[[str], Dict[str, Any]]
+
+
+def commits_match(actual: str, expected: str) -> bool:
+    return (
+        len(actual) >= 7
+        and len(expected) >= 7
+        and (actual.startswith(expected) or expected.startswith(actual))
+    )
+
+
+def source_proto_digest(root: Path) -> str:
+    tracked = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--",
+            *PROTOCOL_SOURCE_PATHS,
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\0")
+    paths = [root / path.decode() for path in tracked if path]
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def source_workspace_digest(root: Path) -> str:
+    diff = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--binary",
+            "HEAD",
+            "--",
+            ".",
+            f":(exclude){_GENERATED_COVERAGE_REPORT}",
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    ).stdout
+    untracked = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+            f":(exclude){_GENERATED_COVERAGE_REPORT}",
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\0")
+    paths = sorted(
+        path
+        for path in untracked
+        if path and path.decode() != _GENERATED_COVERAGE_REPORT
+    )
+    if not diff and not paths:
+        return "clean"
+
+    digest = hashlib.sha256()
+    digest.update(diff)
+    for raw_path in paths:
+        path = root / raw_path.decode()
+        digest.update(raw_path)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def read_service_version(service_url: str) -> dict[str, Any]:
+    url = f"{service_url.rstrip('/')}/app-meta/version"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as error:
+        raise BlockedError(
+            reason=f"Station runtime identity is unavailable at {url}: {error}",
+            resource=f"station-identity:{url}",
+            diagnostic=ResourceDiagnostic.observed(
+                owner="service-attestation",
+                recovery_action=f"Restore the service version endpoint {url} and repeat source attestation.",
+                resource=f"station-identity:{url}",
+                expected={"endpoint": url, "response": "version-object"},
+                observed={"errorType": type(error).__name__, "httpStatus": getattr(error, "code", None)},
+            ),
+        ) from error
+    data = payload.get("data") if isinstance(payload, dict) else None
+    version = data if isinstance(data, dict) else payload
+    if not isinstance(version, dict):
+        raise BlockedError(
+            reason=f"Station runtime identity at {url} is not a JSON object",
+            resource=f"station-identity:{url}",
+            diagnostic=ResourceDiagnostic.observed(
+                owner="service-attestation",
+                recovery_action=f"Repair the version response at {url} before repeating source attestation.",
+                resource=f"station-identity:{url}",
+                expected={"responseType": "dict"},
+                observed={"responseType": type(version).__name__},
+            ),
+        )
+    return version
+
+
+def read_service_runtime_identity(service_url: str) -> str:
+    url = f"{service_url.rstrip('/')}/sub-bootstrap/info"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as error:
+        raise BlockedError(
+            reason=f"Service runtime identity is unavailable at {url}: {error}",
+            resource=f"service-identity:{url}",
+        ) from error
+    data = payload.get("data") if isinstance(payload, dict) else None
+    identity = data if isinstance(data, dict) else payload
+    station_peer_id = (
+        str(identity.get("station_peer_id") or "")
+        if isinstance(identity, dict)
+        else ""
+    )
+    node_peer_id = (
+        str(identity.get("node_peer_id") or "")
+        if isinstance(identity, dict)
+        else ""
+    )
+    if not station_peer_id or not node_peer_id:
+        raise BlockedError(
+            reason=(
+                f"Service runtime identity at {url} must expose independent "
+                "station_peer_id and node_peer_id"
+            ),
+            resource=f"service-identity:{url}",
+        )
+    if station_peer_id == node_peer_id:
+        raise BlockedError(
+            reason=(
+                f"Service runtime identity at {url} reuses one PeerID for "
+                "logical Station and physical Node"
+            ),
+            resource=f"service-identity:{url}",
+        )
+    return station_peer_id
+
+
+def _local_source_identity() -> tuple[str, str, str]:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return commit, "clean" if not status else "dirty", source_proto_digest(REPO_ROOT)
+
+
+def produce_station_attestation(
+    *,
+    environment_id: str,
+    run_id: str,
+    service_id: str,
+    station_url: str,
+    profile_env: dict[str, str],
+    require_runtime_identity: bool = False,
+    remote_source_identity_provider: RemoteSourceIdentityProvider | None = None,
+) -> ServiceAttestation:
+    return produce_service_attestation(
+        environment_id=environment_id,
+        run_id=run_id,
+        service_id=service_id,
+        service_kind="station",
+        endpoint=station_url,
+        mode=profile_env.get("PT_STATION_MODE", "local"),
+        deployment_environment=profile_env.get("PT_STATION_DEPLOY_ENV", ""),
+        producer="station-deployment",
+        require_runtime_identity=require_runtime_identity,
+        remote_source_identity_provider=remote_source_identity_provider,
+    )
+
+
+def produce_service_attestation(
+    *,
+    environment_id: str,
+    run_id: str,
+    service_id: str,
+    service_kind: str,
+    endpoint: str,
+    mode: str,
+    deployment_environment: str,
+    producer: str,
+    require_runtime_identity: bool = False,
+    remote_source_identity_provider: RemoteSourceIdentityProvider | None = None,
+    runtime_version_provider: RuntimeVersionProvider | None = None,
+) -> ServiceAttestation:
+    del run_id
+    version = (
+        runtime_version_provider(deployment_environment)
+        if runtime_version_provider is not None
+        else read_service_version(endpoint)
+    )
+    live_commit = str(version.get("build_commit") or "")
+    build_time = str(version.get("build_time") or "")
+    runtime_identity = str(
+        version.get("peer_id")
+        or version.get("station_peer_id")
+        or version.get("service_id")
+        or ""
+    )
+    if require_runtime_identity and not runtime_identity:
+        runtime_identity = read_service_runtime_identity(endpoint)
+    if live_commit.lower() in {"", "unknown"}:
+        raise BlockedError(
+            reason=(
+                f"Service {service_id!r} at {endpoint} does not expose "
+                "a stable build_commit"
+            ),
+            resource=f"service-identity:{service_id}",
+            diagnostic=ResourceDiagnostic.observed(
+                owner=producer,
+                recovery_action=f"Deploy a source-identified {service_kind} build to {deployment_environment or 'local'} and verify its build_commit at {endpoint}.",
+                resource=f"service-identity:{service_id}",
+                expected={"buildCommit": "known-commit", "endpoint": endpoint},
+                observed={"buildCommit": live_commit, "deployment": deployment_environment},
+            ),
+        )
+
+    if mode == "remote":
+        if not deployment_environment:
+            raise BlockedError(
+                reason=(
+                    f"Remote service {service_id!r} is missing its deployment "
+                    "environment"
+                ),
+                resource=f"service-deployment:{service_id}",
+            )
+        if remote_source_identity_provider is None:
+            raise BlockedError(
+                reason=(
+                    f"Remote service {service_id!r} is missing its deployment "
+                    "source identity provider"
+                ),
+                resource=f"service-deployment:{service_id}",
+            )
+        deployed_commit, workspace_digest, proto_digest = (
+            remote_source_identity_provider(deployment_environment)
+        )
+    else:
+        deployed_commit, workspace_digest, proto_digest = _local_source_identity()
+
+    if not commits_match(live_commit, deployed_commit):
+        raise BlockedError(
+            reason=(
+                f"Live service {service_id!r} commit {live_commit} does not match deployment "
+                f"commit {deployed_commit}"
+            ),
+            resource=f"service-attestation:{service_id}",
+            diagnostic=ResourceDiagnostic.observed(
+                owner=producer,
+                recovery_action=f"Deploy the checked {service_kind} source for {deployment_environment or 'local'} and repeat live/deployed commit readback at {endpoint}.",
+                resource=f"service-attestation:{service_id}",
+                expected={"commit": deployed_commit, "deployment": deployment_environment},
+                observed={"commit": live_commit, "endpoint": endpoint},
+            ),
+        )
+    if workspace_digest != "clean":
+        raise BlockedError(
+            reason=f"Service {service_id!r} deployment workspace is dirty",
+            resource=f"service-attestation:{service_id}",
+            diagnostic=ResourceDiagnostic.observed(
+                owner=producer,
+                recovery_action=f"Reconcile owned source changes in {deployment_environment or 'local'} without discarding unrelated work; redeploy and repeat attestation.",
+                resource=f"service-attestation:{service_id}",
+                expected={"workspaceDigest": "clean", "deployment": deployment_environment},
+                observed={"workspaceDigest": workspace_digest, "commit": deployed_commit},
+            ),
+        )
+
+    produced_at = utc_now()
+    payload = ServiceAttestation(
+        service_id=service_id,
+        service_kind=service_kind,
+        environment_id=environment_id,
+        deployment_environment=deployment_environment or "local",
+        endpoint=endpoint.rstrip("/"),
+        live_commit=deployed_commit,
+        workspace_digest=workspace_digest,
+        protocol_digest=proto_digest,
+        artifact_ref={},
+        produced_at=produced_at,
+        producer=producer,
+        build_time=build_time,
+        runtime_identity=runtime_identity,
+    )
+    return persist_service_attestation(payload)
+
+
+def persist_service_attestation(
+    attestation: ServiceAttestation,
+) -> ServiceAttestation:
+    relative_path = (
+        f"runtime/services/{attestation.service_id}/attestation.json"
+    )
+    try:
+        write_current_artifact(
+            relative_path,
+            (
+                json.dumps(attestation.to_dict(), indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8"),
+            repo_root=REPO_ROOT,
+        )
+        artifact_ref = current_artifact_ref(
+            relative_path,
+            repo_root=REPO_ROOT,
+            media_type="application/json",
+        )
+    except ProvisioningError:
+        raise
+    return replace(
+        attestation,
+        artifact_ref=artifact_ref.to_dict(),
+    )

@@ -1,0 +1,1184 @@
+from __future__ import annotations
+
+import copy
+import unittest
+from collections.abc import Mapping
+from typing import Any
+from unittest.mock import Mock, patch
+
+from tooling.acceptance.core import DriverError, GateError
+from tooling.acceptance.gates.mobile.messaging_journey import (
+    MOBILE_WRITE_REVOKED_ERROR_KEY,
+    MobileMessagingJourney,
+    MessagingActor,
+)
+
+
+class FakeMessagingNetwork:
+    def __init__(self) -> None:
+        self.conversations: dict[str, dict[str, Any]] = {}
+        self.messages: dict[str, list[dict[str, Any]]] = {}
+        self.typing: dict[str, dict[str, dict[str, Any]]] = {}
+        self.friend_requests: list[dict[str, Any]] = []
+        self.actors: dict[str, MessagingActor] = {}
+        self.sequence = 0
+
+    def add_conversation(
+        self,
+        conversation_id: str,
+        *,
+        kind: int,
+        owner_ptid: str,
+        member_ptids: list[str],
+        name: str = "",
+    ) -> None:
+        self.conversations[conversation_id] = {
+            "conversationId": conversation_id,
+            "authorityStationId": "station-primary",
+            "kind": kind,
+            "name": name,
+            "ownerPtid": owner_ptid,
+            "memberPtids": member_ptids,
+            "membershipEpoch": 1,
+            "mlsEpoch": 1 if kind == 2 else 0,
+            "active": True,
+            "updatedAtUnixMs": 1,
+        }
+        self.messages.setdefault(conversation_id, [])
+
+
+class FakeMessagingSession:
+    def __init__(
+        self,
+        network: FakeMessagingNetwork,
+        actor: MessagingActor,
+    ) -> None:
+        self.network = network
+        self.actor = actor
+        self.active_station = ""
+        self.refresh_count = 0
+        self.login_emails: list[str] = []
+        self.lifecycle_restart_count = 0
+        self.social_runtime_active = False
+        self.scope_bootstrap_reads_per_refresh = 0
+        self.scope_bootstrap_reads_remaining = 0
+        self.runtime_phase = "ACTIVE"
+        self.lifecycle_scope_phases: list[str] = []
+        self.messaging_projection_reads_while_bootstrapping = 0
+        self.contact_open_inputs: list[dict[str, Any]] = []
+        self.contact_open_preparing_count = 0
+        self.friend_request_send_count = 0
+        self.people_search_queries: list[str] = []
+        self.write_admission_reads = 0
+        self.write_admission_sequence: list[dict[str, Any]] = []
+        self.network.actors[actor.ptid] = actor
+
+    def call_action(
+        self,
+        action: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Any:
+        body = dict(payload or {})
+        if action == "station.add":
+            self.active_station = self.actor.station_peer_id
+            return {
+                "verifiedStationPeerId": self.actor.station_peer_id,
+            }
+        if action == "access.submit":
+            if body["kind"] == "start":
+                return {
+                    "decision": {
+                        "attemptId": f"attempt-{self.actor.client_id}",
+                    },
+                    "session": None,
+                }
+            if body.get("password") != "1":
+                raise AssertionError("unexpected fixture credential")
+            email = body.get("email")
+            if not isinstance(email, str):
+                raise AssertionError("login email must be a string")
+            self.login_emails.append(email)
+            return {
+                "decision": {"state": "ACCESS_DECISION_STATE_GRANTED"},
+                "session": {
+                    "stationPeerId": self.actor.station_peer_id,
+                    "actorPtid": self.actor.ptid,
+                },
+            }
+        if action == "social.people.search":
+            if set(body) != {"query", "federationId"}:
+                raise AssertionError("search requires one explicit Federation context")
+            if body["federationId"] != self.actor.federation_id:
+                raise AssertionError("search Federation context mismatch")
+            query = str(body["query"])
+            self.people_search_queries.append(query)
+            return [
+                {
+                    "ptid": actor.ptid,
+                    "federationId": actor.federation_id,
+                    "homeStationPeerId": actor.station_peer_id,
+                }
+                for actor in self.network.actors.values()
+                if (
+                    (
+                        actor.federated_handle == query
+                        or (
+                            actor.station_peer_id == self.actor.station_peer_id
+                            and actor.role == query
+                        )
+                    )
+                    and actor.federation_id == body["federationId"]
+                )
+            ]
+        if action == "social.request.send":
+            if not self.social_runtime_active:
+                raise GateError("mobile.social.runtimeUnavailable")
+            self.friend_request_send_count += 1
+            receiver = self.network.actors[str(body["receiverPtid"])]
+            if body["receiverHomeStationPeerId"] != receiver.station_peer_id:
+                raise AssertionError("receiver Home Station identity mismatch")
+            if body["federationId"] != "federation-1":
+                raise AssertionError("receiver Federation identity mismatch")
+            self.network.sequence += 1
+            self.network.friend_requests.append(
+                {
+                    "requestId": f"request-{self.network.sequence}",
+                    "federationId": body["federationId"],
+                    "senderPtid": self.actor.ptid,
+                    "receiverPtid": body["receiverPtid"],
+                    "senderHomeStationPeerId": self.actor.station_peer_id,
+                    "receiverHomeStationPeerId": body[
+                        "receiverHomeStationPeerId"
+                    ],
+                    "status": 1,
+                }
+            )
+            return self._social_projection()
+        if action == "social.request.accept":
+            request = next(
+                request
+                for request in self.network.friend_requests
+                if request["requestId"] == body["requestId"]
+            )
+            request["status"] = 2
+            return self._social_projection()
+        if action == "social.contact.open":
+            self.contact_open_inputs.append(body)
+            if self.contact_open_preparing_count > 0:
+                self.contact_open_preparing_count -= 1
+                raise DriverError("mobile.contacts.conversationPreparing")
+            peer_ptid = str(body["peerPtid"])
+            federation_id = body.get("federationId")
+            if federation_id is None:
+                # Local scope: the same-Station relationship is seeded by the
+                # provisioner; no federated friend request is involved.
+                peer = self.network.actors.get(peer_ptid)
+                accepted = (
+                    peer is not None
+                    and peer.station_peer_id == self.actor.station_peer_id
+                )
+            else:
+                federation_id = str(federation_id)
+                accepted = any(
+                    request["status"] == 2
+                    and request["federationId"] == federation_id
+                    and {
+                        request["senderPtid"],
+                        request["receiverPtid"],
+                    }
+                    == {self.actor.ptid, peer_ptid}
+                    for request in self.network.friend_requests
+                )
+            if not accepted:
+                raise AssertionError(
+                    "Contact Direct creation requires an accepted relationship"
+                )
+            conversation_id = "-".join(
+                sorted((self.actor.ptid, peer_ptid))
+            )
+            self.network.add_conversation(
+                conversation_id,
+                kind=1,
+                owner_ptid=self.actor.ptid,
+                member_ptids=[
+                    self.actor.ptid,
+                    peer_ptid,
+                ],
+            )
+            return {"conversationId": conversation_id}
+        if action == "recovery.snapshot":
+            self.write_admission_reads += 1
+            admission = (
+                self.write_admission_sequence.pop(0)
+                if self.write_admission_sequence
+                else {"open": True, "reason": None}
+            )
+            return {
+                "hasActiveRecovery": not admission["open"],
+                "isWriteBlocked": not admission["open"],
+                "writeAdmission": admission,
+                "updatedAtMs": self.write_admission_reads,
+                "states": [],
+            }
+        if action == "social.reconcile":
+            return self._social_projection()
+        if action == "messaging.createGroup":
+            conversation_id = str(body["conversationId"])
+            if body.get("federationId") != self.actor.federation_id:
+                raise AssertionError("Group Federation identity mismatch")
+            self.network.add_conversation(
+                conversation_id,
+                kind=2,
+                owner_ptid=self.actor.ptid,
+                member_ptids=list(body["memberPtids"]),
+                name=str(body["name"]),
+            )
+            return {
+                "conversationId": conversation_id,
+                "commandId": f"create-{conversation_id}",
+                "state": "projected",
+            }
+        if action == "messaging.typing":
+            conversation_id = str(body["conversationId"])
+            self.network.typing.setdefault(conversation_id, {})[
+                self.actor.ptid
+            ] = {
+                "typing": bool(body["isTyping"]),
+                "lastUpdate": 1,
+            }
+            return {
+                "conversationId": conversation_id,
+                "isTyping": bool(body["isTyping"]),
+                "submitted": True,
+            }
+        if action == "social.projection.read":
+            return self._social_projection()
+        if action == "messaging.attachment.stage":
+            return {
+                "stageId": f"stage-{self.actor.client_id}",
+                "filename": body["filename"],
+                "mimeType": body["mimeType"],
+                "plaintextSize": 41,
+                "completed": True,
+            }
+        if action == "messaging.send":
+            self.network.sequence += 1
+            message_id = f"message-{self.network.sequence}"
+            attachment_ids = (
+                [f"attachment-{self.network.sequence}"]
+                if body.get("attachmentStageIds")
+                else []
+            )
+            self.network.messages[str(body["conversationId"])].append(
+                {
+                    "eventId": f"event-{self.network.sequence}",
+                    "eventSequence": self.network.sequence,
+                    "messageId": message_id,
+                    "senderPtid": self.actor.ptid,
+                    "state": "delivered",
+                    "timestampUnixMs": self.network.sequence,
+                    "retracted": False,
+                    "reactions": [],
+                    "readByPtids": [],
+                    "plaintext": body["plaintext"],
+                    "attachments": [
+                        {
+                            "attachmentId": attachment_id,
+                            "filename": "acceptance.txt",
+                            "mimeType": "text/plain",
+                            "plaintextSize": 41,
+                            "availabilityState": "local",
+                        }
+                        for attachment_id in attachment_ids
+                    ],
+                }
+            )
+            return {
+                "conversationId": body["conversationId"],
+                "commandId": f"command-{self.network.sequence}",
+                "messageId": message_id,
+                "attachmentIds": attachment_ids,
+                "state": "pending",
+            }
+        if action == "messaging.interact":
+            message = self._message(
+                str(body["conversationId"]),
+                str(body["messageId"]),
+            )
+            if body["kind"] == "reaction":
+                message["reactions"].append(
+                    {
+                        "actorPtid": self.actor.ptid,
+                        "reaction": body["reaction"],
+                        "createdAtUnixMs": 2,
+                    }
+                )
+            elif body["kind"] == "edit":
+                message["editedText"] = body["plaintext"]
+                message["editedAtUnixMs"] = 2
+            return {
+                "conversationId": body["conversationId"],
+                "commandId": f"interaction-{body['messageId']}",
+                "messageId": body["messageId"],
+                "attachmentIds": [],
+                "state": "pending",
+            }
+        if action == "messaging.read":
+            conversation_id = str(body["conversationId"])
+            for message in self.network.messages[conversation_id]:
+                if message["eventSequence"] <= body["lastReadSequence"]:
+                    message["readByPtids"] = sorted(
+                        {
+                            *message["readByPtids"],
+                            self.actor.ptid,
+                        }
+                    )
+                    message["state"] = "read"
+            return {
+                "conversationId": conversation_id,
+                "lastReadSequence": body["lastReadSequence"],
+                "submitted": True,
+            }
+        if action == "messaging.search":
+            query = str(body["query"])
+            return [
+                copy.deepcopy(message)
+                for message in self.network.messages[str(body["conversationId"])]
+                if query in (
+                    str(message.get("editedText") or "")
+                    or str(message["plaintext"])
+                )
+            ]
+        if action == "messaging.reconcile":
+            return {
+                "deviceEnrolled": True,
+                "processed": 0,
+                "cursor": self.network.sequence,
+                "laneHead": self.network.sequence,
+                "consumerEpoch": 1,
+                "deliveryReceiptSubmitted": False,
+                "commandState": "idle",
+            }
+        if action == "messaging.projection.read":
+            if self.runtime_phase != "ACTIVE":
+                self.messaging_projection_reads_while_bootstrapping += 1
+            return {
+                "runtime": {
+                    "active": True,
+                    "deviceEnrolled": True,
+                    "laneSequence": self.network.sequence,
+                    "consumerEpoch": 1,
+                    "conversationCount": len(self.network.conversations),
+                    "activationGeneration": 1,
+                    "workerPhase": "running",
+                },
+                "conversations": copy.deepcopy(
+                    list(self.network.conversations.values())
+                ),
+                "messages": copy.deepcopy(self.network.messages),
+            }
+        if action == "messaging.attachment.open":
+            return {"state": "ready", "available": True}
+        if action == "lifecycle.restart":
+            self.lifecycle_restart_count += 1
+            self.social_runtime_active = True
+            self.scope_bootstrap_reads_remaining = (
+                self.scope_bootstrap_reads_per_refresh
+            )
+            self.runtime_phase = (
+                "BOOTSTRAPPING"
+                if self.scope_bootstrap_reads_remaining > 0
+                else "ACTIVE"
+            )
+            return {"requested": True, "scope": "webview"}
+        if action == "lifecycle.scope.read":
+            if self.scope_bootstrap_reads_remaining > 0:
+                self.scope_bootstrap_reads_remaining -= 1
+                self.runtime_phase = "BOOTSTRAPPING"
+                actor_ptid = None
+                runtime_station_peer_id = None
+                launch_state = "app-boot"
+            else:
+                self.runtime_phase = "ACTIVE"
+                actor_ptid = self.actor.ptid
+                runtime_station_peer_id = self.actor.station_peer_id
+                launch_state = "shell"
+            self.lifecycle_scope_phases.append(self.runtime_phase)
+            return {
+                "generation": self.lifecycle_restart_count,
+                "phase": self.runtime_phase,
+                "launchState": launch_state,
+                "activeStationPeerId": self.actor.station_peer_id,
+                "activeActorPtid": actor_ptid,
+                "runtimeStationPeerId": runtime_station_peer_id,
+            }
+        raise AssertionError(f"unexpected action: {action}")
+
+    def refresh_webview(self) -> None:
+        self.refresh_count += 1
+        self.social_runtime_active = True
+        self.scope_bootstrap_reads_remaining = (
+            self.scope_bootstrap_reads_per_refresh
+        )
+        self.runtime_phase = (
+            "BOOTSTRAPPING"
+            if self.scope_bootstrap_reads_remaining > 0
+            else "ACTIVE"
+        )
+
+    def switch_to_app_webview(self, timeout: float = 30.0) -> str:
+        del timeout
+        return "WEBVIEW_peers"
+
+    def _message(
+        self,
+        conversation_id: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        return next(
+            message
+            for message in self.network.messages[conversation_id]
+            if message["messageId"] == message_id
+        )
+
+    def _social_projection(self) -> dict[str, Any]:
+        return {
+            "active": self.social_runtime_active,
+            "activeSessionUlid": None,
+            "friendRequests": copy.deepcopy(self.network.friend_requests),
+            "typingPeers": copy.deepcopy(self.network.typing),
+            "peerOnline": {},
+            "lastReconcileAt": 1,
+            "ingress": {
+                "lifecycle": "active",
+                "streamCursor": "event-1",
+                "writeAdmissionOpen": True,
+                "staleDomains": [],
+                "dataQueueDepth": 0,
+                "controlQueueDepth": 0,
+            },
+        }
+
+
+class IncrementingClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def monotonic(self) -> float:
+        self.value += 0.001
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class MobileMessagingJourneyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.network = FakeMessagingNetwork()
+        self.sender = MessagingActor(
+            client_id="sim-ios",
+            role="alice",
+            station_url="https://station-primary.example",
+            station_peer_id="station-primary",
+            ptid="ptid:alice",
+            account_ref="station-account:alice@p.t",
+            federated_handle="@alice@station-primary.example",
+            federation_id="federation-1",
+        )
+        self.receiver = MessagingActor(
+            client_id="sim-ios-peer",
+            role="bob",
+            station_url="https://station-secondary.example",
+            station_peer_id="station-secondary",
+            ptid="ptid:bob",
+            account_ref="station-account:bob@p.t",
+            federated_handle="@bob@station-secondary.example",
+            federation_id="federation-1",
+        )
+        self.sender_session = FakeMessagingSession(self.network, self.sender)
+        self.receiver_session = FakeMessagingSession(
+            self.network,
+            self.receiver,
+        )
+        clock = IncrementingClock()
+        self.journey = MobileMessagingJourney(
+            timeout_seconds=1,
+            poll_interval_seconds=0.01,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+    def test_social_convergence_proves_typing_delivery_and_receipt(self) -> None:
+        self.journey.authenticate(self.sender_session, self.sender, password="1")
+        self.journey.authenticate(
+            self.receiver_session,
+            self.receiver,
+            password="1",
+        )
+
+        result = self.journey.run_social_convergence(
+            sender_session=self.sender_session,
+            receiver_session=self.receiver_session,
+            sender=self.sender,
+            receiver=self.receiver,
+            journey_id="social",
+        )
+
+        self.assertEqual(result["scenario"], "social-convergence")
+        self.assertEqual(result["senderPtid"], "ptid:alice")
+        self.assertEqual(result["receiverPtid"], "ptid:bob")
+        self.assertGreaterEqual(result["deliveryElapsedMs"], 0)
+        self.assertEqual(
+            self.sender_session.contact_open_inputs,
+            [
+                {
+                    "peerPtid": "ptid:bob",
+                    "federationId": "federation-1",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.sender_session.people_search_queries,
+            [self.receiver.federated_handle],
+        )
+        message = self.network.messages[result["conversationId"]][0]
+        self.assertIn("ptid:bob", message["readByPtids"])
+
+    def test_same_station_direct_is_local_and_federation_free(self) -> None:
+        receiver = MessagingActor(
+            client_id="sim-ios-peer",
+            role="bob",
+            station_url=self.sender.station_url,
+            station_peer_id=self.sender.station_peer_id,
+            ptid="ptid:bob",
+            account_ref="station-account:bob@p.t",
+            federated_handle="@bob@station-primary.example",
+            federation_id="",
+        )
+        receiver_session = FakeMessagingSession(self.network, receiver)
+        self.sender_session.social_runtime_active = True
+        receiver_session.social_runtime_active = True
+
+        for _ in range(2):
+            self.journey._create_direct(
+                self.sender_session,
+                receiver_session,
+                self.sender,
+                receiver,
+            )
+
+        # Local scope never performs a federated people search or federated
+        # friend request; the Station derives scope from the shared Station.
+        self.assertEqual(self.sender_session.people_search_queries, [])
+        self.assertEqual(self.sender_session.friend_request_send_count, 0)
+        self.assertEqual(
+            self.sender_session.contact_open_inputs,
+            [{"peerPtid": "ptid:bob"}, {"peerPtid": "ptid:bob"}],
+        )
+        self.assertEqual(
+            self.journey.direct_scope(self.sender, receiver),
+            "local",
+        )
+
+    def test_contact_direct_waits_for_effective_write_admission(self) -> None:
+        self.journey.authenticate(self.sender_session, self.sender, password="1")
+        self.journey.authenticate(
+            self.receiver_session,
+            self.receiver,
+            password="1",
+        )
+        self.sender_session.write_admission_sequence = [
+            {"open": False, "reason": "recovery_projection_blocked"},
+            {"open": False, "reason": "runtime_reconciling"},
+            {"open": True, "reason": None},
+        ]
+
+        result = self.journey.run_social_convergence(
+            sender_session=self.sender_session,
+            receiver_session=self.receiver_session,
+            sender=self.sender,
+            receiver=self.receiver,
+            journey_id="admission",
+        )
+
+        self.assertEqual(self.sender_session.write_admission_reads, 3)
+        self.assertEqual(
+            self.sender_session.contact_open_inputs,
+            [{"peerPtid": "ptid:bob", "federationId": "federation-1"}],
+        )
+        self.assertEqual(result["conversationId"], "ptid:alice-ptid:bob")
+
+    def test_contact_direct_retries_conversation_preparing(self) -> None:
+        self.sender_session.social_runtime_active = True
+        self.receiver_session.social_runtime_active = True
+        self.sender_session.contact_open_preparing_count = 2
+
+        conversation_id = self.journey._create_direct(
+            self.sender_session,
+            self.receiver_session,
+            self.sender,
+            self.receiver,
+        )
+
+        self.assertEqual(conversation_id, "ptid:alice-ptid:bob")
+        self.assertEqual(len(self.sender_session.contact_open_inputs), 3)
+
+    def test_contact_direct_admission_timeout_retains_last_public_reason(
+        self,
+    ) -> None:
+        self.sender_session.write_admission_sequence = [
+            {"open": False, "reason": "runtime_reconciling"},
+        ] * 200
+
+        with self.assertRaisesRegex(
+            GateError,
+            "last reason: runtime_reconciling",
+        ):
+            self.journey._await_write_admission(
+                self.sender_session,
+                "sender contact Direct write admission",
+            )
+        self.assertEqual(self.sender_session.contact_open_inputs, [])
+
+    def test_write_action_skips_reconcile_when_admission_holds(self) -> None:
+        session = Mock()
+        session.call_action.return_value = {"messageId": "m-1"}
+
+        result = self.journey._call_write_action(
+            session,
+            "sim-ios",
+            "messaging.send",
+            {"conversationId": "c1", "plaintext": "hi"},
+            "Direct send",
+        )
+
+        self.assertEqual(result["messageId"], "m-1")
+        session.call_action.assert_called_once_with(
+            "messaging.send",
+            {"conversationId": "c1", "plaintext": "hi"},
+        )
+
+    def test_write_action_retries_once_after_revoked_write_admission(self) -> None:
+        class ReconcileClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 2.0
+                return self.value
+
+            def sleep(self, _seconds: float) -> None:
+                return None
+
+        class RevokedThenOpenSession:
+            def __init__(self) -> None:
+                self.actions: list[str] = []
+                self.send_attempts = 0
+                self.reconcile_calls = 0
+
+            def call_action(self, action: str, body: Any = None) -> Any:
+                self.actions.append(action)
+                if action == "messaging.send":
+                    self.send_attempts += 1
+                    if self.send_attempts == 1:
+                        raise DriverError(
+                            "Mobile Acceptance action 'messaging.send' failed "
+                            f"with {MOBILE_WRITE_REVOKED_ERROR_KEY}"
+                        )
+                    return {"messageId": "m-2"}
+                if action == "social.reconcile":
+                    self.reconcile_calls += 1
+                    return {"reconciled": True}
+                if action == "recovery.snapshot":
+                    # First read is the closed initial snapshot; the poll loop
+                    # then observes stable-open admissions.
+                    if self.reconcile_calls == 0:
+                        return {
+                            "isWriteBlocked": True,
+                            "writeAdmission": {
+                                "open": False,
+                                "reason": "runtime_reconciling",
+                            },
+                            "states": [],
+                        }
+                    return {
+                        "isWriteBlocked": False,
+                        "writeAdmission": {"open": True, "reason": None},
+                        "states": [],
+                    }
+                raise AssertionError(f"unexpected action {action}")
+
+        clock = ReconcileClock()
+        journey = MobileMessagingJourney(
+            timeout_seconds=10,
+            poll_interval_seconds=0.01,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        session = RevokedThenOpenSession()
+
+        result = journey._call_write_action(
+            session,
+            "sim-ios",
+            "messaging.send",
+            {"conversationId": "c1", "plaintext": "hi"},
+            "Direct send",
+        )
+
+        self.assertEqual(result["messageId"], "m-2")
+        self.assertEqual(session.send_attempts, 2)
+        self.assertEqual(session.reconcile_calls, 1)
+        self.assertIn("social.reconcile", session.actions)
+
+    def test_write_action_propagates_non_admission_driver_error(self) -> None:
+        session = Mock()
+        session.call_action.side_effect = DriverError(
+            "acceptance.mobile.actionUnavailable:messaging.send"
+        )
+
+        with self.assertRaises(DriverError):
+            self.journey._call_write_action(
+                session,
+                "sim-ios",
+                "messaging.send",
+                {"conversationId": "c1", "plaintext": "hi"},
+                "Direct send",
+            )
+
+        called_actions = [call.args[0] for call in session.call_action.call_args_list]
+        self.assertNotIn("social.reconcile", called_actions)
+        self.assertEqual(called_actions, ["messaging.send"])
+
+    def test_write_admission_wait_fails_closed_when_barrier_never_reopens(
+        self,
+    ) -> None:
+        class StalledClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.01
+                return self.value
+
+            def sleep(self, _seconds: float) -> None:
+                self.value += 0.01
+
+        session = Mock()
+        session.call_action.side_effect = lambda action, body=None: (
+            {"reconciled": True}
+            if action == "social.reconcile"
+            else {
+                "isWriteBlocked": True,
+                "writeAdmission": {
+                    "open": False,
+                    "reason": "runtime_reconciling",
+                },
+                "states": [],
+            }
+        )
+        clock = StalledClock()
+        journey = MobileMessagingJourney(
+            timeout_seconds=0.05,
+            poll_interval_seconds=0.01,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        with self.assertRaisesRegex(
+            GateError, "write admission did not reopen before timeout"
+        ):
+            journey._wait_for_mobile_write_admission(
+                session, "sim-ios", force_reconcile=True
+            )
+
+    def test_write_admission_open_requires_no_pending_reconcile_state(self) -> None:
+        clean = {
+            "isWriteBlocked": False,
+            "writeAdmission": {"open": True, "reason": None},
+            "states": [],
+        }
+        pending = {
+            "isWriteBlocked": False,
+            "writeAdmission": {"open": True, "reason": None},
+            "states": [{"kind": "event-overflow-reconcile"}],
+        }
+        blocked = {
+            "isWriteBlocked": True,
+            "writeAdmission": {"open": False, "reason": "recovery_projection_blocked"},
+            "states": [],
+        }
+        self.assertTrue(
+            MobileMessagingJourney._write_admission_open(clean)
+        )
+        self.assertFalse(
+            MobileMessagingJourney._write_admission_open(pending)
+        )
+        self.assertFalse(
+            MobileMessagingJourney._write_admission_open(blocked)
+        )
+
+    def test_read_write_action_retries_through_same_admission_guard(self) -> None:
+        session = Mock()
+        session.call_action.side_effect = [
+            DriverError(
+                "Mobile Acceptance action 'messaging.read' failed with "
+                f"{MOBILE_WRITE_REVOKED_ERROR_KEY}"
+            ),
+            {"submitted": True},
+        ]
+
+        with patch.object(
+            self.journey, "_wait_for_mobile_write_admission"
+        ) as wait_admission:
+            result = self.journey._call_write_action(
+                session,
+                "sim-ios-peer",
+                "messaging.read",
+                {"conversationId": "c1", "lastReadSequence": 3},
+                "read receipt",
+            )
+
+        wait_admission.assert_called_once_with(
+            session, "sim-ios-peer", force_reconcile=True
+        )
+        actions = [call.args[0] for call in session.call_action.call_args_list]
+        self.assertEqual(actions, ["messaging.read", "messaging.read"])
+        self.assertTrue(result["submitted"])
+
+    def test_interact_write_action_retries_without_duplicating_other_actions(
+        self,
+    ) -> None:
+        session = Mock()
+        session.call_action.side_effect = [
+            DriverError(
+                "Mobile Acceptance action 'messaging.interact' failed with "
+                f"{MOBILE_WRITE_REVOKED_ERROR_KEY}"
+            ),
+            {"interactionId": "i-1"},
+        ]
+
+        with patch.object(
+            self.journey, "_wait_for_mobile_write_admission"
+        ) as wait_admission:
+            result = self.journey._call_write_action(
+                session,
+                "sim-ios",
+                "messaging.interact",
+                {"kind": "reaction", "conversationId": "c1",
+                 "messageId": "m1", "reaction": "ack", "remove": False},
+                "reaction",
+            )
+
+        wait_admission.assert_called_once()
+        actions = [call.args[0] for call in session.call_action.call_args_list]
+        self.assertEqual(actions, ["messaging.interact", "messaging.interact"])
+        self.assertEqual(result["interactionId"], "i-1")
+
+    def test_call_write_action_rejects_non_gated_action(self) -> None:
+        with self.assertRaisesRegex(
+            GateError, "not a mobile write-admission-gated action"
+        ):
+            self.journey._call_write_action(
+                Mock(),
+                "sim-ios",
+                "social.people.search",
+                {"query": "bob"},
+                "people search",
+            )
+
+    def test_authentication_resolves_canonical_station_account_reference(
+        self,
+    ) -> None:
+        self.sender_session.scope_bootstrap_reads_per_refresh = 1
+        self.journey.authenticate(
+            self.sender_session,
+            self.sender,
+            password="1",
+        )
+
+        self.assertEqual(self.sender_session.login_emails, ["alice@p.t"])
+        self.assertEqual(self.sender_session.lifecycle_restart_count, 1)
+        self.assertEqual(self.sender_session.refresh_count, 0)
+        self.assertTrue(self.sender_session.social_runtime_active)
+        self.assertEqual(
+            self.sender_session.lifecycle_scope_phases,
+            ["BOOTSTRAPPING", "ACTIVE"],
+        )
+
+    def test_post_restart_waits_for_full_harness_registration(self) -> None:
+        actor = self.sender
+
+        class Session:
+            def __init__(self) -> None:
+                self.scope_attempts = 0
+                self.social_attempts = 0
+
+            def call_action(
+                self,
+                action: str,
+                _payload: Mapping[str, Any] | None = None,
+            ) -> Any:
+                if action == "lifecycle.restart":
+                    return {"requested": True, "scope": "webview"}
+                if action == "lifecycle.scope.read":
+                    self.scope_attempts += 1
+                    if self.scope_attempts == 1:
+                        raise DriverError(
+                            "acceptance.mobile.actionUnavailable:"
+                            "lifecycle.scope.read"
+                        )
+                    return {
+                        "phase": "ACTIVE",
+                        "activeStationPeerId": actor.station_peer_id,
+                        "runtimeStationPeerId": actor.station_peer_id,
+                        "activeActorPtid": actor.ptid,
+                    }
+                if action == "social.projection.read":
+                    self.social_attempts += 1
+                    if self.social_attempts == 1:
+                        raise DriverError(
+                            "acceptance.mobile.actionUnavailable:"
+                            "social.projection.read"
+                        )
+                    return {
+                        "active": True,
+                        "ingress": {
+                            "lifecycle": "active",
+                            "writeAdmissionOpen": True,
+                            "staleDomains": [],
+                        },
+                    }
+                raise AssertionError(action)
+
+            def refresh_webview(self) -> None:
+                return None
+
+            def switch_to_app_webview(
+                self,
+                timeout: float = 30.0,
+            ) -> str:
+                del timeout
+                return "WEBVIEW_peers"
+
+        session = Session()
+        journey = MobileMessagingJourney(
+            timeout_seconds=0.1,
+            poll_interval_seconds=0.001,
+        )
+
+        journey._activate_authenticated_shell(session, actor)
+
+        self.assertEqual(session.scope_attempts, 2)
+        self.assertEqual(session.social_attempts, 2)
+
+    def test_social_activation_rejects_failed_dependency_without_polling(self) -> None:
+        calls: list[str] = []
+
+        class Session:
+            def call_action(
+                self,
+                action: str,
+                _payload: Mapping[str, Any] | None = None,
+            ) -> Any:
+                calls.append(action)
+                if action == "social.projection.read":
+                    return {"active": False, "ingress": None}
+                if action == "lifecycle.snapshot":
+                    return {
+                        "runtimes": [
+                            {
+                                "id": "messaging",
+                                "status": "failed",
+                                "errorKey": "mobile.lifecycle.runtimeFailed",
+                            },
+                            {
+                                "id": "social",
+                                "status": "failed",
+                                "errorKey": (
+                                    "mobile.lifecycle.dependencyFailed:messaging"
+                                ),
+                            },
+                        ]
+                    }
+                raise AssertionError(action)
+
+        with self.assertRaisesRegex(
+            GateError,
+            "sim-ios runtime messaging failed",
+        ):
+            self.journey._social_runtime_active(Session(), "sim-ios")
+        self.assertEqual(
+            calls,
+            ["social.projection.read", "lifecycle.snapshot"],
+        )
+
+    def test_social_activation_waits_for_pending_runtime(self) -> None:
+        class Session:
+            def call_action(
+                self,
+                action: str,
+                _payload: Mapping[str, Any] | None = None,
+            ) -> Any:
+                if action == "social.projection.read":
+                    return {"active": False, "ingress": None}
+                if action == "lifecycle.snapshot":
+                    return {
+                        "runtimes": [
+                            {
+                                "id": "messaging",
+                                "status": "bootstrapping",
+                                "errorKey": None,
+                            }
+                        ]
+                    }
+                raise AssertionError(action)
+
+        self.assertFalse(
+            self.journey._social_runtime_active(Session(), "sim-ios")
+        )
+
+    def test_authentication_rejects_non_station_account_reference(self) -> None:
+        malformed = MessagingActor(
+            client_id="sim-ios",
+            role="alice",
+            station_url=self.sender.station_url,
+            station_peer_id=self.sender.station_peer_id,
+            ptid=self.sender.ptid,
+            account_ref="fixture:alice",
+            federated_handle=self.sender.federated_handle,
+            federation_id=self.sender.federation_id,
+        )
+
+        with self.assertRaisesRegex(GateError, "must be Station-owned"):
+            self.journey.authenticate(
+                self.sender_session,
+                malformed,
+                password="1",
+            )
+
+        self.assertEqual(self.sender_session.active_station, "")
+        self.assertEqual(self.sender_session.login_emails, [])
+        self.assertEqual(self.sender_session.lifecycle_restart_count, 0)
+        self.assertEqual(self.sender_session.refresh_count, 0)
+
+    def test_chat_contacts_waits_for_authenticated_runtime_after_restart(
+        self,
+    ) -> None:
+        self.journey.authenticate(self.sender_session, self.sender, password="1")
+        self.journey.authenticate(
+            self.receiver_session,
+            self.receiver,
+            password="1",
+        )
+        self.receiver_session.lifecycle_scope_phases.clear()
+        self.receiver_session.scope_bootstrap_reads_per_refresh = 1
+
+        result = self.journey.run_chat_contacts(
+            sender_session=self.sender_session,
+            receiver_session=self.receiver_session,
+            sender=self.sender,
+            receiver=self.receiver,
+            journey_id="chat",
+        )
+
+        self.assertEqual(result["scenario"], "chat-contacts")
+        for kind in ("direct", "group"):
+            self.assertTrue(result[kind]["restartReadback"])
+            self.assertTrue(result[kind]["searchReadback"])
+            self.assertTrue(result[kind]["interactionReadback"])
+            self.assertTrue(result[kind]["receiptReadback"])
+        self.assertEqual(self.receiver_session.refresh_count, 0)
+        self.assertEqual(
+            self.receiver_session.lifecycle_scope_phases,
+            [
+                "BOOTSTRAPPING",
+                "ACTIVE",
+                "BOOTSTRAPPING",
+                "ACTIVE",
+            ],
+        )
+        self.assertEqual(
+            self.receiver_session.messaging_projection_reads_while_bootstrapping,
+            0,
+        )
+
+    def test_attachment_journey_rejects_public_type_as_private_mime(self) -> None:
+        self.journey.authenticate(self.sender_session, self.sender, password="1")
+        self.journey.authenticate(
+            self.receiver_session, self.receiver, password="1"
+        )
+        original_call = self.receiver_session.call_action
+
+        def read_with_invalid_metadata(
+            action: str, payload: Mapping[str, Any] | None = None
+        ) -> Any:
+            result = original_call(action, payload)
+            if action == "messaging.projection.read":
+                for messages in result["messages"].values():
+                    for message in messages:
+                        for attachment in message["attachments"]:
+                            attachment["mimeType"] = "application/octet-stream"
+            return result
+
+        with patch.object(
+            self.receiver_session, "call_action", side_effect=read_with_invalid_metadata
+        ), self.assertRaisesRegex(GateError, "private metadata changed"):
+            self.journey.run_chat_contacts(
+                sender_session=self.sender_session,
+                receiver_session=self.receiver_session,
+                sender=self.sender,
+                receiver=self.receiver,
+                journey_id="private-mime",
+            )
+
+    def test_authentication_rejects_wrong_fixture_identity(self) -> None:
+        wrong = MessagingActor(
+            client_id="sim-ios",
+            role="alice",
+            station_url=self.sender.station_url,
+            station_peer_id=self.sender.station_peer_id,
+            ptid="ptid:other",
+            account_ref=self.sender.account_ref,
+            federated_handle=self.sender.federated_handle,
+            federation_id=self.sender.federation_id,
+        )
+
+        with self.assertRaisesRegex(GateError, "does not match"):
+            self.journey.authenticate(
+                self.sender_session,
+                wrong,
+                password="1",
+            )
+
+    def test_timeout_remains_a_gate_failure(self) -> None:
+        class EmptySession(FakeMessagingSession):
+            def call_action(
+                self,
+                action: str,
+                payload: Mapping[str, Any] | None = None,
+            ) -> Any:
+                if action == "messaging.projection.read":
+                    return {
+                        "runtime": {},
+                        "conversations": [],
+                        "messages": {},
+                    }
+                return super().call_action(action, payload)
+
+        sender_session = EmptySession(self.network, self.sender)
+        receiver_session = EmptySession(self.network, self.receiver)
+        sender_session.social_runtime_active = True
+        receiver_session.social_runtime_active = True
+
+        with self.assertRaisesRegex(GateError, "did not converge"):
+            self.journey.run_social_convergence(
+                sender_session=sender_session,
+                receiver_session=receiver_session,
+                sender=self.sender,
+                receiver=self.receiver,
+                journey_id="timeout",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

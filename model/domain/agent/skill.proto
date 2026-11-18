@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package peers_touch.model.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+import "domain/agent/agent.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/app/subserver/agent/model;model";
+
+message SkillManifest {
+  string skill_id = 1;
+  string agent_id = 2;
+  string name = 3;
+  string description = 4;
+  string category = 5;
+  repeated string platforms = 6;
+  SkillConditions conditions = 7;
+  string content = 8;
+  string source = 9;
+  string trust_level = 10;
+  string scan_verdict = 11;
+  int32 version = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  bool enabled = 15;
+  repeated SkillResource resources = 16;
+}
+
+message SkillConditions {
+  repeated string fallback_for_toolsets = 1;
+  repeated string requires_tools = 2;
+}
+
+enum SkillResourceKind {
+  SKILL_RESOURCE_KIND_UNSPECIFIED = 0;
+  SKILL_RESOURCE_KIND_DOCUMENT = 1;
+  SKILL_RESOURCE_KIND_REFERENCE = 2;
+  SKILL_RESOURCE_KIND_TEMPLATE = 3;
+  SKILL_RESOURCE_KIND_ASSET = 4;
+  SKILL_RESOURCE_KIND_SCRIPT = 5;
+}
+
+message SkillResource {
+  string path = 1;
+  string content_hash = 2;
+  uint64 size = 3;
+  SkillResourceKind kind = 4;
+  ToolExecutionOwner execution_owner = 5;
+}
+
+message SkillResourceInput {
+  string path = 1;
+  bytes content = 2;
+  SkillResourceKind kind = 3;
+  ToolExecutionOwner execution_owner = 4;
+}
+
+message SkillFinding {
+  string pattern_id = 1;
+  string severity = 2;
+  string category = 3;
+  string file = 4;
+  int32 line = 5;
+  string match = 6;
+  string description = 7;
+}
+
+message SkillScanResult {
+  string skill_name = 1;
+  string source = 2;
+  string trust_level = 3;
+  string verdict = 4;
+  repeated SkillFinding findings = 5;
+  google.protobuf.Timestamp scanned_at = 6;
+  string summary = 7;
+}
+
+message ListSkillsRequest {
+  string agent_id = 1;
+  string category = 2;
+}
+
+message ListSkillsResponse {
+  repeated SkillManifest skills = 1;
+}
+
+message GetSkillRequest {
+  string skill_id = 1;
+  string file_path = 2;
+  // Required for Station lookup; optional for file-only clients.
+  string agent_id = 3;
+}
+
+message GetSkillResponse {
+  SkillManifest skill = 1;
+  string file_content = 2;
+}
+
+message ReadSkillResourceRequest {
+  string agent_id = 1;
+  string skill_id = 2;
+  int32 version = 3;
+  string path = 4;
+}
+
+message ReadSkillResourceResponse {
+  SkillResource resource = 1;
+  bytes content = 2;
+}
+
+message InstallSkillRequest {
+  string agent_id = 1;
+  string source = 2;
+  string name = 3;
+  string content = 4;
+  string trust_level = 5;
+  repeated SkillResourceInput resources = 6;
+}
+
+message InstallSkillResponse {
+  string skill_id = 1;
+  string verdict = 2;
+  SkillScanResult scan_result = 3;
+  bool installed = 4;
+}
+
+message UpdateSkillRequest {
+  reserved 6;
+  reserved "enabled";
+
+  string agent_id = 1;
+  string skill_id = 2;
+  optional string name = 3;
+  optional string description = 4;
+  optional string content = 5;
+  repeated SkillResourceInput resources = 8;
+}
+
+message UpdateSkillResponse {
+  SkillManifest skill = 1;
+  SkillScanResult scan_result = 2;
+  bool success = 3;
+}
+
+message DeleteSkillRequest {
+  string agent_id = 1;
+  string skill_id = 2;
+}
+
+message DeleteSkillResponse {
+  bool success = 1;
+}
+
+message PatchSkillRequest {
+  string skill_id = 1;
+  string old_string = 2;
+  string new_string = 3;
+}
+
+message PatchSkillResponse {
+  SkillManifest skill = 1;
+  bool success = 2;
+}

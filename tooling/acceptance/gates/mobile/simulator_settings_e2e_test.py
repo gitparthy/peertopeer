@@ -1,0 +1,628 @@
+from __future__ import annotations
+
+import unittest
+from unittest.mock import patch
+
+from tooling.acceptance.core import ArtifactRef
+from tooling.acceptance.core.proof import assertions_pass
+from tooling.acceptance.gates.mobile.simulator_runtime_binding import (
+    MobileSimulatorBindingActivation,
+)
+from tooling.acceptance.gates.mobile.simulator_settings_e2e import (
+    GATE_ID,
+    IOS_CLIENT,
+    PEER_IOS_CLIENT,
+    PROVEN_SCOPE,
+    SimulatorSettingsGate,
+)
+
+
+RUN_ID = "20260920T120000000000Z-" + ("1" * 32)
+WORKSPACE_ID = "a" * 16
+
+
+def _proof(client_id: str, role: str) -> ArtifactRef:
+    return ArtifactRef(
+        workspace_id=WORKSPACE_ID,
+        gate_id=GATE_ID,
+        run_id=RUN_ID,
+        path=f"runtime/bindings/{client_id}/{role}.json",
+        sha256="b" * 64,
+        media_type="application/json",
+    )
+
+
+def _activation(
+    client_id: str,
+    roles: tuple[str, ...],
+) -> MobileSimulatorBindingActivation:
+    return MobileSimulatorBindingActivation(
+        client_id=client_id,
+        launch_generation=1,
+        identity={
+            "runtime": "simulator",
+            "instanceId": f"{client_id}-1",
+            "identityDigest": "c" * 64,
+        },
+        scope={
+            "generation": 1,
+            "phase": "ACTIVE",
+            "launchState": "station-selection",
+            "activeStationPeerId": "station-primary-peer",
+            "activeActorPtid": None,
+            "runtimeStationPeerId": None,
+            "deviceId": f"device-{client_id}",
+            "social": {
+                "stationPeerId": None,
+                "actorPtid": None,
+                "sessionCount": 0,
+                "requestCount": 0,
+                "messageThreadCount": 0,
+            },
+            "group": {
+                "stationPeerId": None,
+                "actorPtid": None,
+                "groupCount": 0,
+                "messageThreadCount": 0,
+            },
+            "navigation": {
+                "primaryRouteId": "tab:chat",
+                "detailKeys": [],
+                "overlayRouteId": None,
+            },
+        },
+        active_binding_role="station-primary",
+        binding_proofs={role: _proof(client_id, role) for role in roles},
+    )
+
+
+class _Binding:
+    def __init__(self) -> None:
+        self.profile = {
+            "actorPtid": "ptid:alice",
+            "profileRevision": "1",
+            "displayName": "Alice",
+            "note": "",
+            "region": "",
+            "timezone": "",
+            "defaultVisibility": "followers",
+            "manuallyApprovesFollowers": False,
+            "messagePermission": "friends",
+            "autoExpireDays": 30,
+        }
+        self.notification = {
+            "category": 1,
+            "enabled": True,
+            "pushEnabled": True,
+            "soundEnabled": True,
+        }
+        self.notification_revision = 1
+        self.devices = {
+            IOS_CLIENT: {
+                "theme": "system",
+                "fontSize": "medium",
+                "compactMode": False,
+                "mediaAutoDownload": True,
+            },
+            PEER_IOS_CLIENT: {
+                "theme": "light",
+                "fontSize": "small",
+                "compactMode": True,
+                "mediaAutoDownload": False,
+            },
+        }
+        self.calls: list[tuple[str, str, object]] = []
+        self.closed = False
+
+    def create_bound_session(
+        self,
+        client_id: str,
+    ) -> MobileSimulatorBindingActivation:
+        roles = (
+            ("station-primary", "station-secondary")
+            if client_id == IOS_CLIENT
+            else ("station-primary",)
+        )
+        return _activation(client_id, roles)
+
+    def authenticate_fixture_actor(self, client_id: str) -> dict[str, object]:
+        self.calls.append((client_id, "authenticate", None))
+        return {
+            "preAuthenticationScope": {},
+            "login": {
+                "session": {
+                    "stationPeerId": "station-primary-peer",
+                    "actorPtid": "ptid:alice",
+                }
+            },
+        }
+
+    def call_action(
+        self,
+        client_id: str,
+        action: str,
+        payload: object = None,
+    ) -> object:
+        self.calls.append((client_id, action, payload))
+        if action == "lifecycle.waitReady":
+            return {
+                "phase": "ACTIVE",
+                "generation": 1,
+                "runtimes": [
+                    {"id": "profile", "status": "ready"},
+                    {"id": "notification", "status": "ready"},
+                ],
+            }
+        if action == "recovery.snapshot":
+            return {
+                "hasActiveRecovery": False,
+                "isWriteBlocked": False,
+                "writeAdmission": {"open": True, "reason": None},
+                "states": [],
+            }
+        if action == "social.reconcile":
+            return {"reconciled": True}
+        if action == "settings.profile.read":
+            return dict(self.profile)
+        if action == "settings.profile.update":
+            assert isinstance(payload, dict)
+            self.profile.update(payload)
+            self.profile["profileRevision"] = str(
+                int(self.profile["profileRevision"]) + 1
+            )
+            return {"outcome": 1, "profile": dict(self.profile)}
+        if action == "settings.notifications.read":
+            return {
+                "revision": str(self.notification_revision),
+                "preferences": [dict(self.notification)],
+            }
+        if action == "settings.notifications.update":
+            assert isinstance(payload, dict)
+            self.notification.update(payload)
+            self.notification_revision += 1
+            return {
+                "outcome": 1,
+                "snapshot": {
+                    "revision": str(self.notification_revision),
+                    "preferences": [dict(self.notification)],
+                },
+            }
+        if action == "settings.device.read":
+            return dict(self.devices[client_id])
+        if action == "settings.device.update":
+            assert isinstance(payload, dict)
+            self.devices[client_id] = dict(payload)
+            return dict(payload)
+        if action == "lifecycle.restart":
+            return {"requested": True, "scope": "webview"}
+        if action == "cleanup":
+            return {"cleared": True}
+        raise AssertionError(action)
+
+    def close(self) -> tuple[str, ...]:
+        self.closed = True
+        return (PEER_IOS_CLIENT, IOS_CLIENT)
+
+
+class SimulatorSettingsGateTests(unittest.TestCase):
+    def test_execute_projects_observed_scope_after_success(self) -> None:
+        class Artifacts:
+            run_id = RUN_ID
+            result: dict[str, object] | None = None
+
+            def __enter__(self) -> "Artifacts":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def write_json(
+                self,
+                _path: str,
+                value: dict[str, object],
+                *,
+                role: str,
+            ) -> None:
+                if role == "mobile-simulator-settings-result":
+                    self.result = value
+
+            def complete(self, **_kwargs: object) -> None:
+                return None
+
+        binding = _Binding()
+        artifacts = Artifacts()
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_settings_e2e.ArtifactSession",
+            return_value=artifacts,
+        ):
+            self.assertEqual(gate.execute(), 0)
+
+        self.assertIsNotNone(artifacts.result)
+        assert artifacts.result is not None
+        self.assertEqual(artifacts.result["observedScope"], list(PROVEN_SCOPE))
+
+    @staticmethod
+    def _valid_settings_journey() -> dict[str, object]:
+        return {
+            "scenario": "settings",
+            "actorPtid": "ptid:alice",
+            "profileUpdate": {"profile": {"actorPtid": "ptid:alice"}},
+            "profileReadback": {
+                "actorPtid": "ptid:alice",
+                "displayName": "Acceptance journey",
+            },
+            "notificationUpdate": {
+                "snapshot": {"preferences": [{"category": 1}]}
+            },
+            "notificationReadback": {
+                "preferences": [{"category": 1, "enabled": False}]
+            },
+            "deviceReadback": {
+                "theme": "dark",
+                "fontSize": "large",
+                "compactMode": True,
+                "mediaAutoDownload": False,
+            },
+            "deviceIsolation": True,
+            "sessionReplacementObserved": True,
+            "bindingProofs": {
+                IOS_CLIENT: {"station-primary": _proof(IOS_CLIENT, "sp")},
+                PEER_IOS_CLIENT: {
+                    "station-primary": _proof(PEER_IOS_CLIENT, "sp")
+                },
+            },
+        }
+
+    def test_settings_assertions_satisfy_core_proof_contract(self) -> None:
+        gate = SimulatorSettingsGate(binding_factory=lambda: _Binding())  # type: ignore[arg-type]
+        assertions = gate._assertions_from_settings_evidence(
+            self._valid_settings_journey(), gate._result_base("PASS")
+        )
+
+        self.assertTrue(assertions_pass(assertions))
+        self.assertEqual(
+            len(assertions), len({item["name"] for item in assertions})
+        )
+        names = {item["name"] for item in assertions}
+        self.assertIn(
+            "settings:device-settings-survive-ios-restart", names
+        )
+        self.assertIn(
+            "settings:both-clients-closed-runtime-binding-proofs", names
+        )
+
+    def test_settings_assertions_fail_closed_on_missing_observation(
+        self,
+    ) -> None:
+        gate = SimulatorSettingsGate(binding_factory=lambda: _Binding())  # type: ignore[arg-type]
+        broken = self._valid_settings_journey()
+        broken["deviceIsolation"] = False
+        broken["bindingProofs"] = {IOS_CLIENT: {"station-primary": {}}}
+
+        assertions = gate._assertions_from_settings_evidence(
+            broken, gate._result_base("PASS")
+        )
+        self.assertFalse(assertions_pass(assertions))
+        failed = {item["name"] for item in assertions if not item["passed"]}
+        self.assertIn("settings:device-settings-stay-local-per-client", failed)
+        self.assertIn(
+            "settings:both-clients-closed-runtime-binding-proofs", failed
+        )
+
+    def test_closed_write_admission_reconciles_before_settings_write(
+        self,
+    ) -> None:
+        class AdmissionBinding(_Binding):
+            def __init__(self) -> None:
+                super().__init__()
+                self.snapshots = [
+                    {
+                        "hasActiveRecovery": True,
+                        "isWriteBlocked": True,
+                        "writeAdmission": {
+                            "open": False,
+                            "reason": "runtime_restarting",
+                        },
+                        "states": [{
+                            "kind": "event-overflow-reconcile",
+                        }],
+                    },
+                    {
+                        "hasActiveRecovery": False,
+                        "isWriteBlocked": False,
+                        "writeAdmission": {"open": True, "reason": None},
+                        "states": [],
+                    },
+                ]
+
+            def call_action(
+                self,
+                client_id: str,
+                action: str,
+                payload: object = None,
+            ) -> object:
+                if action == "recovery.snapshot":
+                    self.calls.append((client_id, action, payload))
+                    if len(self.snapshots) > 1:
+                        return self.snapshots.pop(0)
+                    return dict(self.snapshots[0])
+                return super().call_action(client_id, action, payload)
+
+        binding = AdmissionBinding()
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+
+        snapshot = gate._wait_for_mobile_write_admission(  # type: ignore[arg-type]
+            binding,
+            IOS_CLIENT,
+            timeout_seconds=1,
+            stable_seconds=0,
+        )
+
+        self.assertTrue(snapshot["writeAdmission"]["open"])
+        actions = [call[1] for call in binding.calls]
+        self.assertEqual(
+            actions,
+            [
+                "recovery.snapshot",
+                "social.reconcile",
+                "recovery.snapshot",
+            ],
+        )
+        self.assertEqual(
+            gate.events[-1],
+            {
+                "event": "write-admission-ready",
+                "clientId": IOS_CLIENT,
+                "reconciled": True,
+                "activeRecovery": False,
+            },
+        )
+
+    def test_write_admission_re_reconciles_while_fence_stays_closed(
+        self,
+    ) -> None:
+        closed_snapshot = {
+            "hasActiveRecovery": True,
+            "isWriteBlocked": True,
+            "writeAdmission": {
+                "open": False,
+                "reason": "control_event_handler_failed",
+            },
+            "states": [{
+                "kind": "write-revocation",
+                "detail": {
+                    "reason": "control_event_handler_failed",
+                    "handlerError": "MOBILE_MESSAGING_NATIVE_FAILURE",
+                },
+            }],
+        }
+        open_snapshot = {
+            "hasActiveRecovery": False,
+            "isWriteBlocked": False,
+            "writeAdmission": {"open": True, "reason": None},
+            "states": [],
+        }
+
+        class RetryAdmissionBinding(_Binding):
+            def __init__(self) -> None:
+                super().__init__()
+                self.snapshots = [
+                    dict(closed_snapshot),
+                    dict(closed_snapshot),
+                    dict(closed_snapshot),
+                    dict(open_snapshot),
+                ]
+
+            def call_action(
+                self,
+                client_id: str,
+                action: str,
+                payload: object = None,
+            ) -> object:
+                if action == "recovery.snapshot":
+                    self.calls.append((client_id, action, payload))
+                    if len(self.snapshots) > 1:
+                        return self.snapshots.pop(0)
+                    return dict(self.snapshots[0])
+                return super().call_action(client_id, action, payload)
+
+        binding = RetryAdmissionBinding()
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+
+        snapshot = gate._wait_for_mobile_write_admission(  # type: ignore[arg-type]
+            binding,
+            IOS_CLIENT,
+            timeout_seconds=2,
+            stable_seconds=0,
+            reconcile_retry_seconds=0,
+        )
+
+        self.assertTrue(snapshot["writeAdmission"]["open"])
+        reconcile_calls = [
+            call
+            for call in binding.calls
+            if call[1] == "social.reconcile"
+        ]
+        # One explicit reconcile plus one retry per still-closed poll.
+        self.assertEqual(len(reconcile_calls), 3)
+        self.assertTrue(
+            any(
+                event.get("event") == "write-admission-runtime-diagnostics"
+                for event in gate.events
+            )
+        )
+
+    def test_authentication_restarts_one_failed_runtime_generation(self) -> None:
+        class RetryBinding(_Binding):
+            wait_attempts = 0
+
+            def call_action(
+                self,
+                client_id: str,
+                action: str,
+                payload: object = None,
+            ) -> object:
+                if action == "lifecycle.waitReady":
+                    self.calls.append((client_id, action, payload))
+                    self.wait_attempts += 1
+                    return {
+                        "phase": "ACTIVE",
+                        "generation": self.wait_attempts,
+                        "runtimes": [{
+                            "id": "social",
+                            "status": (
+                                "failed"
+                                if self.wait_attempts == 1
+                                else "ready"
+                            ),
+                            "errorKey": (
+                                "mobile.lifecycle.runtimeFailed"
+                                if self.wait_attempts == 1
+                                else None
+                            ),
+                        }],
+                    }
+                return super().call_action(client_id, action, payload)
+
+        binding = RetryBinding()
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+
+        actor_ptid = gate._authenticate(  # type: ignore[arg-type]
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id="station-primary-peer",
+        )
+
+        self.assertEqual(actor_ptid, "ptid:alice")
+        self.assertEqual(binding.wait_attempts, 2)
+        self.assertEqual(
+            [
+                call[2]
+                for call in binding.calls
+                if call[1] == "lifecycle.waitReady"
+            ],
+            [
+                {"includeDiagnostics": True, "minimumGeneration": 0},
+                {"includeDiagnostics": True, "minimumGeneration": 2},
+            ],
+        )
+
+    def test_same_account_converges_and_device_settings_remain_local(self) -> None:
+        binding = _Binding()
+        original_profile = dict(binding.profile)
+        original_notification = dict(binding.notification)
+        original_ios_device = dict(binding.devices[IOS_CLIENT])
+        original_peer_device = dict(binding.devices[PEER_IOS_CLIENT])
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+
+        result = gate._run_journey(binding, "journey-1")  # type: ignore[arg-type]
+
+        self.assertEqual(result["actorPtid"], "ptid:alice")
+        self.assertTrue(result["deviceIsolation"])
+        self.assertTrue(result["sessionReplacementObserved"])
+        self.assertEqual(binding.devices[PEER_IOS_CLIENT], original_peer_device)
+        self.assertNotEqual(binding.devices[IOS_CLIENT], original_ios_device)
+        self.assertEqual(
+            set(result["bindingProofs"][IOS_CLIENT]),
+            {"station-primary", "station-secondary"},
+        )
+        self.assertEqual(
+            [
+                call[0]
+                for call in binding.calls
+                if call[1] == "lifecycle.waitReady"
+            ],
+            [IOS_CLIENT, PEER_IOS_CLIENT],
+        )
+
+        self.assertIsNone(gate._cleanup(binding))  # type: ignore[arg-type]
+        self.assertEqual(
+            {
+                field: binding.profile[field]
+                for field in original_profile
+                if field != "profileRevision"
+            },
+            {
+                field: value
+                for field, value in original_profile.items()
+                if field != "profileRevision"
+            },
+        )
+        self.assertGreater(
+            int(binding.profile["profileRevision"]),
+            int(original_profile["profileRevision"]),
+        )
+        self.assertEqual(binding.notification, original_notification)
+        self.assertEqual(binding.devices[IOS_CLIENT], original_ios_device)
+        self.assertTrue(binding.closed)
+
+    def test_cleanup_reports_restore_failure_without_skipping_runtime_close(
+        self,
+    ) -> None:
+        binding = _Binding()
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+        gate._active_clients.extend((IOS_CLIENT, PEER_IOS_CLIENT))
+        gate._profile_restore = {"displayName": "Alice"}
+        original_call_action = binding.call_action
+
+        def fail_profile_restore(
+            client_id: str,
+            action: str,
+            payload: object = None,
+        ) -> object:
+            if action == "settings.profile.update":
+                raise RuntimeError("restore failed")
+            return original_call_action(client_id, action, payload)
+
+        binding.call_action = fail_profile_restore  # type: ignore[method-assign]
+
+        error = gate._cleanup(binding)  # type: ignore[arg-type]
+
+        self.assertEqual(error, "Profile restore: RuntimeError")
+        self.assertTrue(binding.closed)
+        self.assertEqual(
+            next(
+                item
+                for item in gate.cleanup
+                if item["resource"] == "Profile-restore"
+            )["status"],
+            "failed",
+        )
+
+    def test_cleanup_refreshes_profile_revision_before_one_retry(self) -> None:
+        binding = _Binding()
+        gate = SimulatorSettingsGate(binding_factory=lambda: binding)  # type: ignore[arg-type]
+        gate._active_clients.extend((IOS_CLIENT, PEER_IOS_CLIENT))
+        gate._restore_owner_client = PEER_IOS_CLIENT
+        gate._profile_restore = {"displayName": "Alice"}
+        original_call_action = binding.call_action
+        failed_once = False
+
+        def fail_once(
+            client_id: str,
+            action: str,
+            payload: object = None,
+        ) -> object:
+            nonlocal failed_once
+            if action == "settings.profile.update" and not failed_once:
+                failed_once = True
+                raise RuntimeError("stale revision")
+            return original_call_action(client_id, action, payload)
+
+        binding.call_action = fail_once  # type: ignore[method-assign]
+
+        self.assertIsNone(gate._cleanup(binding))  # type: ignore[arg-type]
+        restored = next(
+            item
+            for item in gate.cleanup
+            if item["resource"] == "Profile-restore"
+        )
+        self.assertEqual(restored["status"], "passed")
+        self.assertTrue(restored["recoveredAfterRefresh"])
+        self.assertTrue(binding.closed)
+
+
+if __name__ == "__main__":
+    unittest.main()

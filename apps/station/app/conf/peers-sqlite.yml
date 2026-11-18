@@ -1,0 +1,40 @@
+peers:
+  version: 0.0.1
+  touch:
+    routers:
+      management: true
+      activitypub: true
+      wellknown: true
+      user: true
+      peer: true
+      message: true
+      mastodon: true
+      social: true
+  run-mode: 2
+  includes: federation.yml, store.sqlite.yml, sub_bootstrap.yml, sub_agent.yml, sub_oss.yml, sub_turn.yml, sub_aichat.yml, log.yml, actor.yml, server.host.local.yml, oauth.yml, sub_dashboard.yml, sub_channel.yml
+  config:
+    hierarchy-merge: true
+  node:
+    transport:
+      name: native
+      native:
+        enable-relay: false
+        libp2p-identity-key-file: station-node.key
+    relay-service:
+      reservation-ttl-seconds: 3600
+      max-reservations: 256
+      max-circuits-per-peer: 64
+      max-bytes-per-direction: 268435456
+      max-circuit-duration-seconds: 3600
+      max-reservations-per-ip: 8
+      max-reservations-per-asn: 32
+      buffer-size: 32768
+    relay-pool:
+      mode: "off"
+      renew-before-seconds: 1200
+      retry-min-seconds: 1
+      retry-max-seconds: 60
+      relays: []
+    server:
+      name: hertz
+      address: :18080

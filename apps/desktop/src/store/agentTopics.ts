@@ -1,0 +1,522 @@
+import { createDesktopStore } from './createDesktopStore';
+import { replaceEqualDeep } from '@tanstack/query-core';
+import { chatService, type Session } from '../services/chat-service';
+import { api } from '../services/desktop_api';
+import { useAgentStore } from './agent';
+import { log } from '../utils/logger';
+import { resolveI18nValue } from '../i18n/index';
+import { createAgentDraftKey, isAgentDraftKey } from './agentDraft';
+
+export type TopicTitleState = 'untitled' | 'manual' | 'generating' | 'generated' | 'failed';
+
+export interface AgentTopic extends Session {
+  titleState: TopicTitleState;
+  previousTitle?: string;
+  titleError?: string;
+  titleUpdatedAt?: string;
+}
+
+interface TopicTitleHistory {
+  previousTitle: string;
+  generatedTitle: string;
+  generatedAt: string;
+}
+
+export type TopicSearchMode = 'title' | 'content';
+export type TopicSortBy = 'updated_at' | 'created_at';
+
+export interface AgentTopicLoadError {
+  message: string;
+  reason: string;
+  failedAt: string;
+  retryable: true;
+}
+
+interface AgentTopicState {
+  topicsByAgentId: Record<string, AgentTopic[]>;
+  activeAgentId: string;
+  loadingAgentIds: Record<string, boolean>;
+  loadErrorsByAgentId: Record<string, AgentTopicLoadError | undefined>;
+  generatingTitleKeys: Record<string, boolean>;
+  titleHistoryByKey: Record<string, TopicTitleHistory>;
+  lastError?: string;
+  searchQuery: string;
+  searchMode: TopicSearchMode;
+  sortBy: TopicSortBy;
+
+  getTopicsForAgent: (agentId: string) => AgentTopic[];
+  loadTopicsForAgent: (agentId: string, reason?: string) => Promise<AgentTopic[]>;
+  reconcileSelectedAgentTopics: (reason?: string) => Promise<void>;
+  upsertTopics: (agentId: string, sessions: Session[]) => void;
+  createDraftTopic: (agentId: string, agentName: string, title: string) => AgentTopic;
+  ensureDraftTopic: (agentId: string, agentName: string, title: string) => AgentTopic;
+  promoteDraftTopic: (agentId: string, draftKey: string, session: Session) => void;
+  deleteTopic: (key: string) => Promise<void>;
+  deleteTopics: (keys: string[]) => Promise<void>;
+  renameTopic: (key: string, title: string) => Promise<void>;
+  smartRenameTopic: (key: string) => Promise<{ title: string }>;
+  revertGeneratedTitle: (key: string) => Promise<void>;
+  pinTopic: (key: string, pinned: boolean) => Promise<void>;
+  setTopicModel: (key: string, model: string, provider: string) => Promise<void>;
+  favoriteTopic: (key: string, favorite: boolean) => Promise<void>;
+  setSearchQuery: (query: string) => void;
+  setSearchMode: (mode: TopicSearchMode) => void;
+  setSortBy: (sortBy: TopicSortBy) => void;
+  discardAgentProjection: (agentId: string) => void;
+  resetProjection: () => void;
+}
+
+function toISODate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return new Date().toISOString();
+  return date.toISOString();
+}
+
+function normalizeTopic(session: Session, previous?: AgentTopic): AgentTopic {
+  const title = resolveI18nValue(session.title)?.trim() || '';
+  return {
+    ...session,
+    title,
+    created_at: toISODate(session.created_at),
+    updated_at: toISODate(session.updated_at),
+    titleState: previous?.titleState ?? (title ? 'manual' : 'untitled'),
+    previousTitle: previous?.previousTitle,
+    titleError: previous?.titleError,
+    titleUpdatedAt: previous?.titleUpdatedAt,
+    pinned: session.pinned ?? previous?.pinned ?? false,
+    favorite: session.favorite ?? previous?.favorite ?? false,
+  };
+}
+
+function replaceTopic(
+  topicsByAgentId: Record<string, AgentTopic[]>,
+  key: string,
+  update: (topic: AgentTopic) => AgentTopic,
+): Record<string, AgentTopic[]> {
+  let changed = false;
+  const next: Record<string, AgentTopic[]> = {};
+  for (const [agentId, topics] of Object.entries(topicsByAgentId)) {
+    next[agentId] = topics.map((topic) => {
+      if (topic.key !== key) return topic;
+      changed = true;
+      return update(topic);
+    });
+  }
+  return changed ? next : topicsByAgentId;
+}
+
+function removeTopic(
+  topicsByAgentId: Record<string, AgentTopic[]>,
+  key: string,
+): Record<string, AgentTopic[]> {
+  const next: Record<string, AgentTopic[]> = {};
+  for (const [agentId, topics] of Object.entries(topicsByAgentId)) {
+    next[agentId] = topics.filter((topic) => topic.key !== key);
+  }
+  return next;
+}
+
+function findSelectedAgentId(): string {
+  const { agents, selectedAgent } = useAgentStore.getState();
+  return agents.find((agent) => agent.name === selectedAgent)?.id || '';
+}
+
+const topicLoadsByAgentId = new Map<string, Promise<AgentTopic[]>>();
+const topicModelMutations = new Set<string>();
+
+export const useAgentTopicStore = createDesktopStore<AgentTopicState>('agentTopics', (set, get) => ({
+  topicsByAgentId: {},
+  activeAgentId: '',
+  loadingAgentIds: {},
+  loadErrorsByAgentId: {},
+  generatingTitleKeys: {},
+  titleHistoryByKey: {},
+  searchQuery: '',
+  searchMode: 'title',
+  sortBy: 'updated_at',
+
+  getTopicsForAgent: (agentId: string) => get().topicsByAgentId[agentId] || [],
+
+  loadTopicsForAgent: (agentId: string, reason = 'manual') => {
+    if (!agentId) {
+      return Promise.reject(new Error('Agent id is required to load topics'));
+    }
+    const inFlight = topicLoadsByAgentId.get(agentId);
+    if (inFlight) return inFlight;
+
+    let load!: Promise<AgentTopic[]>;
+    load = (async () => {
+      log.info('agentTopics', 'loading agent topics', { agentId, reason });
+      set((state) => {
+        const loadErrorsByAgentId = { ...state.loadErrorsByAgentId };
+        delete loadErrorsByAgentId[agentId];
+        return {
+          activeAgentId: agentId,
+          loadingAgentIds: { ...state.loadingAgentIds, [agentId]: true },
+          loadErrorsByAgentId,
+          lastError: undefined,
+        };
+      });
+      try {
+        const sessions = await Promise.resolve().then(() => chatService.listAgentSessions(agentId));
+        if (topicLoadsByAgentId.get(agentId) !== load) return [];
+        const existingByKey = new Map((get().topicsByAgentId[agentId] || []).map((topic) => [topic.key, topic]));
+        const drafts = (get().topicsByAgentId[agentId] || []).filter((topic) =>
+          isAgentDraftKey(topic.key),
+        );
+        const topics = replaceEqualDeep(get().topicsByAgentId[agentId], [
+          ...drafts,
+          ...sessions.map((session) => normalizeTopic(session, existingByKey.get(session.key))),
+        ]);
+        set((state) => ({
+          topicsByAgentId: { ...state.topicsByAgentId, [agentId]: topics },
+          loadingAgentIds: { ...state.loadingAgentIds, [agentId]: false },
+        }));
+        return topics;
+      } catch (error) {
+        if (topicLoadsByAgentId.get(agentId) !== load) return [];
+        const message = error instanceof Error ? error.message : String(error);
+        const loadError: AgentTopicLoadError = {
+          message,
+          reason,
+          failedAt: new Date().toISOString(),
+          retryable: true,
+        };
+        log.error('agentTopics', 'failed to load agent topics', { agentId, reason, error: message });
+        set((state) => ({
+          loadingAgentIds: { ...state.loadingAgentIds, [agentId]: false },
+          loadErrorsByAgentId: {
+            ...state.loadErrorsByAgentId,
+            [agentId]: loadError,
+          },
+          lastError: message,
+        }));
+        throw error;
+      }
+    })();
+
+    topicLoadsByAgentId.set(agentId, load);
+    void load.then(
+      () => {
+        if (topicLoadsByAgentId.get(agentId) === load) {
+          topicLoadsByAgentId.delete(agentId);
+        }
+      },
+      () => {
+        if (topicLoadsByAgentId.get(agentId) === load) {
+          topicLoadsByAgentId.delete(agentId);
+        }
+      },
+    );
+    return load;
+  },
+
+  reconcileSelectedAgentTopics: async (reason = 'reconcile') => {
+    const agentId = findSelectedAgentId();
+    if (!agentId) return;
+    try {
+      await get().loadTopicsForAgent(agentId, reason);
+    } catch {
+      // The per-Agent retryable error is already projected by loadTopicsForAgent.
+    }
+  },
+
+  upsertTopics: (agentId: string, sessions: Session[]) => {
+    if (!agentId) return;
+    set((state) => {
+      const existing = new Map((state.topicsByAgentId[agentId] || []).map((topic) => [topic.key, topic]));
+      for (const session of sessions) {
+        existing.set(session.key, normalizeTopic(session, existing.get(session.key)));
+      }
+      return {
+        activeAgentId: agentId,
+        topicsByAgentId: { ...state.topicsByAgentId, [agentId]: Array.from(existing.values()) },
+      };
+    });
+  },
+
+  createDraftTopic: (agentId: string, agentName: string, title: string) => {
+    const now = new Date().toISOString();
+    const key = createAgentDraftKey(agentId);
+    const topic: AgentTopic = {
+      id: key,
+      key,
+      agent_name: agentName,
+      title,
+      message_count: 0,
+      created_at: now,
+      updated_at: now,
+      titleState: 'untitled',
+    };
+    set((state) => ({
+      activeAgentId: agentId,
+      topicsByAgentId: {
+        ...state.topicsByAgentId,
+        [agentId]: [
+          topic,
+          ...(state.topicsByAgentId[agentId] || []).filter(
+            (existing) => !isAgentDraftKey(existing.key),
+          ),
+        ],
+      },
+    }));
+    return topic;
+  },
+
+  ensureDraftTopic: (agentId: string, agentName: string, title: string) => {
+    const existingDraft = (get().topicsByAgentId[agentId] || []).find((topic) =>
+      isAgentDraftKey(topic.key),
+    );
+    return existingDraft ?? get().createDraftTopic(agentId, agentName, title);
+  },
+
+  promoteDraftTopic: (agentId: string, draftKey: string, session: Session) => {
+    if (!agentId || !isAgentDraftKey(draftKey)) return;
+    set((state) => {
+      const topics = state.topicsByAgentId[agentId] || [];
+      const draftIndex = topics.findIndex((topic) => topic.key === draftKey);
+      const existingRealIndex = topics.findIndex((topic) => topic.key === session.key);
+      if (draftIndex < 0 && existingRealIndex >= 0) return state;
+
+      const draft = draftIndex >= 0 ? topics[draftIndex] : undefined;
+      const promoted = normalizeTopic(
+        {
+          ...session,
+          id: session.key,
+          key: session.key,
+          title: session.title || draft?.title || '',
+          created_at: draft?.created_at || session.created_at,
+          model_override: session.model_override ?? draft?.model_override,
+          provider_override: session.provider_override ?? draft?.provider_override,
+        },
+        draft,
+      );
+      const next = topics.filter(
+        (topic) => topic.key !== draftKey && topic.key !== session.key,
+      );
+      next.splice(draftIndex >= 0 ? draftIndex : 0, 0, promoted);
+      return {
+        activeAgentId: agentId,
+        topicsByAgentId: { ...state.topicsByAgentId, [agentId]: next },
+      };
+    });
+  },
+
+  deleteTopic: async (key: string) => {
+    await get().deleteTopics([key]);
+  },
+
+  deleteTopics: async (keys: string[]) => {
+    const selected = [...new Set(keys)];
+    const persisted = selected.filter((key) => !isAgentDraftKey(key));
+    if (persisted.length) await chatService.deleteSessions(persisted);
+    set((state) => ({
+      topicsByAgentId: selected.reduce(removeTopic, state.topicsByAgentId),
+      generatingTitleKeys: Object.fromEntries(
+        Object.entries(state.generatingTitleKeys).filter(([key]) => !selected.includes(key)),
+      ),
+      titleHistoryByKey: Object.fromEntries(
+        Object.entries(state.titleHistoryByKey).filter(([key]) => !selected.includes(key)),
+      ),
+    }));
+  },
+
+  renameTopic: async (key: string, title: string) => {
+    const nextTitle = title.trim();
+    if (!nextTitle) return;
+    const before = get().topicsByAgentId;
+    set((state) => ({
+      topicsByAgentId: replaceTopic(state.topicsByAgentId, key, (topic) => ({
+        ...topic,
+        title: nextTitle,
+        titleState: 'manual',
+        previousTitle: topic.title,
+        titleError: undefined,
+        titleUpdatedAt: new Date().toISOString(),
+      })),
+    }));
+    try {
+      await chatService.renameSession(key, nextTitle);
+    } catch (error) {
+      set({ topicsByAgentId: before });
+      throw error;
+    }
+  },
+
+  smartRenameTopic: async (key: string) => {
+    const before = get().topicsByAgentId;
+    let previousTitle = '';
+    set((state) => ({
+      generatingTitleKeys: { ...state.generatingTitleKeys, [key]: true },
+      topicsByAgentId: replaceTopic(state.topicsByAgentId, key, (topic) => {
+        previousTitle = topic.title;
+        return { ...topic, titleState: 'generating', titleError: undefined };
+      }),
+    }));
+    try {
+      const result = await chatService.smartRenameSession(key);
+      const generatedAt = new Date().toISOString();
+      set((state) => ({
+        generatingTitleKeys: { ...state.generatingTitleKeys, [key]: false },
+        titleHistoryByKey: {
+          ...state.titleHistoryByKey,
+          [key]: { previousTitle, generatedTitle: result.title, generatedAt },
+        },
+        topicsByAgentId: replaceTopic(state.topicsByAgentId, key, (topic) => ({
+          ...topic,
+          title: result.title,
+          titleState: 'generated',
+          previousTitle,
+          titleError: undefined,
+          titleUpdatedAt: generatedAt,
+        })),
+      }));
+      return { title: result.title };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      set((state) => ({
+        generatingTitleKeys: { ...state.generatingTitleKeys, [key]: false },
+        topicsByAgentId: replaceTopic(before, key, (topic) => ({
+          ...topic,
+          titleState: 'failed',
+          titleError: message,
+        })),
+      }));
+      throw error;
+    }
+  },
+
+  revertGeneratedTitle: async (key: string) => {
+    const history = get().titleHistoryByKey[key];
+    if (!history) return;
+    await get().renameTopic(key, history.previousTitle);
+    set((state) => {
+      const nextHistory = { ...state.titleHistoryByKey };
+      delete nextHistory[key];
+      return { titleHistoryByKey: nextHistory };
+    });
+  },
+
+  pinTopic: async (key: string, pinned: boolean) => {
+    const before = get().topicsByAgentId;
+    set((state) => ({
+      topicsByAgentId: replaceTopic(state.topicsByAgentId, key, (topic) => ({
+        ...topic,
+        pinned,
+      })),
+    }));
+    try {
+      const conversation = await api.getAgentConversation(key);
+      await api.updateAgentConversation({
+        conversation_id: key,
+        expected_version: conversation.version,
+        meta: { pinned: String(pinned) },
+      });
+    } catch (error) {
+      log.warn('agentTopics', 'Failed to persist pin state, rolling back', { key, pinned, error: String(error) });
+      set({ topicsByAgentId: before });
+    }
+  },
+
+  setTopicModel: async (key, model, provider) => {
+    if (!key || (Boolean(model) !== Boolean(provider))) {
+      throw new Error('Topic model selection requires both Provider and model');
+    }
+    if (!Object.values(get().topicsByAgentId).some((topics) => (
+      topics.some((topic) => topic.key === key)
+    ))) {
+      throw new Error('Topic is no longer available');
+    }
+    if (topicModelMutations.has(key)) {
+      throw new Error('Topic model selection is already being saved');
+    }
+    topicModelMutations.add(key);
+    try {
+      if (!isAgentDraftKey(key)) {
+        const conversation = await api.getAgentConversation(key);
+        await api.updateAgentConversation({
+          conversation_id: key,
+          expected_version: conversation.version,
+          model_name: model,
+          provider_id: provider,
+        });
+      }
+      set((state) => ({
+        topicsByAgentId: replaceTopic(state.topicsByAgentId, key, (topic) => ({
+          ...topic,
+          model_override: model || undefined,
+          provider_override: provider || undefined,
+        })),
+      }));
+    } finally {
+      topicModelMutations.delete(key);
+    }
+  },
+
+  favoriteTopic: async (key: string, favorite: boolean) => {
+    const before = get().topicsByAgentId;
+    set((state) => ({
+      topicsByAgentId: replaceTopic(state.topicsByAgentId, key, (topic) => ({
+        ...topic,
+        favorite,
+      })),
+    }));
+    try {
+      const conversation = await api.getAgentConversation(key);
+      await api.updateAgentConversation({
+        conversation_id: key,
+        expected_version: conversation.version,
+        meta: { favorite: String(favorite) },
+      });
+    } catch (error) {
+      log.warn('agentTopics', 'Failed to persist favorite state, rolling back', { key, favorite, error: String(error) });
+      set({ topicsByAgentId: before });
+    }
+  },
+
+  setSearchQuery: (query: string) => {
+    set({ searchQuery: query });
+  },
+
+  setSearchMode: (mode: TopicSearchMode) => {
+    set({ searchMode: mode });
+  },
+
+  setSortBy: (sortBy: TopicSortBy) => {
+    set({ sortBy });
+  },
+
+  discardAgentProjection: (agentId) => {
+    const keys = new Set((get().topicsByAgentId[agentId] || []).map((topic) => topic.key));
+    keys.add(createAgentDraftKey(agentId));
+    topicLoadsByAgentId.delete(agentId);
+    for (const key of keys) topicModelMutations.delete(key);
+    const without = <T,>(records: Record<string, T>, removed: Set<string>) =>
+      Object.fromEntries(Object.entries(records).filter(([key]) => !removed.has(key)));
+    set((state) => ({
+      topicsByAgentId: without(state.topicsByAgentId, new Set([agentId])),
+      loadingAgentIds: without(state.loadingAgentIds, new Set([agentId])),
+      loadErrorsByAgentId: without(state.loadErrorsByAgentId, new Set([agentId])),
+      generatingTitleKeys: without(state.generatingTitleKeys, keys),
+      titleHistoryByKey: without(state.titleHistoryByKey, keys),
+      ...(state.activeAgentId === agentId ? { activeAgentId: '', lastError: undefined } : {}),
+    }));
+  },
+
+  resetProjection: () => {
+    topicLoadsByAgentId.clear();
+    topicModelMutations.clear();
+    set({
+      topicsByAgentId: {},
+      activeAgentId: '',
+      loadingAgentIds: {},
+      loadErrorsByAgentId: {},
+      generatingTitleKeys: {},
+      titleHistoryByKey: {},
+      lastError: undefined,
+      searchQuery: '',
+      searchMode: 'title',
+      sortBy: 'updated_at',
+    });
+  },
+}));

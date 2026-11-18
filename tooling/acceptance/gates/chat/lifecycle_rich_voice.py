@@ -1,0 +1,1997 @@
+#!/usr/bin/env python3
+"""Prove CHAT-J03 encrypted attachments and recorded voice on Native Desktop."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+from selenium.webdriver.support.ui import WebDriverWait
+
+from tooling.acceptance.core import AcceptanceGate, GateError
+from tooling.acceptance.drivers.native import (
+    MouseAction,
+    NativeControlSnapshot,
+    NativeDesktopRuntimeBinding,
+    NativeKey,
+)
+from tooling.acceptance.drivers.native.runtime import NativeLaunchOptions
+from tooling.acceptance.drivers.tauri import TauriSession
+from tooling.acceptance.gates.chat.lifecycle_file_viewing import (
+    REQUIRED_FILE_VIEWING_ASSERTIONS,
+    prove_file_detail,
+    prove_file_download_recovery,
+    prove_file_format_preview,
+)
+from tooling.acceptance.gates.chat.lifecycle_file_fixtures import (
+    FILE_FORMAT_KINDS,
+    create_file_format_fixtures,
+)
+from tooling.acceptance.gates.chat.lifecycle_file_native import (
+    prove_export_retention,
+    prove_external_file_isolation,
+    prove_file_grant_revocation,
+    prove_native_file_preview,
+)
+from tooling.acceptance.gates.chat.lifecycle_file_scope import ChatFileScopeJourney
+from tooling.acceptance.gates.chat.native_file_picker import (
+    select_native_file,
+    wait_for_actionable_file_trigger,
+)
+from tooling.acceptance.gates.chat.native_support import (
+    active_direct_route_multiaddr,
+    async_harness,
+    enter_chat_page,
+    runtime_station_service,
+    selected_native_runtime,
+    wait_until,
+)
+from tooling.acceptance.gates.chat.native_two_client_runner import (
+    LIFECYCLE_RICH_VOICE_GATE_ID,
+    NativeTwoClientGate,
+)
+from tooling.acceptance.node_connectivity_native_support import (
+    DirectRouteFaultProxy,
+)
+
+
+GATE_ID = LIFECYCLE_RICH_VOICE_GATE_ID
+REPORT_PATH = None
+STEP_TIMEOUT = 120.0
+REQUIRED_RICH_VOICE_ASSERTIONS = REQUIRED_FILE_VIEWING_ASSERTIONS | {
+    "rich_attachment_retry_retained",
+    "rich_attachment_upload_retry_identity",
+    "rich_attachment_download_retry_identity",
+    "rich_attachment_byte_identity",
+    "rich_attachment_restart_recovery",
+    "rich_screenshot_cancel_geometry",
+    "rich_screenshot_confirm_geometry",
+    "voice_capture_permission",
+    "voice_cancel_boundary",
+    "voice_preview_discard",
+    "voice_metadata_persisted",
+    "voice_byte_identity",
+    "voice_playback_progress_seek_pause",
+    "voice_playback_terminal_end",
+    "voice_playback_failure_retry",
+    "voice_asset_eviction_fault",
+    "voice_restart_recovery",
+}
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class LifecycleRichVoiceGate(NativeTwoClientGate):
+    gate_id = GATE_ID
+    phase = "CHAT-W03"
+    bom = ("CHAT-G06", "CHAT-G07", "CHAT-UR06")
+    spec = ("CHAT-J03", "chat-rich-media-recorded-voice")
+    report_path = REPORT_PATH
+
+    def __init__(
+        self,
+        *,
+        manifest: dict[str, Any],
+        actor_manifest: dict[str, Any],
+        runtime_binding: NativeDesktopRuntimeBinding,
+    ) -> None:
+        super().__init__(
+            manifest=manifest,
+            actor_manifest=actor_manifest,
+            runtime_binding=runtime_binding,
+            gate_id=GATE_ID,
+        )
+
+    @staticmethod
+    def _active_conversation_id(client: TauriSession) -> str:
+        value = client.find_element(
+            "[data-chat-conversation-pane]",
+            STEP_TIMEOUT,
+        ).get_attribute("data-chat-conversation-pane")
+        if not value:
+            raise GateError("active rich-media conversation identity is missing")
+        return str(value)
+
+    def _scroll_file_preview(self, actor: str, selector: str) -> None:
+        client = self.clients[actor]
+        point = self._native_click(actor, selector)
+        rect = client.find_element(selector, 5).rect
+        before = client.driver.get_screenshot_as_png()
+        self.runtime_binding.native_adapter.post_scroll_to_process(
+            client.process_id, point, delta_y=round(rect["height"] * 0.7),
+        )
+        previous = before
+
+        def settled() -> bool:
+            nonlocal previous
+            current = client.driver.get_screenshot_as_png()
+            ready = current != before and current == previous
+            previous = current
+            return ready
+
+        wait_until(
+            settled, f"{actor} native document paging pixels settled", timeout=10,
+        )
+
+    def _select_native_file(
+        self,
+        actor: str,
+        trigger_selector: str,
+        source_path: Path,
+    ) -> None:
+        client = self.clients[actor]
+        trigger = wait_for_actionable_file_trigger(
+            actor=actor,
+            client=client,
+            selector=trigger_selector,
+            timeout_seconds=STEP_TIMEOUT,
+        )
+        select_native_file(
+            actor=actor,
+            client=client,
+            sessions=tuple(self.clients.values()),
+            runtime_binding=self.runtime_binding,
+            source_path=source_path,
+            trigger=trigger.click,
+        )
+
+    def _restart_client_preserving_state(self, actor: str) -> TauriSession:
+        predecessor = self.clients[actor]
+        self.save_app_log(predecessor, f"{actor}-before-rich-restart")
+        self.client_lifecycles.stop_preserving_session(predecessor)
+        successor = self.runtime_binding.create_bound_session(
+            actor,
+            NativeLaunchOptions(
+                window_slot=("alice", "bob").index(actor),
+                window_count=2,
+            ),
+        )
+        self.runtime_instances.append(successor)
+        self.client_lifecycles.register(successor, self.ptids[actor])
+        self.client_lifecycles.transfer_preserved_session(
+            predecessor,
+            successor,
+        )
+        self.client_lifecycles.mark_live(successor)
+        self.register_driver(successor)
+        restored = wait_until(
+            lambda: (
+                value
+                if (
+                    isinstance(
+                        value := async_harness(
+                            successor,
+                            "hydrateActiveActor",
+                            {},
+                            timeout=30,
+                        ),
+                        dict,
+                    )
+                    and value.get("actorPtid") == self.ptids[actor]
+                )
+                else None
+            ),
+            f"{actor} restored authenticated rich-media session",
+            timeout=45,
+        )
+        self.client_lifecycles.mark_authenticated(successor)
+        self.clients[actor] = successor
+        if restored.get("actorPtid") != self.ptids[actor]:
+            raise GateError(f"{actor} rich-media restart restored the wrong actor")
+        return successor
+
+    def _engine_message(
+        self,
+        actor: str,
+        conversation_id: str,
+        message_id: str,
+    ) -> dict[str, Any] | None:
+        value = async_harness(
+            self.clients[actor],
+            "engineMessages",
+            {
+                "actorPtid": self.ptids[actor],
+                "conversationId": conversation_id,
+            },
+        )
+        messages = value.get("messages") if isinstance(value, dict) else None
+        if not isinstance(messages, list):
+            return None
+        return next(
+            (
+                message
+                for message in messages
+                if isinstance(message, dict)
+                and (
+                    message.get("messageId")
+                    or message.get("message_id")
+                )
+                == message_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _message_attachment(
+        message: dict[str, Any],
+        attachment_id: str,
+    ) -> dict[str, Any] | None:
+        attachments = message.get("attachments")
+        if not isinstance(attachments, list):
+            return None
+        return next(
+            (
+                attachment
+                for attachment in attachments
+                if isinstance(attachment, dict)
+                and (
+                    attachment.get("attachmentId")
+                    or attachment.get("attachment_id")
+                )
+                == attachment_id
+            ),
+            None,
+        )
+
+    def _engine_attachment(
+        self,
+        actor: str,
+        conversation_id: str,
+        message_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any] | None:
+        message = self._engine_message(actor, conversation_id, message_id)
+        if message is None:
+            return None
+        return self._message_attachment(message, attachment_id)
+
+    @staticmethod
+    def _voice_surface_snapshot(
+        client: TauriSession,
+        message_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        value = client.execute_script(
+            """
+            const messageId = arguments[0];
+            const attachmentId = arguments[1];
+            const message = document.querySelector(
+              `[data-message-ulid="${messageId}"]`
+            );
+            const attachment = document.querySelector(
+              `[data-messaging-attachment-id="${attachmentId}"]`
+            );
+            const viewport = document.querySelector('.chat-message-scroll');
+            const describeAttachment = element => element ? {
+              attachmentId: element.getAttribute(
+                'data-messaging-attachment-id'
+              ) || '',
+              openState: element.getAttribute(
+                'data-messaging-attachment-open-state'
+              ) || '',
+              voiceNote: element.getAttribute('data-chat-voice-note') || '',
+            } : null;
+            return {
+              messageVisible: Boolean(message),
+              attachmentVisible: Boolean(attachment),
+              attachmentState: attachment?.getAttribute(
+                'data-messaging-attachment-open-state'
+              ) || '',
+              attachment: describeAttachment(attachment),
+              voiceNote: attachment?.getAttribute('data-chat-voice-note') || '',
+              renderedMessageIds: Array.from(
+                document.querySelectorAll('[data-message-ulid]')
+              ).slice(-8).map(
+                element => element.getAttribute('data-message-ulid') || ''
+              ),
+              renderedAttachments: Array.from(
+                document.querySelectorAll('[data-messaging-attachment-id]')
+              ).slice(-8).map(describeAttachment),
+              scroll: viewport ? {
+                clientHeight: viewport.clientHeight,
+                scrollHeight: viewport.scrollHeight,
+                scrollTop: viewport.scrollTop,
+              } : null,
+            };
+            """,
+            message_id,
+            attachment_id,
+        )
+        return value if isinstance(value, dict) else {}
+
+    def _open_attachment(self, actor: str, attachment_id: str) -> Path:
+        def open_verified_path() -> Path | None:
+            try:
+                value = async_harness(
+                    self.clients[actor],
+                    "openAttachment",
+                    {
+                        "actorPtid": self.ptids[actor],
+                        "attachmentId": attachment_id,
+                    },
+                    timeout=60,
+                )
+            except GateError as error:
+                if "ATTACHMENT_TRANSFER_ERROR_CODE_RETRY_LATER" in str(error):
+                    return None
+                raise
+            local_path = (
+                str(value.get("localPath") or "")
+                if isinstance(value, dict)
+                else ""
+            )
+            return Path(local_path) if local_path else None
+
+        path = wait_until(
+            open_verified_path,
+            f"{actor} verified attachment cache path",
+            timeout=60,
+        )
+        return path
+
+    @staticmethod
+    def _composer_outcome(
+        client: TauriSession,
+        conversation_id: str,
+        after_revision: int,
+    ) -> dict[str, Any] | None:
+        composer = client.find_element(
+            f'[data-chat-composer="{conversation_id}"]',
+            5,
+        )
+        revision = int(
+            composer.get_attribute("data-chat-send-outcome-revision") or 0
+        )
+        if revision <= after_revision:
+            return None
+        return {
+            "revision": revision,
+            "state": composer.get_attribute("data-chat-send-outcome-state") or "",
+            "messageId": composer.get_attribute(
+                "data-chat-send-outcome-message-id"
+            )
+            or "",
+            "attachmentIds": [
+                item
+                for item in (
+                    composer.get_attribute(
+                        "data-chat-send-outcome-attachment-ids"
+                    )
+                    or ""
+                ).split(",")
+                if item
+            ],
+        }
+
+    @staticmethod
+    def _renderer_geometry(client: TauriSession) -> dict[str, Any]:
+        value = client.execute_script(
+            """
+            const rect = (selector) => {
+              const node = document.querySelector(selector);
+              const bounds = node?.getBoundingClientRect();
+              return bounds ? {
+                left: bounds.left,
+                top: bounds.top,
+                width: bounds.width,
+                height: bounds.height,
+              } : null;
+            };
+            return {
+              screenX: window.screenX,
+              screenY: window.screenY,
+              outerWidth: window.outerWidth,
+              outerHeight: window.outerHeight,
+              innerWidth: window.innerWidth,
+              innerHeight: window.innerHeight,
+              devicePixelRatio: window.devicePixelRatio,
+              pane: rect('[data-chat-conversation-pane]'),
+              composer: rect('[data-chat-composer]'),
+            };
+            """
+        )
+        if not isinstance(value, dict):
+            raise GateError("renderer geometry snapshot is unavailable")
+        return value
+
+    def _geometry_snapshot(
+        self,
+        actor: str,
+    ) -> dict[str, Any]:
+        client = self.clients[actor]
+        if client.process_id is None:
+            raise GateError(f"{actor} process identity is unavailable")
+        cooperative_activation = (
+            self.runtime_binding.request_cooperative_activation(
+                client,
+                tuple(self.clients.values()),
+            )
+        )
+        WebDriverWait(
+            client.driver,
+            10,
+            poll_frequency=0.05,
+        ).until(
+            lambda driver: (
+                control
+                if (
+                    (
+                        control := self.runtime_binding.native_adapter.focused_control(
+                            client.process_id or 0
+                        )
+                    ).frontmost
+                    and control.main_window
+                    and control.actual_frontmost_pid == client.process_id
+                    and bool(
+                        driver.execute_script("return document.hasFocus()")
+                    )
+                )
+                else None
+            )
+        )
+        renderer = self._renderer_geometry(client)
+        driver_window = client.driver.get_window_rect()
+        device_pixel_ratio = float(renderer["devicePixelRatio"])
+        if device_pixel_ratio <= 0:
+            raise GateError(
+                f"{actor} native window device pixel ratio is invalid"
+            )
+        center = (
+            (
+                float(driver_window["x"])
+                + float(driver_window["width"]) / 2
+            )
+            / device_pixel_ratio,
+            (
+                float(driver_window["y"])
+                + float(driver_window["height"]) / 2
+            )
+            / device_pixel_ratio,
+        )
+        stack = self.runtime_binding.native_adapter.window_stack_at_point(center)
+        native = next(
+            (
+                window.to_dict()
+                for window in stack.windows
+                if window.owner_pid == client.process_id
+                and window.alpha > 0
+            ),
+            None,
+        )
+        if not native:
+            raise GateError(
+                f"{actor} native window bounds are unavailable after "
+                f"cooperative activation={cooperative_activation}: "
+                f"{stack.error}"
+            )
+        return {"native": native, "renderer": renderer}
+
+    @staticmethod
+    def _geometry_equal(
+        before: dict[str, Any],
+        after: dict[str, Any],
+        *,
+        allow_composer_expansion: bool = False,
+    ) -> bool:
+        def close(left: Any, right: Any) -> bool:
+            return abs(float(left) - float(right)) <= 1.0
+
+        before_native = before["native"]["bounds"]
+        after_native = after["native"]["bounds"]
+        before_renderer = before["renderer"]
+        after_renderer = after["renderer"]
+        native_equal = all(
+            close(before_native[key], after_native[key])
+            for key in ("left", "top", "width", "height")
+        )
+        renderer_equal = all(
+            close(before_renderer[key], after_renderer[key])
+            for key in (
+                "screenX",
+                "screenY",
+                "outerWidth",
+                "outerHeight",
+                "innerWidth",
+                "innerHeight",
+                "devicePixelRatio",
+            )
+        )
+        pane_equal = all(
+            close(before_renderer["pane"][key], after_renderer["pane"][key])
+            for key in ("left", "top", "width", "height")
+        )
+        before_composer = before_renderer["composer"]
+        after_composer = after_renderer["composer"]
+        if allow_composer_expansion:
+            composer_equal = (
+                close(before_composer["left"], after_composer["left"])
+                and close(before_composer["width"], after_composer["width"])
+                and close(
+                    float(before_composer["top"])
+                    + float(before_composer["height"]),
+                    float(after_composer["top"])
+                    + float(after_composer["height"]),
+                )
+                and float(after_composer["top"])
+                <= float(before_composer["top"]) + 1.0
+                and float(after_composer["height"])
+                >= float(before_composer["height"]) - 1.0
+            )
+        else:
+            composer_equal = all(
+                close(before_composer[key], after_composer[key])
+                for key in ("left", "top", "width", "height")
+            )
+        return native_equal and renderer_equal and pane_equal and composer_equal
+
+    def _wait_for_screenshot_picker(
+        self,
+        actor: str,
+    ) -> NativeControlSnapshot:
+        client = self.clients[actor]
+        if client.process_id is None:
+            raise GateError(f"{actor} screenshot picker has no owning process")
+        return wait_until(
+            lambda: (
+                control
+                if not (
+                    control := self.runtime_binding.native_adapter.focused_control(
+                        client.process_id or 0
+                    )
+                ).frontmost
+                else None
+            ),
+            f"{actor} screenshot picker to become frontmost",
+            timeout=10,
+        )
+
+    def _native_click(self, actor: str, selector: str) -> tuple[float, float]:
+        client = self.clients[actor]
+        if client.process_id is None:
+            raise GateError(f"{actor} native click has no owning process")
+        self.runtime_binding.request_cooperative_activation(
+            client,
+            tuple(self.clients.values()),
+        )
+        WebDriverWait(
+            client.driver,
+            10,
+            poll_frequency=0.05,
+        ).until(
+            lambda driver: bool(
+                driver.execute_script("return document.hasFocus()")
+            )
+        )
+        element = client.find_element(selector, 10)
+        geometry = client.execute_script(
+            """
+            const element = arguments[0];
+            const rect = element.getBoundingClientRect();
+            return {
+              element: {
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                height: rect.height,
+              },
+              viewport: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+                devicePixelRatio: window.devicePixelRatio,
+              },
+            };
+            """,
+            element,
+        )
+        driver_window = client.driver.get_window_rect()
+        ratio = float(geometry["viewport"]["devicePixelRatio"])
+        native_window = {
+            "left": float(driver_window["x"]) / ratio,
+            "top": float(driver_window["y"]) / ratio,
+            "width": float(driver_window["width"]) / ratio,
+            "height": float(driver_window["height"]) / ratio,
+        }
+        origin = self.runtime_binding.native_adapter.content_origin(
+            client.process_id
+        )
+        if origin is None:
+            origin = (
+                native_window["left"]
+                + max(
+                    0.0,
+                    (
+                        native_window["width"]
+                        - float(geometry["viewport"]["width"])
+                    )
+                    / 2,
+                ),
+                native_window["top"]
+                + max(
+                    0.0,
+                    native_window["height"]
+                    - float(geometry["viewport"]["height"]),
+                ),
+            )
+        point = (
+            origin[0]
+            + float(geometry["element"]["left"])
+            + float(geometry["element"]["width"]) / 2,
+            origin[1]
+            + float(geometry["element"]["top"])
+            + float(geometry["element"]["height"]) / 2,
+        )
+        adapter = self.runtime_binding.native_adapter
+        mouse_down = False
+        try:
+            adapter.post_mouse((MouseAction.LEFT_DOWN,), point)
+            mouse_down = True
+            adapter.post_mouse((MouseAction.LEFT_UP,), point)
+            mouse_down = False
+        finally:
+            if mouse_down:
+                adapter.post_mouse((MouseAction.LEFT_UP,), point)
+        return point
+
+    def _cancel_screenshot(self, actor: str) -> dict[str, Any]:
+        client = self.clients[actor]
+        before = self._geometry_snapshot(actor)
+        self._native_click(actor, "[data-chat-screenshot-capture]")
+        self._wait_for_screenshot_picker(actor)
+        self.runtime_binding.native_adapter.post_key(
+            NativeKey.ESCAPE,
+            private_source=True,
+        )
+        wait_until(
+            lambda: (
+                self._geometry_snapshot(actor)
+                if client.find_element(
+                    "[data-chat-screenshot-capture]",
+                    5,
+                ).is_enabled()
+                else None
+            ),
+            f"{actor} screenshot cancellation to restore the app",
+            timeout=20,
+        )
+        after = self._geometry_snapshot(actor)
+        evidence = {"before": before, "after": after}
+        self.assert_condition(
+            "rich_screenshot_cancel_geometry",
+            self._geometry_equal(before, after),
+            json.dumps(evidence, sort_keys=True),
+        )
+        return evidence
+
+    def _confirm_screenshot(self, actor: str) -> dict[str, Any]:
+        client = self.clients[actor]
+        before = self._geometry_snapshot(actor)
+        self._native_click(actor, "[data-chat-screenshot-capture]")
+        self._wait_for_screenshot_picker(actor)
+        native = before["native"]["bounds"]
+        left = float(native["left"]) + 32
+        top = float(native["top"]) + 72
+        adapter = self.runtime_binding.native_adapter
+        adapter.drag_mouse(
+            (left, top),
+            (left + 180, top + 120),
+        )
+        draft = wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in client.find_elements(
+                        '[data-chat-attachment-draft]'
+                        '[data-chat-attachment-status="ready"]'
+                    )
+                    if item.is_displayed()
+                ),
+                None,
+            ),
+            f"{actor} confirmed screenshot draft",
+            timeout=30,
+        )
+        after = self._geometry_snapshot(actor)
+        evidence = {
+            "before": before,
+            "after": after,
+            "draftId": draft.get_attribute("data-chat-attachment-draft") or "",
+            "preview": draft.get_attribute("data-chat-attachment-preview") or "",
+        }
+        self.assert_condition(
+            "rich_screenshot_confirm_geometry",
+            self._geometry_equal(
+                before,
+                after,
+                allow_composer_expansion=True,
+            )
+            and bool(evidence["draftId"])
+            and bool(evidence["preview"]),
+            json.dumps(evidence, sort_keys=True),
+        )
+        buttons = draft.find_elements("tag name", "button")
+        if not buttons:
+            raise GateError("confirmed screenshot draft has no discard control")
+        buttons[-1].click()
+        wait_until(
+            lambda: not client.find_elements(
+                f'[data-chat-attachment-draft="{evidence["draftId"]}"]'
+            ),
+            "confirmed screenshot draft discard",
+            timeout=10,
+        )
+        return evidence
+
+    def _prove_attachment_failure(
+        self,
+        actor: str,
+        empty_file: Path,
+    ) -> dict[str, Any]:
+        client = self.clients[actor]
+        self._select_native_file(
+            actor,
+            "[data-chat-attachment-picker]",
+            empty_file,
+        )
+        draft = wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in client.find_elements(
+                        '[data-chat-attachment-draft]'
+                        '[data-chat-attachment-status="failed"]'
+                    )
+                    if item.is_displayed()
+                ),
+                None,
+            ),
+            "failed rich attachment draft",
+            timeout=30,
+        )
+        draft_id = draft.get_attribute("data-chat-attachment-draft") or ""
+        attempt = int(
+            draft.get_attribute("data-chat-attachment-attempt") or 0
+        )
+        buttons = draft.find_elements("tag name", "button")
+        if len(buttons) < 2:
+            raise GateError("failed rich attachment lacks retry and discard")
+        buttons[0].click()
+        retained = wait_until(
+            lambda: (
+                item
+                if (
+                    item := next(
+                        (
+                            candidate
+                            for candidate in client.find_elements(
+                                f'[data-chat-attachment-draft="{draft_id}"]'
+                                '[data-chat-attachment-status="failed"]'
+                            )
+                            if candidate.is_displayed()
+                        ),
+                        None,
+                    )
+                )
+                and int(
+                    item.get_attribute("data-chat-attachment-attempt") or 0
+                )
+                > attempt
+                else None
+            ),
+            "failed rich attachment retained after retry",
+            timeout=30,
+        )
+        evidence = {
+            "draftId": draft_id,
+            "attemptBefore": attempt,
+            "attemptAfter": int(
+                retained.get_attribute("data-chat-attachment-attempt") or 0
+            ),
+            "status": retained.get_attribute("data-chat-attachment-status"),
+        }
+        self.assert_condition(
+            "rich_attachment_retry_retained",
+            bool(draft_id)
+            and evidence["attemptAfter"] > attempt
+            and evidence["status"] == "failed",
+            json.dumps(evidence, sort_keys=True),
+        )
+        retained_buttons = retained.find_elements("tag name", "button")
+        retained_buttons[-1].click()
+        return evidence
+
+    def _prove_file_attachment(
+        self,
+        actor: str,
+        peer: str,
+        conversation_id: str,
+        source: Path,
+    ) -> dict[str, Any]:
+        if self.runtime_binding is None:
+            raise GateError("Native Desktop runtime binding is required")
+        client = self.clients[actor]
+        composer = client.find_element(
+            f'[data-chat-composer="{conversation_id}"]',
+            10,
+        )
+        revision = int(
+            composer.get_attribute("data-chat-send-outcome-revision") or 0
+        )
+        upload_proxy = DirectRouteFaultProxy(
+            active_direct_route_multiaddr(self.clients[actor]),
+        )
+        download_proxy = DirectRouteFaultProxy(
+            active_direct_route_multiaddr(self.clients[peer]),
+        )
+        proxies_started = False
+        upload_override = None
+        download_override = None
+        try:
+            upload_proxy.start()
+            download_proxy.start()
+            proxies_started = True
+            upload_override = self.runtime_binding.create_transport_override(
+                actor,
+                "station",
+                upload_proxy.multiaddr,
+            )
+            download_override = self.runtime_binding.create_transport_override(
+                peer,
+                "station",
+                download_proxy.multiaddr,
+            )
+            self.runtime_binding.apply_verified_direct_route_override(
+                actor,
+                "station",
+                upload_override,
+            )
+            upload_proxy.arm_once()
+            self._select_native_file(
+                actor,
+                "[data-chat-attachment-picker]",
+                source,
+            )
+            wait_until(
+                lambda: next(
+                    (
+                        item
+                        for item in client.find_elements(
+                            '[data-chat-attachment-draft]'
+                            '[data-chat-attachment-status="ready"]'
+                        )
+                        if item.is_displayed()
+                    ),
+                    None,
+                ),
+                "ready rich attachment draft",
+                timeout=30,
+            )
+            client.find_element("[data-chat-send]", 10).click()
+            outcome = wait_until(
+                lambda: self._composer_outcome(
+                    client,
+                    conversation_id,
+                    revision,
+                ),
+                "interrupted rich attachment send outcome",
+                timeout=180,
+            )
+            if (
+                outcome["state"] != "pending"
+                or not outcome["messageId"]
+                or len(outcome["attachmentIds"]) != 1
+            ):
+                raise GateError(
+                    "interrupted rich attachment did not retain one durable "
+                    f"pending identity: {outcome}"
+                )
+            message_id = str(outcome["messageId"])
+            attachment_id = str(outcome["attachmentIds"][0])
+            expected_hash = file_sha256(source)
+            projections: dict[str, Any] = {}
+            hashes: dict[str, str] = {}
+            actor_attachment = wait_until(
+                lambda: self._engine_attachment(
+                    actor,
+                    conversation_id,
+                    message_id,
+                    attachment_id,
+                ),
+                "interrupted rich attachment projection",
+                timeout=180,
+            )
+            upload_evidence = wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        (snapshot := upload_proxy.evidence())[
+                            "failureCount"
+                        ] == 1
+                        and snapshot["forwardedConnections"] >= 1
+                    )
+                    else None
+                ),
+                "rich attachment upload to resume after connection loss",
+                timeout=30,
+            )
+            self.assert_condition(
+                "rich_attachment_upload_retry_identity",
+                isinstance(actor_attachment, dict)
+                and upload_evidence["dropRemaining"] == 0
+                and upload_evidence["failureCount"] == 1,
+                json.dumps(
+                    {
+                        "messageId": message_id,
+                        "attachmentId": attachment_id,
+                        "initialOutcome": outcome,
+                        "transport": upload_evidence,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            self.runtime_binding.clear_verified_direct_route_override(
+                actor,
+                "station",
+                upload_override,
+            )
+            upload_override = None
+
+            actor_path = self._open_attachment(actor, attachment_id)
+            projections[actor] = actor_attachment
+            hashes[actor] = self.runtime_binding.native_file_sha256(
+                actor,
+                actor_path,
+            )
+
+            peer_attachment = wait_until(
+                lambda: self._engine_attachment(
+                    peer,
+                    conversation_id,
+                    message_id,
+                    attachment_id,
+                ),
+                "receiver rich attachment Engine projection",
+                timeout=180,
+            )
+            projections[peer] = peer_attachment
+            self.runtime_binding.apply_verified_direct_route_override(
+                peer,
+                "station",
+                download_override,
+            )
+            download_proxy.arm()
+            # A pre-existing libp2p connection can briefly survive the route
+            # override, so the first object fetch may not traverse the armed
+            # proxy. Reassert the override periodically (each reapplication
+            # closes the live route) until the proxy observes a real drop.
+            last_reapply = [time.monotonic()]
+
+            def wait_download_interrupted() -> bool:
+                if download_proxy.evidence()["failureCount"] >= 1:
+                    return True
+                if time.monotonic() - last_reapply[0] >= 5.0:
+                    self.runtime_binding.apply_verified_direct_route_override(
+                        peer,
+                        "station",
+                        download_override,
+                    )
+                    last_reapply[0] = time.monotonic()
+                return False
+
+            download_recovery = prove_file_download_recovery(
+                client=self.clients[peer],
+                attachment_id=attachment_id,
+                resume_transport=download_proxy.disarm,
+                wait_interrupted=wait_download_interrupted,
+                assert_condition=self.assert_condition,
+            )
+            peer_path = self._open_attachment(peer, attachment_id)
+            hashes[peer] = self.runtime_binding.native_file_sha256(
+                peer,
+                peer_path,
+            )
+            download_evidence = wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        (snapshot := download_proxy.evidence())[
+                            "failureCount"
+                        ] >= 1
+                        and snapshot["forwardedConnections"] >= 1
+                    )
+                    else None
+                ),
+                "rich attachment download to resume after connection loss",
+                timeout=30,
+            )
+            self.assert_condition(
+                "rich_attachment_download_retry_identity",
+                download_evidence["failureCount"] >= 1
+                and download_evidence["dropRemaining"] == 0
+                and hashes[peer] == expected_hash,
+                json.dumps(
+                    {
+                        "messageId": message_id,
+                        "attachmentId": attachment_id,
+                        "transport": download_evidence,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            evidence = {
+                "messageId": message_id,
+                "attachmentId": attachment_id,
+                "initialOutcome": outcome,
+                "expectedHash": expected_hash,
+                "hashes": hashes,
+                "projections": projections,
+                "uploadRetry": upload_evidence,
+                "downloadRetry": download_evidence,
+                "downloadRecovery": download_recovery,
+            }
+            self.assert_condition(
+                "rich_attachment_byte_identity",
+                set(hashes.values()) == {expected_hash}
+                and projections[actor] == projections[peer]
+                and projections[actor].get("contentKind") == "file"
+                and int(projections[actor].get("durationMs") or 0) == 0,
+                json.dumps(evidence, sort_keys=True),
+            )
+            return evidence
+        finally:
+            cleanup_errors: list[str] = []
+            if upload_override is not None:
+                try:
+                    self.runtime_binding.clear_verified_direct_route_override(
+                        actor,
+                        "station",
+                        upload_override,
+                    )
+                except Exception as error:
+                    cleanup_errors.append(f"upload override: {error}")
+            if download_override is not None:
+                try:
+                    self.runtime_binding.clear_verified_direct_route_override(
+                        peer,
+                        "station",
+                        download_override,
+                    )
+                except Exception as error:
+                    cleanup_errors.append(f"download override: {error}")
+            if proxies_started:
+                for label, proxy in (
+                    ("upload proxy", upload_proxy),
+                    ("download proxy", download_proxy),
+                ):
+                    try:
+                        proxy.stop()
+                    except Exception as error:
+                        cleanup_errors.append(f"{label}: {error}")
+            if cleanup_errors:
+                raise GateError(
+                    "rich attachment fault transport cleanup failed: "
+                    + "; ".join(cleanup_errors)
+                )
+
+    def _prove_file_format_matrix(
+        self,
+        actor: str,
+        peer: str,
+        conversation_id: str,
+        root: Path,
+    ) -> dict[str, Any]:
+        files = create_file_format_fixtures(root)
+        observations: dict[str, Any] = {}
+        for index, (format_id, source) in enumerate(files.items()):
+            sender, receiver = (actor, peer) if index % 2 == 0 else (peer, actor)
+            client = self.clients[sender]
+            composer = client.find_element(f'[data-chat-composer="{conversation_id}"]', 10)
+            revision = int(composer.get_attribute("data-chat-send-outcome-revision") or 0)
+            self._select_native_file(sender, "[data-chat-attachment-picker]", source)
+            wait_until(
+                lambda: next(
+                    (item for item in client.find_elements(
+                        '[data-chat-attachment-draft][data-chat-attachment-status="ready"]'
+                    ) if item.is_displayed()), None,
+                ),
+                f"{sender} {format_id} draft", timeout=30,
+            )
+            client.find_element("[data-chat-send]", 10).click()
+            outcome = wait_until(
+                lambda: self._composer_outcome(client, conversation_id, revision),
+                f"{sender} {format_id} send outcome", timeout=60,
+            )
+            if (
+                outcome["state"] != "pending" or not outcome["messageId"]
+                or len(outcome["attachmentIds"]) != 1
+            ):
+                raise GateError(f"file-format send outcome is invalid: {outcome}")
+            message_id = str(outcome["messageId"])
+            attachment_id = str(outcome["attachmentIds"][0])
+            expected_hash = file_sha256(source)
+            observations[format_id] = {
+                "messageId": message_id, "attachmentId": attachment_id,
+                "senderActor": sender, "receiverActor": receiver,
+            }
+            for participant, role in ((sender, "sender"), (receiver, "receiver")):
+                wait_until(
+                    lambda participant=participant: self._engine_attachment(
+                        participant, conversation_id, message_id, attachment_id,
+                    ),
+                    f"{participant} {format_id} encrypted projection", timeout=60,
+                )
+                evidence_root = root / "file-format-evidence" / format_id / role
+                retained = {}
+                def retain_evidence(observed):
+                    for image in sorted(evidence_root.glob("*.png")):
+                        if str(image) in retained:
+                            continue
+                        retained[str(image)] = self.report.add_evidence_file(
+                            f"file-format-{format_id}-{role}-{image.name}", image,
+                            destination_dir=self.evidence_dir,
+                        )
+                    for record in sorted(evidence_root.glob("*.json")):
+                        if str(record) in retained:
+                            continue
+                        pixels = json.loads(record.read_text())
+                        for key in ("screenshot", "contentScreenshot", "headerScreenshot", "navigationScreenshot"):
+                            if pixels.get(key) in retained:
+                                pixels[key] = retained[pixels[key]]
+                        record.write_text(json.dumps(pixels, ensure_ascii=False, indent=2))
+                        retained[str(record)] = self.report.add_evidence_file(
+                            f"file-format-{format_id}-{role}-{record.name}", record,
+                            destination_dir=self.evidence_dir,
+                        )
+                    for key in (
+                        "pixelsEvidence", "nextPixelsEvidence",
+                        "overviewPixelsEvidence", "figurePixelsEvidence",
+                    ):
+                        pixels = observed.get(key, {})
+                        for key in ("screenshot", "contentScreenshot", "headerScreenshot", "navigationScreenshot"):
+                            if pixels.get(key) in retained:
+                                pixels[key] = retained[pixels[key]]
+                observed = prove_file_format_preview(
+                    client=self.clients[participant],
+                    attachment_id=attachment_id,
+                    source=source,
+                    format_id=format_id,
+                    role=role,
+                    evidence_root=evidence_root,
+                    assert_condition=self.assert_condition,
+                    scroll_preview=lambda selector, participant=participant: self._scroll_file_preview(
+                        participant, selector,
+                    ),
+                    retain_evidence=retain_evidence,
+                )
+                # Cache hashes supplement the actual card and decoder evidence.
+                path = self._open_attachment(participant, attachment_id)
+                actual_hash = self.runtime_binding.native_file_sha256(participant, path)
+                self.assert_condition(
+                    f"rich_file_format_{format_id}_{role}_bytes",
+                    actual_hash == expected_hash,
+                    json.dumps({"expected": expected_hash, "actual": actual_hash}),
+                )
+                observations[format_id][role] = observed
+        self.assert_condition(
+            "rich_file_supported_format_matrix",
+            set(observations) == set(FILE_FORMAT_KINDS)
+            and all("sender" in item and "receiver" in item for item in observations.values()),
+            json.dumps(observations, sort_keys=True),
+        )
+        return observations
+
+    def _prove_file_scope_boundaries(
+        self,
+        actor: str,
+        peer: str,
+        conversation_id: str,
+        attachment_id: str,
+        root: Path,
+    ) -> dict[str, Any]:
+        observations: dict[str, Any] = {}
+        for participant, role in ((actor, "sender"), (peer, "receiver")):
+            client = self.clients[participant]
+            other = peer if participant == actor else actor
+            evidence_root = root / "file-scope-evidence" / role
+            journey = ChatFileScopeJourney(
+                client=client, runtime_binding=self.runtime_binding,
+                account=str(self.actor_specs[participant]["accountRef"]).removeprefix("station-account:"),
+                actor_ptid=self.ptids[participant], conversation_id=conversation_id,
+                primary_station=runtime_station_service(self.manifest, participant),
+                secondary_station=runtime_station_service(self.manifest, other),
+                native_click=lambda selector, participant=participant: self._native_click(
+                    participant, selector,
+                ),
+                evidence_root=evidence_root,
+            )
+            journey.prepare()
+
+            def restore() -> None:
+                enter_chat_page(client)
+                client.find_element(
+                    f'[data-pt-conversation-item="{conversation_id}"]', 15,
+                ).click()
+
+            def close_detail() -> dict[str, Any]:
+                client.find_element(".ant-modal-close", 5).click()
+                return {"boundary": "detail-close"}
+
+            def leave_chat() -> dict[str, Any]:
+                client.find_element(
+                    '[data-pt-primary-nav="settings"] button, '
+                    '[data-pt-primary-nav="settings"] [role="button"]', 10,
+                ).click()
+                route = wait_until(
+                    lambda: value if (
+                        (value := client.execute_script("return location.hash"))
+                        and value != "#/chat"
+                    ) else None,
+                    "real primary navigation left Chat", timeout=15,
+                )
+                return {"boundary": "leave-chat", "route": route}
+
+            observations[role] = {}
+            try:
+                for boundary, transition in (("close", close_detail), ("leave_chat", leave_chat)):
+                    observations[role][boundary] = prove_file_grant_revocation(
+                        client=client, runtime_binding=self.runtime_binding,
+                        attachment_id=attachment_id, actor_ptid=self.ptids[participant],
+                        transition=transition, restore=restore,
+                        evidence_root=evidence_root / boundary,
+                    )
+                observations[role].update(journey.prove(attachment_id))
+            finally:
+                references = {
+                    str(path): self.report.add_evidence_file(
+                        f"file-scope-{role}-{'-'.join(path.relative_to(evidence_root).parts)}",
+                        path, destination_dir=self.evidence_dir,
+                    )
+                    for path in evidence_root.rglob("*.png")
+                }
+
+                def retained(value: Any) -> Any:
+                    if isinstance(value, dict):
+                        return {key: retained(item) for key, item in value.items()}
+                    return references.get(value, value) if isinstance(value, str) else value
+
+                observations[role] = retained(observations[role])
+            for boundary, result in observations[role].items():
+                ui = result.get("ui", result)
+                self.assert_condition(
+                    f"rich_file_scope_{role}_{boundary}",
+                    ui["afterStatus"] == 404
+                    and len(ui["rejectedIntents"]) == 3
+                    and ui["nativeResourcesUnchanged"],
+                    json.dumps(result, sort_keys=True),
+                )
+        required = {"close", "leave_chat", "conversation", "account", "station", "logout"}
+        self.assert_condition(
+            "rich_file_scope_fencing",
+            all(
+                set(observations[role]) == required
+                and all(
+                    observations[role][boundary]["supporting-authority"]["afterStatus"] == 404
+                    and len(observations[role][boundary]["supporting-authority"]["rejectedIntents"]) == 3
+                    and observations[role][boundary]["supporting-authority"]["nativeResourcesUnchanged"]
+                    for boundary in ("conversation", "account", "station")
+                )
+                for role in ("sender", "receiver")
+            ),
+            json.dumps(observations, sort_keys=True),
+        )
+        return observations
+
+    def _prove_native_file_actions(
+        self,
+        actor: str,
+        peer: str,
+        attachment: dict[str, Any],
+        source: Path,
+        format_matrix: dict[str, Any],
+        root: Path,
+    ) -> dict[str, Any]:
+        observations: dict[str, Any] = {}
+        for participant, role in ((actor, "sender"), (peer, "receiver")):
+            client = self.clients[participant]
+            cache_path = self._open_attachment(participant, str(attachment["attachmentId"]))
+            evidence_root = root / "native-file-evidence" / role
+            native_click = lambda selector, participant=participant: self._native_click(
+                participant, selector,
+            )
+            actions = {}
+            try:
+                actions["preview"] = prove_native_file_preview(
+                    client=client, runtime_binding=self.runtime_binding,
+                    attachment_id=str(format_matrix["pdf"]["attachmentId"]),
+                    source=root / "formats" / "format-report.pdf",
+                    evidence_root=evidence_root,
+                    native_click=native_click,
+                    expected_text="File viewing page 1",
+                )
+                actions["externalCopy"] = prove_external_file_isolation(
+                    client=client, runtime_binding=self.runtime_binding,
+                    attachment_id=str(attachment["attachmentId"]),
+                    source=source, cache_path=cache_path,
+                    evidence_root=evidence_root, native_click=native_click,
+                )
+                actions["export"] = prove_export_retention(
+                    client=client, runtime_binding=self.runtime_binding,
+                    attachment_id=str(attachment["attachmentId"]),
+                    source=source, cache_path=cache_path,
+                    destination=root / "exports" / role / source.name,
+                    evidence_root=evidence_root, native_click=native_click,
+                )
+            finally:
+                # Persist native observations before the Suite fixture root is
+                # reclaimed, including screenshots preceding a failed action.
+                references = {
+                    str(path): self.report.add_evidence_file(
+                        f"file-{role}-{path.name}", path,
+                        destination_dir=self.evidence_dir,
+                    )
+                    for path in sorted(evidence_root.glob("*.png"))
+                }
+
+                def retained(value):
+                    if isinstance(value, dict):
+                        return {key: retained(item) for key, item in value.items()}
+                    return references.get(value, value) if isinstance(value, str) else value
+
+                for path in sorted(evidence_root.glob("*.json")):
+                    record = retained(json.loads(path.read_text()))
+                    path.write_text(json.dumps(record, indent=2))
+                    references[str(path)] = self.report.add_evidence_file(
+                        f"file-{role}-{path.name}", path,
+                        destination_dir=self.evidence_dir,
+                    )
+                actions = retained(actions)
+            observations[role] = actions
+        for name, field in (
+            ("rich_file_native_preview", "preview"),
+            ("rich_file_external_copy_isolation", "externalCopy"),
+            ("rich_file_export_survives_eviction", "export"),
+        ):
+            self.assert_condition(
+                name,
+                all(field in observations[role] for role in ("sender", "receiver")),
+                json.dumps({role: actions[field] for role, actions in observations.items()},
+                           sort_keys=True),
+            )
+        return observations
+
+    def _record_until_preview(
+        self,
+        actor: str,
+        *,
+        minimum_seconds: int,
+    ) -> dict[str, Any]:
+        client = self.clients[actor]
+        if client.process_id is None:
+            raise GateError(f"{actor} voice capture has no owning process")
+        client.find_element("[data-chat-voice-record]", 10).click()
+        recording = self._wait_for_voice_recording(actor)
+        self.assert_condition(
+            "voice_capture_permission",
+            recording.is_displayed(),
+            "production MediaRecorder reached the recording state",
+        )
+        wait_until(
+            lambda: (
+                recording
+                if int(
+                    recording.get_attribute(
+                        "data-chat-voice-recording-seconds"
+                    )
+                    or 0
+                )
+                >= minimum_seconds
+                else None
+            ),
+            f"{actor} recorded voice duration",
+            timeout=max(10, minimum_seconds + 5),
+        )
+        client.find_element("[data-chat-voice-finish]", 10).click()
+        preview = wait_until(
+            lambda: (
+                element
+                if (
+                    element := client.find_element(
+                        '[data-chat-voice-draft="preview"]',
+                        5,
+                    )
+                ).is_displayed()
+                else None
+            ),
+            f"{actor} local voice preview",
+            timeout=15,
+        )
+        duration_ms = int(
+            preview.get_attribute("data-chat-voice-duration-ms") or 0
+        )
+        if duration_ms < minimum_seconds * 1_000:
+            raise GateError(
+                f"{actor} voice preview duration is incomplete: {duration_ms}"
+            )
+        return {"durationMs": duration_ms}
+
+    def _wait_for_voice_recording(self, actor: str) -> Any:
+        client = self.clients[actor]
+        if client.process_id is None:
+            raise GateError(f"{actor} voice capture has no owning process")
+        permission_accepted = False
+
+        def recording_or_permission() -> Any:
+            nonlocal permission_accepted
+            recording = next(
+                (
+                    element
+                    for element in client.find_elements(
+                        "[data-chat-voice-recording]"
+                    )
+                    if element.is_displayed()
+                ),
+                None,
+            )
+            if recording is not None:
+                return recording
+            accepted = (
+                self.runtime_binding.native_adapter
+                .accept_media_capture_permission_to_process(
+                    client.process_id or 0
+                )
+            )
+            if accepted and not permission_accepted:
+                permission_accepted = True
+            return None
+
+        return wait_until(
+            recording_or_permission,
+            f"{actor} microphone capture to start",
+            timeout=30,
+        )
+
+    def _prove_voice_cancel_and_discard(
+        self,
+        actor: str,
+    ) -> dict[str, Any]:
+        client = self.clients[actor]
+        client.find_element("[data-chat-voice-record]", 10).click()
+        self._wait_for_voice_recording(actor)
+        client.find_element("[data-chat-voice-cancel]", 10).click()
+        cancelled = wait_until(
+            lambda: (
+                True
+                if not client.find_elements(
+                    "[data-chat-voice-recording], [data-chat-voice-draft]"
+                )
+                else None
+            ),
+            f"{actor} voice cancellation",
+            timeout=10,
+        )
+        self.assert_condition(
+            "voice_cancel_boundary",
+            cancelled is True,
+            "cancel removed the recording without creating a draft",
+        )
+        preview = self._record_until_preview(actor, minimum_seconds=1)
+        client.find_element("[data-chat-voice-discard]", 10).click()
+        discarded = wait_until(
+            lambda: (
+                True
+                if not client.find_elements("[data-chat-voice-draft]")
+                else None
+            ),
+            f"{actor} voice preview discard",
+            timeout=10,
+        )
+        self.assert_condition(
+            "voice_preview_discard",
+            discarded is True and int(preview["durationMs"]) > 0,
+            json.dumps(preview, sort_keys=True),
+        )
+        return {"cancelled": cancelled, "preview": preview}
+
+    def _prove_voice_message(
+        self,
+        actor: str,
+        peer: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        client = self.clients[actor]
+        composer = client.find_element(
+            f'[data-chat-composer="{conversation_id}"]',
+            10,
+        )
+        revision = int(
+            composer.get_attribute("data-chat-send-outcome-revision") or 0
+        )
+        preview = self._record_until_preview(actor, minimum_seconds=2)
+        client.find_element("[data-chat-voice-send]", 10).click()
+        outcome = wait_until(
+            lambda: self._composer_outcome(
+                client,
+                conversation_id,
+                revision,
+            ),
+            "recorded voice send outcome",
+            timeout=180,
+        )
+        if (
+            outcome["state"] != "pending"
+            or not outcome["messageId"]
+            or len(outcome["attachmentIds"]) != 1
+        ):
+            raise GateError(f"recorded voice send outcome is invalid: {outcome}")
+        message_id = str(outcome["messageId"])
+        attachment_id = str(outcome["attachmentIds"][0])
+        projections: dict[str, Any] = {}
+        hashes: dict[str, str] = {}
+        paths: dict[str, Path] = {}
+        for participant in (actor, peer):
+            attachment = wait_until(
+                lambda participant=participant: self._engine_attachment(
+                    participant,
+                    conversation_id,
+                    message_id,
+                    attachment_id,
+                ),
+                f"{participant} recorded voice Engine projection",
+                timeout=180,
+            )
+            projections[participant] = attachment
+            paths[participant] = self._open_attachment(
+                participant,
+                attachment_id,
+            )
+            hashes[participant] = self.runtime_binding.native_file_sha256(
+                participant,
+                paths[participant],
+            )
+        persisted_duration = int(
+            projections[actor].get("durationMs")
+            or projections[actor].get("duration_ms")
+            or 0
+        )
+        metadata_evidence = {
+            "preview": preview,
+            "messageId": message_id,
+            "attachmentId": attachment_id,
+            "projections": projections,
+        }
+        self.assert_condition(
+            "voice_metadata_persisted",
+            projections[actor] == projections[peer]
+            and projections[actor].get("contentKind") == "voice_note"
+            and persisted_duration == int(preview["durationMs"])
+            and str(projections[actor].get("mimeType") or "").startswith(
+                "audio/"
+            ),
+            json.dumps(metadata_evidence, sort_keys=True),
+        )
+        self.assert_condition(
+            "voice_byte_identity",
+            len(set(hashes.values())) == 1
+            and next(iter(hashes.values()), "") != "",
+            json.dumps(hashes, sort_keys=True),
+        )
+
+        peer_client = self.clients[peer]
+        voice_selector = (
+            f'[data-message-ulid="{message_id}"] '
+            f'[data-messaging-attachment-id="{attachment_id}"]'
+            '[data-chat-voice-note="true"]'
+        )
+        last_voice_surface: dict[str, Any] = {}
+
+        def ready_voice_surface() -> Any:
+            nonlocal last_voice_surface
+            last_voice_surface = self._voice_surface_snapshot(
+                peer_client,
+                message_id,
+                attachment_id,
+            )
+            if (
+                last_voice_surface.get("messageVisible") is True
+                and last_voice_surface.get("attachmentVisible") is True
+                and last_voice_surface.get("voiceNote") == "true"
+                and last_voice_surface.get("attachmentState") == "ready"
+            ):
+                return peer_client.find_element(voice_selector, 1)
+            return None
+
+        try:
+            voice = wait_until(
+                ready_voice_surface,
+                "receiver recorded voice playback surface",
+                timeout=60,
+            )
+        except GateError as error:
+            raise GateError(
+                f"{error}; surface="
+                f"{json.dumps(last_voice_surface, sort_keys=True)}"
+            ) from error
+        seek = voice.find_element("css selector", "[data-chat-voice-seek]")
+        peer_client.execute_script(
+            """
+            const input = arguments[0];
+            const value = arguments[1];
+            const setter = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype,
+              'value',
+            )?.set;
+            if (!setter) throw new Error('range setter missing');
+            setter.call(input, value);
+            input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            """,
+            seek,
+            str(max(0.5, persisted_duration / 2_000)),
+        )
+        sought = wait_until(
+            lambda: (
+                int(
+                    voice.get_attribute("data-chat-voice-position-ms")
+                    or 0
+                )
+                if int(
+                    voice.get_attribute("data-chat-voice-position-ms")
+                    or 0
+                )
+                > 0
+                else None
+            ),
+            "receiver recorded voice seek",
+            timeout=10,
+        )
+        toggle = voice.find_element(
+            "css selector",
+            "[data-chat-voice-toggle]",
+        )
+        toggle.click()
+        wait_until(
+            lambda: (
+                True
+                if toggle.get_attribute("data-chat-voice-playing") == "true"
+                else None
+            ),
+            "receiver recorded voice playback",
+            timeout=10,
+        )
+        toggle.click()
+        paused = wait_until(
+            lambda: (
+                True
+                if toggle.get_attribute("data-chat-voice-playing") == "false"
+                else None
+            ),
+            "receiver recorded voice pause",
+            timeout=10,
+        )
+        playback_evidence = {
+            "durationMs": persisted_duration,
+            "positionMs": sought,
+            "paused": paused,
+        }
+        self.assert_condition(
+            "voice_playback_progress_seek_pause",
+            persisted_duration > 0 and sought > 0 and paused is True,
+            json.dumps(playback_evidence, sort_keys=True),
+        )
+        peer_client.execute_script(
+            """
+            const input = arguments[0];
+            const maximum = Number(input.max || 0);
+            const value = Math.max(0, maximum - 0.1);
+            const setter = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype,
+              'value',
+            )?.set;
+            if (!setter) throw new Error('range setter missing');
+            setter.call(input, String(value));
+            input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            """,
+            seek,
+        )
+        toggle.click()
+        ended = wait_until(
+            lambda: (
+                True
+                if voice.get_attribute("data-chat-voice-playback-state")
+                == "ended"
+                else None
+            ),
+            "receiver recorded voice terminal end state",
+            timeout=10,
+        )
+        playback_evidence["ended"] = ended
+        self.assert_condition(
+            "voice_playback_terminal_end",
+            ended is True
+            and int(
+                voice.get_attribute("data-chat-voice-position-ms") or 0
+            )
+            > 0,
+            json.dumps(playback_evidence, sort_keys=True),
+        )
+
+        paths[peer].unlink()
+        fault = peer_client.driver.execute_async_script(
+            """
+            const done = arguments[arguments.length - 1];
+            const root = document.querySelector(arguments[0]);
+            const audio = root?.querySelector('audio');
+            (async () => {
+                if (!audio?.src) throw new Error('voice audio source missing');
+                const source = audio.src;
+                const handle = new URL(source).pathname.replace(/^\\/+/, '');
+                if (!handle) throw new Error('voice access handle missing');
+                // This is a native fault injection. Recovery still uses the
+                // production visible retry control below.
+                await window.__TAURI__.core.invoke('messaging_release_attachment', {
+                    input: { access_handle: handle },
+                });
+                const response = await fetch(source, {
+                    headers: { Range: 'bytes=0-31' }, cache: 'no-store',
+                });
+                audio.load();
+                done({ ok: true, assetStatus: response.status });
+            })().catch(error => done({ ok: false, error: String(error) }));
+            """,
+            voice_selector,
+        )
+        self.assert_condition(
+            "voice_asset_eviction_fault",
+            isinstance(fault, dict) and fault.get("ok") is True
+            and fault.get("assetStatus") == 404 and not paths[peer].exists(),
+            json.dumps(fault, sort_keys=True),
+        )
+        retry = wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in peer_client.find_elements(
+                        f'{voice_selector} [data-chat-voice-retry]'
+                    )
+                    if item.is_displayed()
+                ),
+                None,
+            ),
+            "receiver recorded voice terminal retry",
+            timeout=15,
+        )
+        retry.click()
+        recovered = wait_until(
+            lambda: (
+                element
+                if (
+                    element := peer_client.find_element(
+                        voice_selector,
+                        5,
+                    )
+                ).get_attribute("data-messaging-attachment-open-state")
+                == "ready"
+                and element.get_attribute("data-chat-voice-terminal")
+                == "false"
+                else None
+            ),
+            "receiver recorded voice cache recovery",
+            timeout=60,
+        )
+        recovered_path = self._open_attachment(peer, attachment_id)
+        recovered_hash = self.runtime_binding.native_file_sha256(
+            peer,
+            recovered_path,
+        )
+        self.assert_condition(
+            "voice_playback_failure_retry",
+            recovered is not None
+            and recovered_hash == hashes[actor],
+            json.dumps(
+                {
+                    "senderHash": hashes[actor],
+                    "recoveredHash": recovered_hash,
+                },
+                sort_keys=True,
+            ),
+        )
+        return {
+            **metadata_evidence,
+            "hashes": hashes,
+            "paths": {
+                participant: str(path)
+                for participant, path in paths.items()
+            },
+            "playback": playback_evidence,
+            "recoveredHash": recovered_hash,
+        }
+
+    def prove_additional_journey_assertions(self) -> None:
+        actor = self.direction_order[0]
+        peer = next(name for name in self.clients if name != actor)
+        conversation_id = self._active_conversation_id(self.clients[actor])
+        with tempfile.TemporaryDirectory(prefix="pt-chat-rich-voice-") as raw:
+            root = Path(raw)
+            empty_file = root / "empty.png"
+            empty_file.write_bytes(b"")
+            source_file = root / "rich-attachment.txt"
+            source_file.write_bytes(
+                b"peers-touch-chat-rich-voice-byte-identity\n"
+            )
+            retry_evidence = self._prove_attachment_failure(
+                actor,
+                empty_file,
+            )
+            cancel_geometry = self._cancel_screenshot(actor)
+            confirm_geometry = self._confirm_screenshot(actor)
+            attachment = self._prove_file_attachment(
+                actor,
+                peer,
+                conversation_id,
+                source_file,
+            )
+            viewing = {
+                participant: prove_file_detail(
+                    client=self.clients[participant],
+                    runtime_binding=self.runtime_binding,
+                    attachment_id=str(attachment["attachmentId"]),
+                    source=source_file,
+                    role=role,
+                    native_click=lambda selector, participant=participant: self._native_click(
+                        participant, selector,
+                    ),
+                    assert_condition=self.assert_condition,
+                )
+                for participant, role in ((actor, "sender"), (peer, "receiver"))
+            }
+            format_matrix = self._prove_file_format_matrix(
+                actor, peer, conversation_id, root / "formats",
+            )
+            native_files = self._prove_native_file_actions(
+                actor, peer, attachment, source_file, format_matrix, root,
+            )
+            file_scope = self._prove_file_scope_boundaries(
+                actor, peer, conversation_id, str(attachment["attachmentId"]),
+                root,
+            )
+            voice_boundaries = self._prove_voice_cancel_and_discard(actor)
+            voice = self._prove_voice_message(
+                actor,
+                peer,
+                conversation_id,
+            )
+
+        peer_client = self._restart_client_preserving_state(peer)
+        enter_chat_page(peer_client)
+        peer_client.find_element(
+            f'[data-pt-conversation-item="{conversation_id}"]',
+            STEP_TIMEOUT,
+        ).click()
+        attachment_message_id = str(attachment["messageId"])
+        attachment_id = str(attachment["attachmentId"])
+        voice_message_id = str(voice["messageId"])
+        voice_attachment_id = str(voice["attachmentId"])
+        wait_until(
+            lambda: self._engine_message(
+                peer,
+                conversation_id,
+                attachment_message_id,
+            ),
+            "restarted receiver rich attachment projection",
+            timeout=60,
+        )
+        attachment_path = self._open_attachment(peer, attachment_id)
+        attachment_hash = self.runtime_binding.native_file_sha256(
+            peer,
+            attachment_path,
+        )
+        attachment_restart_evidence = {
+            "messageId": attachment_message_id,
+            "attachmentId": attachment_id,
+            "expectedHash": attachment["expectedHash"],
+            "actualHash": attachment_hash,
+        }
+        self.assert_condition(
+            "rich_attachment_restart_recovery",
+            attachment_hash == attachment["expectedHash"],
+            json.dumps(attachment_restart_evidence, sort_keys=True),
+        )
+        restarted_voice_metadata = wait_until(
+            lambda: self._engine_attachment(
+                peer,
+                conversation_id,
+                voice_message_id,
+                voice_attachment_id,
+            ),
+            "restarted receiver voice projection",
+            timeout=60,
+        )
+        voice_path = self._open_attachment(peer, voice_attachment_id)
+        voice_hash = self.runtime_binding.native_file_sha256(
+            peer,
+            voice_path,
+        )
+        voice_restart_evidence = {
+            "messageId": voice_message_id,
+            "attachmentId": voice_attachment_id,
+            "metadata": restarted_voice_metadata,
+            "expectedHash": voice["hashes"][actor],
+            "actualHash": voice_hash,
+        }
+        self.assert_condition(
+            "voice_restart_recovery",
+            isinstance(restarted_voice_metadata, dict)
+            and restarted_voice_metadata.get("contentKind") == "voice_note"
+            and int(restarted_voice_metadata.get("durationMs") or 0) > 0
+            and voice_hash == voice["hashes"][actor],
+            json.dumps(voice_restart_evidence, sort_keys=True),
+        )
+        self.report.runtime["richVoiceJourney"] = {
+            "actor": actor,
+            "peer": peer,
+            "conversationId": conversation_id,
+            "retry": retry_evidence,
+            "screenshotCancel": cancel_geometry,
+            "screenshotConfirm": confirm_geometry,
+            "attachment": attachment,
+            "fileViewing": viewing,
+            "fileFormatMatrix": format_matrix,
+            "nativeFileActions": native_files,
+            "fileScopeBoundaries": file_scope,
+            "voiceBoundaries": voice_boundaries,
+            "voice": voice,
+            "attachmentRestart": attachment_restart_evidence,
+            "voiceRestart": voice_restart_evidence,
+        }
+
+    def run(self) -> dict[str, Any]:
+        result = super().run()
+        assertion_names = {assertion.name for assertion in self.report.assertions}
+        missing = REQUIRED_RICH_VOICE_ASSERTIONS - assertion_names
+        if missing:
+            raise GateError(
+                f"rich voice assertions are missing: {sorted(missing)}"
+            )
+        result["journey"] = "rich-media-recorded-voice"
+        self.report.runtime["journey"] = "rich-media-recorded-voice"
+        return result
+
+
+def main() -> int:
+    selected = selected_native_runtime(GATE_ID)
+    gate: AcceptanceGate = LifecycleRichVoiceGate(
+        manifest=selected.manifest,
+        actor_manifest=selected.actor_manifest,
+        runtime_binding=selected.binding,
+    )
+    return gate.execute()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

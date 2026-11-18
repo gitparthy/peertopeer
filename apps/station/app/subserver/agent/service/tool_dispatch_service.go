@@ -1,0 +1,5183 @@
+// tool_dispatch_service.go owns Station policy, decision, targeted dispatch,
+// receipt validation, and ToolBatch continuation admission.
+package service
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/domain"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/errcode"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/infrastructure/persistence"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/model"
+	"github.com/peers-labs/peers-touch/station/frame/core/store"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	defaultCapabilityLeaseTTL = 5 * time.Minute
+	defaultToolDeadline       = 2 * time.Minute
+	defaultReconciliationTTL  = 10 * time.Minute
+	maxCapabilityPullLimit    = 100
+)
+
+type ToolPolicy string
+
+const (
+	ToolPolicyAuto   ToolPolicy = "auto"
+	ToolPolicyManual ToolPolicy = "manual"
+	ToolPolicyDeny   ToolPolicy = "deny"
+)
+
+type ToolRiskLevel string
+
+const (
+	ToolRiskLow    ToolRiskLevel = "low"
+	ToolRiskMedium ToolRiskLevel = "medium"
+	ToolRiskHigh   ToolRiskLevel = "high"
+)
+
+type AuthorizedToolProposal struct {
+	ToolCallID      string
+	ToolName        string
+	CapabilityID    string
+	SchemaVersion   string
+	BindingID       string
+	BindingRevision uint64
+	ExecutionOwner  model.ToolExecutionOwner
+	Arguments       []byte
+	ResourceRefs    []*model.ClientResourceRef
+}
+
+type ToolBatchProposal struct {
+	ActorID                   string
+	TurnID                    string
+	AttemptID                 string
+	ToolBatchID               string
+	ConversationID            string
+	AgentID                   string
+	Provider                  string
+	Model                     string
+	Effort                    string
+	ThinkingMode              string
+	SystemPrompt              string
+	Iteration                 uint32
+	MaxRetries                uint32
+	ContextWindowSize         uint32
+	DelegationDepth           uint32
+	RestrictedTools           []string
+	TaskID                    string
+	StepID                    string
+	ClientCapabilitySessionID string
+	ReadinessSnapshotID       string
+	Deadline                  time.Time
+	Calls                     []AuthorizedToolProposal
+}
+
+type ProposalDecision struct {
+	ToolCallID       string
+	ToolName         string
+	Arguments        string
+	ApprovalID       string
+	DecisionRevision uint64
+	ExpiresAt        time.Time
+	Status           string
+	ExecutionOwner   string
+	Reason           string
+	FencingToken     uint64
+}
+
+type ToolDispatchService struct {
+	now                 func() time.Time
+	capabilityProof     *ClientCapabilityProofService
+	conversations       *ConversationService
+	acceptanceScenarios *CapabilityAcceptanceScenarioService
+}
+
+func NewToolDispatchService() *ToolDispatchService {
+	return &ToolDispatchService{now: func() time.Time { return time.Now().UTC() }}
+}
+
+func (s *ToolDispatchService) SetCapabilityProofService(proof *ClientCapabilityProofService) {
+	s.capabilityProof = proof
+}
+
+func (s *ToolDispatchService) SetConversationService(conversations *ConversationService) {
+	s.conversations = conversations
+}
+
+func (s *ToolDispatchService) SetAcceptanceScenarioService(
+	scenarios *CapabilityAcceptanceScenarioService,
+) {
+	s.acceptanceScenarios = scenarios
+}
+
+func (s *ToolDispatchService) reachAcceptanceBarrier(
+	ctx context.Context,
+	actorPTID string,
+	barrier string,
+) (bool, error) {
+	if s.acceptanceScenarios == nil {
+		return false, nil
+	}
+	return s.acceptanceScenarios.ReachStationBarrier(
+		ctx,
+		actorPTID,
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+		barrier,
+	)
+}
+
+func (s *ToolDispatchService) matchesAcceptanceBarrier(
+	actorPTID string,
+	barrier string,
+) bool {
+	return s.acceptanceScenarios != nil &&
+		s.acceptanceScenarios.MatchesStationBarrier(
+			actorPTID,
+			model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+			barrier,
+		)
+}
+
+func (s *ToolDispatchService) reachAcceptanceTupleBarrier(
+	ctx context.Context,
+	actorPTID string,
+	cell string,
+	ordering string,
+) (bool, error) {
+	return s.reachAcceptanceTupleBarrierForFamily(
+		ctx,
+		actorPTID,
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+		cell,
+		ordering,
+	)
+}
+
+func (s *ToolDispatchService) reachAcceptanceTupleBarrierForFamily(
+	ctx context.Context,
+	actorPTID string,
+	family model.CapabilityAcceptanceScenarioFamily,
+	cell string,
+	ordering string,
+) (bool, error) {
+	if s.acceptanceScenarios == nil {
+		return false, nil
+	}
+	return s.acceptanceScenarios.ReachStationTupleBarrier(
+		ctx,
+		actorPTID,
+		family,
+		cell,
+		ordering,
+	)
+}
+
+func (s *ToolDispatchService) reachAcceptanceToolCallTupleBarrierForFamily(
+	ctx context.Context,
+	actorPTID string,
+	family model.CapabilityAcceptanceScenarioFamily,
+	cell string,
+	ordering string,
+	toolCallID string,
+) (bool, error) {
+	if s.acceptanceScenarios == nil {
+		return false, nil
+	}
+	if err := s.acceptanceScenarios.BindToolCall(
+		actorPTID,
+		family,
+		cell,
+		ordering,
+		toolCallID,
+	); err != nil {
+		return false, err
+	}
+	return s.acceptanceScenarios.ReachStationTupleBarrier(
+		ctx,
+		actorPTID,
+		family,
+		cell,
+		ordering,
+	)
+}
+
+func (s *ToolDispatchService) matchesAcceptanceTuple(
+	actorPTID string,
+	cell string,
+	ordering string,
+) bool {
+	return s.acceptanceScenarios != nil &&
+		s.acceptanceScenarios.MatchesStationTuple(
+			actorPTID,
+			model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+			cell,
+			ordering,
+		)
+}
+
+func (s *ToolDispatchService) acceptanceScenarioToolCall(
+	ctx context.Context,
+	actorPTID string,
+) (*persistence.ToolCall, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var call persistence.ToolCall
+	if err := db.WithContext(ctx).
+		Where(
+			"actor_id = ? AND status IN ?",
+			strings.TrimSpace(actorPTID),
+			[]string{
+				persistence.ToolCallStatusWaitingApproval,
+				persistence.ToolCallStatusApproved,
+				persistence.ToolCallStatusDispatchCommitted,
+				persistence.ToolCallStatusPrepared,
+			},
+		).
+		Order("created_at DESC, tool_call_id DESC").
+		First(&call).Error; err != nil {
+		return nil, notFoundToolError("acceptance scenario ToolCall", err)
+	}
+	return &call, nil
+}
+
+func (s *ToolDispatchService) acceptanceScenarioBinding(
+	ctx context.Context,
+	actorPTID string,
+	toolCallID string,
+) (string, uint64, error) {
+	if strings.TrimSpace(toolCallID) == "" {
+		call, err := s.acceptanceScenarioToolCall(ctx, actorPTID)
+		if err != nil {
+			return "", 0, err
+		}
+		return call.BindingID, call.BindingRevision, nil
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	var call persistence.ToolCall
+	if err := db.WithContext(ctx).
+		Where(
+			"actor_id = ? AND tool_call_id = ?",
+			strings.TrimSpace(actorPTID),
+			strings.TrimSpace(toolCallID),
+		).
+		First(&call).Error; err != nil {
+		return "", 0, notFoundToolError(
+			"acceptance scenario ToolCall",
+			err,
+		)
+	}
+	return call.BindingID, call.BindingRevision, nil
+}
+
+func (s *ToolDispatchService) revokeAcceptanceScenarioSession(
+	ctx context.Context,
+	actorPTID string,
+	expirePreparedReconciliation bool,
+) error {
+	call, err := s.acceptanceScenarioToolCall(ctx, actorPTID)
+	if err != nil {
+		return err
+	}
+	sessionID := call.CapabilitySessionID
+	if sessionID == "" {
+		db, openErr := s.getDB(ctx)
+		if openErr != nil {
+			return openErr
+		}
+		var batch persistence.ToolBatch
+		if loadErr := db.WithContext(ctx).
+			Where("id = ? AND actor_id = ?", call.ToolBatchID, call.ActorID).
+			First(&batch).Error; loadErr != nil {
+			return notFoundToolError("acceptance scenario ToolBatch", loadErr)
+		}
+		sessionID = batch.CapabilitySessionID
+	}
+	if sessionID == "" {
+		return nil
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	result := db.WithContext(ctx).
+		Model(&persistence.ClientCapabilityLease{}).
+		Where(
+			"session_id = ? AND actor_id = ? AND revoked_at IS NULL",
+			sessionID,
+			call.ActorID,
+		).
+		Updates(map[string]interface{}{
+			"lease_revision": gorm.Expr("lease_revision + ?", 1),
+			"revoked_at":     now,
+			"revoke_reason": int32(
+				model.ClientCapabilityLeaseRevokeReason_CLIENT_CAPABILITY_LEASE_REVOKE_REASON_WORKER_SHUTDOWN,
+			),
+			"updated_at": now,
+		})
+	if result.Error != nil {
+		return internalToolError(
+			"revoke acceptance scenario capability lease",
+			result.Error,
+		)
+	}
+	if expirePreparedReconciliation &&
+		call.ExecutionOwner == persistence.ToolOwnerClientCapability &&
+		call.Status == persistence.ToolCallStatusPrepared {
+		if err := db.WithContext(ctx).
+			Model(&persistence.ToolCall{}).
+			Where(
+				"id = ? AND status = ?",
+				call.ID,
+				persistence.ToolCallStatusPrepared,
+			).
+			Updates(map[string]interface{}{
+				"reconciliation_deadline": now,
+				"updated_at":              now,
+			}).Error; err != nil {
+			return internalToolError(
+				"expire revoked prepared ToolCall reconciliation",
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) expireAcceptanceScenarioLease(
+	ctx context.Context,
+	actorPTID string,
+) error {
+	call, err := s.acceptanceScenarioToolCall(ctx, actorPTID)
+	if err != nil {
+		return err
+	}
+	sessionID := call.CapabilitySessionID
+	if sessionID == "" {
+		var batch persistence.ToolBatch
+		db, openErr := s.getDB(ctx)
+		if openErr != nil {
+			return openErr
+		}
+		if loadErr := db.WithContext(ctx).
+			Where("id = ? AND actor_id = ?", call.ToolBatchID, call.ActorID).
+			First(&batch).Error; loadErr != nil {
+			return notFoundToolError("acceptance scenario ToolBatch", loadErr)
+		}
+		sessionID = batch.CapabilitySessionID
+	}
+	if sessionID == "" {
+		if call.ExecutionOwner != persistence.ToolOwnerStation ||
+			call.Status != persistence.ToolCallStatusPrepared {
+			return nil
+		}
+		db, err := s.getDB(ctx)
+		if err != nil {
+			return err
+		}
+		result := db.WithContext(ctx).
+			Model(&persistence.ToolCall{}).
+			Where(
+				"id = ? AND status = ? AND executor_lease_id = ?",
+				call.ID,
+				persistence.ToolCallStatusPrepared,
+				call.ExecutorLeaseID,
+			).
+			Updates(map[string]interface{}{
+				"executor_lease_id": generateID("station_executor_expired"),
+				"updated_at":        s.now(),
+			})
+		if result.Error != nil {
+			return internalToolError(
+				"expire acceptance Station executor lease",
+				result.Error,
+			)
+		}
+		if result.RowsAffected != 1 {
+			return invalidToolState(
+				"acceptance Station executor lease changed",
+			)
+		}
+		return nil
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	expiredAt := s.now().Add(-time.Microsecond)
+	if err := db.WithContext(ctx).
+		Model(&persistence.ClientCapabilityLease{}).
+		Where("session_id = ? AND actor_id = ?", sessionID, call.ActorID).
+		Updates(map[string]interface{}{
+			"expires_at": expiredAt,
+			"updated_at": s.now(),
+		}).Error; err != nil {
+		return internalToolError(
+			"expire acceptance scenario capability lease",
+			err,
+		)
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) expireAcceptanceScenarioDeadlines(
+	ctx context.Context,
+	actorPTID string,
+) error {
+	call, err := s.acceptanceScenarioToolCall(ctx, actorPTID)
+	if err != nil {
+		return err
+	}
+	expiredAt := s.now().Add(-time.Microsecond)
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	if err := db.WithContext(ctx).
+		Model(&persistence.ToolCall{}).
+		Where("id = ? AND status = ?", call.ID, persistence.ToolCallStatusPrepared).
+		Updates(map[string]interface{}{
+			"execution_deadline": expiredAt,
+			"updated_at":         s.now(),
+		}).Error; err != nil {
+		return internalToolError(
+			"expire acceptance scenario ToolCall deadlines",
+			err,
+		)
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) expireAcceptanceScenarioRecoveryCredential(
+	ctx context.Context,
+	actorPTID string,
+) error {
+	call, err := s.acceptanceScenarioToolCall(ctx, actorPTID)
+	if err != nil {
+		return err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	expiredAt := s.now().Add(-time.Microsecond)
+	if call.ReceiptRecoveryCredentialID != "" {
+		if err := db.WithContext(ctx).
+			Model(&persistence.ReceiptRecoveryCredential{}).
+			Where(
+				"id = ? AND tool_call_id = ?",
+				call.ReceiptRecoveryCredentialID,
+				call.ToolCallID,
+			).
+			Updates(map[string]interface{}{
+				"expires_at": expiredAt,
+			}).Error; err != nil {
+			return internalToolError(
+				"expire acceptance receipt recovery credential",
+				err,
+			)
+		}
+		return nil
+	}
+	if call.ExecutionOwner != persistence.ToolOwnerStation ||
+		call.Status != persistence.ToolCallStatusPrepared ||
+		call.ExecutionDeadline == nil ||
+		call.ReconciliationDeadline == nil {
+		return invalidToolState(
+			"acceptance receipt recovery credential requires a prepared ToolCall",
+		)
+	}
+	credentialID := generateID("station_receipt_recovery")
+	credential := &persistence.ReceiptRecoveryCredential{
+		ID:                     credentialID,
+		ActorID:                call.ActorID,
+		DeviceID:               "station-executor",
+		DeviceSigningKeyID:     "station-internal",
+		RequestID:              "station-" + call.ToolCallID,
+		ToolCallID:             call.ToolCallID,
+		ExecutionClaimID:       call.ExecutionClaimID,
+		FencingToken:           call.FencingToken,
+		PayloadHash:            call.PayloadHash,
+		ReplayPolicy:           call.ReplayPolicy,
+		ExecutionDeadline:      call.ExecutionDeadline.UTC(),
+		ReconciliationDeadline: call.ReconciliationDeadline.UTC(),
+		ScopeHash:              hashString("station-scope:" + call.ToolCallID),
+		NonceHash:              hashString("station-nonce:" + call.ToolCallID),
+		IssuedAt:               s.now(),
+		ExpiresAt:              expiredAt,
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(credential).Error; err != nil {
+			return internalToolError(
+				"persist Station receipt recovery credential",
+				err,
+			)
+		}
+		result := tx.Model(&persistence.ToolCall{}).
+			Where(
+				"id = ? AND status = ? AND receipt_recovery_credential_id = ''",
+				call.ID,
+				persistence.ToolCallStatusPrepared,
+			).
+			Update("receipt_recovery_credential_id", credentialID)
+		if result.Error != nil {
+			return internalToolError(
+				"bind Station receipt recovery credential",
+				result.Error,
+			)
+		}
+		if result.RowsAffected != 1 {
+			return invalidToolState(
+				"Station receipt recovery credential binding changed",
+			)
+		}
+		return nil
+	})
+}
+
+func (s *ToolDispatchService) advanceAcceptanceScenarioFence(
+	ctx context.Context,
+	actorPTID string,
+) error {
+	call, err := s.acceptanceScenarioToolCall(ctx, actorPTID)
+	if err != nil {
+		return err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	result := db.WithContext(ctx).
+		Model(&persistence.ToolCall{}).
+		Where(
+			"id = ? AND status = ? AND fencing_token = ?",
+			call.ID,
+			persistence.ToolCallStatusPrepared,
+			call.FencingToken,
+		).
+		Updates(map[string]interface{}{
+			"fencing_token": call.FencingToken + 1,
+			"updated_at":    s.now(),
+		})
+	if result.Error != nil {
+		return internalToolError(
+			"advance acceptance scenario ToolCall fence",
+			result.Error,
+		)
+	}
+	if result.RowsAffected != 1 {
+		return invalidToolState("acceptance ToolCall fence changed")
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) settleAcceptanceRejectedReceipt(
+	ctx context.Context,
+	actorPTID string,
+	toolCallID string,
+	rejectionCode string,
+) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var call persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"actor_id = ? AND tool_call_id = ?",
+				strings.TrimSpace(actorPTID),
+				strings.TrimSpace(toolCallID),
+			).
+			First(&call).Error; err != nil {
+			return notFoundToolError("rejected acceptance ToolCall", err)
+		}
+		if call.Status == persistence.ToolCallStatusUnknownSideEffect {
+			if call.ErrorCode == "" || call.ErrorCode == "tool_deadline_expired" {
+				if err := tx.Model(&persistence.ToolCall{}).
+					Where(
+						"id = ? AND status = ? AND error_code = ?",
+						call.ID,
+						persistence.ToolCallStatusUnknownSideEffect,
+						call.ErrorCode,
+					).
+					Update("error_code", rejectionCode).Error; err != nil {
+					return internalToolError(
+						"record rejected ToolCall outcome",
+						err,
+					)
+				}
+			}
+			return nil
+		}
+		if call.Status != persistence.ToolCallStatusPrepared {
+			return invalidToolState(
+				"rejected acceptance ToolCall is not reconcilable",
+			)
+		}
+		now := s.now()
+		expiredAt := now.Add(-time.Microsecond)
+		if err := tx.Model(&persistence.ToolCall{}).
+			Where("id = ? AND status = ?", call.ID, persistence.ToolCallStatusPrepared).
+			Update("reconciliation_deadline", expiredAt).Error; err != nil {
+			return internalToolError(
+				"expire rejected ToolCall reconciliation",
+				err,
+			)
+		}
+		return commitUnknownToolSideEffectTx(
+			tx,
+			&call,
+			rejectionCode,
+			now,
+		)
+	})
+}
+
+func (s *ToolDispatchService) getDB(ctx context.Context) (*gorm.DB, error) {
+	db, err := store.GetRDS(ctx, store.WithRDSDBName("agent"))
+	if err != nil {
+		return nil, fmt.Errorf("open agent db: %w", err)
+	}
+	return db, nil
+}
+
+func (s *ToolDispatchService) RegisterCapabilityLease(
+	ctx context.Context,
+	actorID string,
+	authSessionID string,
+	deviceID string,
+	request *model.RegisterClientCapabilityLeaseRequest,
+) (*model.RegisterClientCapabilityLeaseResponse, error) {
+	if request == nil || request.GetAdvertisement() == nil {
+		return nil, invalidToolRequest("capability advertisement is required")
+	}
+	actorID = strings.TrimSpace(actorID)
+	authSessionID = strings.TrimSpace(authSessionID)
+	deviceID = strings.TrimSpace(deviceID)
+	if actorID == "" || authSessionID == "" || deviceID == "" {
+		return nil, invalidToolRequest("authenticated actor, session, and device are required")
+	}
+	leasePTID := actorID
+	if s.capabilityProof != nil {
+		leasePTID = s.capabilityProof.ResolveActorPTID(ctx, actorID)
+	}
+	if s.capabilityProof == nil {
+		return nil, internalToolError("verify capability command", fmt.Errorf("proof service is not configured"))
+	}
+	verified, err := s.capabilityProof.Verify(
+		ctx,
+		actorID,
+		deviceID,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REGISTER_LEASE,
+		request,
+		request.GetCommandProof(),
+	)
+	if err != nil {
+		var proofErr *ClientCapabilityCommandProofError
+		if errors.As(err, &proofErr) {
+			return &model.RegisterClientCapabilityLeaseResponse{ErrorCode: proofErr.Code}, nil
+		}
+		return nil, err
+	}
+	input := request.GetAdvertisement()
+	if len(input.GetCapabilities()) == 0 {
+		return nil, invalidToolRequest("at least one client capability is required")
+	}
+	if err := validateClientCapabilityAdvertisement(input.GetCapabilities()); err != nil {
+		return nil, err
+	}
+
+	now := s.now()
+	expiresAt := now.Add(defaultCapabilityLeaseTTL)
+	capabilityBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(
+		&model.ClientCapabilityLease{Capabilities: input.GetCapabilities()},
+	)
+	if err != nil {
+		return nil, internalToolError("encode capability advertisement", err)
+	}
+	lease := &model.ClientCapabilityLease{
+		CapabilitySessionId: generateID("capability_session"),
+		Ptid:                leasePTID,
+		DeviceId:            deviceID,
+		Platform:            input.GetPlatform(),
+		Capabilities:        input.GetCapabilities(),
+		ExpiresAt:           timestamppb.New(expiresAt),
+		ConnectionId:        input.GetConnectionId(),
+		LeaseId:             generateID("capability_lease"),
+		LeaseRevision:       1,
+		CapabilitySetHash:   hashBytes(capabilityBytes),
+		DeviceSigningKeyId:  input.GetDeviceSigningKeyId(),
+	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(lease)
+	if err != nil {
+		return nil, internalToolError("encode capability lease", err)
+	}
+
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	response := &model.RegisterClientCapabilityLeaseResponse{Lease: lease}
+	responseBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+	if err != nil {
+		return nil, internalToolError("encode capability lease response", err)
+	}
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		command, replayed, err := bindCapabilityCommandTx(
+			tx,
+			actorID,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REGISTER_LEASE,
+			verified,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			if len(command.ResponseRef) == 0 {
+				return invalidToolState("capability registration replay has no response")
+			}
+			return proto.Unmarshal(command.ResponseRef, response)
+		}
+		row := &persistence.ClientCapabilityLease{
+			SessionID:          lease.GetCapabilitySessionId(),
+			ActorID:            actorID,
+			AuthSessionID:      authSessionID,
+			DeviceID:           deviceID,
+			PlatformKind:       int32(lease.GetPlatform()),
+			ConnectionID:       lease.GetConnectionId(),
+			LeaseID:            lease.GetLeaseId(),
+			LeaseRevision:      lease.GetLeaseRevision(),
+			CapabilitySetHash:  lease.GetCapabilitySetHash(),
+			DeviceSigningKeyID: lease.GetDeviceSigningKeyId(),
+			LeasePayload:       encoded,
+			DispatchSequence:   0,
+			ExpiresAt:          expiresAt,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}
+		if err := tx.Create(row).Error; err != nil {
+			return internalToolError("persist capability lease", err)
+		}
+		if _, err := s.takeOverPreparedCallsForLeaseTx(tx, row, now); err != nil {
+			return err
+		}
+		return storeCapabilityCommandOutcomeTx(
+			tx,
+			command.CommandID,
+			0,
+			lease.GetLeaseId(),
+			lease.GetLeaseRevision(),
+			responseBytes,
+		)
+	})
+	return response, err
+}
+
+func (s *ToolDispatchService) ListCapabilitySessions(
+	ctx context.Context,
+	actorID string,
+) (*model.ListClientCapabilitySessionsResponse, error) {
+	actorID = strings.TrimSpace(actorID)
+	if actorID == "" {
+		return nil, invalidToolRequest("authenticated actor is required")
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	var rows []persistence.ClientCapabilityLease
+	if err := db.WithContext(ctx).
+		Where(
+			"actor_id = ? AND revoked_at IS NULL AND expires_at > ? AND "+
+				persistence.ActiveLeaseParentAuthSessionCondition,
+			actorID,
+			now,
+			now,
+		).
+		Order("created_at ASC").
+		Find(&rows).Error; err != nil {
+		return nil, internalToolError("list active capability sessions", err)
+	}
+	sessions := make([]*model.ClientCapabilitySession, 0, len(rows))
+	for _, row := range rows {
+		var lease model.ClientCapabilityLease
+		if err := proto.Unmarshal(row.LeasePayload, &lease); err != nil {
+			return nil, internalToolError("decode capability session", err)
+		}
+		sessions = append(sessions, capabilitySessionFromLeaseRow(&row, &lease))
+	}
+	return &model.ListClientCapabilitySessionsResponse{Sessions: sessions}, nil
+}
+
+func (s *ToolDispatchService) GetActiveCapabilitySession(
+	ctx context.Context,
+	actorID string,
+	sessionID string,
+) (*model.ClientCapabilitySession, error) {
+	actorID = strings.TrimSpace(actorID)
+	sessionID = strings.TrimSpace(sessionID)
+	if actorID == "" || sessionID == "" {
+		return nil, invalidToolRequest("authenticated actor and capability session are required")
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	var row persistence.ClientCapabilityLease
+	queryErr := db.WithContext(ctx).
+		Where(
+			"actor_id = ? AND session_id = ? AND revoked_at IS NULL AND expires_at > ? AND "+
+				persistence.ActiveLeaseParentAuthSessionCondition,
+			actorID,
+			sessionID,
+			now,
+			now,
+		).
+		First(&row).Error
+	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if queryErr != nil {
+		return nil, internalToolError("get active capability session", queryErr)
+	}
+	var lease model.ClientCapabilityLease
+	if err := proto.Unmarshal(row.LeasePayload, &lease); err != nil {
+		return nil, internalToolError("decode capability session", err)
+	}
+	return capabilitySessionFromLeaseRow(&row, &lease), nil
+}
+
+func capabilitySessionFromLeaseRow(
+	row *persistence.ClientCapabilityLease,
+	lease *model.ClientCapabilityLease,
+) *model.ClientCapabilitySession {
+	return &model.ClientCapabilitySession{
+		SessionId:         row.SessionID,
+		Ptid:              lease.GetPtid(),
+		DeviceId:          row.DeviceID,
+		PlatformKind:      model.ClientPlatform(row.PlatformKind),
+		TypedCapabilities: lease.GetCapabilities(),
+		ExpiresAt:         timestamppb.New(row.ExpiresAt),
+		ConnectionId:      row.ConnectionID,
+		LeaseId:           lease.GetLeaseId(),
+		LeaseRevision:     lease.GetLeaseRevision(),
+	}
+}
+
+func (s *ToolDispatchService) RenewCapabilityLease(
+	ctx context.Context,
+	actorID string,
+	authSessionID string,
+	deviceID string,
+	request *model.RenewClientCapabilityLeaseRequest,
+) (*model.RenewClientCapabilityLeaseResponse, error) {
+	if request == nil || s.capabilityProof == nil {
+		return nil, invalidToolRequest("renew request and proof service are required")
+	}
+	verified, err := s.capabilityProof.Verify(
+		ctx,
+		actorID,
+		deviceID,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_RENEW_LEASE,
+		request,
+		request.GetCommandProof(),
+	)
+	if err != nil {
+		var proofErr *ClientCapabilityCommandProofError
+		if errors.As(err, &proofErr) {
+			return &model.RenewClientCapabilityLeaseResponse{ErrorCode: proofErr.Code}, nil
+		}
+		return nil, err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	response := &model.RenewClientCapabilityLeaseResponse{}
+	now := s.now()
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		command, replayed, err := bindCapabilityCommandTx(
+			tx,
+			actorID,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_RENEW_LEASE,
+			verified,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return proto.Unmarshal(command.ResponseRef, response)
+		}
+		var row persistence.ClientCapabilityLease
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"session_id = ? AND lease_id = ? AND actor_id = ? AND auth_session_id = ? AND device_id = ? AND revoked_at IS NULL",
+			request.GetCapabilitySessionId(),
+			request.GetLeaseId(),
+			actorID,
+			authSessionID,
+			deviceID,
+		).First(&row).Error; err != nil {
+			return notFoundToolError("active capability lease", err)
+		}
+		if row.LeaseRevision != request.GetExpectedLeaseRevision() ||
+			row.CapabilitySetHash != request.GetCapabilitySetHash() ||
+			row.DeviceSigningKeyID != request.GetDeviceSigningKeyId() {
+			return errcode.New(errcode.AgentVersionConflict, http.StatusConflict, "capability lease revision or immutable binding changed", nil)
+		}
+		var lease model.ClientCapabilityLease
+		if err := proto.Unmarshal(row.LeasePayload, &lease); err != nil {
+			return internalToolError("decode capability lease", err)
+		}
+		row.LeaseRevision++
+		row.ExpiresAt = now.Add(defaultCapabilityLeaseTTL)
+		row.UpdatedAt = now
+		lease.LeaseRevision = row.LeaseRevision
+		lease.ExpiresAt = timestamppb.New(row.ExpiresAt)
+		row.LeasePayload, err = proto.MarshalOptions{Deterministic: true}.Marshal(&lease)
+		if err != nil {
+			return internalToolError("encode renewed capability lease", err)
+		}
+		if err := tx.Save(&row).Error; err != nil {
+			return internalToolError("renew capability lease", err)
+		}
+		response.Lease = &lease
+		encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+		if err != nil {
+			return internalToolError("encode capability renewal response", err)
+		}
+		return storeCapabilityCommandOutcomeTx(tx, command.CommandID, 0, row.LeaseID, row.LeaseRevision, encoded)
+	})
+	return response, err
+}
+
+func (s *ToolDispatchService) RevokeCapabilityLease(
+	ctx context.Context,
+	actorID string,
+	authSessionID string,
+	deviceID string,
+	request *model.RevokeClientCapabilityLeaseRequest,
+) (*model.RevokeClientCapabilityLeaseResponse, error) {
+	if request == nil || s.capabilityProof == nil {
+		return nil, invalidToolRequest("revoke request and proof service are required")
+	}
+	verified, err := s.capabilityProof.Verify(
+		ctx,
+		actorID,
+		deviceID,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REVOKE_LEASE,
+		request,
+		request.GetCommandProof(),
+	)
+	if err != nil {
+		var proofErr *ClientCapabilityCommandProofError
+		if errors.As(err, &proofErr) {
+			return &model.RevokeClientCapabilityLeaseResponse{ErrorCode: proofErr.Code}, nil
+		}
+		return nil, err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	response := &model.RevokeClientCapabilityLeaseResponse{}
+	now := s.now()
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		command, replayed, err := bindCapabilityCommandTx(
+			tx,
+			actorID,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REVOKE_LEASE,
+			verified,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return proto.Unmarshal(command.ResponseRef, response)
+		}
+		var row persistence.ClientCapabilityLease
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"session_id = ? AND lease_id = ? AND actor_id = ? AND auth_session_id = ? AND device_id = ? AND revoked_at IS NULL",
+			request.GetCapabilitySessionId(),
+			request.GetLeaseId(),
+			actorID,
+			authSessionID,
+			deviceID,
+		).First(&row).Error; err != nil {
+			return notFoundToolError("active capability lease", err)
+		}
+		if row.LeaseRevision != request.GetExpectedLeaseRevision() {
+			return errcode.New(errcode.AgentVersionConflict, http.StatusConflict, "capability lease revision changed", nil)
+		}
+		row.LeaseRevision++
+		row.RevokedAt = &now
+		row.RevokeReason = int32(request.GetReason())
+		row.UpdatedAt = now
+		if err := tx.Save(&row).Error; err != nil {
+			return internalToolError("revoke capability lease", err)
+		}
+		response.CapabilitySessionId = row.SessionID
+		response.LeaseId = row.LeaseID
+		response.LeaseRevision = row.LeaseRevision
+		response.RevokedAt = timestamppb.New(now)
+		response.Reason = request.GetReason()
+		encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+		if err != nil {
+			return internalToolError("encode capability revoke response", err)
+		}
+		return storeCapabilityCommandOutcomeTx(tx, command.CommandID, 0, row.LeaseID, row.LeaseRevision, encoded)
+	})
+	return response, err
+}
+
+func (s *ToolDispatchService) ProposeAuthorizedBatch(
+	ctx context.Context,
+	proposal ToolBatchProposal,
+) ([]ProposalDecision, error) {
+	decisions, _, err := s.proposeBatch(ctx, proposal, nil)
+	return decisions, err
+}
+
+func (s *ToolDispatchService) proposeAuthorizedBatchWithProjection(
+	ctx context.Context,
+	proposal ToolBatchProposal,
+	project func(*gorm.DB) error,
+) ([]ProposalDecision, bool, error) {
+	// Projection joins only new-batch admission; durable batch replay bypasses
+	// current mutable authority and reuses its pinned ToolCall records.
+	return s.proposeBatch(ctx, proposal, project)
+}
+
+func (s *ToolDispatchService) proposeBatch(
+	ctx context.Context,
+	proposal ToolBatchProposal,
+	project func(*gorm.DB) error,
+) ([]ProposalDecision, bool, error) {
+	if err := validateToolBatchProposal(proposal); err != nil {
+		return nil, false, err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var decisions []ProposalDecision
+	projected := false
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := s.now()
+		deadline := canonicalToolDeadline(proposal.Deadline)
+		if deadline.IsZero() {
+			deadline = canonicalToolDeadline(now.Add(defaultToolDeadline))
+		}
+		restrictedToolsJSON, err := marshalRestrictedTools(proposal.RestrictedTools)
+		if err != nil {
+			return internalToolError("encode restricted tool set", err)
+		}
+
+		batch := &persistence.ToolBatch{
+			ID:                  proposal.ToolBatchID,
+			ActorID:             proposal.ActorID,
+			TurnID:              proposal.TurnID,
+			AttemptID:           proposal.AttemptID,
+			ConversationID:      proposal.ConversationID,
+			AgentID:             proposal.AgentID,
+			Provider:            proposal.Provider,
+			Model:               proposal.Model,
+			Effort:              proposal.Effort,
+			ThinkingMode:        proposal.ThinkingMode,
+			SystemPrompt:        proposal.SystemPrompt,
+			Iteration:           proposal.Iteration,
+			MaxRetries:          proposal.MaxRetries,
+			ContextWindowSize:   proposal.ContextWindowSize,
+			DelegationDepth:     proposal.DelegationDepth,
+			RestrictedToolsJSON: restrictedToolsJSON,
+			TaskID:              proposal.TaskID,
+			StepID:              proposal.StepID,
+			CapabilitySessionID: proposal.ClientCapabilitySessionID,
+			ExpectedCallCount:   uint32(len(proposal.Calls)),
+			Status:              persistence.ToolBatchStatusOpen,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+		}
+		var existing persistence.ToolBatch
+		if err := tx.Where("id = ? AND actor_id = ?", batch.ID, batch.ActorID).
+			First(&existing).Error; err == nil {
+			var replayErr error
+			decisions, replayErr = loadToolBatchProposalReplayTx(tx, proposal, &existing)
+			return replayErr
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return internalToolError("load existing tool batch", err)
+		}
+
+		if project != nil {
+			// Terminal settlement owns turn -> message -> conversation locks.
+			// Join that order before capability/batch writes or projection so
+			// cancellation cannot wait on a conversation held by this batch.
+			var turn persistence.AgentTurn
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND conversation_id = ?", proposal.TurnID, proposal.ConversationID).
+				First(&turn).Error; err != nil {
+				return internalToolError("lock projected tool batch turn", err)
+			}
+			if isTerminalTurnDomainStatus(domain.TurnStatus(turn.Status)) {
+				return errcode.NewLifecycleTerminalMutation(turn.ID, turn.Status)
+			}
+		}
+
+		var lease *model.ClientCapabilityLease
+		authorizations := make(
+			[]*toolCapabilityAuthorization,
+			len(proposal.Calls),
+		)
+		for index, call := range proposal.Calls {
+			authorization, err := resolveToolCapabilityAuthorizationTx(
+				tx,
+				proposal,
+				call,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			if authorization.ExecutionOwner ==
+				model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_CLIENT_CAPABILITY {
+				if lease == nil {
+					lease, err = loadActiveCapabilityLeaseTx(
+						tx,
+						proposal.ActorID,
+						proposal.ClientCapabilitySessionID,
+						now,
+					)
+					if err != nil {
+						return err
+					}
+				}
+				if err := validateCapabilityCall(lease, call); err != nil {
+					return err
+				}
+			} else if len(call.ResourceRefs) > 0 {
+				return invalidToolRequest(
+					"Station-owned tools cannot consume client resource references",
+				)
+			}
+			authorizations[index] = authorization
+		}
+		createBatch := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(batch)
+		if createBatch.Error != nil {
+			return internalToolError("persist tool batch", createBatch.Error)
+		}
+		if createBatch.RowsAffected == 0 {
+			if loadErr := tx.Where(
+				"actor_id = ? AND turn_id = ? AND attempt_id = ? AND iteration = ?",
+				batch.ActorID,
+				batch.TurnID,
+				batch.AttemptID,
+				batch.Iteration,
+			).First(&existing).Error; loadErr != nil {
+				return internalToolError("load existing tool batch", loadErr)
+			}
+			var replayErr error
+			decisions, replayErr = loadToolBatchProposalReplayTx(tx, proposal, &existing)
+			return replayErr
+		}
+		if project != nil {
+			if err := project(tx); err != nil {
+				return err
+			}
+			projected = true
+		}
+
+		decisions = make([]ProposalDecision, 0, len(proposal.Calls))
+		for index, call := range proposal.Calls {
+			decision, err := s.proposeCallTx(
+				tx,
+				proposal,
+				lease,
+				call,
+				authorizations[index],
+				deadline,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			decisions = append(decisions, decision)
+		}
+
+		for _, decision := range decisions {
+			if decision.Status == persistence.ToolCallStatusDenied {
+				return blockToolBatchTx(tx, proposal.ToolBatchID, now)
+			}
+		}
+		for index := range decisions {
+			if decisions[index].Status != persistence.ToolCallStatusApproved ||
+				decisions[index].ExecutionOwner != persistence.ToolOwnerClientCapability {
+				continue
+			}
+			var call persistence.ToolCall
+			if err := tx.Where(
+				"actor_id = ? AND tool_call_id = ?",
+				proposal.ActorID,
+				decisions[index].ToolCallID,
+			).First(&call).Error; err != nil {
+				return internalToolError("load approved client tool call", err)
+			}
+			if err := s.dispatchCallTx(tx, &call, now); err != nil {
+				return err
+			}
+			decisions[index].Status = call.Status
+			decisions[index].FencingToken = call.FencingToken
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return decisions, projected, nil
+}
+
+func loadToolBatchProposalReplayTx(
+	tx *gorm.DB,
+	proposal ToolBatchProposal,
+	batch *persistence.ToolBatch,
+) ([]ProposalDecision, error) {
+	restrictedToolsJSON, err := marshalRestrictedTools(proposal.RestrictedTools)
+	if err != nil {
+		return nil, internalToolError("encode restricted tool set replay", err)
+	}
+	if batch == nil ||
+		batch.ID != proposal.ToolBatchID ||
+		batch.ActorID != proposal.ActorID ||
+		batch.TurnID != proposal.TurnID ||
+		batch.AttemptID != proposal.AttemptID ||
+		batch.ConversationID != proposal.ConversationID ||
+		batch.AgentID != proposal.AgentID ||
+		batch.Provider != proposal.Provider ||
+		batch.Model != proposal.Model ||
+		batch.Effort != proposal.Effort ||
+		batch.ThinkingMode != proposal.ThinkingMode ||
+		batch.SystemPrompt != proposal.SystemPrompt ||
+		batch.Iteration != proposal.Iteration ||
+		batch.MaxRetries != proposal.MaxRetries ||
+		batch.ContextWindowSize != proposal.ContextWindowSize ||
+		batch.DelegationDepth != proposal.DelegationDepth ||
+		string(batch.RestrictedToolsJSON) != string(restrictedToolsJSON) ||
+		batch.TaskID != proposal.TaskID ||
+		batch.StepID != proposal.StepID ||
+		batch.CapabilitySessionID != proposal.ClientCapabilitySessionID ||
+		batch.ExpectedCallCount != uint32(len(proposal.Calls)) {
+		return nil, idempotencyToolError("tool batch identity payload mismatch")
+	}
+
+	var records []persistence.ToolCall
+	if err := tx.Where(
+		"actor_id = ? AND tool_batch_id = ?",
+		proposal.ActorID,
+		proposal.ToolBatchID,
+	).Find(&records).Error; err != nil {
+		return nil, internalToolError("load tool batch replay calls", err)
+	}
+	if len(records) != len(proposal.Calls) {
+		return nil, idempotencyToolError("tool batch replay call count mismatch")
+	}
+	recordsByCallID := make(map[string]*persistence.ToolCall, len(records))
+	for index := range records {
+		recordsByCallID[records[index].ToolCallID] = &records[index]
+	}
+
+	decisions := make([]ProposalDecision, 0, len(proposal.Calls))
+	for _, proposed := range proposal.Calls {
+		record := recordsByCallID[proposed.ToolCallID]
+		if record == nil || !toolProposalMatchesRecord(proposal, proposed, record) {
+			return nil, idempotencyToolError("tool batch replay payload mismatch")
+		}
+		if err := tx.Model(&persistence.ToolCall{}).
+			Where("id = ?", record.ID).
+			UpdateColumn(
+				"duplicate_delivery_count",
+				gorm.Expr("duplicate_delivery_count + ?", 1),
+			).Error; err != nil {
+			return nil, internalToolError("record duplicate tool proposal", err)
+		}
+		decisions = append(decisions, proposalDecisionFromRecord(record))
+	}
+	return decisions, nil
+}
+
+func marshalRestrictedTools(values []string) ([]byte, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(values)
+}
+
+func toolProposalMatchesRecord(
+	proposal ToolBatchProposal,
+	proposed AuthorizedToolProposal,
+	record *persistence.ToolCall,
+) bool {
+	resourceRefs, err := proto.MarshalOptions{Deterministic: true}.Marshal(
+		&model.ClientCapabilityRequest{ResourceRefs: proposed.ResourceRefs},
+	)
+	argumentsMatch := record.ArgumentsHash == hashBytes(proposed.Arguments) &&
+		string(record.BoundedArguments) == string(proposed.Arguments)
+	if isConnectorResourceToolName(proposed.ToolName) {
+		argumentsMatch = connectorProposalMatchesPinned(
+			proposed.Arguments,
+			record.BoundedArguments,
+			record.CapabilityID,
+			record.ManifestVersion,
+		)
+	}
+	return err == nil &&
+		record.ActorID == proposal.ActorID &&
+		record.TurnID == proposal.TurnID &&
+		record.AttemptID == proposal.AttemptID &&
+		record.ToolBatchID == proposal.ToolBatchID &&
+		record.ToolName == proposed.ToolName &&
+		record.CapabilityID == proposed.CapabilityID &&
+		record.SchemaVersion == proposed.SchemaVersion &&
+		record.ManifestVersion == proposed.SchemaVersion &&
+		record.BindingID == proposed.BindingID &&
+		record.BindingRevision == proposed.BindingRevision &&
+		record.ReadinessSnapID == proposal.ReadinessSnapshotID &&
+		record.ExecutionOwner == toolExecutionOwnerStorageValue(proposed.ExecutionOwner) &&
+		argumentsMatch &&
+		string(record.ResourceRefs) == string(resourceRefs)
+}
+
+func connectorProposalMatchesPinned(
+	proposed []byte,
+	pinned []byte,
+	capabilityID string,
+	capabilityVersion string,
+) bool {
+	var proposedObject map[string]json.RawMessage
+	if err := json.Unmarshal(proposed, &proposedObject); err != nil {
+		return false
+	}
+	for key := range proposedObject {
+		if key != "params" {
+			return false
+		}
+	}
+	var pinnedObject map[string]json.RawMessage
+	if err := json.Unmarshal(pinned, &pinnedObject); err != nil {
+		return false
+	}
+	var pinnedCapabilityID string
+	var pinnedCapabilityVersion string
+	if err := json.Unmarshal(pinnedObject["capability_id"], &pinnedCapabilityID); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(
+		pinnedObject["capability_version"],
+		&pinnedCapabilityVersion,
+	); err != nil {
+		return false
+	}
+	if pinnedCapabilityID != capabilityID ||
+		pinnedCapabilityVersion != capabilityVersion {
+		return false
+	}
+	proposedParams := proposedObject["params"]
+	if len(proposedParams) == 0 {
+		proposedParams = json.RawMessage(`{}`)
+	}
+	pinnedParams := pinnedObject["params"]
+	return jsonSemanticEqual(proposedParams, pinnedParams)
+}
+
+func jsonSemanticEqual(left []byte, right []byte) bool {
+	var leftValue interface{}
+	var rightValue interface{}
+	return json.Unmarshal(left, &leftValue) == nil &&
+		json.Unmarshal(right, &rightValue) == nil &&
+		reflect.DeepEqual(leftValue, rightValue)
+}
+
+func proposalDecisionFromRecord(record *persistence.ToolCall) ProposalDecision {
+	return ProposalDecision{
+		ToolCallID:       record.ToolCallID,
+		ToolName:         record.ToolName,
+		Arguments:        string(record.BoundedArguments),
+		ApprovalID:       record.ApprovalID,
+		DecisionRevision: record.DecisionRevision,
+		ExpiresAt:        toolCallExecutionDeadline(record),
+		Status:           record.Status,
+		ExecutionOwner:   record.ExecutionOwner,
+		FencingToken:     record.FencingToken,
+	}
+}
+
+func toolCallExecutionDeadline(record *persistence.ToolCall) time.Time {
+	if record == nil || record.ExecutionDeadline == nil {
+		return time.Time{}
+	}
+	return canonicalToolDeadline(*record.ExecutionDeadline)
+}
+
+func canonicalToolDeadline(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
+}
+
+func (s *ToolDispatchService) SubmitDecision(
+	ctx context.Context,
+	actorID string,
+	request *model.SubmitToolApprovalDecisionRequest,
+) (*model.SubmitToolApprovalDecisionResponse, error) {
+	if err := validateDecisionRequest(actorID, request); err != nil {
+		return nil, err
+	}
+	for _, scenario := range []struct {
+		family   model.CapabilityAcceptanceScenarioFamily
+		cell     string
+		ordering string
+	}{
+		{
+			family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+			cell:   "R-05", ordering: "A",
+		},
+		{
+			family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+			cell:   "R-07", ordering: "A",
+		},
+		{
+			family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+			cell:   "ERR-O01", ordering: "single",
+		},
+		{
+			family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+			cell:   "ERR-O05", ordering: "single",
+		},
+		{
+			family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_CONNECTOR_J05,
+			cell:   "R-06", ordering: "A",
+		},
+		{
+			family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_CONNECTOR_J05,
+			cell:   "R-07", ordering: "A",
+		},
+	} {
+		interrupted, err := s.reachAcceptanceToolCallTupleBarrierForFamily(
+			ctx,
+			actorID,
+			scenario.family,
+			scenario.cell,
+			scenario.ordering,
+			request.GetToolCallId(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if interrupted {
+			return nil, errCapabilityAcceptanceWorkerInterrupted
+		}
+	}
+	interrupted, err := s.reachAcceptanceBarrier(
+		ctx,
+		actorID,
+		capabilityBarrierDecisionBeforeCommit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if interrupted {
+		return nil, errCapabilityAcceptanceWorkerInterrupted
+	}
+	canonicalHash := decisionPayloadHash(request)
+	if request.GetPayloadHash() != canonicalHash {
+		return decisionRejection(
+			request,
+			model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_IDEMPOTENCY_CONFLICT,
+		), nil
+	}
+
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var response *model.SubmitToolApprovalDecisionResponse
+	barrierAfterDecision := false
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		replayed, found, err := loadDecisionReplayTx(tx, actorID, request.GetIdempotencyKey(), canonicalHash)
+		if err != nil {
+			if businessError, ok := err.(*errcode.BizError); ok &&
+				businessError.Code == errcode.AgentIdempotencyConflict {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_IDEMPOTENCY_CONFLICT,
+				)
+				return nil
+			}
+			return err
+		}
+		if found {
+			response = replayed
+			return nil
+		}
+
+		var call persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("actor_id = ? AND tool_call_id = ?", actorID, request.GetToolCallId()).
+			First(&call).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_NOT_FOUND,
+				)
+				return nil
+			}
+			return notFoundToolError("tool call", err)
+		}
+		replayed, found, err = loadDecisionReplayTx(
+			tx,
+			actorID,
+			request.GetIdempotencyKey(),
+			canonicalHash,
+		)
+		if err != nil {
+			if businessError, ok := err.(*errcode.BizError); ok &&
+				businessError.Code == errcode.AgentIdempotencyConflict {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_IDEMPOTENCY_CONFLICT,
+				)
+				return nil
+			}
+			return err
+		}
+		if found {
+			response = replayed
+			return nil
+		}
+		if call.ApprovalID != request.GetApprovalId() {
+			return unauthorizedToolRequest("approval identity mismatch")
+		}
+		if call.ToolName == clarificationToolName {
+			if err := validateClarificationAnswer(call.BoundedArguments, request.GetAnswer(), request.GetApproved()); err != nil {
+				return err
+			}
+		} else if request.GetAnswer() != "" {
+			return invalidToolRequest("only clarification decisions accept an answer")
+		}
+		if call.DecisionRevision != request.GetExpectedRevision() {
+			response = decisionRejection(
+				request,
+				model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION,
+			)
+			response.DecisionRevision = call.DecisionRevision
+			return nil
+		}
+		now := s.now()
+		if call.Status == persistence.ToolCallStatusWaitingApproval &&
+			call.ExecutionDeadline != nil &&
+			!call.ExecutionDeadline.After(now) {
+			result := tx.Model(&persistence.ToolCall{}).
+				Where(
+					"id = ? AND decision_revision = ? AND status = ?",
+					call.ID,
+					call.DecisionRevision,
+					persistence.ToolCallStatusWaitingApproval,
+				).
+				Updates(map[string]interface{}{
+					"status":     persistence.ToolCallStatusExpired,
+					"error_code": string(errcode.AgentToolApprovalExpired),
+					"ended_at":   now,
+					"updated_at": now,
+				})
+			if result.Error != nil {
+				return internalToolError("expire tool approval", result.Error)
+			}
+			if result.RowsAffected != 1 {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION,
+				)
+				return nil
+			}
+			if err := blockToolBatchTx(tx, call.ToolBatchID, now); err != nil {
+				return err
+			}
+			call.Status = persistence.ToolCallStatusExpired
+			call.ErrorCode = string(errcode.AgentToolApprovalExpired)
+		}
+		if call.Status != persistence.ToolCallStatusWaitingApproval {
+			if call.Status == persistence.ToolCallStatusExpired {
+				response = expiredDecisionRejection(request, &call)
+				if err := persistDecisionAcknowledgementTx(
+					tx,
+					actorID,
+					request,
+					response,
+					canonicalHash,
+					call.DecisionRevision,
+					now,
+				); err != nil {
+					return err
+				}
+				return nil
+			}
+			return invalidToolState("tool call is not waiting for approval")
+		}
+		if request.GetApproved() &&
+			call.ExecutionOwner == persistence.ToolOwnerClientCapability {
+			connectorError, err := connectorApprovalAvailabilityTx(tx, &call, now)
+			if err != nil {
+				return err
+			}
+			if connectorError != nil {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_CONNECTOR_UNAVAILABLE,
+				)
+				response.OutcomeError = connectorError
+				return persistDecisionAcknowledgementTx(
+					tx,
+					actorID,
+					request,
+					response,
+					canonicalHash,
+					call.DecisionRevision,
+					now,
+				)
+			}
+		}
+		if request.GetApproved() {
+			active, actualRevision, err := pinnedToolBindingActiveTx(
+				tx,
+				&call,
+			)
+			if err != nil {
+				return err
+			}
+			if !active {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION,
+				)
+				response.DecisionRevision = call.DecisionRevision
+				response.OutcomeError = errcode.NewCapabilityBindingVersionConflict(
+					call.BindingID,
+					call.BindingRevision,
+					actualRevision,
+				).Payload
+				return persistDecisionAcknowledgementTx(
+					tx,
+					actorID,
+					request,
+					response,
+					canonicalHash,
+					call.DecisionRevision,
+					now,
+				)
+			}
+		}
+		if request.GetApproved() &&
+			s.acceptanceScenarios != nil &&
+			s.acceptanceScenarios.ForcesExecutorUnavailable(actorID) {
+			targetDeviceID := call.TargetDeviceID
+			if targetDeviceID == "" {
+				targetDeviceID = "station-executor"
+			}
+			response = decisionRejection(
+				request,
+				model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_EXECUTOR_UNAVAILABLE,
+			)
+			response.OutcomeError = errcode.NewClientExecutorUnavailablePayload(
+				targetDeviceID,
+				call.CapabilityID,
+			)
+			return persistDecisionAcknowledgementTx(
+				tx,
+				actorID,
+				request,
+				response,
+				canonicalHash,
+				call.DecisionRevision,
+				now,
+			)
+		}
+		if request.GetApproved() &&
+			call.ExecutionOwner == persistence.ToolOwnerClientCapability {
+			available, err := clientExecutorAvailableTx(tx, &call, now)
+			if err != nil {
+				return err
+			}
+			if !available {
+				response = decisionRejection(
+					request,
+					model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_EXECUTOR_UNAVAILABLE,
+				)
+				response.OutcomeError = errcode.NewClientExecutorUnavailablePayload(
+					call.TargetDeviceID,
+					call.CapabilityID,
+				)
+				return persistDecisionAcknowledgementTx(
+					tx,
+					actorID,
+					request,
+					response,
+					canonicalHash,
+					call.DecisionRevision,
+					now,
+				)
+			}
+		}
+
+		revision := call.DecisionRevision + 1
+		status := persistence.ToolCallStatusDenied
+		if request.GetApproved() {
+			status = persistence.ToolCallStatusApproved
+		}
+		update := map[string]interface{}{
+			"decision_id":           request.GetDecisionId(),
+			"decision_revision":     revision,
+			"decision_payload_hash": canonicalHash,
+			"approved":              request.GetApproved(),
+			"status":                status,
+			"updated_at":            now,
+		}
+		var outcomeError *model.ErrorPayload
+		if call.ToolName == clarificationToolName && request.GetApproved() {
+			update["clarification_answer"] = request.GetAnswer()
+		}
+		if !request.GetApproved() {
+			update["ended_at"] = now
+			update["error_code"] = string(errcode.AgentToolApprovalDenied)
+			outcomeError = errcode.NewToolApprovalDeniedPayload(
+				request.GetToolCallId(),
+				request.GetDecisionId(),
+			)
+		}
+		result := tx.Model(&persistence.ToolCall{}).
+			Where("id = ? AND decision_revision = ? AND status = ?",
+				call.ID,
+				request.GetExpectedRevision(),
+				persistence.ToolCallStatusWaitingApproval,
+			).
+			Updates(update)
+		if result.Error != nil {
+			return internalToolError("commit tool decision", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			response = decisionRejection(
+				request,
+				model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION,
+			)
+			return nil
+		}
+		call.DecisionID = request.GetDecisionId()
+		call.DecisionRevision = revision
+		call.DecisionPayloadHash = canonicalHash
+		call.Approved = request.GetApproved()
+		call.Status = status
+
+		if request.GetApproved() &&
+			call.ExecutionOwner == persistence.ToolOwnerClientCapability {
+			if !s.matchesAcceptanceBarrier(
+				actorID,
+				capabilityBarrierDecisionBeforeClaim,
+			) {
+				if err := s.dispatchCallTx(tx, &call, now); err != nil {
+					return err
+				}
+			}
+			barrierAfterDecision = true
+		} else if !request.GetApproved() {
+			if err := blockToolBatchTx(tx, call.ToolBatchID, now); err != nil {
+				return err
+			}
+		} else if call.ExecutionOwner != persistence.ToolOwnerStation {
+			return invalidToolState("tool execution owner is invalid")
+		}
+
+		response = &model.SubmitToolApprovalDecisionResponse{
+			Accepted:         true,
+			DecisionRevision: revision,
+			ApprovalId:       request.GetApprovalId(),
+			ToolCallId:       request.GetToolCallId(),
+			DecisionId:       request.GetDecisionId(),
+			Approved:         request.GetApproved(),
+			IdempotencyKey:   request.GetIdempotencyKey(),
+			PayloadHash:      canonicalHash,
+			OutcomeError:     outcomeError,
+		}
+		return persistDecisionAcknowledgementTx(
+			tx,
+			actorID,
+			request,
+			response,
+			canonicalHash,
+			revision,
+			now,
+		)
+	})
+	if err == nil && barrierAfterDecision &&
+		response.GetAccepted() && response.GetApproved() {
+		for _, scenario := range []struct {
+			family model.CapabilityAcceptanceScenarioFamily
+			cell   string
+		}{
+			{
+				family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+				cell:   "R-07",
+			},
+			{
+				family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_CONNECTOR_J05,
+				cell:   "R-06",
+			},
+			{
+				family: model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_CONNECTOR_J05,
+				cell:   "R-07",
+			},
+		} {
+			interrupted, barrierErr := s.reachAcceptanceToolCallTupleBarrierForFamily(
+				ctx,
+				actorID,
+				scenario.family,
+				scenario.cell,
+				"B",
+				request.GetToolCallId(),
+			)
+			if barrierErr != nil {
+				return nil, barrierErr
+			}
+			if interrupted {
+				return nil, errCapabilityAcceptanceWorkerInterrupted
+			}
+		}
+	}
+	return response, err
+}
+
+// refreshStaleLeaseDispatchTx re-pins envelopes dispatched under an earlier
+// lease revision to the current lease. Routine renewals keep the same session
+// and authority lineage but bump the revision, so delivered envelopes would
+// otherwise be rejected forever as authority mismatches until their deadline.
+// Non-deliverable calls get their stale outbox rows invalidated.
+func (s *ToolDispatchService) refreshStaleLeaseDispatchTx(
+	tx *gorm.DB,
+	leaseRow *persistence.ClientCapabilityLease,
+	actorID string,
+	deviceID string,
+	now time.Time,
+) error {
+	var stale []persistence.ToolDispatchOutbox
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"actor_id = ? AND capability_session_id = ? AND target_device_id = ? "+
+				"AND invalidated_at IS NULL "+
+				"AND execution_deadline > ? AND capability_lease_revision < ?",
+			actorID,
+			leaseRow.SessionID,
+			deviceID,
+			now,
+			leaseRow.LeaseRevision,
+		).
+		Find(&stale).Error; err != nil {
+		return internalToolError("load stale capability dispatches", err)
+	}
+	refreshed := make(map[string]struct{}, len(stale))
+	for _, row := range stale {
+		if _, seen := refreshed[row.ToolCallID]; seen {
+			continue
+		}
+		refreshed[row.ToolCallID] = struct{}{}
+		invalidate := tx.Model(&persistence.ToolDispatchOutbox{}).
+			Where(
+				"tool_call_id = ? AND invalidated_at IS NULL",
+				row.ToolCallID,
+			).
+			Update("invalidated_at", now)
+		if invalidate.Error != nil {
+			return internalToolError("invalidate stale capability dispatch", invalidate.Error)
+		}
+
+		var call persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tool_call_id = ? AND actor_id = ?", row.ToolCallID, actorID).
+			First(&call).Error; err != nil {
+			return notFoundToolError("tool call for stale capability dispatch", err)
+		}
+		deliverable := call.Status == persistence.ToolCallStatusDispatchCommitted &&
+			!call.ResultPersisted &&
+			call.ExecutionDeadline != nil &&
+			call.ReconciliationDeadline != nil &&
+			call.ExecutionDeadline.After(now) &&
+			call.ReconciliationDeadline.After(now)
+		if !deliverable {
+			continue
+		}
+		// Re-issue with a new sequence, fence and envelope against the
+		// current lease. The call identity, approval and claim are retained.
+		if err := s.issueCapabilityRequestTx(
+			tx,
+			&call,
+			leaseRow,
+			now,
+			persistence.ToolCallStatusDispatchCommitted,
+			call.FencingToken,
+			"",
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) PullCapabilityRequests(
+	ctx context.Context,
+	actorID string,
+	deviceID string,
+	request *model.PullClientCapabilityRequestsRequest,
+) (*model.PullClientCapabilityRequestsResponse, error) {
+	if request == nil ||
+		strings.TrimSpace(actorID) == "" ||
+		strings.TrimSpace(deviceID) == "" ||
+		strings.TrimSpace(request.GetCapabilitySessionId()) == "" {
+		return nil, invalidToolRequest("actor, device, and capability_session_id are required")
+	}
+	if supplied := strings.TrimSpace(request.GetDeviceId()); supplied != "" && supplied != deviceID {
+		return nil, unauthorizedToolRequest("request device does not match authenticated device")
+	}
+	if s.capabilityProof == nil {
+		return nil, internalToolError("verify capability pull", fmt.Errorf("proof service is not configured"))
+	}
+	verified, err := s.capabilityProof.Verify(
+		ctx,
+		actorID,
+		deviceID,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_PULL_REQUESTS,
+		request,
+		request.GetCommandProof(),
+	)
+	if err != nil {
+		var proofErr *ClientCapabilityCommandProofError
+		if errors.As(err, &proofErr) {
+			return &model.PullClientCapabilityRequestsResponse{ErrorCode: proofErr.Code}, nil
+		}
+		return nil, err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	limit := int(request.GetLimit())
+	if limit <= 0 || limit > maxCapabilityPullLimit {
+		limit = maxCapabilityPullLimit
+	}
+	now := s.now()
+	var rows []persistence.ToolDispatchOutbox
+	var leaseExpiredError *errcode.BizError
+	var notifications []clientLeaseExpiredTurn
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		command, replayed, err := bindCapabilityCommandTx(
+			tx,
+			actorID,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_PULL_REQUESTS,
+			verified,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if replayed && len(command.ResponseRef) > 0 {
+			var payload model.ErrorPayload
+			if err := proto.Unmarshal(command.ResponseRef, &payload); err != nil {
+				return internalToolError("decode capability pull replay", err)
+			}
+			if payload.GetErrorType() != string(errcode.AgentClientLeaseExpired) {
+				return invalidToolState("capability pull replay response is invalid")
+			}
+			leaseExpiredError = errcode.NewClientLeaseExpiredFromPayload(&payload)
+			return nil
+		}
+
+		var leaseRow persistence.ClientCapabilityLease
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"session_id = ? AND actor_id = ?",
+				request.GetCapabilitySessionId(),
+				actorID,
+			).
+			First(&leaseRow).Error; err != nil {
+			return notFoundToolError("active capability lease", err)
+		}
+		if leaseRow.RevokedAt != nil {
+			return notFoundToolError("active capability lease", gorm.ErrRecordNotFound)
+		}
+		if !leaseRow.ExpiresAt.After(now) {
+			if leaseRow.DeviceID != deviceID {
+				return notFoundToolError("active capability lease", gorm.ErrRecordNotFound)
+			}
+			leaseExpiredError = errcode.NewClientLeaseExpired(
+				leaseRow.SessionID,
+				leaseRow.LeaseID,
+				leaseRow.ExpiresAt,
+			)
+			encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(
+				leaseExpiredError.Payload,
+			)
+			if err != nil {
+				return internalToolError("encode expired capability lease outcome", err)
+			}
+			if err := storeCapabilityCommandOutcomeTx(
+				tx,
+				command.CommandID,
+				0,
+				leaseRow.LeaseID,
+				leaseRow.LeaseRevision,
+				encoded,
+			); err != nil {
+				return err
+			}
+			notifications, err = s.appendClientLeaseExpiredEventsTx(
+				tx,
+				actorID,
+				leaseRow.SessionID,
+				leaseExpiredError.Payload,
+				now,
+			)
+			return err
+		}
+
+		var lease model.ClientCapabilityLease
+		if err := proto.Unmarshal(leaseRow.LeasePayload, &lease); err != nil {
+			return internalToolError("decode capability lease", err)
+		}
+		if lease.GetDeviceId() != deviceID {
+			return unauthorizedToolRequest(
+				"capability session does not belong to authenticated device",
+			)
+		}
+		// Routine renewals bump the lease revision while approved calls wait
+		// for delivery. Re-pin any stale pending envelope to the current
+		// revision; otherwise the executor rejects it as an authority mismatch
+		// until the call deadline expires.
+		if err := s.refreshStaleLeaseDispatchTx(tx, &leaseRow, actorID, deviceID, now); err != nil {
+			return err
+		}
+		if err := tx.Where(
+			"actor_id = ? AND capability_session_id = ? AND target_device_id = ? "+
+				"AND dispatch_sequence > ? AND invalidated_at IS NULL "+
+				"AND execution_deadline > ?",
+			actorID,
+			request.GetCapabilitySessionId(),
+			deviceID,
+			request.GetAfterSequence(),
+			now,
+		).
+			Order("dispatch_sequence ASC").
+			Limit(limit).
+			Find(&rows).Error; err != nil {
+			return internalToolError("load targeted capability requests", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, notification := range notifications {
+		s.conversations.notifyTurnEvent(notification.conversationID, notification.turnID)
+	}
+	if leaseExpiredError != nil {
+		return nil, leaseExpiredError
+	}
+	if len(rows) > 0 {
+		interrupted, barrierErr := s.reachAcceptanceBarrier(
+			ctx,
+			actorID,
+			capabilityBarrierClaimBeforeDelivery,
+		)
+		if barrierErr != nil {
+			return nil, barrierErr
+		}
+		if interrupted {
+			return nil, errCapabilityAcceptanceWorkerInterrupted
+		}
+	}
+
+	response := &model.PullClientCapabilityRequestsResponse{}
+	for _, row := range rows {
+		var envelope model.ClientCapabilityRequest
+		if err := proto.Unmarshal(row.Envelope, &envelope); err != nil {
+			return nil, internalToolError("decode targeted capability request", err)
+		}
+		response.Requests = append(response.Requests, &envelope)
+		response.LastSequence = row.DispatchSequence
+	}
+	return response, nil
+}
+
+type clientLeaseExpiredTurn struct {
+	conversationID string
+	turnID         string
+}
+
+func (s *ToolDispatchService) appendClientLeaseExpiredEventsTx(
+	tx *gorm.DB,
+	actorID string,
+	sessionID string,
+	outcome *model.ErrorPayload,
+	now time.Time,
+) ([]clientLeaseExpiredTurn, error) {
+	var calls []persistence.ToolCall
+	if err := tx.Where(
+		"actor_id = ? AND capability_session_id = ? AND status = ?",
+		actorID,
+		sessionID,
+		persistence.ToolCallStatusDispatchCommitted,
+	).
+		Order("turn_id ASC, attempt_id ASC, tool_call_id ASC").
+		Find(&calls).Error; err != nil {
+		return nil, internalToolError("load expired-lease pending tool calls", err)
+	}
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	if s.conversations == nil {
+		return nil, internalToolError(
+			"persist expired-lease turn event",
+			errors.New("conversation service is not configured"),
+		)
+	}
+
+	outcomeJSON, err := (protojson.MarshalOptions{
+		UseProtoNames:   true,
+		EmitUnpopulated: true,
+	}).Marshal(outcome)
+	if err != nil {
+		return nil, internalToolError("encode expired-lease turn outcome", err)
+	}
+	retryable := outcome.GetRetryable()
+	terminal := outcome.GetTerminal()
+	details := make(map[string]string, len(outcome.GetDetails()))
+	for key, value := range outcome.GetDetails() {
+		details[key] = value
+	}
+
+	seen := make(map[string]struct{}, len(calls))
+	notifications := make([]clientLeaseExpiredTurn, 0, len(calls))
+	for i := range calls {
+		key := calls[i].TurnID + "\x00" + calls[i].AttemptID
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		var batch persistence.ToolBatch
+		if err := tx.Where(
+			"id = ? AND actor_id = ? AND turn_id = ? AND attempt_id = ?",
+			calls[i].ToolBatchID,
+			actorID,
+			calls[i].TurnID,
+			calls[i].AttemptID,
+		).
+			First(&batch).Error; err != nil {
+			return nil, internalToolError("load expired-lease tool batch", err)
+		}
+		alreadyEmitted, err := hasClientLeaseExpiredEventTx(
+			tx,
+			batch.ConversationID,
+			calls[i].TurnID,
+			calls[i].AttemptID,
+			sessionID,
+			outcome.GetDetails()["lease_id"],
+		)
+		if err != nil {
+			return nil, internalToolError("load expired-lease turn event", err)
+		}
+		if alreadyEmitted {
+			continue
+		}
+		event := TurnEvent{
+			Type:           "progress",
+			TurnID:         calls[i].TurnID,
+			AttemptID:      calls[i].AttemptID,
+			ConversationID: batch.ConversationID,
+			AgentID:        batch.AgentID,
+			Stage:          "client_lease_expired",
+			Error:          outcome.GetError(),
+			ErrorType:      outcome.GetErrorType(),
+			LocaleKey:      outcome.GetLocaleKey(),
+			Retryable:      &retryable,
+			Terminal:       &terminal,
+			Details:        details,
+			OutcomeError:   outcomeJSON,
+		}
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return nil, internalToolError("encode expired-lease turn event", err)
+		}
+		if _, err := s.conversations.persistTurnEventTx(
+			tx,
+			batch.ConversationID,
+			calls[i].TurnID,
+			calls[i].AttemptID,
+			event.Type,
+			payload,
+			now,
+		); err != nil {
+			return nil, internalToolError("persist expired-lease turn event", err)
+		}
+		notifications = append(notifications, clientLeaseExpiredTurn{
+			conversationID: batch.ConversationID,
+			turnID:         calls[i].TurnID,
+		})
+	}
+	return notifications, nil
+}
+
+func hasClientLeaseExpiredEventTx(
+	tx *gorm.DB,
+	conversationID string,
+	turnID string,
+	attemptID string,
+	sessionID string,
+	leaseID string,
+) (bool, error) {
+	var turn persistence.AgentTurn
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND conversation_id = ?", turnID, conversationID).
+		First(&turn).Error; err != nil {
+		return false, err
+	}
+
+	var rows []persistence.TurnEvent
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"turn_id = ? AND attempt_id = ? AND event_type = ?",
+			turnID,
+			attemptID,
+			"progress",
+		).
+		Find(&rows).Error; err != nil {
+		return false, err
+	}
+	for i := range rows {
+		var event TurnEvent
+		if err := json.Unmarshal([]byte(rows[i].Payload), &event); err != nil {
+			return false, err
+		}
+		if event.Stage == "client_lease_expired" &&
+			event.ErrorType == string(errcode.AgentClientLeaseExpired) &&
+			event.Details["session_id"] == sessionID &&
+			event.Details["lease_id"] == leaseID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *ToolDispatchService) SubmitReceipt(
+	ctx context.Context,
+	actorID string,
+	deviceID string,
+	request *model.SubmitClientCapabilityReceiptRequest,
+) (*model.SubmitClientCapabilityReceiptResponse, error) {
+	if request == nil || request.GetReceipt() == nil {
+		return nil, invalidToolRequest("client capability receipt is required")
+	}
+	receipt := request.GetReceipt()
+	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(deviceID) == "" {
+		return nil, unauthorizedToolRequest("authenticated actor and device are required")
+	}
+	if receipt.GetRecoveryProof() != nil {
+		return &model.SubmitClientCapabilityReceiptResponse{
+			ErrorCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_RECOVERY_REQUIRED,
+		}, nil
+	}
+	if s.capabilityProof == nil {
+		return nil, internalToolError("verify capability receipt", fmt.Errorf("proof service is not configured"))
+	}
+	verified, err := s.capabilityProof.Verify(
+		ctx,
+		actorID,
+		deviceID,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_SUBMIT_ACTIVE_RECEIPT,
+		request,
+		request.GetCommandProof(),
+	)
+	if err != nil {
+		var proofErr *ClientCapabilityCommandProofError
+		if errors.As(err, &proofErr) {
+			return &model.SubmitClientCapabilityReceiptResponse{CommandErrorCode: proofErr.Code}, nil
+		}
+		return nil, err
+	}
+	receiptHash := protoPayloadHash(receipt)
+
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	response := &model.SubmitClientCapabilityReceiptResponse{}
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, _, err := bindCapabilityCommandTx(
+			tx,
+			actorID,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_SUBMIT_ACTIVE_RECEIPT,
+			verified,
+			s.now(),
+		); err != nil {
+			return err
+		}
+		replayed, found, err := loadReceiptReplayTx(tx, receipt, receiptHash)
+		if err != nil {
+			return err
+		}
+		if found {
+			response = replayed
+			return nil
+		}
+
+		var outbox persistence.ToolDispatchOutbox
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("request_id = ?", receipt.GetRequestId()).
+			First(&outbox).Error; err != nil {
+			return notFoundToolError("client capability request", err)
+		}
+		var call persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tool_call_id = ?", receipt.GetToolCallId()).
+			First(&call).Error; err != nil {
+			return notFoundToolError("tool call", err)
+		}
+		var lease persistence.ClientCapabilityLease
+		leaseErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"session_id = ? AND actor_id = ? AND device_id = ? AND lease_id = ?",
+			call.CapabilitySessionID,
+			actorID,
+			deviceID,
+			call.ExecutorLeaseID,
+		).First(&lease).Error
+		now := s.now()
+		if leaseErr != nil {
+			if !errors.Is(leaseErr, gorm.ErrRecordNotFound) {
+				return internalToolError("lock capability lease for receipt", leaseErr)
+			}
+			code := model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH
+			if err := storeReceiptAttemptTx(tx, receipt, receiptHash, false, code.String(), now); err != nil {
+				return err
+			}
+			response.ErrorCode = code
+			return nil
+		}
+		if lease.LeaseRevision != call.CapabilityLeaseRevision ||
+			lease.RevokedAt != nil ||
+			!lease.ExpiresAt.After(now) {
+			code := model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH
+			if lease.LeaseRevision == call.CapabilityLeaseRevision &&
+				lease.RevokedAt == nil &&
+				!lease.ExpiresAt.After(now) {
+				code = model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED
+			}
+			if err := storeReceiptAttemptTx(tx, receipt, receiptHash, false, code.String(), now); err != nil {
+				return err
+			}
+			response.ErrorCode = code
+			return nil
+		}
+		if code := validateReceiptTuple(actorID, deviceID, now, &call, &outbox, receipt); code != model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_UNSPECIFIED {
+			if err := storeReceiptAttemptTx(tx, receipt, receiptHash, false, code.String(), now); err != nil {
+				return err
+			}
+			response.ErrorCode = code
+			return nil
+		}
+
+		switch receipt.GetStatus() {
+		case model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED:
+			if call.Status != persistence.ToolCallStatusDispatchCommitted {
+				code := model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_INVALID_TRANSITION
+				if err := storeReceiptAttemptTx(tx, receipt, receiptHash, false, code.String(), now); err != nil {
+					return err
+				}
+				response.ErrorCode = code
+				return nil
+			}
+			if err := storeReceiptAttemptTx(tx, receipt, receiptHash, true, "", now); err != nil {
+				return err
+			}
+			result := tx.Model(&persistence.ToolCall{}).
+				Where("id = ? AND status = ?", call.ID, persistence.ToolCallStatusDispatchCommitted).
+				Updates(map[string]interface{}{
+					"status":              persistence.ToolCallStatusPrepared,
+					"side_effect_receipt": receipt.GetSideEffectReceiptId(),
+					"started_at":          now,
+					"updated_at":          now,
+				})
+			if result.Error != nil {
+				return internalToolError("commit prepared receipt", result.Error)
+			}
+			if result.RowsAffected != 1 {
+				return invalidToolState("tool call prepared transition lost")
+			}
+			if err := tx.Model(&persistence.ToolDispatchOutbox{}).
+				Where("request_id = ?", outbox.RequestID).
+				Update("acknowledged_at", now).Error; err != nil {
+				return internalToolError("acknowledge capability request", err)
+			}
+			response.Accepted = true
+			return nil
+
+		case model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED,
+			model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_FAILED,
+			model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_RECONCILED_UNKNOWN:
+			if call.Status != persistence.ToolCallStatusPrepared {
+				code := model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_INVALID_TRANSITION
+				if err := storeReceiptAttemptTx(tx, receipt, receiptHash, false, code.String(), now); err != nil {
+					return err
+				}
+				response.ErrorCode = code
+				return nil
+			}
+			if strings.TrimSpace(receipt.GetResultId()) == "" {
+				return invalidToolRequest("terminal receipt result_id is required")
+			}
+			if err := storeReceiptAttemptTx(tx, receipt, receiptHash, true, "", now); err != nil {
+				return err
+			}
+			return s.commitTerminalReceiptTx(tx, &call, receipt, now, response)
+		default:
+			code := model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_INVALID_TRANSITION
+			if err := storeReceiptAttemptTx(tx, receipt, receiptHash, false, code.String(), now); err != nil {
+				return err
+			}
+			response.ErrorCode = code
+			return nil
+		}
+	})
+	if err == nil && !response.GetAccepted() &&
+		receipt.GetStatus() !=
+			model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED {
+		for _, cell := range []string{"ERR-O02", "ERR-O04", "ERR-O08"} {
+			if !s.matchesAcceptanceTuple(actorID, cell, "single") {
+				continue
+			}
+			if settleErr := s.settleAcceptanceRejectedReceipt(
+				ctx,
+				actorID,
+				receipt.GetToolCallId(),
+				response.GetErrorCode().String(),
+			); settleErr != nil {
+				return nil, settleErr
+			}
+			break
+		}
+	}
+	if err == nil &&
+		response.GetAccepted() &&
+		receipt.GetStatus() !=
+			model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED &&
+		!s.matchesAcceptanceBarrier(
+			actorID,
+			capabilityBarrierResultBeforeContinue,
+		) {
+		continuationID, ensureErr := s.EnsureReadyContinuationForToolCall(
+			ctx,
+			actorID,
+			receipt.GetToolCallId(),
+		)
+		if ensureErr != nil {
+			return nil, ensureErr
+		}
+		response.ContinuationId = continuationID
+	}
+	return response, err
+}
+
+func (s *ToolDispatchService) ClaimReadyContinuation(
+	ctx context.Context,
+	leaseDuration time.Duration,
+) (*persistence.ToolContinuation, error) {
+	if leaseDuration <= 0 {
+		return nil, invalidToolRequest("continuation lease duration must be positive")
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var claimed persistence.ToolContinuation
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := s.now()
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where(
+				"status = ? OR (status = ? AND provider_request_emitted = ? AND lease_expires_at < ?)",
+				persistence.ToolContinuationStatusReady,
+				persistence.ToolContinuationStatusClaimed,
+				false,
+				now,
+			).
+			Order("created_at ASC").
+			First(&claimed).Error; err != nil {
+			return err
+		}
+		claimed.Status = persistence.ToolContinuationStatusClaimed
+		claimed.LeaseID = generateID("continuation_lease")
+		claimed.FencingToken++
+		expiresAt := now.Add(leaseDuration)
+		claimed.LeaseExpiresAt = &expiresAt
+		claimed.UpdatedAt = now
+		return tx.Save(&claimed).Error
+	})
+	return &claimed, err
+}
+
+func (s *ToolDispatchService) ReleaseContinuationClaim(
+	ctx context.Context,
+	continuationID string,
+	leaseID string,
+	fencingToken uint64,
+) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	result := db.WithContext(ctx).
+		Model(&persistence.ToolContinuation{}).
+		Where(
+			"id = ? AND status = ? AND lease_id = ? AND fencing_token = ? AND provider_request_emitted = ?",
+			strings.TrimSpace(continuationID),
+			persistence.ToolContinuationStatusClaimed,
+			strings.TrimSpace(leaseID),
+			fencingToken,
+			false,
+		).
+		Updates(map[string]interface{}{
+			"status":           persistence.ToolContinuationStatusReady,
+			"lease_id":         "",
+			"lease_expires_at": nil,
+			"updated_at":       now,
+		})
+	if result.Error != nil {
+		return internalToolError("release tool continuation claim", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return invalidToolState("tool continuation claim is no longer releasable")
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) EnsureReadyContinuationForToolCall(
+	ctx context.Context,
+	actorPTID string,
+	toolCallID string,
+) (string, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return "", err
+	}
+	var call persistence.ToolCall
+	if err := db.WithContext(ctx).
+		Where("actor_id = ? AND tool_call_id = ?", actorPTID, toolCallID).
+		First(&call).Error; err != nil {
+		return "", notFoundToolError("tool call", err)
+	}
+	return s.ensureReadyContinuation(ctx, call.ToolBatchID)
+}
+
+func (s *ToolDispatchService) ReconcileReadyContinuations(
+	ctx context.Context,
+) (int64, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var batches []persistence.ToolBatch
+	if err := db.WithContext(ctx).
+		Where("status = ?", persistence.ToolBatchStatusReadyForContinuation).
+		Order("updated_at ASC, id ASC").
+		Find(&batches).Error; err != nil {
+		return 0, internalToolError("load ready tool batches", err)
+	}
+	var affected int64
+	for i := range batches {
+		interrupted, err := s.reachAcceptanceBarrier(
+			ctx,
+			batches[i].ActorID,
+			capabilityBarrierResultBeforeContinue,
+		)
+		if err != nil {
+			return affected, err
+		}
+		if interrupted {
+			return affected, errCapabilityAcceptanceWorkerInterrupted
+		}
+		continuationID, err := s.ensureReadyContinuation(ctx, batches[i].ID)
+		if err != nil {
+			return affected, err
+		}
+		if continuationID != "" {
+			affected++
+		}
+	}
+	return affected, nil
+}
+
+func (s *ToolDispatchService) ensureReadyContinuation(
+	ctx context.Context,
+	toolBatchID string,
+) (string, error) {
+	if strings.TrimSpace(toolBatchID) == "" {
+		return "", invalidToolRequest("tool batch is required")
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return "", err
+	}
+	var continuationID string
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var batch persistence.ToolBatch
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", toolBatchID).
+			First(&batch).Error; err != nil {
+			return notFoundToolError("tool batch", err)
+		}
+		if batch.Status != persistence.ToolBatchStatusReadyForContinuation {
+			return nil
+		}
+		var existing persistence.ToolContinuation
+		err := tx.Where("tool_batch_id = ?", toolBatchID).First(&existing).Error
+		if err == nil {
+			continuationID = existing.ID
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return internalToolError("load tool batch continuation", err)
+		}
+		now := s.now()
+		continuation := &persistence.ToolContinuation{
+			ID:          generateID("tool_continuation"),
+			TurnID:      batch.TurnID,
+			AttemptID:   batch.AttemptID,
+			ToolBatchID: batch.ID,
+			Status:      persistence.ToolContinuationStatusReady,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		if err := tx.Create(continuation).Error; err != nil {
+			return internalToolError("persist tool batch continuation", err)
+		}
+		continuationID = continuation.ID
+		return nil
+	})
+	return continuationID, err
+}
+
+func (s *ToolDispatchService) AwaitAndClaimBatchContinuation(
+	ctx context.Context,
+	toolBatchID string,
+	leaseDuration time.Duration,
+) (*persistence.ToolContinuation, []persistence.ToolResult, error) {
+	if strings.TrimSpace(toolBatchID) == "" || leaseDuration <= 0 {
+		return nil, nil, invalidToolRequest("tool batch and continuation lease duration are required")
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		continuation, results, ready, err := s.claimBatchContinuation(ctx, toolBatchID, leaseDuration)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ready {
+			return continuation, results, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *ToolDispatchService) claimBatchContinuation(
+	ctx context.Context,
+	toolBatchID string,
+	leaseDuration time.Duration,
+) (*persistence.ToolContinuation, []persistence.ToolResult, bool, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	var claimed persistence.ToolContinuation
+	var results []persistence.ToolResult
+	ready := false
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var batch persistence.ToolBatch
+		if err := tx.Where("id = ?", toolBatchID).First(&batch).Error; err != nil {
+			return notFoundToolError("tool batch", err)
+		}
+		if batch.Status == persistence.ToolBatchStatusBlocked {
+			return invalidToolState("tool batch is blocked")
+		}
+		if batch.Status != persistence.ToolBatchStatusReadyForContinuation {
+			return nil
+		}
+
+		now := s.now()
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tool_batch_id = ? AND status = ?", toolBatchID, persistence.ToolContinuationStatusReady).
+			First(&claimed).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil
+			}
+			return internalToolError("load tool batch continuation", err)
+		}
+		claimed.Status = persistence.ToolContinuationStatusClaimed
+		claimed.LeaseID = generateID("continuation_lease")
+		claimed.FencingToken++
+		expiresAt := now.Add(leaseDuration)
+		claimed.LeaseExpiresAt = &expiresAt
+		claimed.UpdatedAt = now
+		if err := tx.Save(&claimed).Error; err != nil {
+			return internalToolError("claim tool batch continuation", err)
+		}
+		if err := tx.Where("tool_batch_id = ?", toolBatchID).
+			Order("created_at ASC").
+			Find(&results).Error; err != nil {
+			return internalToolError("load tool batch results", err)
+		}
+		ready = true
+		return nil
+	})
+	return &claimed, results, ready, err
+}
+
+func (s *ToolDispatchService) MarkContinuationEmitted(
+	ctx context.Context,
+	continuationID string,
+	leaseID string,
+	fencingToken uint64,
+	providerIdempotent bool,
+) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	result := db.WithContext(ctx).Model(&persistence.ToolContinuation{}).
+		Where(
+			"id = ? AND status = ? AND lease_id = ? AND fencing_token = ?",
+			continuationID,
+			persistence.ToolContinuationStatusClaimed,
+			leaseID,
+			fencingToken,
+		).
+		Updates(map[string]interface{}{
+			"provider_request_emitted": true,
+			"provider_idempotent":      providerIdempotent,
+			"updated_at":               s.now(),
+		})
+	if result.Error != nil {
+		return internalToolError("mark continuation emitted", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return invalidToolState("continuation lease is stale")
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) CompleteContinuation(
+	ctx context.Context,
+	continuationID string,
+	leaseID string,
+	fencingToken uint64,
+	providerResponse []byte,
+) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	result := db.WithContext(ctx).Model(&persistence.ToolContinuation{}).
+		Where(
+			"id = ? AND status = ? AND lease_id = ? AND fencing_token = ?",
+			continuationID,
+			persistence.ToolContinuationStatusClaimed,
+			leaseID,
+			fencingToken,
+		).
+		Updates(map[string]interface{}{
+			"status":            persistence.ToolContinuationStatusCompleted,
+			"provider_response": providerResponse,
+			"completed_at":      now,
+			"updated_at":        now,
+		})
+	if result.Error != nil {
+		return internalToolError("complete continuation", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return invalidToolState("continuation lease is stale")
+	}
+	return nil
+}
+
+func (s *ToolDispatchService) ReconcileExpiredContinuations(ctx context.Context) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&persistence.ToolContinuation{}).
+			Where(
+				"status = ? AND lease_expires_at < ? AND provider_request_emitted = ?",
+				persistence.ToolContinuationStatusClaimed,
+				now,
+				false,
+			).
+			Updates(map[string]interface{}{
+				"status":           persistence.ToolContinuationStatusReady,
+				"lease_id":         "",
+				"lease_expires_at": nil,
+				"updated_at":       now,
+			}).Error; err != nil {
+			return internalToolError("requeue pre-emission continuations", err)
+		}
+		if err := tx.Model(&persistence.ToolContinuation{}).
+			Where(
+				"status = ? AND lease_expires_at < ? AND provider_request_emitted = ? AND provider_idempotent = ?",
+				persistence.ToolContinuationStatusClaimed,
+				now,
+				true,
+				true,
+			).
+			Updates(map[string]interface{}{
+				"status":           persistence.ToolContinuationStatusReady,
+				"lease_id":         "",
+				"lease_expires_at": nil,
+				"updated_at":       now,
+			}).Error; err != nil {
+			return internalToolError("requeue provider-idempotent continuations", err)
+		}
+		return tx.Model(&persistence.ToolContinuation{}).
+			Where(
+				"status = ? AND lease_expires_at < ? AND provider_request_emitted = ? AND provider_idempotent = ?",
+				persistence.ToolContinuationStatusClaimed,
+				now,
+				true,
+				false,
+			).
+			Updates(map[string]interface{}{
+				"status":     persistence.ToolContinuationStatusReconciliationRequired,
+				"updated_at": now,
+			}).Error
+	})
+}
+
+func (s *ToolDispatchService) ExpireStaleApprovals(ctx context.Context, timeout time.Duration) (int64, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+	now := s.now()
+	cutoff := now.Add(-timeout)
+	var affected int64
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var calls []persistence.ToolCall
+		if err := tx.Where("status = ? AND updated_at < ?", persistence.ToolCallStatusWaitingApproval, cutoff).
+			Find(&calls).Error; err != nil {
+			return err
+		}
+		for _, call := range calls {
+			result := tx.Model(&persistence.ToolCall{}).
+				Where("id = ? AND status = ?", call.ID, persistence.ToolCallStatusWaitingApproval).
+				Updates(map[string]interface{}{
+					"status":     persistence.ToolCallStatusExpired,
+					"error_code": string(errcode.AgentToolApprovalExpired),
+					"ended_at":   now,
+					"updated_at": now,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 1 {
+				affected++
+				if err := blockToolBatchTx(tx, call.ToolBatchID, now); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	return affected, err
+}
+
+func (s *ToolDispatchService) SettleExpiredToolCalls(ctx context.Context) (int64, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+	now := s.now()
+	var affected int64
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var calls []persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"(execution_deadline <= ? AND status IN ?) OR "+
+					"(reconciliation_deadline <= ? AND status IN ? AND result_persisted = ?)",
+				now,
+				[]string{
+					persistence.ToolCallStatusWaitingApproval,
+					persistence.ToolCallStatusDispatchCommitted,
+				},
+				now,
+				[]string{
+					persistence.ToolCallStatusPrepared,
+					persistence.ToolCallStatusCancelled,
+				},
+				false,
+			).
+			Find(&calls).Error; err != nil {
+			return internalToolError("load expired tool calls", err)
+		}
+		for i := range calls {
+			status := persistence.ToolCallStatusExpired
+			errorCode := string(errcode.AgentToolApprovalExpired)
+			if calls[i].Status == persistence.ToolCallStatusPrepared ||
+				calls[i].Status == persistence.ToolCallStatusCancelled {
+				status = persistence.ToolCallStatusUnknownSideEffect
+				if strings.TrimSpace(calls[i].ErrorCode) != "" {
+					errorCode = calls[i].ErrorCode
+				} else {
+					errorCode = "tool_deadline_expired"
+				}
+			} else if calls[i].Status == persistence.ToolCallStatusDispatchCommitted {
+				errorCode = "tool_deadline_expired"
+			}
+			result := tx.Model(&persistence.ToolCall{}).
+				Where("id = ? AND status = ?", calls[i].ID, calls[i].Status).
+				Updates(map[string]interface{}{
+					"status":     status,
+					"error_code": errorCode,
+					"ended_at":   now,
+					"updated_at": now,
+				})
+			if result.Error != nil {
+				return internalToolError("settle expired tool call", result.Error)
+			}
+			if result.RowsAffected == 0 {
+				continue
+			}
+			affected++
+			if err := blockToolBatchTx(tx, calls[i].ToolBatchID, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return affected, err
+}
+
+func (s *ToolDispatchService) GetPendingByTurn(ctx context.Context, turnID string) ([]persistence.ToolCall, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var calls []persistence.ToolCall
+	err = db.WithContext(ctx).
+		Where("turn_id = ? AND status IN ?", turnID, []string{
+			persistence.ToolCallStatusProposed,
+			persistence.ToolCallStatusWaitingApproval,
+			persistence.ToolCallStatusApproved,
+			persistence.ToolCallStatusDispatchCommitted,
+			persistence.ToolCallStatusPrepared,
+		}).
+		Find(&calls).Error
+	return calls, err
+}
+
+type StationToolExecutionCompletion struct {
+	ResultID       string
+	ContinuationID string
+	Replayed       bool
+}
+
+type stationToolExecutionReceipt struct {
+	status        string
+	callStatus    string
+	resultID      string
+	payloadHash   string
+	boundedResult []byte
+	errorCode     string
+}
+
+// ClaimReadyStationTool durably establishes the single execution attempt
+func (s *ToolDispatchService) rejectAcceptanceStationReceiptIfNeeded(
+	ctx context.Context,
+	claim *persistence.ToolCall,
+) (bool, error) {
+	if claim == nil {
+		return false, nil
+	}
+	rejectionCode := ""
+	for _, candidate := range []struct {
+		cell string
+		code model.ClientCapabilityReceiptErrorCode
+	}{
+		{
+			cell: "ERR-O02",
+			code: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+		},
+		{
+			cell: "ERR-O04",
+			code: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+		},
+		{
+			cell: "ERR-O06",
+			code: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_RECOVERY_CREDENTIAL_EXPIRED,
+		},
+		{
+			cell: "ERR-O08",
+			code: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_STALE_FENCE,
+		},
+	} {
+		if s.matchesAcceptanceTuple(claim.ActorID, candidate.cell, "single") {
+			rejectionCode = candidate.code.String()
+			break
+		}
+	}
+	if rejectionCode == "" {
+		return false, nil
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return false, err
+	}
+	now := s.now()
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND actor_id = ?", claim.ID, claim.ActorID).
+			First(&current).Error; err != nil {
+			return notFoundToolError("Station ToolCall recovery", err)
+		}
+		if current.Status != persistence.ToolCallStatusPrepared ||
+			current.StationReceiptStatus == "" ||
+			current.StationReceiptPayloadHash == "" {
+			return invalidToolState(
+				"Station receipt rejection requires a durable PREPARED receipt",
+			)
+		}
+		if s.matchesAcceptanceTuple(claim.ActorID, "ERR-O06", "single") {
+			var credential persistence.ReceiptRecoveryCredential
+			if err := tx.Where(
+				"id = ? AND tool_call_id = ?",
+				current.ReceiptRecoveryCredentialID,
+				current.ToolCallID,
+			).First(&credential).Error; err != nil {
+				return notFoundToolError(
+					"Station receipt recovery credential",
+					err,
+				)
+			}
+			if credential.ExpiresAt.After(now) {
+				return invalidToolState(
+					"Station receipt recovery credential is still active",
+				)
+			}
+		}
+		receipt := stationToolReceiptFromRecord(&current)
+		if receipt == nil {
+			return invalidToolState("Station terminal receipt is unavailable")
+		}
+		attempt := &persistence.ToolReceiptAttempt{
+			ID:                  generateID("station_receipt_attempt"),
+			RequestID:           generateID("station_recovery"),
+			Sequence:            current.DispatchSequence + 1,
+			ToolCallID:          current.ToolCallID,
+			FencingToken:        claim.FencingToken,
+			Status:              current.StationReceiptStatus,
+			PayloadHash:         current.PayloadHash,
+			ReceiptHash:         current.StationReceiptPayloadHash,
+			ResultID:            receipt.resultID,
+			SideEffectReceiptID: current.SideEffectReceipt,
+			BoundedResult:       append([]byte(nil), current.StationReceiptResult...),
+			ErrorCode:           current.StationReceiptErrorCode,
+			Accepted:            false,
+			RejectionCode:       rejectionCode,
+			OccurredAt:          now,
+			CreatedAt:           now,
+		}
+		if err := tx.Create(attempt).Error; err != nil {
+			return internalToolError(
+				"persist rejected Station receipt recovery",
+				err,
+			)
+		}
+		expiredAt := now.Add(-time.Microsecond)
+		if err := tx.Model(&persistence.ToolCall{}).
+			Where("id = ? AND status = ?", current.ID, persistence.ToolCallStatusPrepared).
+			Updates(map[string]interface{}{
+				"reconciliation_deadline": expiredAt,
+				"updated_at":              now,
+			}).Error; err != nil {
+			return internalToolError(
+				"expire rejected Station receipt reconciliation",
+				err,
+			)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.SettleExpiredToolCalls(ctx); err != nil {
+		return false, err
+	}
+	if err := db.WithContext(ctx).
+		Model(&persistence.ToolCall{}).
+		Where("id = ? AND status = ?", claim.ID, persistence.ToolCallStatusUnknownSideEffect).
+		Update("error_code", rejectionCode).Error; err != nil {
+		return false, internalToolError(
+			"record rejected Station receipt outcome",
+			err,
+		)
+	}
+	return true, nil
+}
+
+// before TurnService invokes a Station-owned handler.
+// before TurnService invokes a Station-owned handler.
+func (s *ToolDispatchService) ClaimReadyStationTool(
+	ctx context.Context,
+) (*persistence.ToolCall, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	var claimed persistence.ToolCall
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var candidate persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Table("agent_tool_calls AS tool_call").
+			Select("tool_call.*").
+			Joins("JOIN agent_tool_batches AS batch ON batch.id = tool_call.tool_batch_id").
+			Where(
+				"tool_call.execution_owner = ? AND tool_call.status IN ? "+
+					"AND tool_call.execution_deadline > ? AND batch.status = ?",
+				persistence.ToolOwnerStation,
+				[]string{
+					persistence.ToolCallStatusApproved,
+					persistence.ToolCallStatusPrepared,
+				},
+				now,
+				persistence.ToolBatchStatusOpen,
+			).
+			Order("tool_call.created_at ASC, tool_call.tool_call_id ASC").
+			First(&candidate).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if candidate.Status == persistence.ToolCallStatusPrepared {
+			claimed = candidate
+			return nil
+		}
+		interrupted, err := s.reachAcceptanceBarrier(
+			ctx,
+			candidate.ActorID,
+			capabilityBarrierDecisionBeforeClaim,
+		)
+		if err != nil {
+			return err
+		}
+		if interrupted {
+			return errCapabilityAcceptanceWorkerInterrupted
+		}
+
+		claimID := generateID("execution_claim")
+		executorLeaseID := generateID("station_executor")
+		receiptID := generateID("station_receipt")
+		nextFence := candidate.FencingToken + 1
+		nextSequence := candidate.DispatchSequence + 1
+		payloadHash := stationToolExecutionPayloadHash(&candidate, nextFence)
+		result := tx.Model(&persistence.ToolCall{}).
+			Where(
+				"id = ? AND execution_owner = ? AND status = ? AND fencing_token = ?",
+				candidate.ID,
+				persistence.ToolOwnerStation,
+				persistence.ToolCallStatusApproved,
+				candidate.FencingToken,
+			).
+			Updates(map[string]interface{}{
+				"status":                  persistence.ToolCallStatusPrepared,
+				"execution_claim_id":      claimID,
+				"executor_lease_id":       executorLeaseID,
+				"fencing_token":           nextFence,
+				"dispatch_sequence":       nextSequence,
+				"dispatch_committed_at":   now,
+				"payload_hash":            payloadHash,
+				"side_effect_receipt":     receiptID,
+				"execution_attempt_count": gorm.Expr("execution_attempt_count + ?", 1),
+				"started_at":              now,
+				"updated_at":              now,
+			})
+		if result.Error != nil {
+			return internalToolError("claim Station tool execution", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		if err := tx.First(&claimed, "id = ?", candidate.ID).Error; err != nil {
+			return internalToolError("reload Station tool execution claim", err)
+		}
+		return nil
+	})
+	if strings.TrimSpace(claimed.ToolCallID) == "" {
+		return nil, err
+	}
+	return &claimed, err
+}
+
+func (s *ToolDispatchService) BeginStationToolEffect(
+	ctx context.Context,
+	claim *persistence.ToolCall,
+) error {
+	if claim == nil || strings.TrimSpace(claim.ToolCallID) == "" ||
+		strings.TrimSpace(claim.ExecutionClaimID) == "" ||
+		claim.FencingToken == 0 {
+		return invalidToolRequest("begin Station tool effect requires a claim and fence")
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	result := db.WithContext(ctx).
+		Model(&persistence.ToolCall{}).
+		Where(
+			"actor_id = ? AND tool_call_id = ? AND execution_owner = ? "+
+				"AND status = ? AND execution_claim_id = ? AND fencing_token = ? "+
+				"AND station_effect_started_at IS NULL",
+			claim.ActorID,
+			claim.ToolCallID,
+			persistence.ToolOwnerStation,
+			persistence.ToolCallStatusPrepared,
+			claim.ExecutionClaimID,
+			claim.FencingToken,
+		).
+		Updates(map[string]interface{}{
+			"station_effect_started_at": now,
+			"updated_at":                now,
+		})
+	if result.Error != nil {
+		return internalToolError("begin Station tool effect", result.Error)
+	}
+	if result.RowsAffected == 1 {
+		claim.StationEffectStartedAt = &now
+		return nil
+	}
+	var current persistence.ToolCall
+	if err := db.WithContext(ctx).
+		Where("actor_id = ? AND tool_call_id = ?", claim.ActorID, claim.ToolCallID).
+		First(&current).Error; err != nil {
+		return notFoundToolError("Station tool call", err)
+	}
+	if current.ExecutionOwner != persistence.ToolOwnerStation ||
+		current.Status != persistence.ToolCallStatusPrepared ||
+		current.ExecutionClaimID != claim.ExecutionClaimID ||
+		current.FencingToken != claim.FencingToken ||
+		current.StationEffectStartedAt == nil {
+		return invalidToolState("Station tool execution claim is stale")
+	}
+	claim.StationEffectStartedAt = current.StationEffectStartedAt
+	return nil
+}
+
+func (s *ToolDispatchService) RecordStationToolExecutionReceipt(
+	ctx context.Context,
+	claim *persistence.ToolCall,
+	output string,
+	executionErr error,
+) (*stationToolExecutionReceipt, error) {
+	if claim == nil ||
+		strings.TrimSpace(claim.ToolCallID) == "" ||
+		strings.TrimSpace(claim.ExecutionClaimID) == "" ||
+		claim.FencingToken == 0 {
+		return nil, invalidToolRequest("record Station tool receipt requires a claim and fence")
+	}
+	receipt := stationToolReceipt(claim, output, executionErr)
+	return s.recordStationToolExecutionReceipt(ctx, claim, receipt)
+}
+
+func (s *ToolDispatchService) RecordStationToolUnknownReceipt(
+	ctx context.Context,
+	claim *persistence.ToolCall,
+) (*stationToolExecutionReceipt, error) {
+	if claim == nil ||
+		strings.TrimSpace(claim.ToolCallID) == "" ||
+		strings.TrimSpace(claim.ExecutionClaimID) == "" ||
+		claim.FencingToken == 0 {
+		return nil, invalidToolRequest("record Station tool receipt requires a claim and fence")
+	}
+	errorCode := "station_tool_side_effect_unknown"
+	payloadHash := hashString(fmt.Sprintf(
+		"%s\x00%s\x00%s",
+		claim.ToolCallID,
+		persistence.ToolReceiptStatusReconciledUnknown,
+		errorCode,
+	))
+	return s.recordStationToolExecutionReceipt(
+		ctx,
+		claim,
+		&stationToolExecutionReceipt{
+			status:      persistence.ToolReceiptStatusReconciledUnknown,
+			callStatus:  persistence.ToolCallStatusUnknownSideEffect,
+			payloadHash: payloadHash,
+			errorCode:   errorCode,
+		},
+	)
+}
+
+func (s *ToolDispatchService) recordStationToolExecutionReceipt(
+	ctx context.Context,
+	claim *persistence.ToolCall,
+	receipt *stationToolExecutionReceipt,
+) (*stationToolExecutionReceipt, error) {
+	if receipt == nil {
+		return nil, invalidToolRequest("Station tool receipt is required")
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("actor_id = ? AND tool_call_id = ?", claim.ActorID, claim.ToolCallID).
+			First(&current).Error; err != nil {
+			return notFoundToolError("Station tool call", err)
+		}
+		if current.ExecutionOwner != persistence.ToolOwnerStation ||
+			current.Status != persistence.ToolCallStatusPrepared ||
+			current.ExecutionClaimID != claim.ExecutionClaimID ||
+			current.FencingToken != claim.FencingToken ||
+			current.PayloadHash != claim.PayloadHash {
+			return invalidToolState("Station tool execution claim is stale")
+		}
+		if current.StationReceiptStatus != "" {
+			if current.StationReceiptStatus != receipt.status ||
+				current.StationReceiptPayloadHash != receipt.payloadHash ||
+				current.StationReceiptErrorCode != receipt.errorCode ||
+				!bytes.Equal(current.StationReceiptResult, receipt.boundedResult) {
+				return idempotencyToolError("Station tool receipt payload mismatch")
+			}
+			return nil
+		}
+		if current.StationEffectStartedAt == nil {
+			current.StationEffectStartedAt = &now
+		}
+		current.StationReceiptStatus = receipt.status
+		current.StationReceiptPayloadHash = receipt.payloadHash
+		current.StationReceiptResult = append([]byte(nil), receipt.boundedResult...)
+		current.StationReceiptErrorCode = receipt.errorCode
+		current.StationReceiptCommittedAt = &now
+		current.UpdatedAt = now
+		return tx.Save(&current).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	claim.StationReceiptStatus = receipt.status
+	claim.StationReceiptPayloadHash = receipt.payloadHash
+	claim.StationReceiptResult = append([]byte(nil), receipt.boundedResult...)
+	claim.StationReceiptErrorCode = receipt.errorCode
+	claim.StationReceiptCommittedAt = &now
+	return receipt, nil
+}
+
+// CompleteStationToolExecution commits the authoritative result and batch
+// continuation under the claim/fence established before the side effect.
+func (s *ToolDispatchService) CompleteStationToolExecution(
+	ctx context.Context,
+	claim *persistence.ToolCall,
+	output string,
+	executionErr error,
+) (*StationToolExecutionCompletion, error) {
+	if claim == nil ||
+		strings.TrimSpace(claim.ToolCallID) == "" ||
+		strings.TrimSpace(claim.ExecutionClaimID) == "" ||
+		claim.FencingToken == 0 {
+		return nil, invalidToolRequest("complete Station tool execution requires a claim and fence")
+	}
+	receipt := stationToolReceiptFromRecord(claim)
+	if receipt == nil {
+		var err error
+		receipt, err = s.RecordStationToolExecutionReceipt(
+			ctx,
+			claim,
+			output,
+			executionErr,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	completion := &StationToolExecutionCompletion{}
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current persistence.ToolCall
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("actor_id = ? AND tool_call_id = ?", claim.ActorID, claim.ToolCallID).
+			First(&current).Error; err != nil {
+			return notFoundToolError("Station tool call", err)
+		}
+		var existing persistence.ToolResult
+		if err := tx.Where("tool_call_id = ?", current.ToolCallID).First(&existing).Error; err == nil {
+			if existing.ID != receipt.resultID ||
+				existing.PayloadHash != receipt.payloadHash {
+				return idempotencyToolError("Station tool result payload mismatch")
+			}
+			if err := tx.Model(&persistence.ToolCall{}).
+				Where("id = ?", current.ID).
+				UpdateColumn(
+					"duplicate_delivery_count",
+					gorm.Expr("duplicate_delivery_count + ?", 1),
+				).Error; err != nil {
+				return internalToolError("record duplicate Station tool result", err)
+			}
+			completion.ResultID = existing.ID
+			completion.ContinuationID = continuationIDForBatch(tx, current.ToolBatchID)
+			completion.Replayed = true
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return internalToolError("load existing Station tool result", err)
+		}
+		if current.ExecutionOwner != persistence.ToolOwnerStation ||
+			current.Status != persistence.ToolCallStatusPrepared ||
+			current.ExecutionClaimID != claim.ExecutionClaimID ||
+			current.FencingToken != claim.FencingToken ||
+			current.PayloadHash != claim.PayloadHash ||
+			current.StationReceiptStatus != receipt.status ||
+			current.StationReceiptPayloadHash != receipt.payloadHash ||
+			current.StationReceiptCommittedAt == nil {
+			return invalidToolState("Station tool execution claim is stale")
+		}
+		if receipt.status == persistence.ToolReceiptStatusReconciledUnknown {
+			if err := commitUnknownToolSideEffectTx(
+				tx,
+				&current,
+				receipt.errorCode,
+				s.now(),
+			); err != nil {
+				return err
+			}
+			return nil
+		}
+		committed, err := commitNewToolResultTx(
+			tx,
+			&current,
+			toolTerminalResult{
+				ID:            receipt.resultID,
+				Status:        receipt.status,
+				CallStatus:    receipt.callStatus,
+				PayloadHash:   receipt.payloadHash,
+				BoundedResult: append([]byte(nil), receipt.boundedResult...),
+				ErrorCode:     receipt.errorCode,
+			},
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		completion.ResultID = committed.ResultID
+		completion.ContinuationID = committed.ContinuationID
+		return nil
+	})
+	if err == nil && !s.matchesAcceptanceBarrier(
+		claim.ActorID,
+		capabilityBarrierResultBeforeContinue,
+	) {
+		continuationID, ensureErr := s.EnsureReadyContinuationForToolCall(
+			ctx,
+			claim.ActorID,
+			claim.ToolCallID,
+		)
+		if ensureErr != nil {
+			return nil, ensureErr
+		}
+		completion.ContinuationID = continuationID
+	}
+	return completion, err
+}
+
+func stationToolReceipt(
+	claim *persistence.ToolCall,
+	output string,
+	executionErr error,
+) *stationToolExecutionReceipt {
+	status := persistence.ToolReceiptStatusApplied
+	callStatus := persistence.ToolCallStatusSucceeded
+	errorCode := ""
+	resultContent := output
+	if executionErr != nil {
+		status = persistence.ToolReceiptStatusFailed
+		callStatus = persistence.ToolCallStatusFailed
+		errorCode = "station_tool_execution_failed"
+		resultContent = fmt.Sprintf("[tool_error] %s: %v", claim.ToolName, executionErr)
+	}
+	payloadHash := hashString(fmt.Sprintf(
+		"%s\x00%s\x00%s\x00%s",
+		claim.ToolCallID,
+		status,
+		errorCode,
+		resultContent,
+	))
+	return &stationToolExecutionReceipt{
+		status:        status,
+		callStatus:    callStatus,
+		resultID:      "tool_result_" + payloadHash[:24],
+		payloadHash:   payloadHash,
+		boundedResult: []byte(resultContent),
+		errorCode:     errorCode,
+	}
+}
+
+func stationToolReceiptFromRecord(
+	call *persistence.ToolCall,
+) *stationToolExecutionReceipt {
+	if call == nil || strings.TrimSpace(call.StationReceiptStatus) == "" ||
+		len(call.StationReceiptPayloadHash) < 24 {
+		return nil
+	}
+	callStatus := persistence.ToolCallStatusSucceeded
+	switch call.StationReceiptStatus {
+	case persistence.ToolReceiptStatusFailed:
+		callStatus = persistence.ToolCallStatusFailed
+	case persistence.ToolReceiptStatusReconciledUnknown:
+		callStatus = persistence.ToolCallStatusUnknownSideEffect
+	}
+	return &stationToolExecutionReceipt{
+		status:     call.StationReceiptStatus,
+		callStatus: callStatus,
+		resultID: func() string {
+			if call.StationReceiptStatus ==
+				persistence.ToolReceiptStatusReconciledUnknown {
+				return ""
+			}
+			return "tool_result_" + call.StationReceiptPayloadHash[:24]
+		}(),
+		payloadHash:   call.StationReceiptPayloadHash,
+		boundedResult: append([]byte(nil), call.StationReceiptResult...),
+		errorCode:     call.StationReceiptErrorCode,
+	}
+}
+
+func (s *ToolDispatchService) proposeCallTx(
+	tx *gorm.DB,
+	proposal ToolBatchProposal,
+	lease *model.ClientCapabilityLease,
+	call AuthorizedToolProposal,
+	authorization *toolCapabilityAuthorization,
+	deadline time.Time,
+	now time.Time,
+) (ProposalDecision, error) {
+	if authorization == nil {
+		return ProposalDecision{}, invalidToolState(
+			"tool capability authorization is required",
+		)
+	}
+	risk := authorization.Risk
+	policy := authorization.Policy
+	// A question always waits for a human, even when ordinary tools are automatic.
+	if call.ToolName == clarificationToolName {
+		if authorization.ExecutionOwner != model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION {
+			return ProposalDecision{}, invalidToolRequest("clarification must be Station-owned")
+		}
+		if err := validateClarificationAnswer(call.Arguments, "", false); err != nil {
+			return ProposalDecision{}, err
+		}
+		if policy != ToolPolicyDeny {
+			policy = ToolPolicyManual
+		}
+	}
+	boundedArguments := authorization.BoundedArguments
+	if boundedArguments == nil {
+		boundedArguments = call.Arguments
+	}
+	status := persistence.ToolCallStatusApproved
+	approved := true
+	reason := "auto_approved_low_risk"
+	if policy == ToolPolicyDeny {
+		status = persistence.ToolCallStatusDenied
+		approved = false
+		reason = "denied_by_policy"
+	} else if policy == ToolPolicyManual {
+		status = persistence.ToolCallStatusWaitingApproval
+		approved = false
+		reason = "requires_manual_approval"
+	}
+
+	resourceRefs, err := proto.MarshalOptions{Deterministic: true}.Marshal(&model.ClientCapabilityRequest{
+		ResourceRefs: call.ResourceRefs,
+	})
+	if err != nil {
+		return ProposalDecision{}, internalToolError("encode client resource references", err)
+	}
+	approvalID := generateID("approval")
+	reconciliationDeadline := deadline.Add(defaultReconciliationTTL)
+	row := &persistence.ToolCall{
+		ID:                generateID("tool_call"),
+		ActorID:           proposal.ActorID,
+		ConversationID:    proposal.ConversationID,
+		TurnID:            proposal.TurnID,
+		AttemptID:         proposal.AttemptID,
+		ToolBatchID:       proposal.ToolBatchID,
+		ToolName:          call.ToolName,
+		ToolCallID:        call.ToolCallID,
+		CapabilityID:      call.CapabilityID,
+		SchemaVersion:     call.SchemaVersion,
+		BoundedArguments:  append([]byte(nil), boundedArguments...),
+		ResourceRefs:      resourceRefs,
+		ArgumentsHash:     hashBytes(boundedArguments),
+		RedactedArguments: redactArguments(string(boundedArguments)),
+		RiskClass:         string(risk),
+		ApprovalPolicy:    string(policy),
+		ManifestID:        authorization.ManifestID,
+		ManifestVersion:   authorization.ManifestVersion,
+		BindingID:         authorization.BindingID,
+		BindingRevision:   authorization.BindingRevision,
+		ReadinessSnapID:   authorization.ReadinessSnapshotID,
+		ApprovalID:        approvalID,
+		Approved:          approved,
+		ExecutionOwner:    toolExecutionOwnerStorageValue(authorization.ExecutionOwner),
+		ReplayPolicy: int32(
+			model.ClientExecutionReplayPolicy_CLIENT_EXECUTION_REPLAY_POLICY_NO_REPLAY_AFTER_PREPARED,
+		),
+		Status:                 status,
+		ExecutionDeadline:      &deadline,
+		ReconciliationDeadline: &reconciliationDeadline,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}
+	if s.acceptanceScenarios != nil {
+		replayPolicy, externalKey, configured :=
+			s.acceptanceScenarios.ToolReplayPolicy(proposal.ActorID)
+		if configured {
+			row.ReplayPolicy = int32(replayPolicy)
+			row.ExternalIdempotencyKey = externalKey
+		}
+	}
+	if policy == ToolPolicyDeny {
+		row.ErrorCode = string(errcode.AgentToolApprovalDenied)
+	}
+	if authorization.ExecutionOwner ==
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_CLIENT_CAPABILITY {
+		if lease == nil {
+			return ProposalDecision{}, invalidToolState(
+				"client capability lease is required for client-owned tool",
+			)
+		}
+		row.CapabilitySessionID = lease.GetCapabilitySessionId()
+		row.TargetDeviceID = lease.GetDeviceId()
+		row.ExecutorLeaseID = lease.GetLeaseId()
+		row.CapabilityLeaseRevision = lease.GetLeaseRevision()
+	}
+	if policy != ToolPolicyManual {
+		row.DecisionRevision = 1
+		row.DecisionID = generateID("decision")
+		row.DecisionPayloadHash = policyDecisionPayloadHash(row)
+	}
+	if err := tx.Create(row).Error; err != nil {
+		return ProposalDecision{}, internalToolError("persist tool call", err)
+	}
+	return ProposalDecision{
+		ToolCallID:       call.ToolCallID,
+		ToolName:         call.ToolName,
+		Arguments:        string(boundedArguments),
+		ApprovalID:       approvalID,
+		DecisionRevision: row.DecisionRevision,
+		ExpiresAt:        deadline,
+		Status:           row.Status,
+		ExecutionOwner:   row.ExecutionOwner,
+		Reason:           reason,
+		FencingToken:     row.FencingToken,
+	}, nil
+}
+
+type toolCapabilityAuthorization struct {
+	ManifestID          string
+	ManifestVersion     string
+	BindingID           string
+	BindingRevision     uint64
+	ReadinessSnapshotID string
+	ExecutionOwner      model.ToolExecutionOwner
+	Risk                ToolRiskLevel
+	Policy              ToolPolicy
+	BoundedArguments    []byte
+}
+
+func resolveToolCapabilityAuthorizationTx(
+	tx *gorm.DB,
+	proposal ToolBatchProposal,
+	call AuthorizedToolProposal,
+	now time.Time,
+) (*toolCapabilityAuthorization, error) {
+	bindingID := strings.TrimSpace(call.BindingID)
+	snapshotID := strings.TrimSpace(proposal.ReadinessSnapshotID)
+	if bindingID == "" || snapshotID == "" {
+		return nil, invalidToolRequest(
+			"binding_id and readiness_snapshot_id are required for authorized tool dispatch",
+		)
+	}
+
+	var binding persistence.AgentCapabilityBinding
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"binding_id = ?",
+		bindingID,
+	).First(&binding).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errcode.NewToolUnknown(call.ToolName, call.SchemaVersion)
+		}
+		return nil, internalToolError("load capability binding for tool dispatch", err)
+	}
+	if binding.Ptid != proposal.ActorID ||
+		binding.AgentID != proposal.AgentID {
+		return nil, invalidToolState(
+			"capability binding is not owned by the admitted actor and Agent",
+		)
+	}
+	if binding.TombstonedAt != nil || !binding.Enabled {
+		return nil, errcode.NewToolUnknown(call.ToolName, call.SchemaVersion)
+	}
+	if binding.CapabilityID != call.CapabilityID ||
+		binding.CapabilityVersion != call.SchemaVersion ||
+		binding.Revision != call.BindingRevision {
+		return nil, invalidToolState("capability binding identity or revision is stale")
+	}
+
+	var manifest persistence.CapabilityManifest
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"capability_id = ? AND version = ?",
+		binding.CapabilityID,
+		binding.CapabilityVersion,
+	).First(&manifest).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errcode.NewToolUnknown(call.ToolName, call.SchemaVersion)
+		}
+		return nil, internalToolError("load capability manifest for tool dispatch", err)
+	}
+	if manifest.RetiredAt != nil {
+		return nil, errcode.NewToolUnknown(call.ToolName, call.SchemaVersion)
+	}
+	if model.CapabilityAvailability(manifest.Availability) !=
+		model.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE {
+		return nil, invalidToolState("capability manifest is unavailable")
+	}
+	if (manifest.OwnerPtid != "" && manifest.OwnerPtid != proposal.ActorID) ||
+		!capabilityManifestMatchesToolCall(manifest, call) {
+		return nil, invalidToolState("capability manifest authority is stale")
+	}
+	executionOwner := model.ToolExecutionOwner(manifest.ExecutionOwner)
+	if executionOwner == model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_UNSPECIFIED ||
+		executionOwner != call.ExecutionOwner {
+		return nil, invalidToolState("capability execution owner is stale or invalid")
+	}
+	boundedArguments := append([]byte(nil), call.Arguments...)
+	if model.CapabilitySourceKind(manifest.SourceKind) ==
+		model.CapabilitySourceKind_CAPABILITY_SOURCE_KIND_CONNECTOR {
+		var pinErr error
+		boundedArguments, _, pinErr = pinConnectorInvocationTx(
+			tx,
+			proposal.ActorID,
+			call.ToolName,
+			call.CapabilityID,
+			call.SchemaVersion,
+			call.Arguments,
+			now,
+		)
+		if pinErr != nil {
+			return nil, pinErr
+		}
+	}
+
+	var snapshotRecord persistence.CapabilityReadinessSnapshot
+	if err := tx.Where(
+		"snapshot_id = ? AND ptid = ? AND agent_id = ?",
+		snapshotID,
+		proposal.ActorID,
+		proposal.AgentID,
+	).First(&snapshotRecord).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, invalidToolState("capability readiness snapshot is missing")
+		}
+		return nil, internalToolError("load readiness snapshot for tool dispatch", err)
+	}
+	if !snapshotRecord.ExpiresAt.After(now) {
+		return nil, invalidToolState("capability readiness snapshot has expired")
+	}
+	sum := sha256.Sum256(snapshotRecord.Payload)
+	if !strings.EqualFold(snapshotRecord.PayloadHash, hex.EncodeToString(sum[:])) {
+		return nil, invalidToolState("capability readiness snapshot payload hash mismatch")
+	}
+	var snapshot model.CapabilityReadinessSnapshot
+	if err := proto.Unmarshal(snapshotRecord.Payload, &snapshot); err != nil {
+		return nil, internalToolError("decode readiness snapshot for tool dispatch", err)
+	}
+	if snapshot.GetSnapshotId() != snapshotID ||
+		snapshot.GetPtid() != proposal.ActorID ||
+		snapshot.GetAgentId() != proposal.AgentID {
+		return nil, invalidToolState("capability readiness snapshot authority mismatch")
+	}
+	if snapshot.GetExpiresAt() == nil ||
+		!snapshot.GetExpiresAt().AsTime().Equal(snapshotRecord.ExpiresAt) ||
+		!snapshot.GetExpiresAt().AsTime().After(now) {
+		return nil, invalidToolState("capability readiness snapshot expiry mismatch")
+	}
+	if selected := snapshot.GetSelectedClientSessionId(); selected != "" && selected != proposal.ClientCapabilitySessionID {
+		return nil, invalidToolState("capability readiness selected client session is stale")
+	}
+
+	ready := false
+	for _, capability := range snapshot.GetCapabilities() {
+		if capability.GetCapabilityId() == binding.CapabilityID &&
+			capability.GetCapabilityVersion() == binding.CapabilityVersion &&
+			capability.GetBindingId() == binding.BindingID &&
+			capability.GetBindingRevision() == binding.Revision {
+			ready = capability.GetState() ==
+				model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY
+			break
+		}
+	}
+	if !ready {
+		return nil, invalidToolState("capability is not ready in the selected snapshot")
+	}
+
+	policy, err := toolPolicyFromCapabilityBinding(
+		model.CapabilityApprovalPolicy(binding.ApprovalPolicy),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &toolCapabilityAuthorization{
+		ManifestID:          manifest.CapabilityID,
+		ManifestVersion:     manifest.Version,
+		BindingID:           binding.BindingID,
+		BindingRevision:     binding.Revision,
+		ReadinessSnapshotID: snapshotID,
+		ExecutionOwner:      executionOwner,
+		Risk:                ToolRiskLevel(manifest.RiskClass),
+		Policy:              policy,
+		BoundedArguments:    boundedArguments,
+	}, nil
+}
+
+func capabilityManifestMatchesToolCall(
+	manifest persistence.CapabilityManifest,
+	call AuthorizedToolProposal,
+) bool {
+	if model.CapabilitySourceKind(manifest.SourceKind) !=
+		model.CapabilitySourceKind_CAPABILITY_SOURCE_KIND_SKILL {
+		return manifest.SourceInstanceID == call.ToolName
+	}
+	if call.ToolName != "skill_view" {
+		return false
+	}
+	var input skillViewArgs
+	if err := json.Unmarshal(call.Arguments, &input); err != nil {
+		return false
+	}
+	return strings.TrimSpace(input.Name) != "" &&
+		strings.TrimSpace(input.Name) == strings.TrimSpace(manifest.SourceInstanceID)
+}
+
+func toolExecutionOwnerStorageValue(owner model.ToolExecutionOwner) string {
+	switch owner {
+	case model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION:
+		return persistence.ToolOwnerStation
+	case model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_CLIENT_CAPABILITY:
+		return persistence.ToolOwnerClientCapability
+	default:
+		return persistence.ToolOwnerUnspecified
+	}
+}
+
+func toolPolicyFromCapabilityBinding(
+	policy model.CapabilityApprovalPolicy,
+) (ToolPolicy, error) {
+	switch policy {
+	case model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_ALLOW_LIST:
+		return ToolPolicyAuto, nil
+	case model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL:
+		return ToolPolicyManual, nil
+	case model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_DENY:
+		return ToolPolicyDeny, nil
+	default:
+		return "", invalidToolState("capability binding approval policy is invalid")
+	}
+}
+
+func (s *ToolDispatchService) dispatchCallTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	now time.Time,
+) error {
+	var leaseRow persistence.ClientCapabilityLease
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("session_id = ? AND actor_id = ? AND device_id = ? AND revoked_at IS NULL AND expires_at > ? AND "+
+			persistence.ActiveLeaseParentAuthSessionCondition,
+			call.CapabilitySessionID,
+			call.ActorID,
+			call.TargetDeviceID,
+			now,
+			now,
+		).
+		First(&leaseRow).Error; err != nil {
+		return notFoundToolError("active capability lease", err)
+	}
+	var lease model.ClientCapabilityLease
+	if err := proto.Unmarshal(leaseRow.LeasePayload, &lease); err != nil {
+		return internalToolError("decode capability lease", err)
+	}
+	if !leaseAllowsCapability(&lease, call.CapabilityID, call.SchemaVersion, len(call.BoundedArguments)) {
+		return unauthorizedToolRequest("capability lease does not authorize request")
+	}
+
+	call.ExecutionClaimID = generateID("execution_claim")
+	return s.issueCapabilityRequestTx(
+		tx,
+		call,
+		&leaseRow,
+		now,
+		persistence.ToolCallStatusApproved,
+		call.FencingToken,
+		"",
+	)
+}
+
+func clientExecutorAvailableTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	now time.Time,
+) (bool, error) {
+	var leaseRow persistence.ClientCapabilityLease
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"session_id = ? AND actor_id = ? AND device_id = ? AND revoked_at IS NULL AND expires_at > ? AND "+
+				persistence.ActiveLeaseParentAuthSessionCondition,
+			call.CapabilitySessionID,
+			call.ActorID,
+			call.TargetDeviceID,
+			now,
+			now,
+		).
+		First(&leaseRow).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, internalToolError("resolve active capability lease", err)
+	}
+	var lease model.ClientCapabilityLease
+	if err := proto.Unmarshal(leaseRow.LeasePayload, &lease); err != nil {
+		return false, internalToolError("decode capability lease", err)
+	}
+	if !leaseAllowsCapability(
+		&lease,
+		call.CapabilityID,
+		call.SchemaVersion,
+		len(call.BoundedArguments),
+	) {
+		return false, nil
+	}
+	if leasedCapabilityDeclaresWorkspaceGrant(&lease, call.CapabilityID) {
+		var count int64
+		if err := tx.Model(&persistence.ClientCapabilityResourceGrant{}).
+			Where(
+				"session_id = ? AND capability_id = ? AND expires_at > ?",
+				lease.GetCapabilitySessionId(),
+				call.CapabilityID,
+				now,
+			).
+			Count(&count).Error; err != nil {
+			return false, internalToolError("count active capability resource grant", err)
+		}
+		if count == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func pinnedToolBindingActiveTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+) (bool, uint64, error) {
+	var binding persistence.AgentCapabilityBinding
+	if err := tx.Where(
+		"binding_id = ? AND ptid = ?",
+		call.BindingID,
+		call.ActorID,
+	).First(&binding).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, 0, nil
+		}
+		return false, 0, internalToolError(
+			"load pinned capability binding",
+			err,
+		)
+	}
+	return binding.TombstonedAt == nil &&
+			binding.Enabled &&
+			binding.Revision == call.BindingRevision,
+		binding.Revision,
+		nil
+}
+
+func (s *ToolDispatchService) issueCapabilityRequestTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	leaseRow *persistence.ClientCapabilityLease,
+	now time.Time,
+	expectedStatus string,
+	expectedFence uint64,
+	previousCredentialID string,
+) error {
+	if strings.TrimSpace(call.ExecutionClaimID) == "" {
+		return invalidToolState("tool execution claim is required")
+	}
+	var lease model.ClientCapabilityLease
+	if err := proto.Unmarshal(leaseRow.LeasePayload, &lease); err != nil {
+		return internalToolError("decode capability lease", err)
+	}
+	if !leaseAllowsCapability(&lease, call.CapabilityID, call.SchemaVersion, len(call.BoundedArguments)) {
+		return unauthorizedToolRequest("capability lease does not authorize request")
+	}
+	if call.ExecutionDeadline == nil || call.ReconciliationDeadline == nil {
+		return invalidToolState("tool execution deadlines are not configured")
+	}
+
+	if previousCredentialID != "" {
+		invalidated := tx.Model(&persistence.ReceiptRecoveryCredential{}).
+			Where(
+				"id = ? AND consumed_at IS NULL AND invalidated_at IS NULL AND expires_at > ?",
+				previousCredentialID,
+				now,
+			).
+			Update("invalidated_at", now)
+		if invalidated.Error != nil {
+			return internalToolError("invalidate previous receipt recovery credential", invalidated.Error)
+		}
+		if invalidated.RowsAffected != 1 {
+			return invalidToolState("previous receipt recovery credential is unavailable")
+		}
+	}
+
+	leaseRow.DispatchSequence++
+	sequenceUpdate := tx.Model(&persistence.ClientCapabilityLease{}).
+		Where(
+			"session_id = ? AND lease_revision = ? AND dispatch_sequence = ? "+
+				"AND revoked_at IS NULL AND expires_at > ? AND "+
+				persistence.ActiveLeaseParentAuthSessionCondition,
+			leaseRow.SessionID,
+			leaseRow.LeaseRevision,
+			leaseRow.DispatchSequence-1,
+			now,
+			now,
+		).
+		Updates(map[string]interface{}{
+			"dispatch_sequence": leaseRow.DispatchSequence,
+			"updated_at":        now,
+		})
+	if sequenceUpdate.Error != nil {
+		return internalToolError("advance capability dispatch sequence", sequenceUpdate.Error)
+	}
+	if sequenceUpdate.RowsAffected != 1 {
+		return errcode.New(errcode.AgentVersionConflict, http.StatusConflict, "capability dispatch sequence changed", nil)
+	}
+	call.CapabilitySessionID = leaseRow.SessionID
+	call.TargetDeviceID = leaseRow.DeviceID
+	call.ExecutorLeaseID = leaseRow.LeaseID
+	call.CapabilityLeaseRevision = leaseRow.LeaseRevision
+	call.FencingToken++
+	call.DispatchSequence = leaseRow.DispatchSequence
+
+	var envelopeResourceRefs []*model.ClientResourceRef
+	if leasedCapabilityDeclaresWorkspaceGrant(&lease, call.CapabilityID) {
+		grant, err := activeResourceGrantTx(tx, &lease, call.CapabilityID, now)
+		if err != nil {
+			return err
+		}
+		envelopeResourceRefs = []*model.ClientResourceRef{grant}
+	}
+	marshaledResourceRefs, err := proto.MarshalOptions{Deterministic: true}.Marshal(
+		&model.ClientCapabilityRequest{ResourceRefs: envelopeResourceRefs},
+	)
+	if err != nil {
+		return internalToolError("encode client resource references", err)
+	}
+	call.ResourceRefs = marshaledResourceRefs
+	envelope := &model.ClientCapabilityRequest{
+		RequestId:               generateID("capability_request"),
+		TurnId:                  call.TurnID,
+		ToolCallId:              call.ToolCallID,
+		CapabilitySessionId:     call.CapabilitySessionID,
+		CapabilityId:            call.CapabilityID,
+		SchemaVersion:           call.SchemaVersion,
+		ResourceRefs:            envelopeResourceRefs,
+		BoundedArguments:        append([]byte(nil), call.BoundedArguments...),
+		ApprovalId:              call.ApprovalID,
+		Sequence:                call.DispatchSequence,
+		AttemptId:               call.AttemptID,
+		TargetDeviceId:          call.TargetDeviceID,
+		DecisionId:              call.DecisionID,
+		DecisionRevision:        call.DecisionRevision,
+		ExecutionClaimId:        call.ExecutionClaimID,
+		ExecutorLeaseId:         call.ExecutorLeaseID,
+		FencingToken:            call.FencingToken,
+		DispatchSequence:        call.DispatchSequence,
+		ExecutionDeadline:       timestamppb.New(call.ExecutionDeadline.UTC()),
+		ToolBatchId:             call.ToolBatchID,
+		ReplayPolicy:            model.ClientExecutionReplayPolicy(call.ReplayPolicy),
+		ExternalIdempotencyKey:  call.ExternalIdempotencyKey,
+		ReconciliationDeadline:  timestamppb.New(call.ReconciliationDeadline.UTC()),
+		CapabilityLeaseRevision: call.CapabilityLeaseRevision,
+		ConversationId:          call.ConversationID,
+		ToolName:                call.ToolName,
+	}
+	envelope.PayloadHash = protoPayloadHash(envelope)
+	nonce := make([]byte, clientCapabilityCommandNonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return internalToolError("generate receipt recovery nonce", err)
+	}
+	credentialID := generateID("receipt_recovery")
+	scope := &model.ReceiptRecoveryScopePayload{
+		ActorPtid:               call.ActorID,
+		DeviceId:                call.TargetDeviceID,
+		RequestId:               envelope.GetRequestId(),
+		ToolCallId:              call.ToolCallID,
+		ExecutionClaimId:        call.ExecutionClaimID,
+		CapabilityLeaseRevision: call.CapabilityLeaseRevision,
+		FencingToken:            call.FencingToken,
+		PayloadHash:             envelope.GetPayloadHash(),
+		ReplayPolicy:            envelope.GetReplayPolicy(),
+		ExecutionDeadline:       envelope.GetExecutionDeadline(),
+		ReconciliationDeadline:  envelope.GetReconciliationDeadline(),
+		CredentialId:            credentialID,
+		DeviceSigningKeyId:      leaseRow.DeviceSigningKeyID,
+		Nonce:                   nonce,
+	}
+	scopeBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(scope)
+	if err != nil {
+		return internalToolError("encode receipt recovery scope", err)
+	}
+	scopeHash := hashBytes(scopeBytes)
+	envelope.RecoveryCredential = &model.ReceiptRecoveryCredential{
+		CredentialId:       credentialID,
+		DeviceSigningKeyId: leaseRow.DeviceSigningKeyID,
+		Nonce:              nonce,
+		ScopeHash:          scopeHash,
+		ExpiresAt:          envelope.GetReconciliationDeadline(),
+	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	if err != nil {
+		return internalToolError("encode client capability request", err)
+	}
+
+	outbox := &persistence.ToolDispatchOutbox{
+		RequestID:               envelope.GetRequestId(),
+		ActorID:                 call.ActorID,
+		CapabilitySessionID:     call.CapabilitySessionID,
+		TargetDeviceID:          call.TargetDeviceID,
+		DispatchSequence:        call.DispatchSequence,
+		ToolCallID:              call.ToolCallID,
+		FencingToken:            call.FencingToken,
+		CapabilityLeaseRevision: call.CapabilityLeaseRevision,
+		PayloadHash:             envelope.GetPayloadHash(),
+		Envelope:                encoded,
+		ExecutionDeadline:       call.ExecutionDeadline.UTC(),
+		ReconciliationDeadline:  call.ReconciliationDeadline.UTC(),
+		CreatedAt:               now,
+	}
+	if err := tx.Create(outbox).Error; err != nil {
+		return internalToolError("persist targeted capability request", err)
+	}
+	recovery := &persistence.ReceiptRecoveryCredential{
+		ID:                      credentialID,
+		ActorID:                 call.ActorID,
+		DeviceID:                call.TargetDeviceID,
+		DeviceSigningKeyID:      leaseRow.DeviceSigningKeyID,
+		RequestID:               envelope.GetRequestId(),
+		ToolCallID:              call.ToolCallID,
+		ExecutionClaimID:        call.ExecutionClaimID,
+		CapabilityLeaseRevision: call.CapabilityLeaseRevision,
+		FencingToken:            call.FencingToken,
+		PayloadHash:             envelope.GetPayloadHash(),
+		ReplayPolicy:            call.ReplayPolicy,
+		ExecutionDeadline:       call.ExecutionDeadline.UTC(),
+		ReconciliationDeadline:  call.ReconciliationDeadline.UTC(),
+		ScopeHash:               scopeHash,
+		NonceHash:               hashBytes(nonce),
+		IssuedAt:                now,
+		ExpiresAt:               call.ReconciliationDeadline.UTC(),
+	}
+	if err := tx.Create(recovery).Error; err != nil {
+		return internalToolError("persist receipt recovery credential", err)
+	}
+	query := tx.Model(&persistence.ToolCall{}).
+		Where(
+			"id = ? AND status = ? AND fencing_token = ? AND result_persisted = ? "+
+				"AND execution_deadline > ? AND reconciliation_deadline > ?",
+			call.ID,
+			expectedStatus,
+			expectedFence,
+			false,
+			now,
+			now,
+		)
+	if previousCredentialID != "" {
+		query = query.Where("receipt_recovery_credential_id = ?", previousCredentialID)
+	}
+	result := query.
+		Updates(map[string]interface{}{
+			"status":                         persistence.ToolCallStatusDispatchCommitted,
+			"capability_session_id":          call.CapabilitySessionID,
+			"target_device_id":               call.TargetDeviceID,
+			"execution_claim_id":             call.ExecutionClaimID,
+			"executor_lease_id":              call.ExecutorLeaseID,
+			"fencing_token":                  call.FencingToken,
+			"dispatch_sequence":              call.DispatchSequence,
+			"dispatch_committed_at":          now,
+			"payload_hash":                   envelope.GetPayloadHash(),
+			"capability_lease_revision":      call.CapabilityLeaseRevision,
+			"resource_refs":                  call.ResourceRefs,
+			"receipt_recovery_credential_id": credentialID,
+			"execution_attempt_count":        gorm.Expr("execution_attempt_count + ?", 1),
+			"side_effect_receipt":            "",
+			"started_at":                     nil,
+			"updated_at":                     now,
+		})
+	if result.Error != nil {
+		return internalToolError("commit tool dispatch", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return invalidToolState("tool dispatch state changed")
+	}
+	call.Status = persistence.ToolCallStatusDispatchCommitted
+	call.DispatchCommittedAt = &now
+	call.PayloadHash = envelope.GetPayloadHash()
+	call.ReceiptRecoveryCredentialID = credentialID
+	call.ExecutionAttemptCount++
+	call.SideEffectReceipt = ""
+	call.StartedAt = nil
+	return nil
+}
+
+func (s *ToolDispatchService) commitTerminalReceiptTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	receipt *model.ClientCapabilityReceipt,
+	now time.Time,
+	response *model.SubmitClientCapabilityReceiptResponse,
+) error {
+	resultHash := terminalResultHash(receipt)
+	var existing persistence.ToolResult
+	err := tx.Where("tool_call_id = ?", call.ToolCallID).First(&existing).Error
+	if err == nil {
+		if existing.ID != receipt.GetResultId() || existing.PayloadHash != resultHash {
+			response.ErrorCode = model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_PAYLOAD_CONFLICT
+			return nil
+		}
+		response.Accepted = true
+		response.Replayed = true
+		response.ResultId = existing.ID
+		response.ContinuationId = continuationIDForBatch(tx, call.ToolBatchID)
+		return nil
+	}
+	if err != gorm.ErrRecordNotFound {
+		return internalToolError("load existing tool result", err)
+	}
+
+	status := persistence.ToolCallStatusFailed
+	resultStatus := persistence.ToolReceiptStatusFailed
+	switch receipt.GetStatus() {
+	case model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED:
+		status = persistence.ToolCallStatusSucceeded
+		resultStatus = persistence.ToolReceiptStatusApplied
+	case model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_RECONCILED_UNKNOWN:
+		status = persistence.ToolCallStatusUnknownSideEffect
+		resultStatus = persistence.ToolReceiptStatusReconciledUnknown
+	}
+	if resultStatus == persistence.ToolReceiptStatusReconciledUnknown {
+		if err := commitUnknownToolSideEffectTx(
+			tx,
+			call,
+			receipt.GetErrorCode(),
+			now,
+		); err != nil {
+			return err
+		}
+		response.Accepted = true
+		return nil
+	}
+	commit, err := commitNewToolResultTx(
+		tx,
+		call,
+		toolTerminalResult{
+			ID:            receipt.GetResultId(),
+			Status:        resultStatus,
+			CallStatus:    status,
+			PayloadHash:   resultHash,
+			BoundedResult: append([]byte(nil), receipt.GetBoundedResult()...),
+			ErrorCode:     receipt.GetErrorCode(),
+		},
+		now,
+	)
+	if err != nil {
+		return err
+	}
+	if resultStatus == persistence.ToolReceiptStatusApplied {
+		if err := persistTurnArtifactsTx(tx, call, receipt, now); err != nil {
+			return err
+		}
+	}
+	response.Accepted = true
+	response.ResultId = commit.ResultID
+	response.ContinuationId = commit.ContinuationID
+	return nil
+}
+
+func persistTurnArtifactsTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	receipt *model.ClientCapabilityReceipt,
+	now time.Time,
+) error {
+	artifacts := receipt.GetArtifacts()
+	if len(artifacts) == 0 {
+		return nil
+	}
+	if call.ToolName != "local_file_write" && call.ToolName != "local_file_edit" {
+		return invalidToolRequest("only successful filesystem write/edit receipts may declare artifacts")
+	}
+	var batch persistence.ToolBatch
+	if err := tx.Where("id = ?", call.ToolBatchID).First(&batch).Error; err != nil {
+		return internalToolError("load artifact tool batch", err)
+	}
+	for _, artifact := range artifacts {
+		if artifact == nil || artifact.GetLocator() == nil {
+			return invalidToolRequest("turn artifact metadata is incomplete")
+		}
+		name := strings.TrimSpace(artifact.GetName())
+		sha := strings.ToLower(strings.TrimSpace(artifact.GetSha256()))
+		localRef := strings.TrimSpace(artifact.GetLocator().GetClientLocalRef())
+		if strings.TrimSpace(artifact.GetArtifactId()) == "" ||
+			artifact.GetKind() != model.TurnArtifactKind_TURN_ARTIFACT_KIND_FILE ||
+			name == "" ||
+			strings.ContainsAny(name, `/\`) ||
+			len(sha) != 64 ||
+			localRef == "" ||
+			artifact.GetTurnId() != call.TurnID ||
+			artifact.GetToolCallId() != call.ToolCallID {
+			return invalidToolRequest("turn artifact metadata is invalid")
+		}
+		if _, err := hex.DecodeString(sha); err != nil {
+			return invalidToolRequest("turn artifact sha256 is invalid")
+		}
+		changeType := strings.TrimSpace(artifact.GetChangeType())
+		if changeType != "" && changeType != "created" && changeType != "modified" {
+			return invalidToolRequest("turn artifact change_type is invalid")
+		}
+		beforeSHA := strings.ToLower(strings.TrimSpace(artifact.GetBeforeSha256()))
+		if beforeSHA != "" {
+			if len(beforeSHA) != 64 {
+				return invalidToolRequest("turn artifact before_sha256 is invalid")
+			}
+			if _, err := hex.DecodeString(beforeSHA); err != nil {
+				return invalidToolRequest("turn artifact before_sha256 is invalid")
+			}
+		}
+		if changeType == "created" && beforeSHA != "" {
+			return invalidToolRequest("created artifacts must not carry a before digest")
+		}
+		if changeType == "modified" && beforeSHA == "" {
+			return invalidToolRequest("modified artifacts must carry the before digest")
+		}
+		if len(artifact.GetUnifiedDiff()) > 64*1024 {
+			return invalidToolRequest("turn artifact unified diff exceeds bounds")
+		}
+		createdAt := now
+		if artifact.GetCreatedAt() != nil && artifact.GetCreatedAt().IsValid() {
+			createdAt = artifact.GetCreatedAt().AsTime().UTC()
+		}
+		row := &persistence.TurnArtifact{
+			ID:             artifact.GetArtifactId(),
+			ActorPTID:      call.ActorID,
+			ConversationID: batch.ConversationID,
+			TurnID:         call.TurnID,
+			AgentID:        batch.AgentID,
+			ToolCallID:     call.ToolCallID,
+			Kind:           "file",
+			Name:           name,
+			Size:           artifact.GetSize(),
+			SHA256:         sha,
+			ClientLocalRef: localRef,
+			ClientDeviceID: call.TargetDeviceID,
+			ChangeType:     changeType,
+			BeforeSHA256:   beforeSHA,
+			BeforeSize:     artifact.GetBeforeSize(),
+			UnifiedDiff:    artifact.GetUnifiedDiff(),
+			DiffTruncated:  artifact.GetDiffTruncated(),
+			CreatedAt:      createdAt,
+			UpdatedAt:      now,
+		}
+		if err := tx.Create(row).Error; err != nil {
+			return internalToolError("persist turn artifact", err)
+		}
+	}
+	return nil
+}
+
+type toolTerminalResult struct {
+	ID            string
+	Status        string
+	CallStatus    string
+	PayloadHash   string
+	BoundedResult []byte
+	ErrorCode     string
+}
+
+type toolResultCommit struct {
+	ResultID       string
+	ContinuationID string
+}
+
+func commitUnknownToolSideEffectTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	errorCode string,
+	now time.Time,
+) error {
+	result := tx.Model(&persistence.ToolCall{}).
+		Where(
+			"id = ? AND status = ? AND result_persisted = ?",
+			call.ID,
+			persistence.ToolCallStatusPrepared,
+			false,
+		).
+		Updates(map[string]interface{}{
+			"status":     persistence.ToolCallStatusUnknownSideEffect,
+			"error_code": strings.TrimSpace(errorCode),
+			"ended_at":   now,
+			"updated_at": now,
+		})
+	if result.Error != nil {
+		return internalToolError("commit unknown tool side effect", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return invalidToolState("unknown tool side-effect target changed")
+	}
+	return blockToolBatchTx(tx, call.ToolBatchID, now)
+}
+
+func commitNewToolResultTx(
+	tx *gorm.DB,
+	call *persistence.ToolCall,
+	terminal toolTerminalResult,
+	now time.Time,
+) (*toolResultCommit, error) {
+	var batch persistence.ToolBatch
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", call.ToolBatchID).
+		First(&batch).Error; err != nil {
+		return nil, internalToolError("load tool batch", err)
+	}
+
+	resultContent := string(terminal.BoundedResult)
+	if terminal.Status != persistence.ToolReceiptStatusApplied &&
+		strings.TrimSpace(resultContent) == "" {
+		resultContent = terminal.ErrorCode
+	}
+	toolMessage := fmt.Sprintf("[%s] %s", call.ToolName, resultContent)
+	messageSequence, err := nextMessageSeqTx(tx, batch.ConversationID)
+	if err != nil {
+		return nil, internalToolError("allocate tool result message sequence", err)
+	}
+	messageID := generateID("msg")
+	turnID := call.TurnID
+	modelName := batch.Model
+	metadataJSON, err := json.Marshal(map[string]string{
+		"tool_call_id": call.ToolCallID,
+	})
+	if err != nil {
+		return nil, internalToolError("encode tool result message metadata", err)
+	}
+	message := &persistence.AgentMessage{
+		ID:             messageID,
+		ConversationID: batch.ConversationID,
+		TurnID:         &turnID,
+		ModelName:      &modelName,
+		Role:           string(domain.MessageRoleTool),
+		Status:         "completed",
+		Content:        &toolMessage,
+		MetadataJSON:   metadataJSON,
+		Seq:            messageSequence,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := tx.Create(message).Error; err != nil {
+		return nil, internalToolError("persist tool result message", err)
+	}
+	result := &persistence.ToolResult{
+		ID:            terminal.ID,
+		ToolCallID:    call.ToolCallID,
+		MessageID:     messageID,
+		ToolBatchID:   call.ToolBatchID,
+		TurnID:        call.TurnID,
+		AttemptID:     call.AttemptID,
+		Status:        terminal.Status,
+		PayloadHash:   terminal.PayloadHash,
+		BoundedResult: append([]byte(nil), terminal.BoundedResult...),
+		ErrorCode:     terminal.ErrorCode,
+		CreatedAt:     now,
+	}
+	if err := tx.Create(result).Error; err != nil {
+		return nil, internalToolError("persist tool result", err)
+	}
+	continuationEligible := call.Status == persistence.ToolCallStatusPrepared &&
+		batch.Status == persistence.ToolBatchStatusOpen
+	updates := map[string]interface{}{
+		"result_id":        result.ID,
+		"result_ref":       truncateResult(string(terminal.BoundedResult)),
+		"result_persisted": true,
+		"updated_at":       now,
+	}
+	if call.Status == persistence.ToolCallStatusPrepared {
+		updates["status"] = terminal.CallStatus
+		updates["error_code"] = terminal.ErrorCode
+		updates["ended_at"] = now
+	} else if call.Status == persistence.ToolCallStatusUnknownSideEffect &&
+		batch.Status == persistence.ToolBatchStatusBlocked {
+		var turn persistence.AgentTurn
+		if err := tx.Select("status").
+			Where("id = ?", call.TurnID).
+			First(&turn).Error; err != nil {
+			return nil, internalToolError(
+				"load terminal tool result Turn lifecycle",
+				err,
+			)
+		}
+		if turn.Status == string(domain.TurnStatusCancelled) {
+			updates["status"] = persistence.ToolCallStatusCancelled
+		}
+	}
+	updateResult := tx.Model(&persistence.ToolCall{}).
+		Where("id = ? AND result_persisted = ?", call.ID, false).
+		Updates(updates)
+	if updateResult.Error != nil {
+		return nil, internalToolError("commit terminal tool state", updateResult.Error)
+	}
+	if updateResult.RowsAffected != 1 {
+		return nil, invalidToolState("terminal tool result target changed")
+	}
+	if !continuationEligible {
+		return &toolResultCommit{ResultID: result.ID}, nil
+	}
+
+	batch.TerminalCallCount++
+	if terminal.Status == persistence.ToolReceiptStatusApplied {
+		batch.AppliedCallCount++
+	}
+	batch.UpdatedAt = now
+	commit := &toolResultCommit{ResultID: result.ID}
+	if terminal.Status != persistence.ToolReceiptStatusApplied {
+		batch.Status = persistence.ToolBatchStatusBlocked
+		batch.SettledAt = &now
+	} else if batch.TerminalCallCount == batch.ExpectedCallCount &&
+		batch.AppliedCallCount == batch.ExpectedCallCount {
+		batch.Status = persistence.ToolBatchStatusReadyForContinuation
+		batch.SettledAt = &now
+	}
+	if err := tx.Save(&batch).Error; err != nil {
+		return nil, internalToolError("settle tool batch", err)
+	}
+	return commit, nil
+}
+
+func validateToolBatchProposal(proposal ToolBatchProposal) error {
+	if strings.TrimSpace(proposal.ActorID) == "" ||
+		strings.TrimSpace(proposal.TurnID) == "" ||
+		strings.TrimSpace(proposal.AttemptID) == "" ||
+		strings.TrimSpace(proposal.ToolBatchID) == "" ||
+		strings.TrimSpace(proposal.AgentID) == "" ||
+		strings.TrimSpace(proposal.ReadinessSnapshotID) == "" ||
+		len(proposal.Calls) == 0 {
+		return invalidToolRequest(
+			"actor, turn, attempt, batch, agent, readiness snapshot, and calls are required",
+		)
+	}
+	for _, call := range proposal.Calls {
+		if strings.TrimSpace(call.ToolCallID) == "" ||
+			strings.TrimSpace(call.ToolName) == "" ||
+			strings.TrimSpace(call.CapabilityID) == "" ||
+			strings.TrimSpace(call.SchemaVersion) == "" ||
+			strings.TrimSpace(call.BindingID) == "" ||
+			call.BindingRevision == 0 ||
+			call.ExecutionOwner ==
+				model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_UNSPECIFIED {
+			return invalidToolRequest(
+				"tool call identity, capability, binding lineage, execution owner, and schema are required",
+			)
+		}
+	}
+	return nil
+}
+
+func validateDecisionRequest(actorID string, request *model.SubmitToolApprovalDecisionRequest) error {
+	if request == nil ||
+		strings.TrimSpace(actorID) == "" ||
+		strings.TrimSpace(request.GetApprovalId()) == "" ||
+		strings.TrimSpace(request.GetToolCallId()) == "" ||
+		strings.TrimSpace(request.GetDecisionId()) == "" ||
+		strings.TrimSpace(request.GetIdempotencyKey()) == "" ||
+		strings.TrimSpace(request.GetPayloadHash()) == "" {
+		return invalidToolRequest("complete tool decision identity is required")
+	}
+	return nil
+}
+
+func validateCapabilityCall(lease *model.ClientCapabilityLease, call AuthorizedToolProposal) error {
+	for _, capability := range lease.GetCapabilities() {
+		if capability.GetCapabilityId() != call.CapabilityID ||
+			capability.GetSchemaVersion() != call.SchemaVersion {
+			continue
+		}
+		if capability.GetPermission() ==
+			model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_DENIED {
+			permissionKind := capabilityPermissionKindWireName(
+				capability.GetPermissionKind(),
+			)
+			if permissionKind == "" {
+				return invalidToolState(
+					"denied client capability is missing permission kind",
+				)
+			}
+			return errcode.NewClientPermissionDenied(
+				call.CapabilityID,
+				permissionKind,
+			)
+		}
+		break
+	}
+	if !leaseAllowsCapability(lease, call.CapabilityID, call.SchemaVersion, len(call.Arguments)) {
+		return unauthorizedToolRequest("client capability is unavailable or request exceeds its bound")
+	}
+	for _, ref := range call.ResourceRefs {
+		if ref == nil ||
+			ref.GetResourceRef() == "" ||
+			ref.GetPtid() != lease.GetPtid() ||
+			ref.GetDeviceId() != lease.GetDeviceId() ||
+			ref.GetCapabilitySessionId() != lease.GetCapabilitySessionId() ||
+			ref.GetCapabilityId() != call.CapabilityID {
+			return unauthorizedToolRequest("client resource reference is not bound to the selected lease")
+		}
+	}
+	return nil
+}
+
+func validateClientCapabilityAdvertisement(
+	capabilities []*model.ClientCapability,
+) error {
+	seen := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		if capability == nil ||
+			strings.TrimSpace(capability.GetCapabilityId()) == "" ||
+			strings.TrimSpace(capability.GetSchemaVersion()) == "" {
+			return invalidToolRequest(
+				"client capability identity and schema version are required",
+			)
+		}
+		identity := capability.GetCapabilityId() + "\x00" + capability.GetSchemaVersion()
+		if _, ok := seen[identity]; ok {
+			return invalidToolRequest("client capability advertisement contains a duplicate")
+		}
+		seen[identity] = struct{}{}
+		if _, ok := model.CapabilityPermissionState_name[int32(capability.GetPermission())]; !ok {
+			return invalidToolRequest("client capability permission state is invalid")
+		}
+		if _, ok := model.CapabilityPermissionKind_name[int32(capability.GetPermissionKind())]; !ok {
+			return invalidToolRequest("client capability permission kind is invalid")
+		}
+		if (capability.GetPermission() ==
+			model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_DENIED ||
+			capability.GetPermission() ==
+				model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_PROMPT) &&
+			capability.GetPermissionKind() ==
+				model.CapabilityPermissionKind_CAPABILITY_PERMISSION_KIND_UNSPECIFIED {
+			return invalidToolRequest(
+				"denied or prompt client capability requires permission kind",
+			)
+		}
+	}
+	return nil
+}
+
+func capabilityPermissionKindWireName(
+	kind model.CapabilityPermissionKind,
+) string {
+	if kind ==
+		model.CapabilityPermissionKind_CAPABILITY_PERMISSION_KIND_UNSPECIFIED {
+		return ""
+	}
+	const prefix = "CAPABILITY_PERMISSION_KIND_"
+	name, ok := model.CapabilityPermissionKind_name[int32(kind)]
+	if !ok || !strings.HasPrefix(name, prefix) {
+		return ""
+	}
+	return strings.ToLower(strings.TrimPrefix(name, prefix))
+}
+
+func leaseAllowsCapability(
+	lease *model.ClientCapabilityLease,
+	capabilityID string,
+	schemaVersion string,
+	requestBytes int,
+) bool {
+	for _, capability := range lease.GetCapabilities() {
+		if capability.GetCapabilityId() != capabilityID ||
+			capability.GetSchemaVersion() != schemaVersion {
+			continue
+		}
+		if capability.GetPermission() ==
+			model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_DENIED {
+			return false
+		}
+		if capability.GetPermission() !=
+			model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_GRANTED {
+			continue
+		}
+		if constraints := capability.GetConstraints(); constraints != nil &&
+			constraints.GetMaxRequestBytes() > 0 &&
+			uint64(requestBytes) > constraints.GetMaxRequestBytes() {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func loadActiveCapabilityLeaseTx(
+	tx *gorm.DB,
+	actorID string,
+	sessionID string,
+	now time.Time,
+) (*model.ClientCapabilityLease, error) {
+	var row persistence.ClientCapabilityLease
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("session_id = ? AND actor_id = ? AND revoked_at IS NULL AND expires_at > ? AND "+
+			persistence.ActiveLeaseParentAuthSessionCondition, sessionID, actorID, now, now).
+		First(&row).Error; err != nil {
+		return nil, notFoundToolError("active capability lease", err)
+	}
+	var lease model.ClientCapabilityLease
+	if err := proto.Unmarshal(row.LeasePayload, &lease); err != nil {
+		return nil, internalToolError("decode capability lease", err)
+	}
+	return &lease, nil
+}
+
+func persistDecisionAcknowledgementTx(
+	tx *gorm.DB,
+	actorID string,
+	request *model.SubmitToolApprovalDecisionRequest,
+	response *model.SubmitToolApprovalDecisionResponse,
+	payloadHash string,
+	committedRevision uint64,
+	createdAt time.Time,
+) error {
+	acknowledgement, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+	if err != nil {
+		return internalToolError("encode decision acknowledgement", err)
+	}
+	command := &persistence.ToolDecisionCommand{
+		ID:                generateID("tool_decision"),
+		ActorID:           actorID,
+		ToolCallID:        request.GetToolCallId(),
+		ApprovalID:        request.GetApprovalId(),
+		DecisionID:        request.GetDecisionId(),
+		ExpectedRevision:  request.GetExpectedRevision(),
+		CommittedRevision: committedRevision,
+		Approved:          request.GetApproved(),
+		IdempotencyKey:    request.GetIdempotencyKey(),
+		PayloadHash:       payloadHash,
+		Acknowledgement:   acknowledgement,
+		CreatedAt:         createdAt,
+	}
+	if err := tx.Create(command).Error; err != nil {
+		return internalToolError("persist decision acknowledgement", err)
+	}
+	return nil
+}
+
+func loadDecisionReplayTx(
+	tx *gorm.DB,
+	actorID string,
+	idempotencyKey string,
+	payloadHash string,
+) (*model.SubmitToolApprovalDecisionResponse, bool, error) {
+	var command persistence.ToolDecisionCommand
+	err := tx.Where("actor_id = ? AND idempotency_key = ?", actorID, idempotencyKey).First(&command).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, internalToolError("load tool decision replay", err)
+	}
+	if command.PayloadHash != payloadHash {
+		return nil, false, idempotencyToolError("decision idempotency key payload mismatch")
+	}
+	if err := tx.Model(&persistence.ToolCall{}).
+		Where("actor_id = ? AND tool_call_id = ?", actorID, command.ToolCallID).
+		UpdateColumn(
+			"duplicate_delivery_count",
+			gorm.Expr("duplicate_delivery_count + ?", 1),
+		).Error; err != nil {
+		return nil, false, internalToolError("record duplicate tool decision", err)
+	}
+	var response model.SubmitToolApprovalDecisionResponse
+	if err := proto.Unmarshal(command.Acknowledgement, &response); err != nil {
+		return nil, false, internalToolError("decode tool decision replay", err)
+	}
+	return &response, true, nil
+}
+
+func loadReceiptReplayTx(
+	tx *gorm.DB,
+	receipt *model.ClientCapabilityReceipt,
+	receiptHash string,
+) (*model.SubmitClientCapabilityReceiptResponse, bool, error) {
+	var row persistence.ToolReceiptAttempt
+	err := tx.Where("request_id = ? AND sequence = ?", receipt.GetRequestId(), receipt.GetSequence()).First(&row).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, internalToolError("load client capability receipt replay", err)
+	}
+	if row.ReceiptHash != receiptHash {
+		return nil, false, idempotencyToolError("receipt sequence payload mismatch")
+	}
+	if err := tx.Model(&persistence.ToolCall{}).
+		Where("tool_call_id = ?", row.ToolCallID).
+		UpdateColumn(
+			"duplicate_delivery_count",
+			gorm.Expr("duplicate_delivery_count + ?", 1),
+		).Error; err != nil {
+		return nil, false, internalToolError("record duplicate tool receipt", err)
+	}
+	response := &model.SubmitClientCapabilityReceiptResponse{
+		Accepted: row.Accepted,
+		Replayed: true,
+		ResultId: row.ResultID,
+	}
+	if row.RejectionCode != "" {
+		response.ErrorCode = receiptErrorCode(row.RejectionCode)
+	}
+	if row.ResultID != "" {
+		var result persistence.ToolResult
+		if err := tx.Where("id = ?", row.ResultID).First(&result).Error; err == nil {
+			response.ContinuationId = continuationIDForBatch(tx, result.ToolBatchID)
+		}
+	}
+	return response, true, nil
+}
+
+func storeReceiptAttemptTx(
+	tx *gorm.DB,
+	receipt *model.ClientCapabilityReceipt,
+	receiptHash string,
+	accepted bool,
+	rejectionCode string,
+	now time.Time,
+) error {
+	occurredAt := now
+	if receipt.GetOccurredAt() != nil {
+		occurredAt = receipt.GetOccurredAt().AsTime().UTC()
+	}
+	row := &persistence.ToolReceiptAttempt{
+		ID:                  generateID("tool_receipt"),
+		RequestID:           receipt.GetRequestId(),
+		Sequence:            receipt.GetSequence(),
+		ToolCallID:          receipt.GetToolCallId(),
+		FencingToken:        receipt.GetFencingToken(),
+		Status:              receipt.GetStatus().String(),
+		PayloadHash:         receipt.GetPayloadHash(),
+		ReceiptHash:         receiptHash,
+		ResultID:            receipt.GetResultId(),
+		SideEffectReceiptID: receipt.GetSideEffectReceiptId(),
+		BoundedResult:       append([]byte(nil), receipt.GetBoundedResult()...),
+		ErrorCode:           receipt.GetErrorCode(),
+		Accepted:            accepted,
+		RejectionCode:       rejectionCode,
+		OccurredAt:          occurredAt,
+		CreatedAt:           now,
+	}
+	if err := tx.Create(row).Error; err != nil {
+		return internalToolError("persist client capability receipt", err)
+	}
+	return nil
+}
+
+func validateReceiptTuple(
+	actorID string,
+	deviceID string,
+	now time.Time,
+	call *persistence.ToolCall,
+	outbox *persistence.ToolDispatchOutbox,
+	receipt *model.ClientCapabilityReceipt,
+) model.ClientCapabilityReceiptErrorCode {
+	if outbox.ActorID != actorID ||
+		call.ActorID != actorID ||
+		outbox.ToolCallID != call.ToolCallID ||
+		outbox.CapabilitySessionID != call.CapabilitySessionID ||
+		outbox.TargetDeviceID != deviceID ||
+		receipt.GetTargetDeviceId() != deviceID ||
+		receipt.GetCapabilitySessionId() != call.CapabilitySessionID ||
+		receipt.GetToolBatchId() != call.ToolBatchID ||
+		receipt.GetTurnId() != call.TurnID ||
+		receipt.GetDecisionId() != call.DecisionID ||
+		receipt.GetDecisionRevision() != call.DecisionRevision ||
+		receipt.GetExecutionClaimId() != call.ExecutionClaimID ||
+		receipt.GetExecutorLeaseId() != call.ExecutorLeaseID ||
+		receipt.GetDispatchSequence() != call.DispatchSequence {
+		return model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH
+	}
+	if receipt.GetFencingToken() != call.FencingToken {
+		return model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_STALE_FENCE
+	}
+	if receipt.GetPayloadHash() != call.PayloadHash || receipt.GetPayloadHash() != outbox.PayloadHash {
+		return model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_PAYLOAD_CONFLICT
+	}
+	if call.CapabilityLeaseRevision != outbox.CapabilityLeaseRevision ||
+		call.ExecutionDeadline == nil ||
+		!call.ExecutionDeadline.After(now) ||
+		!outbox.ExecutionDeadline.After(now) {
+		return model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED
+	}
+	return model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_UNSPECIFIED
+}
+
+func blockToolBatchTx(tx *gorm.DB, batchID string, now time.Time) error {
+	return tx.Model(&persistence.ToolBatch{}).
+		Where("id = ? AND status = ?", batchID, persistence.ToolBatchStatusOpen).
+		Updates(map[string]interface{}{
+			"status":     persistence.ToolBatchStatusBlocked,
+			"settled_at": now,
+			"updated_at": now,
+		}).Error
+}
+
+func continuationIDForBatch(tx *gorm.DB, batchID string) string {
+	var continuation persistence.ToolContinuation
+	if err := tx.Select("id").Where("tool_batch_id = ?", batchID).First(&continuation).Error; err != nil {
+		return ""
+	}
+	return continuation.ID
+}
+
+func decisionPayloadHash(request *model.SubmitToolApprovalDecisionRequest) string {
+	canonical := fmt.Sprintf(
+		"%s\x00%s\x00%s\x00%d\x00%t",
+		request.GetApprovalId(),
+		request.GetToolCallId(),
+		request.GetDecisionId(),
+		request.GetExpectedRevision(),
+		request.GetApproved(),
+	)
+	if request.GetAnswer() != "" {
+		canonical += "\x00" + request.GetAnswer()
+	}
+	return hashString(canonical)
+}
+
+func policyDecisionPayloadHash(call *persistence.ToolCall) string {
+	if call == nil {
+		return ""
+	}
+	return hashString(fmt.Sprintf(
+		"%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%s",
+		call.ToolCallID,
+		call.ApprovalPolicy,
+		call.ManifestID,
+		call.ManifestVersion,
+		call.BindingRevision,
+		call.ReadinessSnapID,
+		call.ArgumentsHash,
+	))
+}
+
+func stationToolExecutionPayloadHash(
+	call *persistence.ToolCall,
+	fencingToken uint64,
+) string {
+	if call == nil {
+		return ""
+	}
+	return hashString(fmt.Sprintf(
+		"%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%s",
+		call.ToolCallID,
+		call.ManifestID,
+		call.ManifestVersion,
+		call.BindingID,
+		call.BindingRevision,
+		call.ReadinessSnapID,
+		fencingToken,
+		call.ArgumentsHash,
+	))
+}
+
+func decisionRejection(
+	request *model.SubmitToolApprovalDecisionRequest,
+	code model.ToolApprovalDecisionErrorCode,
+) *model.SubmitToolApprovalDecisionResponse {
+	return &model.SubmitToolApprovalDecisionResponse{
+		Accepted:         false,
+		DecisionRevision: request.GetExpectedRevision(),
+		ApprovalId:       request.GetApprovalId(),
+		ToolCallId:       request.GetToolCallId(),
+		DecisionId:       request.GetDecisionId(),
+		Approved:         request.GetApproved(),
+		IdempotencyKey:   request.GetIdempotencyKey(),
+		PayloadHash:      request.GetPayloadHash(),
+		ErrorCode:        code,
+	}
+}
+
+func expiredDecisionRejection(
+	request *model.SubmitToolApprovalDecisionRequest,
+	call *persistence.ToolCall,
+) *model.SubmitToolApprovalDecisionResponse {
+	response := decisionRejection(
+		request,
+		model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_EXPIRED,
+	)
+	response.DecisionRevision = call.DecisionRevision
+	if call.ExecutionDeadline != nil {
+		response.OutcomeError = errcode.NewToolApprovalExpiredPayload(
+			request.GetDecisionId(),
+			*call.ExecutionDeadline,
+		)
+	}
+	return response
+}
+
+func terminalResultHash(receipt *model.ClientCapabilityReceipt) string {
+	return hashString(fmt.Sprintf(
+		"%s\x00%s\x00%s\x00%x",
+		receipt.GetResultId(),
+		receipt.GetStatus().String(),
+		receipt.GetErrorCode(),
+		receipt.GetBoundedResult(),
+	))
+}
+
+func protoPayloadHash(message proto.Message) string {
+	cloned := proto.Clone(message)
+	switch value := cloned.(type) {
+	case *model.ClientCapabilityRequest:
+		value.PayloadHash = ""
+		value.RecoveryCredential = nil
+	}
+	encoded, _ := proto.MarshalOptions{Deterministic: true}.Marshal(cloned)
+	return hashBytes(encoded)
+}
+
+func receiptErrorCode(value string) model.ClientCapabilityReceiptErrorCode {
+	if number, ok := model.ClientCapabilityReceiptErrorCode_value[value]; ok {
+		return model.ClientCapabilityReceiptErrorCode(number)
+	}
+	return model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_UNSPECIFIED
+}
+
+func redactArguments(args string) string {
+	return redactDiagnosticText(args)
+}
+
+func truncateResult(value string) string {
+	const maxLen = 10000
+	if len(value) > maxLen {
+		return value[:maxLen] + "\n...[truncated]"
+	}
+	return value
+}
+
+func hashString(data string) string {
+	return hashBytes([]byte(data))
+}
+
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func invalidToolRequest(message string) error {
+	return errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest, message, nil)
+}
+
+func unauthorizedToolRequest(message string) error {
+	return errcode.New(errcode.AgentUnauthorized, http.StatusForbidden, message, nil)
+}
+
+func idempotencyToolError(message string) error {
+	return errcode.New(errcode.AgentIdempotencyConflict, http.StatusConflict, message, nil)
+}
+
+func invalidToolState(message string) error {
+	return errcode.New(errcode.AgentInvalidSourceState, http.StatusConflict, message, nil)
+}
+
+func notFoundToolError(entity string, cause error) error {
+	return errcode.New(errcode.AgentNotFound, http.StatusNotFound, entity+" not found", cause)
+}
+
+func internalToolError(operation string, cause error) error {
+	return errcode.New(errcode.AgentInternal, http.StatusInternalServerError, operation, cause)
+}
+
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unique constraint") ||
+		strings.Contains(message, "duplicate key")
+}

@@ -1,0 +1,5211 @@
+#!/usr/bin/env python3
+"""Mobile simulator Environment and Provisioner contract tests."""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import dataclasses
+import hashlib
+import json
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock, Mock, call, patch
+
+from tooling.acceptance.core import (
+    ArtifactRef,
+    BlockedError,
+    ClientRuntime,
+    EnvironmentContract,
+    ProvisioningError,
+    ProvisioningState,
+    ServiceAttestation,
+    new_manifest,
+)
+from tooling.acceptance.core._paths import ENVIRONMENTS_DIR
+from tooling.acceptance.gates.mobile.simulator_e2e import (
+    REQUIRED_HARNESS_ACTIONS,
+    SimulatorAppiumSession,
+    SimulatorBuildTarget,
+    SimulatorDeviceTarget,
+)
+from tooling.acceptance.provisioners import (
+    ChatMixedNativeProvisioner,
+    MobileDirectSimulatorProvisioner,
+    MobileIOSLayoutSimulatorProvisioner,
+    MobileRelaySimulatorProvisioner,
+    MobileSimulatorProvisioner,
+    MobileSocialIOSSimulatorProvisioner,
+    MobileSocialSimulatorProvisioner,
+    MobileStationLifecycleSimulatorProvisioner,
+    StationAccessNativeProvisioner,
+    get_provisioner,
+)
+from tooling.acceptance.provisioners import (
+    mobile_simulator as mobile_simulator_module,
+)
+from tooling.acceptance.provisioners.mobile_simulator import (
+    ANDROID_ABI,
+    ANDROID_AVD_NAME,
+    ANDROID_MANIFEST_RELATIVE_PATH,
+    BASE_SIMULATOR_HARNESS_ACTIONS,
+    DIRECT_SIMULATOR_ENVIRONMENT_ID,
+    EXPECTED_CLIENTS,
+    EXPECTED_DRIVERS,
+    IOS_EMBEDDED_WEB_ASSETS_RESOURCE,
+    IOS_TAURI_FRONTEND_CONFIG_ENV,
+    IOS_TAURI_FRONTEND_CONFIG_FILENAME,
+    IOS_WEB_ASSETS_RELATIVE_PATH,
+    IOS_WEB_DIST_SNAPSHOT_DIRNAME,
+    IOS_DEVICE_NAME,
+    IOS_PEER_DEVICE_NAME,
+    IOS_LAYOUT_CLIENTS,
+    IOS_RUNTIME,
+    MOBILE_RECOVERY_GATE_ID,
+    MOBILE_STATION_OUTAGE_CHANNEL_TIMEOUT_SECONDS,
+    MOBILE_STATION_OUTAGE_CAPABILITY_ID,
+    MOBILE_WEB_DIST_RELATIVE_PATH,
+    SIMULATOR_CAPABILITY_TIMEOUT_SECONDS,
+    SIMULATOR_APPIUM_CAPABILITY_ID,
+    STATION_LIFECYCLE_CAPABILITY_IDLE_TIMEOUT_SECONDS,
+    STATION_BOUND_SIMULATOR_GATE_IDS,
+    STATION_LIFECYCLE_ENVIRONMENT_ID,
+    STATION_LIFECYCLE_HARNESS_ACTIONS,
+    CommandResult,
+    MobileSimulatorAppiumCapabilityHandler,
+    MobileStationOutageCapabilityHandler,
+    SelectedMobileSimulatorProvisioner,
+    _GeneratedAndroidManifestGuard,
+    _resolve_android_ndk_home,
+    _resolve_android_ndk_tool,
+    _resolve_command,
+    _with_simulator_resources,
+    load_mobile_ios_layout_simulator_spec,
+    load_mobile_simulator_spec,
+    load_mobile_station_lifecycle_simulator_spec,
+)
+from tooling.acceptance.provisioners.mobile_service_bindings import (
+    MobileServiceBinding,
+    resolve_mobile_service_bindings,
+)
+
+
+FIXTURE_WEB_INDEX_HTML = (
+    '<!doctype html><script src="/assets/main.js"></script>\n'
+)
+FIXTURE_REGISTRY_CHUNK = "registry-stub.js"
+
+
+def _write_valid_ndk(path: Path) -> Path:
+    path.mkdir(parents=True)
+    (path / "source.properties").write_text(
+        "Pkg.Desc = Android NDK\n",
+        encoding="utf-8",
+    )
+    (path / "toolchains" / "llvm" / "prebuilt" / "test-host").mkdir(
+        parents=True
+    )
+    ranlib = (
+        path
+        / "toolchains"
+        / "llvm"
+        / "prebuilt"
+        / "test-host"
+        / "bin"
+        / "llvm-ranlib"
+    )
+    ranlib.parent.mkdir()
+    ranlib.write_text("", encoding="utf-8")
+    ranlib.chmod(0o755)
+    return path.resolve()
+
+
+class FakeProcess:
+    def __init__(self, name: str, events: list[str]) -> None:
+        self.name = name
+        self.events = events
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def stop(self) -> None:
+        self.events.append(f"stop:{self.name}")
+        self.returncode = 0
+
+
+class FakeCommandExecutor:
+    def __init__(self, repo_root: Path, *, embed_staged_assets: bool = True) -> None:
+        self.repo_root = repo_root
+        self.events: list[str] = []
+        self.commands: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
+        self.embed_staged_assets = embed_staged_assets
+        self.browser_versions = {
+            "com.android.chrome": "124.0.6367.82",
+            "com.google.android.webview": "124.0.6367.82",
+        }
+        self.active_webview_package = "com.google.android.webview"
+        self.driver_version = "124.0.6367.82"
+        self.ios_asset_payloads: list[str] = []
+
+    def run(
+        self,
+        command: tuple[str, ...] | list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> CommandResult:
+        del cwd, timeout
+        command = tuple(command)
+        self.commands.append(command)
+        self.environments.append(dict(env))
+        self.events.append(f"run:{' '.join(command)}")
+
+        if command[:3] == ("xcrun", "simctl", "create"):
+            return CommandResult(
+                0,
+                "ios-" + hashlib.sha256(
+                    command[3].encode("utf-8")
+                ).hexdigest()[:16] + "\n",
+            )
+        if command == ("emulator", "-list-avds"):
+            return CommandResult(0, f"{ANDROID_AVD_NAME}\n")
+        if command == ("adb", "devices"):
+            return CommandResult(
+                0,
+                "List of devices attached\nphysical-device\tdevice\n",
+            )
+        if (
+            len(command) >= 6
+            and command[:4] == ("adb", "-s", command[2], "shell")
+            and command[-2:] == ("getprop", "sys.boot_completed")
+        ):
+            return CommandResult(0, "1\n")
+        if (
+            len(command) >= 6
+            and command[:4] == ("adb", "-s", command[2], "shell")
+            and command[-2:] == ("getprop", "ro.product.cpu.abi")
+        ):
+            return CommandResult(0, f"{ANDROID_ABI}\n")
+        if (
+            len(command) == 7
+            and command[:4] == ("adb", "-s", command[2], "shell")
+            and command[4:6] == ("dumpsys", "package")
+        ):
+            package_name = command[6]
+            version = self.browser_versions.get(package_name)
+            if not version:
+                return CommandResult(1, stderr="Unable to find package")
+            return CommandResult(0, f"Packages:\n  versionName={version}\n")
+        if (
+            len(command) == 6
+            and command[:4] == ("adb", "-s", command[2], "shell")
+            and command[4:] == ("dumpsys", "webviewupdate")
+        ):
+            version = self.browser_versions[self.active_webview_package]
+            return CommandResult(
+                0,
+                "WebView Update Service State:\n"
+                "  Current WebView package (name, version): "
+                f"({self.active_webview_package}, {version})\n",
+            )
+        if command[:4] == (
+            "appium",
+            "driver",
+            "list",
+            "--installed",
+        ):
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "xcuitest": {"version": "9.10.5"},
+                        "uiautomator2": {"version": "4.2.9"},
+                    }
+                ),
+            )
+        if command[-1:] == ("--version",) and Path(command[0]).name == (
+            "chromedriver"
+        ):
+            return CommandResult(
+                0,
+                f"ChromeDriver {self.driver_version}\n",
+            )
+        if command == ("pnpm", "--dir", "apps/mobile", "run", "build"):
+            dist = self.repo_root / MOBILE_WEB_DIST_RELATIVE_PATH
+            (dist / "assets").mkdir(parents=True, exist_ok=True)
+            (dist / "index.html").write_text(
+                FIXTURE_WEB_INDEX_HTML,
+                encoding="utf-8",
+            )
+            (dist / "assets" / "main.js").write_text(
+                "mobile\n",
+                encoding="utf-8",
+            )
+            if env.get("VITE_ACCEPTANCE_HARNESS") == "1":
+                (dist / "assets" / FIXTURE_REGISTRY_CHUNK).write_text(
+                    "acceptance\n",
+                    encoding="utf-8",
+                )
+            return CommandResult(0)
+        if command and command[0] == "xcodebuild":
+            assets = self.repo_root / IOS_WEB_ASSETS_RELATIVE_PATH
+            try:
+                staged_index = (
+                    assets / "index.html"
+                ).read_text(encoding="utf-8")
+                self.ios_asset_payloads.append(staged_index)
+            except OSError as error:
+                return CommandResult(
+                    1,
+                    stderr=f"generated Apple assets are unavailable: {error}",
+                )
+            derived_data = Path(command[command.index("-derivedDataPath") + 1])
+            app = (
+                derived_data
+                / "Build"
+                / "Products"
+                / "debug-iphonesimulator"
+                / "peers-touch-mobile_iOS.app"
+            )
+            app.mkdir(parents=True, exist_ok=True)
+            stub = "ios-app\n"
+            if self.embed_staged_assets:
+                staged_assets = assets / "assets"
+                if staged_assets.is_dir():
+                    stub += "".join(
+                        f"/assets/{path.name}\n"
+                        for path in sorted(staged_assets.iterdir())
+                        if path.is_file()
+                    )
+            (app / "Peers").write_text(stub, encoding="utf-8")
+            return CommandResult(0)
+        if (
+            command[:4] == ("pnpm", "--dir", "apps/mobile", "exec")
+            and "android" in command
+        ):
+            manifest = self.repo_root / ANDROID_MANIFEST_RELATIVE_PATH
+            content = manifest.read_text(encoding="utf-8")
+            manifest.write_text(
+                content.replace(
+                    '                <data android:path="/callback" />\n',
+                    '                <data android:path="/callback" />\n'
+                    "                \n"
+                    "                \n"
+                    "                \n",
+                ),
+                encoding="utf-8",
+            )
+            apk = (
+                self.repo_root
+                / "apps"
+                / "mobile"
+                / "src-tauri"
+                / "gen"
+                / "android"
+                / "app"
+                / "build"
+                / "outputs"
+                / "apk"
+                / "arm64"
+                / "debug"
+                / "app-arm64-debug.apk"
+            )
+            apk.parent.mkdir(parents=True, exist_ok=True)
+            apk.write_bytes(b"android-apk")
+            return CommandResult(0)
+        return CommandResult(0)
+
+    def start(
+        self,
+        command: tuple[str, ...] | list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        log_path: Path,
+    ) -> FakeProcess:
+        del cwd, env
+        command = tuple(command)
+        self.commands.append(command)
+        self.events.append(f"start:{' '.join(command)}")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("", encoding="utf-8")
+        name = "appium" if command[0] == "appium" else "emulator"
+        return FakeProcess(name, self.events)
+
+
+class TestMobileSimulatorProvisioner(MobileSimulatorProvisioner):
+    def _git_commit(self) -> str:
+        return "a" * 40
+
+    def _git_workspace_digest(self) -> str:
+        return "sha256:" + ("b" * 64)
+
+    @staticmethod
+    def _build_inputs_digest(platform: str) -> str:
+        assert platform == "ios"
+        return "sha256:" + ("c" * 64)
+
+    def acquire_profile_lease(self, resource: str, owner: str) -> None:
+        del owner
+        self.register_cleanup(
+            f"environment-lease:{resource}",
+            lambda: self.executor.events.append("release:environment-lease"),
+        )
+
+    @staticmethod
+    def _host_platform_identity() -> tuple[str, str]:
+        return "darwin", "arm64"
+
+
+class TestSelectedMobileSimulatorProvisioner(
+    SelectedMobileSimulatorProvisioner
+):
+    def _git_commit(self) -> str:
+        return "1" * 40
+
+    def _git_workspace_digest(self) -> str:
+        return "clean"
+
+    @staticmethod
+    def _build_inputs_digest(platform: str) -> str:
+        marker = "1" if platform == "ios" else "2"
+        return f"sha256:{marker * 64}"
+
+    def acquire_profile_lease(self, resource: str, owner: str) -> None:
+        del owner
+        self.register_cleanup(
+            f"environment-lease:{resource}",
+            lambda: self.executor.events.append(
+                "release:environment-lease"
+            ),
+        )
+
+    @staticmethod
+    def _host_platform_identity() -> tuple[str, str]:
+        return "darwin", "arm64"
+
+
+class FakeMobileIOSLayoutSimulatorProvisioner(
+    MobileIOSLayoutSimulatorProvisioner
+):
+    def _git_commit(self) -> str:
+        return "source-commit"
+
+    def _git_workspace_digest(self) -> str:
+        return "sha256:workspace"
+
+    def acquire_profile_lease(self, resource: str, owner: str) -> None:
+        del owner
+        self.register_cleanup(
+            f"environment-lease:{resource}",
+            lambda: self.executor.events.append("release:environment-lease"),
+        )
+
+
+class FakeEvidenceRun:
+    run_id = "20260909T120000000000Z-" + ("1" * 32)
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, Any, str | None]] = []
+
+    def write_json(
+        self,
+        path: str,
+        value: dict[str, Any],
+        *,
+        role: str | None = None,
+        redact: bool = True,
+    ) -> ArtifactRef:
+        del redact
+        self.writes.append((path, value, role))
+        return ArtifactRef(
+            workspace_id="a" * 16,
+            gate_id="mobile-simulator-station-lifecycle-e2e",
+            run_id=self.run_id,
+            path=path,
+            sha256=hashlib.sha256(path.encode("utf-8")).hexdigest(),
+            media_type="application/json",
+        )
+
+    def write_bytes(
+        self,
+        path: str,
+        value: bytes,
+        *,
+        media_type: str,
+        role: str | None = None,
+        redact: bool = True,
+    ) -> ArtifactRef:
+        del redact
+        self.writes.append((path, value, role))
+        return ArtifactRef(
+            workspace_id="a" * 16,
+            gate_id="mobile-simulator-station-lifecycle-e2e",
+            run_id=self.run_id,
+            path=path,
+            sha256=hashlib.sha256(value).hexdigest(),
+            media_type=media_type,
+        )
+
+
+class FakeParentSimulatorSession:
+    def __init__(self, client_id: str) -> None:
+        self.client_id = client_id
+        self.platform = "ios"
+        self.session_id = f"raw-session-{client_id}"
+        self.device = SimpleNamespace(identifier=f"raw-device-{client_id}")
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.active_station_peer_id = ""
+        self.actor_ptid: str | None = None
+        self.generation = 0
+        self.started = False
+
+    def start(self) -> "FakeParentSimulatorSession":
+        self.started = True
+        return self
+
+    def stop(self) -> None:
+        self.calls.append(("stop", {}))
+        self.started = False
+
+    def wait_for_ready(self) -> None:
+        self.calls.append(("wait_for_ready", {}))
+
+    def switch_to_native(self) -> None:
+        self.calls.append(("switch_to_native", {}))
+
+    def switch_to_app_webview(self) -> str:
+        self.calls.append(("switch_to_app_webview", {}))
+        return "WEBVIEW_com.peers.touch.mobile"
+
+    def require_harness(self, actions: list[str]) -> list[str]:
+        self.calls.append(("require_harness", {"actions": actions}))
+        return actions
+
+    def get_page_source(self) -> str:
+        return "<html><body>receiver visible message</body></html>"
+
+    def screenshot_bytes(self) -> bytes:
+        return b"\x89PNG\r\n\x1a\nreceiver-visible"
+
+    def execute_script(self, script: str, *arguments: object) -> dict[str, object]:
+        self.calls.append(
+            (
+                "execute_script",
+                {"script": script, "arguments": list(arguments)},
+            )
+        )
+        if "activated:" in script:
+            return {
+                "found": True,
+                "visible": True,
+                "activated": True,
+                "tagName": "button",
+            }
+        if "matched:" in script:
+            return {
+                "found": True,
+                "visible": True,
+                "matched": True,
+                "tagName": "article",
+            }
+        return {
+            "found": True,
+            "visible": True,
+            "updated": True,
+            "tagName": "textarea",
+        }
+
+    def call_action(
+        self,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body = dict(payload or {})
+        self.calls.append((action, body))
+        if action == "station.add":
+            endpoint = str(body["url"])
+            self.actor_ptid = None
+            self.active_station_peer_id = (
+                "peer-secondary"
+                if "secondary" in endpoint
+                else "peer-primary"
+            )
+            self.generation += 1
+            return {
+                "activeStationPeerId": self.active_station_peer_id,
+                "verifiedStationPeerId": self.active_station_peer_id,
+                "canonicalOrigin": endpoint,
+                "entries": [
+                    {
+                        "stationPeerId": self.active_station_peer_id,
+                        "url": endpoint,
+                        "label": "Station",
+                    }
+                ],
+            }
+        if action == "station.select":
+            remote_revocation = (
+                "confirmed"
+                if self.actor_ptid is not None
+                else "not-required"
+            )
+            self.active_station_peer_id = str(body["stationPeerId"])
+            self.actor_ptid = None
+            self.generation += 1
+            return {
+                "activeStationPeerId": self.active_station_peer_id,
+                "entries": [],
+                "sessionRevocation": {
+                    "remoteRevocation": remote_revocation,
+                },
+            }
+        if action == "access.submit":
+            if body.get("kind") == "start":
+                return {
+                    "decision": {"attemptId": "attempt-1"},
+                    "session": None,
+                }
+            self.actor_ptid = "ptid:alice"
+            return {
+                "decision": {
+                    "state": "ACCESS_DECISION_STATE_GRANTED",
+                },
+                "session": {
+                    "stationPeerId": self.active_station_peer_id,
+                    "actorPtid": self.actor_ptid,
+                },
+            }
+        if action == "runtime.prepareActorIdentity":
+            return {"prepared": True}
+        if action == "lifecycle.scope.read":
+            active = self.actor_ptid is not None
+            return {
+                "phase": "ACTIVE",
+                "launchState": "shell" if active else "station-selection",
+                "generation": self.generation,
+                "activeStationPeerId": self.active_station_peer_id,
+                "activeActorPtid": self.actor_ptid,
+                "runtimeStationPeerId": (
+                    self.active_station_peer_id if active else None
+                ),
+                "deviceId": f"device-{self.client_id}",
+                "social": {
+                    "stationPeerId": (
+                        self.active_station_peer_id if active else None
+                    ),
+                    "actorPtid": self.actor_ptid,
+                    "sessionCount": 1 if active else 0,
+                    "requestCount": 0,
+                    "messageThreadCount": 0,
+                },
+                "group": {
+                    "stationPeerId": (
+                        self.active_station_peer_id if active else None
+                    ),
+                    "actorPtid": self.actor_ptid,
+                    "groupCount": 0,
+                    "messageThreadCount": 0,
+                },
+                "navigation": {
+                    "primaryRouteId": "tab:chat",
+                    "detailKeys": [],
+                    "overlayRouteId": None,
+                },
+            }
+        if action == "cleanup":
+            return {
+                "oauthPurge": {
+                    "stationRevocation": "not_required",
+                    "secureStorage": {
+                        "activeAttemptIndexAbsent": True,
+                        "attemptSecretRecordAbsent": True,
+                        "currentSessionIndexAbsent": True,
+                        "credentialRecordAbsent": True,
+                        "publicProjectionAbsent": True,
+                    },
+                },
+                "webSessionProjectionCleared": True,
+                "stationRegistryCleared": True,
+            }
+        return {"ok": True}
+
+
+class MobileSimulatorContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.path = ENVIRONMENTS_DIR / "mobile-simulator.yaml"
+        self.payload = json.loads(self.path.read_text(encoding="utf-8"))
+        self.spec = load_mobile_simulator_spec(self.path)
+        equipment = patch(
+            "tooling.acceptance.provisioners.station_equipment.equip_station_profiles",
+        )
+        self.station_equipment = equipment.start()
+        self.addCleanup(equipment.stop)
+        # Unit tests never hold a live station.reset lease; the per-Station
+        # reset binding is asserted separately in a dedicated regression test.
+        bound = patch(
+            "tooling.acceptance.provisioners.mobile_simulator."
+            "bound_reset_profiles",
+            side_effect=lambda _profiles: contextlib.nullcontext(),
+        )
+        self.bound_reset_profiles = bound.start()
+        self.addCleanup(bound.stop)
+
+    def _station_access_fixture(
+        self,
+    ) -> tuple[
+        StationAccessNativeProvisioner,
+        dict[str, MobileServiceBinding],
+        dict[str, Any],
+        FakeEvidenceRun,
+    ]:
+        path = ENVIRONMENTS_DIR / "station-access-native.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = StationAccessNativeProvisioner(
+            contract,
+            overlay_path=path,
+        )
+        evidence = FakeEvidenceRun()
+        provisioner.bind_evidence_run(evidence)  # type: ignore[arg-type]
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_DIRECT_STATION_URL": (
+                    "https://station-four.example"
+                ),
+                "PT_MOBILE_DIRECT_STATION_DEPLOY_ENV": "station-four",
+            },
+        )
+        return provisioner, bindings, provisioner._load_overlay(), evidence
+
+    def test_contract_is_simulator_only_and_declares_runtime_materials(
+        self,
+    ) -> None:
+        contract = EnvironmentContract.from_yaml(self.path)
+
+        self.assertEqual(contract.id, "mobile-simulator")
+        self.assertFalse(contract.profile.required)
+        self.assertEqual(contract.services, {})
+        self.assertEqual(contract.fixtures, ())
+        self.assertEqual(contract.credentials, ())
+        self.assertEqual(
+            {
+                client.id: (client.platform, client.role, client.runtime)
+                for client in self.spec.clients
+            },
+            EXPECTED_CLIENTS,
+        )
+        self.assertEqual(self.spec.ios_runtime, IOS_RUNTIME)
+        self.assertEqual(self.spec.ios_device_name, IOS_DEVICE_NAME)
+        self.assertEqual(
+            self.spec.ios_peer_device_name,
+            IOS_PEER_DEVICE_NAME,
+        )
+        self.assertEqual(self.spec.android_avd_name, ANDROID_AVD_NAME)
+        self.assertEqual(self.spec.android_abi, ANDROID_ABI)
+        self.assertTrue(self.spec.chromedriver.acquisition_enabled)
+        self.assertEqual(len(self.spec.chromedriver.artifacts), 1)
+        self.assertEqual(
+            self.spec.chromedriver.artifacts[0].browser_major,
+            124,
+        )
+        self.assertEqual(
+            self.spec.build_environment,
+            {
+                "VITE_ACCEPTANCE_HARNESS": "1",
+                "MOBILE_TAURI_STATIC_BUNDLE_BUILD": "1",
+            },
+        )
+        ios_command = self.spec.build_commands["ios"]
+        self.assertNotIn("--debug", ios_command)
+        self.assertEqual(
+            ios_command[ios_command.index("-configuration") + 1],
+            "debug",
+        )
+        android_command = self.spec.build_commands["android"]
+        config_index = android_command.index("--config")
+        self.assertEqual(
+            json.loads(android_command[config_index + 1])["build"]["devUrl"],
+            None,
+        )
+        self.assertIn(
+            "physical-device MS-AG03",
+            self.spec.proof_scope["doesNotProve"],
+        )
+
+    def test_contract_declares_appium_xcuitest_and_uiautomator2(self) -> None:
+        self.assertEqual(
+            {
+                platform: (
+                    driver.identity,
+                    driver.installed_name,
+                    driver.automation_name,
+                    driver.expected_version,
+                )
+                for platform, driver in self.spec.drivers.items()
+            },
+            {
+                "ios": (*EXPECTED_DRIVERS["ios"], "9.10.5"),
+                "android": (*EXPECTED_DRIVERS["android"], "4.2.9"),
+            },
+        )
+        self.assertEqual(self.spec.appium_ownership, "provisioner")
+        self.assertEqual(self.spec.appium_expected_version, "2.19.0")
+        self.assertEqual(
+            set(self.spec.harness_actions),
+            BASE_SIMULATOR_HARNESS_ACTIONS,
+        )
+
+    def test_ios_layout_contract_pins_current_iphone_cell(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-ios-layout-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        spec = load_mobile_ios_layout_simulator_spec(path)
+
+        self.assertEqual(contract.id, "mobile-ios-layout-simulator")
+        self.assertFalse(contract.profile.required)
+        self.assertEqual(
+            {
+                client.id: (client.device_name, client.viewport_role)
+                for client in spec.clients
+            },
+            IOS_LAYOUT_CLIENTS,
+        )
+        self.assertEqual(
+            set(spec.harness_actions),
+            {"projection.read"},
+        )
+        self.assertIn("Android", spec.proof_scope["doesNotProve"])
+
+    def test_physical_role_or_runtime_fails_closed(self) -> None:
+        payload = json.loads(json.dumps(self.payload))
+        payload["clients"][0]["role"] = "physical"
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".yaml",
+            delete=False,
+        ) as file:
+            json.dump(payload, file)
+            path = Path(file.name)
+        try:
+            with self.assertRaisesRegex(
+                Exception,
+                "simulator-only runtime kinds",
+            ):
+                load_mobile_simulator_spec(path)
+        finally:
+            path.unlink()
+
+    def test_provisioner_is_registered(self) -> None:
+        contract = EnvironmentContract.from_yaml(self.path)
+        self.assertIsInstance(
+            get_provisioner(contract),
+            MobileSimulatorProvisioner,
+        )
+
+    def test_social_simulator_overlay_has_typed_service_bindings(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        contract = EnvironmentContract.from_yaml(path)
+
+        self.assertEqual(payload["base_environment"], "mobile-simulator")
+        self.assertEqual(
+            set(contract.services),
+            {"station-primary", "station-secondary", "relay"},
+        )
+        self.assertEqual(
+            {
+                client.id: client.service_bindings["station"].service_id
+                for client in contract.clients
+            },
+            {
+                "sim-ios": "station-primary",
+                "sim-ios-peer": "station-secondary",
+            },
+        )
+        self.assertFalse(contract.profile.required)
+        self.assertFalse(contract.profile.identity_match)
+        self.assertEqual(contract.credentials, ())
+        provisioner = get_provisioner(contract)
+        self.assertIsInstance(
+            provisioner,
+            MobileSocialSimulatorProvisioner,
+        )
+        self.assertEqual(
+            provisioner._load_overlay()["harness"]["namespace"],
+            "__PEERS_MOBILE_ACCEPTANCE__",
+        )
+
+    def test_direct_simulator_binds_two_actors_to_one_station(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-direct-simulator.yaml"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        contract = EnvironmentContract.from_yaml(path)
+
+        self.assertEqual(payload["base_environment"], "mobile-simulator")
+        self.assertEqual(contract.id, DIRECT_SIMULATOR_ENVIRONMENT_ID)
+        self.assertEqual(set(contract.services), {"station"})
+        self.assertEqual(
+            {
+                client.id: (
+                    client.actor,
+                    client.service_bindings["station"].service_id,
+                )
+                for client in contract.clients
+            },
+            {
+                "sim-ios": ("alice", "station"),
+                "sim-ios-peer": ("bob", "station"),
+            },
+        )
+        self.assertNotIn("relay", contract.services)
+        self.assertIn(
+            "cross-Station or Relay delivery",
+            payload["proof_scope"]["does_not_prove"],
+        )
+        self.assertIn(
+            "lifecycle.scope.read",
+            payload["harness"]["required_actions"],
+        )
+        self.assertIn(
+            "build.identity",
+            payload["harness"]["required_actions"],
+        )
+        self.assertIn(
+            "runtime.prepareActorIdentity",
+            payload["harness"]["required_actions"],
+        )
+        self.assertIn(
+            "lifecycle.waitReady",
+            payload["harness"]["required_actions"],
+        )
+        self.assertIsInstance(
+            get_provisioner(contract),
+            MobileDirectSimulatorProvisioner,
+        )
+
+    def test_direct_simulator_accepts_one_explicit_station_profile(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-direct-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = get_provisioner(
+            contract,
+            station_profiles={"station": "chat-native-disposable"},
+        )
+
+        self.assertIsInstance(
+            provisioner,
+            MobileDirectSimulatorProvisioner,
+        )
+        self.assertEqual(
+            provisioner._required_station_profiles(),
+            {"station": "chat-native-disposable"},
+        )
+        self.assertEqual(provisioner._required_service_profiles(), {})
+
+    def test_direct_simulator_injects_station_profile_in_memory(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-direct-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileDirectSimulatorProvisioner(
+            contract,
+            station_profiles={"station": "three"},
+        )
+        active = {"PT_DEV_PROFILE": "three"}
+
+        with patch(
+            "tooling.acceptance.provisioners.mobile_simulator."
+            "resolve_machine_profile_environment",
+            return_value=(
+                "three",
+                Path("/canonical/three/profile.env.example"),
+                15,
+                {
+                    "PT_DEV_PROFILE": "three",
+                    "PT_STATION_MODE": "remote",
+                    "PT_STATION_URL": "https://direct.example",
+                    "PT_STATION_DEPLOY_ENV": "station-three",
+                },
+            ),
+        ):
+            merged = provisioner._inject_station_profile_bindings(active)
+
+        self.assertEqual(
+            merged["PT_MOBILE_DIRECT_STATION_URL"],
+            "https://direct.example",
+        )
+        self.assertEqual(
+            merged["PT_MOBILE_DIRECT_STATION_DEPLOY_ENV"],
+            "station-three",
+        )
+        self.assertNotIn("PT_MOBILE_DIRECT_STATION_URL", active)
+
+    def test_public_simulator_resources_preserve_build_identity(self) -> None:
+        overlay_path = ENVIRONMENTS_DIR / "mobile-direct-simulator.yaml"
+        overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+        resources = {
+            "appium": {
+                "serverVersion": "2.19.0",
+                "expectedServerVersion": "2.19.0",
+                "drivers": {
+                    "ios": {
+                        "identity": "appium-xcuitest",
+                        "automationName": "XCUITest",
+                        "version": "9.10.5",
+                        "expectedVersion": "9.10.5",
+                    },
+                },
+            },
+            "applications": {
+                "ios": {
+                    "id": "com.peers.touch.mobile",
+                    "sha256": "a" * 64,
+                    "callbackScheme": "peers-touch",
+                    "buildIdentity": {
+                        "schema": "peers-mobile-build-identity",
+                        "buildId": "build-ios",
+                    },
+                },
+            },
+            "clients": {
+                client_id: {
+                    "platform": "ios",
+                    "role": client_id,
+                    "runtime": "tauri-ios-simulator",
+                    "deviceRole": client_id,
+                    "profile": client_id,
+                }
+                for client_id in ("sim-ios", "sim-ios-peer")
+            },
+        }
+
+        projected = (
+            MobileStationLifecycleSimulatorProvisioner
+            ._public_simulator_resources(
+                resources,
+                overlay,
+                environment_id=DIRECT_SIMULATOR_ENVIRONMENT_ID,
+            )
+        )
+
+        self.assertEqual(
+            projected["applications"]["ios"]["buildIdentity"],
+            resources["applications"]["ios"]["buildIdentity"],
+        )
+
+    def test_direct_simulator_rejects_non_active_station_profile(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-direct-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileDirectSimulatorProvisioner(
+            contract,
+            station_profiles={"station": "three"},
+        )
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_machine_profile_environment",
+                return_value=(
+                    "two",
+                    Path("/canonical/two/profile.env.example"),
+                    1,
+                    {
+                        "PT_DEV_PROFILE": "two",
+                        "PT_STATION_MODE": "remote",
+                        "PT_STATION_URL": "https://two.example",
+                        "PT_STATION_DEPLOY_ENV": "station-two",
+                    },
+                ),
+            ),
+            self.assertRaisesRegex(
+                BlockedError,
+                "requested='three' active='two'",
+            ),
+        ):
+            provisioner._inject_station_profile_bindings({})
+
+    def test_current_two_actor_gates_use_direct_environment(self) -> None:
+        catalog = json.loads(
+            (ENVIRONMENTS_DIR.parent / "gates.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        gates = catalog["gates"]
+        current_gate_ids = (
+            "mobile-simulator-social-convergence-e2e",
+            "mobile-simulator-chat-contacts-e2e",
+            "mobile-simulator-recovery-e2e",
+            "mobile-simulator-recovery-ui-e2e",
+            "mobile-simulator-moments-e2e",
+        )
+
+        for gate_id in current_gate_ids:
+            with self.subTest(gate_id=gate_id):
+                self.assertEqual(
+                    gates[gate_id]["environment"],
+                    DIRECT_SIMULATOR_ENVIRONMENT_ID,
+                )
+                self.assertEqual(
+                    gates[gate_id]["provisioner"],
+                    DIRECT_SIMULATOR_ENVIRONMENT_ID,
+                )
+        recovery = gates[MOBILE_RECOVERY_GATE_ID]
+        self.assertEqual(
+            recovery["ephemeralCapabilities"],
+            [MOBILE_STATION_OUTAGE_CAPABILITY_ID],
+        )
+        self.assertEqual(
+            recovery["argv"][-2:],
+            ["--scenario", "recovery"],
+        )
+        self.assertGreater(
+            MOBILE_STATION_OUTAGE_CHANNEL_TIMEOUT_SECONDS,
+            420 + SIMULATOR_CAPABILITY_TIMEOUT_SECONDS,
+        )
+
+    def test_station_outage_handler_restores_on_parent_cleanup(self) -> None:
+        before = {
+            "containerId": "station-container",
+            "processIds": [101],
+            "sourceCommit": "a" * 40,
+            "buildCommit": "a" * 40,
+            "runtimeOwner": "docker-compose:test/station",
+        }
+        after = {
+            **before,
+            "processIds": [202],
+        }
+        transport = SimpleNamespace(
+            run_argv=Mock(
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stderr="",
+                    stdout="station-container",
+                )
+            )
+        )
+        config = SimpleNamespace(
+            environment_name="profile-three",
+            public_base_url="http://station.example:18080",
+            transport=lambda: transport,
+        )
+        authority, target_file = self._station_outage_authority()
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_deployment_environment_path",
+                return_value=target_file,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(authority), stderr="",
+                ),
+            ) as checked,
+            patch.dict(
+                "os.environ", {"PT_MOBILE_ACCEPTANCE_ALLOW_STATION_RESTART": "0"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "PosixServiceRuntimeConfig.load",
+                return_value=config,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "inspect_posix_runtime",
+                side_effect=[before, after],
+            ),
+        ):
+            handler = MobileStationOutageCapabilityHandler(
+                deployment_environment="profile-three",
+                expected_commit="a" * 40,
+            )
+            stopped = handler.invoke(
+                "stop",
+                {},
+                deadline_monotonic=time.monotonic() + 30,
+                cancellation=threading.Event(),
+            )
+            cleanup = handler.close()
+
+        self.assertTrue(stopped["stopped"])
+        self.assertTrue(cleanup.closed)
+        command = checked.call_args.args[0]
+        self.assertEqual(command[-4:], ["--target-profile", "three", "--capabilities", "station.deploy"])
+        self.assertNotIn("select", command)
+        self.assertNotIn("register", command)
+        self.assertEqual(
+            transport.run_argv.call_args_list[0].args[0],
+            ["docker", "stop", "--time", "10", "station-container"],
+        )
+        self.assertEqual(
+            transport.run_argv.call_args_list[1].args[0],
+            ["docker", "start", "station-container"],
+        )
+
+    @staticmethod
+    def _station_outage_authority() -> tuple[dict[str, Any], Path]:
+        target_file = Path("/reviewed-env/peers-touch/three/deploy/profile-three.env.example")
+        return {
+            "authority": "machine-control-plane",
+            "binding": {
+                "profile": "other-active-profile", "slot": 6,
+                "canonicalRoot": str(mobile_simulator_module.REPO_ROOT),
+                "allowedCapabilities": ["station.connect", "station.deploy"],
+            },
+            "profile": {
+                "profile": "three", "resetPolicy": "agent-resettable",
+                "sourceState": "tracked-clean", "stationMode": "remote",
+                "stationUrl": "http://station.example:18080",
+                "stationDeployEnvironment": "profile-three",
+                "stationDeployFile": str(target_file),
+            },
+            "source": {"head": "a" * 40},
+        }, target_file
+
+    def test_station_outage_rejects_invalid_authority_before_transport(self) -> None:
+        cases = (
+            ("authority", "authority", "caller"),
+            ("binding", "canonicalRoot", "/other-worktree"),
+            ("binding", "allowedCapabilities", ["station.connect", "station.reset"]),
+            ("binding", "allowedCapabilities", "station.deploy"),
+            ("profile", "profile", "other-profile"),
+            ("profile", "resetPolicy", "stable-protected"),
+            ("profile", "sourceState", "tracked-dirty"),
+            ("profile", "stationMode", "local"),
+            ("profile", "stationUrl", ""),
+            ("profile", "stationDeployEnvironment", "other-station"),
+            ("profile", "stationDeployFile", "/other-target.env.example"),
+            ("source", "head", "b" * 40),
+            ("source", "head", "a" * 7),
+        )
+        for section, key, value in cases:
+            with self.subTest(section=section, key=key, value=value):
+                authority, target_file = self._station_outage_authority()
+                if section == "authority":
+                    authority[key] = value
+                else:
+                    authority[section][key] = value
+                with (
+                    patch.dict(
+                        "os.environ", {"PT_MOBILE_ACCEPTANCE_ALLOW_STATION_RESTART": "1"},
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "resolve_deployment_environment_path",
+                        return_value=target_file,
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator.subprocess.run",
+                        return_value=SimpleNamespace(
+                            returncode=0, stdout=json.dumps(authority), stderr="",
+                        ),
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "PosixServiceRuntimeConfig.load",
+                    ) as config,
+                    self.assertRaises(BlockedError),
+                ):
+                    MobileStationOutageCapabilityHandler(
+                        deployment_environment="profile-three", expected_commit="a" * 40,
+                    )
+                config.assert_not_called()
+
+    def test_station_outage_rejects_runtime_origin_override(self) -> None:
+        authority, target_file = self._station_outage_authority()
+        transport = Mock()
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_deployment_environment_path",
+                return_value=target_file,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(authority), stderr="",
+                ),
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "_station_runtime_config",
+                return_value=SimpleNamespace(
+                    public_base_url="http://other-station.example:18080",
+                    transport=transport,
+                ),
+            ),
+            self.assertRaisesRegex(BlockedError, "runtime origin"),
+        ):
+            MobileStationOutageCapabilityHandler(
+                deployment_environment="profile-three", expected_commit="a" * 40,
+            )
+        transport.assert_not_called()
+
+    def test_station_outage_rejects_missing_or_failed_machine_check(self) -> None:
+        _, target_file = self._station_outage_authority()
+        failures = (
+            SimpleNamespace(returncode=1, stdout="", stderr="WORKSPACE_CAPABILITY_MISSING"),
+            SimpleNamespace(returncode=0, stdout="{}", stderr=""),
+            SimpleNamespace(returncode=0, stdout="not-json", stderr=""),
+            FileNotFoundError("node"),
+            subprocess.TimeoutExpired("machine-dev", 30),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                with (
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "resolve_deployment_environment_path",
+                        return_value=target_file,
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator.subprocess.run",
+                        **({"side_effect": failure} if isinstance(failure, Exception)
+                           else {"return_value": failure}),
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "PosixServiceRuntimeConfig.load",
+                    ) as config,
+                    self.assertRaises(BlockedError),
+                ):
+                    MobileStationOutageCapabilityHandler(
+                        deployment_environment="profile-three", expected_commit="a" * 40,
+                    )
+                config.assert_not_called()
+
+    def test_mobile_social_ios_gate_uses_reset_isolated_environment(
+        self,
+    ) -> None:
+        catalog = json.loads(
+            (ENVIRONMENTS_DIR.parent / "gates.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        gate = catalog["gates"]["mobile-social-ios-native"]
+        self.assertEqual(
+            gate["environment"],
+            "mobile-social-ios-simulator",
+        )
+        self.assertEqual(
+            gate["provisioner"],
+            "mobile-social-ios-simulator",
+        )
+        contract = EnvironmentContract.from_yaml(
+            ENVIRONMENTS_DIR / "mobile-social-ios-simulator.yaml"
+        )
+        provisioner = get_provisioner(
+            contract,
+            station_profiles={"station": "four"},
+        )
+        self.assertIsInstance(
+            provisioner,
+            MobileSocialIOSSimulatorProvisioner,
+        )
+        self.assertTrue(provisioner.requires_actor_reset)
+
+    def test_mobile_social_ios_fixture_resets_actors_and_prekeys(
+        self,
+    ) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-ios-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileSocialIOSSimulatorProvisioner(
+            contract,
+            overlay_path=path,
+        )
+        evidence = FakeEvidenceRun()
+        provisioner.bind_evidence_run(evidence)  # type: ignore[arg-type]
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_DIRECT_STATION_URL": (
+                    "https://station.example"
+                ),
+                "PT_MOBILE_DIRECT_STATION_DEPLOY_ENV": "station-four",
+            },
+        )
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ) as verify_reset,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+            ) as reset,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                side_effect=lambda _endpoint, _deployment, role: SimpleNamespace(
+                    role=role,
+                    account_ref=f"station-account:{role}@p.t",
+                    ptid=f"ptid:{role}",
+                    device_policy="single-active-session",
+                    display_name=f"Canonical {role.title()}",
+                    federated_handle=f"@{role}@station.example",
+                    home_station_peer_id="station-peer",
+                ),
+            ) as destructive_resolver,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_federation_contexts",
+                return_value=(
+                    mobile_simulator_module
+                    .fixture_federation_id_from_station_ids(
+                        ("station-peer", "station-peer"),
+                    )
+                ),
+            ) as prepare_federation,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+            ),
+        ):
+            provisioner._prepare_actor_fixture(
+                "mobile-social-ios-native",
+                bindings,
+                provisioner._load_overlay(),
+            )
+
+        verify_reset.assert_called_once_with(
+            "https://station.example",
+            "station-four",
+        )
+        self.assertEqual(
+            [entry.args for entry in destructive_resolver.call_args_list],
+            [
+                ("https://station.example", "station-four", "alice"),
+                ("https://station.example", "station-four", "bob"),
+                ("https://station.example", "station-four", "eve"),
+            ],
+        )
+        reset.assert_called_once_with(
+            "station-four",
+            ("alice", "bob", "eve"),
+            reset_authorized=True,
+        )
+        prepare_federation.assert_called_once()
+        payload = evidence.writes[-1][1]
+        self.assertTrue(payload["reset"]["authorized"])
+        station = payload["stations"]["station"]
+        self.assertTrue(station["targetVerified"])
+        self.assertFalse(station["existingActorsVerified"])
+
+    def test_station_access_federation_boundary_prepares_fixture_context(
+        self,
+    ) -> None:
+        provisioner, bindings, overlay, evidence = (
+            self._station_access_fixture()
+        )
+        expected_federation_id = (
+            mobile_simulator_module.fixture_federation_id_from_station_ids(
+                ("station-four-peer",)
+            )
+        )
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                side_effect=lambda _endpoint, _deployment, role: SimpleNamespace(
+                    role=role,
+                    account_ref=f"station-account:{role}@p.t",
+                    ptid=f"ptid:{role}",
+                    device_policy="single-active-session",
+                    display_name=f"Canonical {role.title()}",
+                    federated_handle=f"@{role}@station-four.example",
+                    home_station_peer_id="station-four-peer",
+                ),
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_bound_friendships",
+            ) as prepare_friendships,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_federation_contexts",
+                return_value=expected_federation_id,
+            ) as prepare_federation,
+        ):
+            provisioner._prepare_actor_fixture(
+                "station-access-federation-boundary-e2e",
+                bindings,
+                overlay,
+            )
+
+        prepare_friendships.assert_called_once()
+        self.assertEqual(
+            prepare_friendships.call_args.args[0],
+            {
+                "alice": (
+                    "https://station-four.example",
+                    "station-four",
+                ),
+                "bob": (
+                    "https://station-four.example",
+                    "station-four",
+                ),
+            },
+        )
+        self.assertEqual(
+            tuple(
+                actor.role
+                for actor in prepare_friendships.call_args.args[1]
+            ),
+            ("alice", "bob"),
+        )
+        prepare_federation.assert_called_once_with({
+            "station": (
+                "https://station-four.example",
+                "station-four",
+                ("alice", "bob"),
+            ),
+        })
+        self.assertEqual(
+            {
+                actor["federationId"]
+                for actor in evidence.writes[-1][1]["stations"]["station"][
+                    "actors"
+                ]
+            },
+            {expected_federation_id},
+        )
+
+    def test_station_access_auth_gates_skip_fixture_context(
+        self,
+    ) -> None:
+        for gate_id in (
+            "station-access-auth-e2e",
+            "station-access-scope-isolation-e2e",
+        ):
+            with self.subTest(gate_id=gate_id):
+                provisioner, bindings, overlay, evidence = (
+                    self._station_access_fixture()
+                )
+                with (
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "require_station_reset_authority",
+                        return_value={"validation": "current"},
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "verify_reset_target",
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "reset_fixture",
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "resolve_actor_identity",
+                        side_effect=(
+                            lambda _endpoint, _deployment, role: SimpleNamespace(
+                                role=role,
+                                account_ref=f"station-account:{role}@p.t",
+                                ptid=f"ptid:{role}",
+                                device_policy="single-active-session",
+                                display_name=f"Canonical {role.title()}",
+                                federated_handle=(
+                                    f"@{role}@station-four.example"
+                                ),
+                                home_station_peer_id="station-four-peer",
+                            )
+                        ),
+                    ),
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "prepare_bound_friendships",
+                    ) as prepare_friendships,
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "prepare_federation_contexts",
+                    ) as prepare_federation,
+                ):
+                    provisioner._prepare_actor_fixture(
+                        gate_id,
+                        bindings,
+                        overlay,
+                    )
+
+                prepare_friendships.assert_not_called()
+                prepare_federation.assert_not_called()
+                self.assertTrue(
+                    all(
+                        "federationId" not in actor
+                        for actor in evidence.writes[-1][1]["stations"][
+                            "station"
+                        ]["actors"]
+                    )
+                )
+
+    def test_social_simulator_accepts_explicit_station_profiles(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        bindings = {
+            "station-primary": "four",
+            "station-secondary": "fiveArm",
+        }
+        provisioner = get_provisioner(
+            contract,
+            station_profiles=bindings,
+            service_profiles={"relay": "one"},
+        )
+
+        self.assertIsInstance(
+            provisioner,
+            MobileSocialSimulatorProvisioner,
+        )
+        self.assertEqual(
+            provisioner._required_station_profiles(),
+            bindings,
+        )
+        self.assertEqual(
+            provisioner._required_service_profiles(),
+            {"relay": "one"},
+        )
+
+    def test_social_simulator_rejects_invalid_station_profile_sets(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+
+        for bindings in (
+            {"station-primary": "four"},
+            {
+                "station-primary": "four",
+                "station-secondary": "fiveArm",
+                "station-extra": "six",
+            },
+            {
+                "station-primary": "four",
+                "station-secondary": "four",
+            },
+            {
+                "station-primary": "../four",
+                "station-secondary": "fiveArm",
+            },
+        ):
+            with self.subTest(bindings=bindings):
+                provisioner = get_provisioner(
+                    contract,
+                    station_profiles=bindings,
+                )
+                with self.assertRaises(BlockedError):
+                    provisioner._required_station_profiles()
+
+    def test_social_simulator_rejects_invalid_service_profile_sets(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+
+        for bindings in (
+            {"station-primary": "four"},
+            {"relay": "../one"},
+        ):
+            with self.subTest(bindings=bindings):
+                provisioner = get_provisioner(
+                    contract,
+                    service_profiles=bindings,
+                )
+                with self.assertRaises(BlockedError):
+                    provisioner._required_service_profiles()
+
+    def test_social_simulator_injects_station_profiles_in_memory(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            station_profiles={
+                "station-primary": "four",
+                "station-secondary": "fiveArm",
+            },
+        )
+        active = {
+            "PT_DEV_PROFILE": "four",
+            "PT_RELAY_URL": "https://relay.example",
+            "PT_RELAY_DEPLOY_ENV": "relay",
+        }
+        station_profiles = {
+            "four": {
+                "PT_DEV_PROFILE": "four",
+                "PT_STATION_MODE": "remote",
+                "PT_STATION_URL": "https://four.example",
+                "PT_STATION_DEPLOY_ENV": "station-four",
+            },
+            "fiveArm": {
+                "PT_DEV_PROFILE": "fiveArm",
+                "PT_STATION_MODE": "remote",
+                "PT_STATION_URL": "https://five.example",
+                "PT_STATION_DEPLOY_ENV": "station-five-arm",
+            },
+        }
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_reviewed_profile_environment",
+                side_effect=lambda profile_name: (
+                    Path(
+                        f"/canonical/{profile_name}/"
+                        "profile.env.example"
+                    ),
+                    station_profiles[profile_name],
+                ),
+            ),
+        ):
+            merged = provisioner._inject_station_profile_bindings(active)
+
+        self.assertEqual(
+            merged,
+            {
+                **active,
+                "PT_MOBILE_STATION_PRIMARY_URL": "https://four.example",
+                "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "station-four",
+                "PT_MOBILE_STATION_SECONDARY_URL": "https://five.example",
+                "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "station-five-arm",
+            },
+        )
+        self.assertNotIn("PT_MOBILE_STATION_PRIMARY_URL", active)
+
+    def test_social_simulator_injects_relay_profile_in_memory(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            service_profiles={"relay": "one"},
+        )
+        active = {
+            "PT_DEV_PROFILE": "four",
+            "PT_RELAY_URL": "https://stale-relay.example",
+            "PT_RELAY_DEPLOY_ENV": "relay",
+        }
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_reviewed_profile_environment",
+                return_value=(
+                    Path("/canonical/one/profile.env.example"),
+                    {
+                        "PT_DEV_PROFILE": "one",
+                        "PT_RELAY_MODE": "remote",
+                        "PT_RELAY_URL": "https://relay.example",
+                        "PT_RELAY_HEALTH_URL": (
+                            "https://relay.example/healthz"
+                        ),
+                        "PT_RELAY_DEPLOY_ENV": "relay-1",
+                    },
+                ),
+            ),
+        ):
+            merged = provisioner._inject_service_profile_bindings(active)
+
+        self.assertEqual(merged["PT_RELAY_URL"], "https://relay.example")
+        self.assertEqual(merged["PT_RELAY_DEPLOY_ENV"], "relay-1")
+        self.assertEqual(
+            merged["PT_RELAY_HEALTH_URL"],
+            "https://relay.example/healthz",
+        )
+        self.assertEqual(active["PT_RELAY_DEPLOY_ENV"], "relay")
+
+    def test_mobile_relay_embeds_reviewed_trust_anchor_for_build(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        certificate = (
+            b"-----BEGIN CERTIFICATE-----\n"
+            b"YWJj\n"
+            b"-----END CERTIFICATE-----\n"
+        )
+        digest = "sha256:" + hashlib.sha256(certificate).hexdigest()
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            relay_trust_anchor_provider=lambda _: (certificate, digest),
+        )
+        environment, trust = provisioner._resolve_transport_trust(
+            "station-access-mobile-relay-native-e2e",
+            {
+                "relay": MobileServiceBinding(
+                    service_id="relay",
+                    kind="relay",
+                    endpoint="https://relay.example:18081",
+                    deployment_environment="relay-1",
+                    producer="relay-deployment",
+                )
+            },
+        )
+
+        self.assertEqual(
+            base64.b64decode(
+                environment["PT_ACCEPTANCE_RELAY_CA_DER_B64"]
+            ),
+            b"abc",
+        )
+        self.assertEqual(
+            environment["PT_ACCEPTANCE_RELAY_CA_SHA256"],
+            digest,
+        )
+        self.assertEqual(trust["relay"]["sha256"], digest)
+        self.assertEqual(
+            trust["relay"]["mechanism"],
+            "embedded-rustls-root",
+        )
+        provisioner._transport_environment = environment
+        base = provisioner._new_base_provisioner(
+            EnvironmentContract.from_yaml(
+                ENVIRONMENTS_DIR / "mobile-simulator.yaml"
+            ),
+            "a" * 40,
+        )
+        self.assertIsInstance(base, SelectedMobileSimulatorProvisioner)
+        self.assertEqual(base.build_environment, environment)
+
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "ssl.create_default_context",
+                return_value=object(),
+            ) as create_context,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "urllib.request.urlopen",
+                return_value=response,
+            ),
+        ):
+            self.assertTrue(
+                provisioner._service_ready(
+                    MobileServiceBinding(
+                        service_id="relay",
+                        kind="relay",
+                        endpoint="https://relay.example:18081",
+                        health_endpoint="https://relay.example:18081/healthz",
+                        deployment_environment="relay-1",
+                        producer="relay-deployment",
+                    )
+                )
+            )
+        create_context.assert_called_once_with(
+            cadata=certificate.decode("ascii")
+        )
+
+    def test_mobile_relay_prepares_and_owns_station_attachment(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-relay-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        certificate = b"reviewed-relay-ca"
+        digest = "sha256:" + hashlib.sha256(certificate).hexdigest()
+        events: list[object] = []
+
+        class RelayAttachmentFixture:
+            def __init__(self, *, register_cleanup) -> None:
+                self.register_cleanup = register_cleanup
+                events.append(("register-cleanup", register_cleanup))
+
+            def prepare(self, **kwargs: object) -> None:
+                events.append(("prepare", kwargs))
+                self.register_cleanup("test-relay-attachment", self.cleanup)
+
+            def cleanup(self) -> None:
+                events.append("cleanup")
+
+        provisioner = MobileRelaySimulatorProvisioner(
+            contract,
+            relay_trust_anchor_provider=lambda _: (certificate, digest),
+            relay_attachment_fixture_factory=RelayAttachmentFixture,
+        )
+        manifest = new_manifest(
+            environment_id="mobile-relay-simulator",
+            gate_id="station-access-mobile-relay-native-e2e",
+            requested_profile="mobile-relay-simulator",
+            resolved_profile="mobile-relay-simulator",
+            slot=0,
+            commit="a" * 40,
+            worktree="/tmp/worktree",
+            workspace_digest="clean",
+        )
+        service_bindings = {
+            "station-primary": MobileServiceBinding(
+                service_id="station-primary",
+                kind="station",
+                endpoint="https://station.example",
+                deployment_environment="station-four",
+                producer="station-deployment",
+            ),
+            "relay": MobileServiceBinding(
+                service_id="relay",
+                kind="relay",
+                endpoint="https://relay.example:18081",
+                health_endpoint="https://relay.example:18081/healthz",
+                deployment_environment="relay-1",
+                producer="relay-deployment",
+            ),
+        }
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "_station_runtime_config",
+                return_value="station-config",
+            ) as station_runtime_config,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "_relay_peer_identity",
+                return_value="relay-peer",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "PosixServiceRuntimeConfig.load",
+                return_value="relay-config",
+            ),
+        ):
+            provisioner._prepare_service_fixtures(
+                "station-access-mobile-relay-native-e2e",
+                manifest,
+                service_bindings,
+            )
+
+        station_runtime_config.assert_called_once_with(
+            "station-four",
+            station_url="https://station.example",
+            allow_profile_managed=True,
+        )
+        self.assertEqual(events[0], ("register-cleanup", provisioner.register_cleanup))
+        prepared = events[1]
+        self.assertIsInstance(prepared, tuple)
+        _, kwargs = prepared
+        self.assertEqual(
+            kwargs,
+            {
+                "manifest": manifest,
+                "station_config": "station-config",
+                "station_url": "https://station.example",
+                "relay_url": "https://relay.example:18081",
+                "relay_peer_id": "relay-peer",
+                "relay_config": "relay-config",
+                "trust_anchor": certificate,
+            },
+        )
+        self.assertEqual(
+            provisioner.cleanup(),
+            ("test-relay-attachment",),
+        )
+        self.assertEqual(events[-1], "cleanup")
+
+    def test_social_simulator_preserves_base_harness_actions(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertLessEqual(
+            set(REQUIRED_HARNESS_ACTIONS),
+            set(payload["harness"]["required_actions"]),
+        )
+
+    def test_social_environment_failure_blocks_before_resource_acquisition(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+
+        class Base:
+            def __init__(self, _contract: EnvironmentContract) -> None:
+                raise AssertionError(
+                    "base simulator must not be constructed before the overlay"
+                )
+
+        for gate_id in (
+            "mobile-simulator-social-convergence-e2e",
+            "mobile-simulator-chat-contacts-e2e",
+        ):
+            with self.subTest(gate_id=gate_id):
+                provisioner = MobileSocialSimulatorProvisioner(
+                    contract,
+                    base_factory=Base,
+                    overlay_path=path,
+                )
+                with (
+                    patch.object(
+                        provisioner,
+                        "_load_overlay",
+                        side_effect=BlockedError(
+                            reason="environment unavailable",
+                            resource="mobile-social-simulator:environment",
+                        ),
+                    ) as load_overlay,
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "resolve_mobile_service_bindings"
+                    ) as resolve_bindings,
+                    patch.object(
+                        provisioner,
+                        "acquire_profile_lease",
+                    ) as acquire_profile_lease,
+                    patch.object(
+                        provisioner,
+                        "acquire_remote_git_source_lease",
+                    ) as acquire_source_lease,
+                    patch(
+                        "tooling.acceptance.provisioners.mobile_simulator."
+                        "verify_reset_target"
+                    ) as verify_target,
+                    patch.object(
+                        provisioner,
+                        "_attest_services",
+                    ) as attest_services,
+                    patch.object(
+                        provisioner,
+                        "_prepare_actor_fixture",
+                    ) as prepare_fixture,
+                ):
+                    manifest = provisioner.provision(gate_id)
+
+                self.assertEqual(
+                    manifest.state,
+                    ProvisioningState.BLOCKED,
+                )
+                self.assertEqual(
+                    manifest.blocked_resource,
+                    "mobile-social-simulator:environment",
+                )
+                load_overlay.assert_called_once()
+                resolve_bindings.assert_not_called()
+                acquire_profile_lease.assert_not_called()
+                acquire_source_lease.assert_not_called()
+                verify_target.assert_not_called()
+                attest_services.assert_not_called()
+                prepare_fixture.assert_not_called()
+
+    def test_social_service_attestation_uses_remote_source_owner(self) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            overlay_path=path,
+        )
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_STATION_PRIMARY_URL": (
+                    "https://station-primary.example"
+                ),
+                "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "deploy-primary",
+                "PT_MOBILE_STATION_SECONDARY_URL": (
+                    "https://station-secondary.example"
+                ),
+                "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "deploy-secondary",
+                "PT_RELAY_URL": "https://relay.example",
+                "PT_RELAY_DEPLOY_ENV": "deploy-relay",
+                "PT_RELAY_HEALTH_URL": (
+                    "https://relay.example/sub-oss/healthz"
+                ),
+            },
+        )
+
+        with (
+            patch.object(provisioner, "_service_ready", return_value=True),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "produce_station_attestation",
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    runtime_identity=f"peer-{kwargs['service_id']}"
+                ),
+            ) as station_producer,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "produce_service_attestation",
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    runtime_identity=f"peer-{kwargs['service_id']}"
+                ),
+            ) as service_producer,
+        ):
+            services = provisioner._attest_services("run-id", bindings)
+
+        self.assertEqual(
+            set(services),
+            {"station-primary", "station-secondary", "relay"},
+        )
+        for call in station_producer.call_args_list:
+            self.assertIs(
+                call.kwargs["remote_source_identity_provider"],
+                mobile_simulator_module.resolve_remote_source_identity,
+            )
+        self.assertIs(
+            service_producer.call_args.kwargs[
+                "remote_source_identity_provider"
+            ],
+            mobile_simulator_module.resolve_remote_source_identity,
+        )
+        self.assertIs(
+            service_producer.call_args.kwargs[
+                "runtime_version_provider"
+            ],
+            mobile_simulator_module.resolve_service_version,
+        )
+
+    def test_social_actor_fixture_resolves_each_role_in_its_deployment(
+        self,
+    ) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            overlay_path=path,
+            station_profiles={
+                "station-primary": "profile-primary",
+                "station-secondary": "profile-secondary",
+            },
+        )
+        evidence = FakeEvidenceRun()
+        provisioner.bind_evidence_run(evidence)  # type: ignore[arg-type]
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_STATION_PRIMARY_URL": (
+                    "https://station-primary.example"
+                ),
+                "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "deploy-primary",
+                "PT_MOBILE_STATION_SECONDARY_URL": (
+                    "https://station-secondary.example"
+                ),
+                "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "deploy-secondary",
+                "PT_RELAY_URL": "https://relay.example",
+                "PT_RELAY_DEPLOY_ENV": "deploy-relay",
+                "PT_RELAY_HEALTH_URL": (
+                    "https://relay.example/sub-oss/healthz"
+                ),
+            },
+        )
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                side_effect=lambda endpoint, _deployment, role: SimpleNamespace(
+                    role=role,
+                    account_ref=f"station-account:{role}@p.t",
+                    ptid=f"ptid:{role}",
+                    device_policy="single-active-session",
+                    display_name=f"Canonical {role.title()}",
+                    federated_handle=f"@{role}@station.example",
+                    home_station_peer_id=(
+                        "station-primary"
+                        if "primary" in endpoint
+                        else "station-secondary"
+                    ),
+                ),
+            ) as resolve_actor,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_federation_contexts",
+                return_value=(
+                    "fed_chat_"
+                    + hashlib.sha256(
+                        b"station-primary\x00station-secondary"
+                    ).hexdigest()[:20]
+                ),
+            ) as prepare_federation,
+        ):
+            provisioner._prepare_actor_fixture(
+                "mobile-simulator-social-convergence-e2e",
+                bindings,
+                provisioner._load_overlay(),
+            )
+
+        self.assertEqual(
+            resolve_actor.call_args_list,
+            [
+                call(
+                    "https://station-primary.example",
+                    "deploy-primary",
+                    "alice",
+                ),
+                call(
+                    "https://station-primary.example",
+                    "deploy-primary",
+                    "bob",
+                ),
+                call(
+                    "https://station-secondary.example",
+                    "deploy-secondary",
+                    "alice",
+                ),
+                call(
+                    "https://station-secondary.example",
+                    "deploy-secondary",
+                    "bob",
+                ),
+            ],
+        )
+        actor_payload = evidence.writes[-1][1]
+        actors = [
+            actor
+            for station in actor_payload["stations"].values()
+            for actor in station["actors"]
+        ]
+        self.assertTrue(
+            all(actor["federatedHandle"] for actor in actors)
+        )
+        self.assertEqual(
+            {actor["displayName"] for actor in actors},
+            {"Canonical Alice", "Canonical Bob"},
+        )
+        self.assertEqual(
+            {actor["homeStationPeerId"] for actor in actors},
+            {"station-primary", "station-secondary"},
+        )
+        self.assertEqual(
+            len({actor["federationId"] for actor in actors}),
+            1,
+        )
+        self.assertTrue(actors[0]["federationId"])
+        prepare_federation.assert_called_once()
+
+    def test_two_actor_fixture_reset_binds_every_station_profile(
+        self,
+    ) -> None:
+        # Regression: a two-Station provisioner must publish one reviewed
+        # Profile binding per Station before any fixture reset, otherwise the
+        # secondary Station reset falls back to the single active Profile and
+        # the fail-closed target guard rejects it.
+        path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            overlay_path=path,
+            station_profiles={
+                "station-primary": "profile-primary",
+                "station-secondary": "profile-secondary",
+            },
+        )
+        evidence = FakeEvidenceRun()
+        provisioner.bind_evidence_run(evidence)  # type: ignore[arg-type]
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_STATION_PRIMARY_URL": (
+                    "https://station-primary.example"
+                ),
+                "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "deploy-primary",
+                "PT_MOBILE_STATION_SECONDARY_URL": (
+                    "https://station-secondary.example"
+                ),
+                "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "deploy-secondary",
+                "PT_RELAY_URL": "https://relay.example",
+                "PT_RELAY_DEPLOY_ENV": "deploy-relay",
+                "PT_RELAY_HEALTH_URL": (
+                    "https://relay.example/sub-oss/healthz"
+                ),
+            },
+        )
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                side_effect=lambda endpoint, _deployment, role: SimpleNamespace(
+                    role=role,
+                    account_ref=f"station-account:{role}@p.t",
+                    ptid=f"ptid:{role}",
+                    device_policy="single-active-session",
+                    display_name=f"Canonical {role.title()}",
+                    federated_handle=f"@{role}@station.example",
+                    home_station_peer_id=(
+                        "station-primary"
+                        if "primary" in endpoint
+                        else "station-secondary"
+                    ),
+                ),
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_federation_contexts",
+                return_value=(
+                    "fed_chat_"
+                    + hashlib.sha256(
+                        b"station-primary\x00station-secondary"
+                    ).hexdigest()[:20]
+                ),
+            ),
+        ):
+            provisioner._prepare_actor_fixture(
+                "mobile-simulator-social-convergence-e2e",
+                bindings,
+                provisioner._load_overlay(),
+            )
+
+        bound_profiles = {
+            profile
+            for call_args in self.bound_reset_profiles.call_args_list
+            for profile in call_args.args[0]
+        }
+        self.assertEqual(
+            bound_profiles,
+            {"profile-primary", "profile-secondary"},
+        )
+
+    def test_session_class_fixture_omits_unbound_federation_target(
+        self,
+    ) -> None:
+        path = ENVIRONMENTS_DIR / "chat-mixed-native.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = ChatMixedNativeProvisioner(
+            contract,
+            overlay_path=path,
+            station_profiles={
+                "station-primary": "profile-primary",
+                "station-secondary": "profile-secondary",
+            },
+        )
+        evidence = FakeEvidenceRun()
+        provisioner.bind_evidence_run(evidence)  # type: ignore[arg-type]
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_STATION_PRIMARY_URL": (
+                    "https://station-primary.example"
+                ),
+                "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "deploy-primary",
+                "PT_MOBILE_STATION_SECONDARY_URL": (
+                    "https://station-secondary.example"
+                ),
+                "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "deploy-secondary",
+            },
+        )
+        overlay = provisioner._load_overlay()
+        clients = provisioner._clients_for_gate(
+            "station-access-session-class-suite-e2e",
+            overlay,
+        )
+        expected_federation_id = (
+            "fed_chat_"
+            + hashlib.sha256(b"station-primary").hexdigest()[:20]
+        )
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                side_effect=lambda endpoint, _deployment, role: SimpleNamespace(
+                    role=role,
+                    account_ref=f"station-account:{role}@p.t",
+                    ptid=f"ptid:{endpoint}:{role}",
+                    device_policy="single-active-session",
+                    display_name=f"Canonical {role.title()}",
+                    federated_handle=f"@{role}@station.example",
+                    home_station_peer_id=(
+                        "station-primary"
+                        if "primary" in endpoint
+                        else "station-secondary"
+                    ),
+                ),
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_bound_friendships",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_federation_contexts",
+                return_value=expected_federation_id,
+            ) as prepare_federation,
+        ):
+            provisioner._prepare_actor_fixture(
+                "station-access-session-class-suite-e2e",
+                bindings,
+                overlay,
+                clients=clients,
+            )
+
+        targets = prepare_federation.call_args.args[0]
+        self.assertEqual(set(targets), {"station-primary"})
+        self.assertEqual(
+            targets["station-primary"][2],
+            ("alice", "bob"),
+        )
+
+    def test_session_class_public_resources_preserve_identity_sources(
+        self,
+    ) -> None:
+        overlay = json.loads(
+            (
+                ENVIRONMENTS_DIR / "chat-mixed-native.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        assignments = {
+            "desktop-bob": {
+                "actor": "bob",
+                "serviceId": "station-primary",
+            },
+            "sim-ios": {
+                "actor": "bob",
+                "serviceId": "station-primary",
+                "identitySourceClientId": "desktop-bob",
+            },
+            "sim-ios-peer": {
+                "actor": "bob",
+                "serviceId": "station-primary",
+                "identitySourceClientId": "desktop-bob",
+            },
+        }
+        resources = {
+            "appium": {
+                "serverVersion": "2.19.0",
+                "expectedServerVersion": "2.19.0",
+                "drivers": {
+                    "ios": {
+                        "identity": "appium-xcuitest-driver",
+                        "automationName": "XCUITest",
+                        "version": "9.10.5",
+                        "expectedVersion": "9.10.5",
+                    },
+                },
+            },
+            "applications": {
+                "ios": {
+                    "id": "com.peers.touch.mobile",
+                    "sha256": "a" * 64,
+                    "callbackScheme": "peers-touch",
+                },
+            },
+            "clients": {
+                "sim-ios": {
+                    "platform": "ios",
+                    "role": "primary-simulator",
+                    "runtime": "tauri-ios-simulator",
+                    "deviceRole": "primary-simulator",
+                    "profile": "sim-ios",
+                },
+                "sim-ios-peer": {
+                    "platform": "ios",
+                    "role": "peer-simulator",
+                    "runtime": "tauri-ios-simulator",
+                    "deviceRole": "peer-simulator",
+                    "profile": "sim-ios-peer",
+                },
+            },
+            "clientAssignments": assignments,
+        }
+
+        projected = (
+            MobileStationLifecycleSimulatorProvisioner
+            ._public_simulator_resources(
+                resources,
+                overlay,
+                environment_id="chat-mixed-native",
+            )
+        )
+
+        self.assertEqual(
+            projected["clientAssignments"],
+            {
+                "sim-ios": assignments["sim-ios"],
+                "sim-ios-peer": assignments["sim-ios-peer"],
+            },
+        )
+
+    def test_direct_actor_fixture_resolves_both_roles_on_same_station(
+        self,
+    ) -> None:
+        path = ENVIRONMENTS_DIR / "mobile-direct-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(path)
+        provisioner = MobileDirectSimulatorProvisioner(
+            contract,
+            overlay_path=path,
+        )
+        evidence = FakeEvidenceRun()
+        provisioner.bind_evidence_run(evidence)  # type: ignore[arg-type]
+        bindings = resolve_mobile_service_bindings(
+            contract,
+            path,
+            environment={
+                "PT_MOBILE_DIRECT_STATION_URL": (
+                    "https://direct.example"
+                ),
+                "PT_MOBILE_DIRECT_STATION_DEPLOY_ENV": (
+                    "chat-native-disposable-station"
+                ),
+            },
+        )
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+            ) as reset,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                side_effect=lambda _endpoint, _deployment, role: SimpleNamespace(
+                    role=role,
+                    account_ref=f"station-account:{role}@p.t",
+                    ptid=f"ptid:{role}",
+                    device_policy="single-active-session",
+                    display_name=f"Canonical {role.title()}",
+                    federated_handle=f"@{role}@direct",
+                    home_station_peer_id="station-direct",
+                ),
+            ) as resolve_actor,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_federation_contexts",
+                return_value=(
+                    "fed_chat_"
+                    + hashlib.sha256(b"station-direct").hexdigest()[:20]
+                ),
+            ) as prepare_federation,
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "prepare_local_friend_request_lifecycle",
+            ) as prepare_friend_request,
+        ):
+            provisioner._prepare_actor_fixture(
+                "mobile-simulator-recovery-e2e",
+                bindings,
+                provisioner._load_overlay(),
+            )
+
+        reset.assert_called_once_with(
+            "chat-native-disposable-station",
+            ("alice", "bob"),
+            reset_authorized=True,
+        )
+        self.assertEqual(
+            resolve_actor.call_args_list,
+            [
+                call(
+                    "https://direct.example",
+                    "chat-native-disposable-station",
+                    "alice",
+                ),
+                call(
+                    "https://direct.example",
+                    "chat-native-disposable-station",
+                    "bob",
+                ),
+            ],
+        )
+        actor_payload = evidence.writes[-1][1]
+        self.assertEqual(set(actor_payload["stations"]), {"station"})
+        self.assertEqual(
+            {
+                client["id"]: client["serviceId"]
+                for client in actor_payload["clients"]
+            },
+            {
+                "sim-ios": "station",
+                "sim-ios-peer": "station",
+            },
+        )
+        self.assertEqual(
+            {
+                actor["homeStationPeerId"]
+                for actor in actor_payload["stations"]["station"]["actors"]
+            },
+            {"station-direct"},
+        )
+        prepare_friend_request.assert_called_once_with(
+            "chat-native-disposable-station",
+            "ptid:alice",
+            "ptid:bob",
+            reset_authorized=True,
+        )
+        self.assertTrue(
+            actor_payload["stations"]["station"][
+                "friendRequestLifecyclePrepared"
+            ]
+        )
+        prepare_federation.assert_called_once_with({
+            "station": (
+                "https://direct.example",
+                "chat-native-disposable-station",
+                ("alice", "bob"),
+            ),
+        })
+
+    def test_station_lifecycle_overlay_has_exact_topology_and_bindings(
+        self,
+    ) -> None:
+        path = (
+            ENVIRONMENTS_DIR / "mobile-station-lifecycle-simulator.yaml"
+        )
+        contract = EnvironmentContract.from_yaml(path)
+        spec = load_mobile_station_lifecycle_simulator_spec(path)
+
+        self.assertEqual(
+            contract.id,
+            STATION_LIFECYCLE_ENVIRONMENT_ID,
+        )
+        self.assertEqual(
+            set(contract.services),
+            {"station-primary", "station-secondary"},
+        )
+        self.assertFalse(contract.profile.required)
+        self.assertFalse(contract.profile.identity_match)
+        self.assertTrue(
+            all(
+                service.kind == "station"
+                for service in contract.services.values()
+            )
+        )
+        self.assertEqual(
+            {
+                client.id: client.required_service_roles
+                for client in contract.clients
+            },
+            {
+                "sim-ios": (
+                    "station-primary",
+                    "station-secondary",
+                ),
+                "sim-ios-peer": ("station-primary",),
+            },
+        )
+        self.assertEqual(
+            set(spec.harness_actions),
+            STATION_LIFECYCLE_HARNESS_ACTIONS,
+        )
+        self.assertIn(
+            "mobile-simulator-settings-e2e",
+            STATION_BOUND_SIMULATOR_GATE_IDS,
+        )
+        self.assertIn("settings.profile.update", spec.harness_actions)
+        self.assertIn("settings.notifications.update", spec.harness_actions)
+        self.assertIn("settings.device.update", spec.harness_actions)
+        self.assertEqual(contract.credentials, ())
+        self.assertIsInstance(
+            get_provisioner(contract),
+            MobileStationLifecycleSimulatorProvisioner,
+        )
+
+    def test_social_simulator_composes_base_runtime_without_credentials(
+        self,
+    ) -> None:
+        social_path = ENVIRONMENTS_DIR / "mobile-social-simulator.yaml"
+        contract = EnvironmentContract.from_yaml(social_path)
+        base_manifest = _with_simulator_resources(
+            dataclasses.replace(
+                new_manifest(
+                    environment_id="mobile-simulator",
+                    gate_id="mobile-simulator-social-convergence-e2e",
+                    requested_profile="mobile-simulator",
+                    resolved_profile="mobile-simulator",
+                    slot=0,
+                    commit="a" * 40,
+                    worktree="/tmp/worktree",
+                    workspace_digest="dirty:test",
+                ),
+                state=ProvisioningState.FIXTURE_READY,
+                clients=(
+                    ClientRuntime(
+                        actor="simulator",
+                        runtime="tauri-ios-simulator",
+                        worktree="/tmp/worktree",
+                        gateway_port=1,
+                        renderer_port=2,
+                        webdriver_port=3,
+                        profile="sim-ios",
+                        storage_root="/tmp/sim-ios",
+                    ),
+                    ClientRuntime(
+                        actor="peer-simulator",
+                        runtime="tauri-ios-simulator",
+                        worktree="/tmp/worktree",
+                        gateway_port=4,
+                        renderer_port=5,
+                        webdriver_port=6,
+                        profile="sim-ios-peer",
+                        storage_root="/tmp/sim-ios-peer",
+                    ),
+                ),
+            ),
+            {
+                "appium": {},
+                "applications": {},
+                "clients": {},
+                "harness": {},
+                "proofScope": {},
+            },
+        )
+
+        class Base:
+            def __init__(self, _contract: EnvironmentContract) -> None:
+                self.evidence_run = None
+
+            def bind_evidence_run(self, run: object) -> None:
+                self.evidence_run = run
+
+            def provision(self, _gate_id: str) -> object:
+                return base_manifest
+
+            @staticmethod
+            def cleanup() -> tuple[str, ...]:
+                return ()
+
+        def attestation(service_id: str, kind: str) -> ServiceAttestation:
+            return ServiceAttestation(
+                service_id=service_id,
+                service_kind=kind,
+                environment_id="mobile-social-simulator",
+                deployment_environment=f"deploy-{service_id}",
+                endpoint=f"https://{service_id}.example",
+                live_commit="a" * 40,
+                workspace_digest="clean",
+                protocol_digest="b" * 64,
+                artifact_ref={},
+                produced_at="2026-09-04T00:00:00+00:00",
+                producer=f"{kind}-deployment",
+                runtime_identity=f"peer-{service_id}",
+            )
+
+        provisioner = MobileSocialSimulatorProvisioner(
+            contract,
+            base_factory=Base,
+            overlay_path=social_path,
+            station_profiles={"station-primary": "primary", "station-secondary": "secondary"},
+            service_profiles={"relay": "relay"},
+        )
+        provisioner.bind_evidence_run(object())  # type: ignore[arg-type]
+        services = {
+            "station-primary": attestation("station-primary", "station"),
+            "station-secondary": attestation("station-secondary", "station"),
+            "relay": attestation("relay", "relay"),
+        }
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator.resolve_reviewed_profile_environment",
+                side_effect=lambda profile: (
+                    Path(f"/canonical/{profile}/profile.env.example"),
+                    {
+                        "PT_STATION_MODE": "remote",
+                        "PT_STATION_URL": f"https://station-{profile}.example",
+                        "PT_STATION_DEPLOY_ENV": f"station-{profile}",
+                        "PT_RELAY_MODE": "remote",
+                        "PT_RELAY_URL": "https://relay.example",
+                        "PT_RELAY_DEPLOY_ENV": "relay",
+                        "PT_RELAY_HEALTH_URL": "https://relay.example/sub-oss/healthz",
+                    },
+                ),
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "PT_MOBILE_STATION_PRIMARY_URL": (
+                        "https://station-primary.example"
+                    ),
+                    "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": (
+                        "station-primary"
+                    ),
+                    "PT_MOBILE_STATION_SECONDARY_URL": (
+                        "https://station-secondary.example"
+                    ),
+                    "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": (
+                        "station-secondary"
+                    ),
+                    "PT_RELAY_URL": "https://relay.example",
+                    "PT_RELAY_DEPLOY_ENV": "relay",
+                    "PT_RELAY_HEALTH_URL": (
+                        "https://relay.example/sub-oss/healthz"
+                    ),
+                },
+                clear=False,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch.object(
+                provisioner,
+                "acquire_profile_lease",
+            ),
+            patch.object(
+                provisioner,
+                "acquire_remote_git_source_lease",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch.object(
+                provisioner,
+                "_attest_services",
+                return_value=services,
+            ),
+            patch.object(
+                provisioner,
+                "_prepare_actor_fixture",
+                return_value={"artifactKind": "acceptance-artifact-ref"},
+            ),
+        ):
+            manifest = provisioner.provision(
+                "mobile-simulator-social-convergence-e2e"
+            )
+
+        payload = manifest.to_dict()
+        self.assertEqual(
+            manifest.state,
+            ProvisioningState.FIXTURE_READY,
+        )
+        self.assertEqual(payload["environmentId"], "mobile-social-simulator")
+        self.assertEqual(payload["credentialRefs"], [])
+        self.assertEqual(
+            {
+                client["id"]: client["service_bindings"]["station"][
+                    "service_id"
+                ]
+                for client in payload["clients"]
+            },
+            {
+                "sim-ios": "station-primary",
+                "sim-ios-peer": "station-secondary",
+            },
+        )
+        self.assertIn(
+            "social.projection.read",
+            payload["mobileSimulator"]["harness"]["requiredActions"],
+        )
+
+    def test_android_tools_resolve_from_sdk_when_not_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sdk_root = Path(directory)
+            emulator = sdk_root / "emulator" / "emulator"
+            adb = sdk_root / "platform-tools" / "adb"
+            for executable in (emulator, adb):
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("", encoding="utf-8")
+                executable.chmod(0o755)
+
+            environment = {
+                "ANDROID_HOME": str(sdk_root),
+                "PATH": "",
+            }
+            self.assertEqual(
+                _resolve_command(("emulator", "-list-avds"), environment)[0],
+                str(emulator),
+            )
+            self.assertEqual(
+                _resolve_command(("adb", "devices"), environment)[0],
+                str(adb),
+            )
+
+    def test_explicit_ndk_home_wins_over_ambiguous_sdk_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            explicit = _write_valid_ndk(root / "explicit-ndk")
+            sdk_root = root / "sdk"
+            _write_valid_ndk(sdk_root / "ndk" / "26.0.0")
+            _write_valid_ndk(sdk_root / "ndk" / "27.0.0")
+
+            resolved = _resolve_android_ndk_home(
+                {
+                    "NDK_HOME": str(explicit),
+                    "ANDROID_HOME": str(sdk_root),
+                }
+            )
+
+        self.assertEqual(resolved, str(explicit))
+
+    def test_ndk_home_is_discovered_from_single_sdk_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sdk_root = Path(directory) / "sdk"
+            expected = _write_valid_ndk(
+                sdk_root / "ndk" / "27.0.11902837"
+            )
+
+            resolved = _resolve_android_ndk_home(
+                {"ANDROID_SDK_ROOT": str(sdk_root)}
+            )
+
+        self.assertEqual(resolved, str(expected))
+
+    def test_invalid_explicit_ndk_home_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory) / "not-an-ndk"
+            invalid.mkdir()
+
+            with self.assertRaises(BlockedError) as raised:
+                _resolve_android_ndk_home({"NDK_HOME": str(invalid)})
+
+        self.assertEqual(
+            raised.exception.resource,
+            "mobile-simulator:android-ndk-home",
+        )
+
+    def test_missing_sdk_ndk_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sdk_root = Path(directory) / "sdk"
+            sdk_root.mkdir()
+
+            with self.assertRaises(BlockedError) as raised:
+                _resolve_android_ndk_home({"ANDROID_HOME": str(sdk_root)})
+
+        self.assertEqual(
+            raised.exception.resource,
+            "mobile-simulator:android-ndk-discovery",
+        )
+
+    def test_ambiguous_sdk_ndks_require_explicit_ndk_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sdk_root = Path(directory) / "sdk"
+            _write_valid_ndk(sdk_root / "ndk" / "26.0.0")
+            _write_valid_ndk(sdk_root / "ndk" / "27.0.0")
+
+            with self.assertRaises(BlockedError) as raised:
+                _resolve_android_ndk_home({"ANDROID_HOME": str(sdk_root)})
+
+        self.assertEqual(
+            raised.exception.resource,
+            "mobile-simulator:android-ndk-discovery",
+        )
+
+    def test_ndk_tool_resolution_requires_one_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ndk_home = _write_valid_ndk(Path(directory) / "ndk")
+            expected = (
+                ndk_home
+                / "toolchains"
+                / "llvm"
+                / "prebuilt"
+                / "test-host"
+                / "bin"
+                / "llvm-ranlib"
+            )
+
+            resolved = _resolve_android_ndk_tool(
+                str(ndk_home),
+                "llvm-ranlib",
+            )
+
+            self.assertEqual(resolved, str(expected))
+
+    def test_android_manifest_guard_restores_generated_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "AndroidManifest.xml"
+            baseline = (
+                "<activity>\n"
+                f"  {mobile_simulator_module.ANDROID_DEEP_LINK_MARKER}\n"
+                "  <data android:path=\"/callback\" />\n"
+                f"  {mobile_simulator_module.ANDROID_DEEP_LINK_MARKER}\n"
+                "</activity>\n"
+            ).encode()
+            manifest.write_bytes(baseline)
+            guard = _GeneratedAndroidManifestGuard(manifest)
+            manifest.write_bytes(
+                baseline.replace(
+                    b'  <data android:path="/callback" />\n',
+                    b'  <data android:path="/callback" />\n  \n  \n',
+                )
+            )
+
+            guard.restore()
+
+            self.assertEqual(manifest.read_bytes(), baseline)
+
+    def test_android_manifest_guard_rejects_semantic_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "AndroidManifest.xml"
+            baseline = (
+                "<activity>\n"
+                f"  {mobile_simulator_module.ANDROID_DEEP_LINK_MARKER}\n"
+                "  <data android:scheme=\"peers-touch\" />\n"
+                f"  {mobile_simulator_module.ANDROID_DEEP_LINK_MARKER}\n"
+                "</activity>\n"
+            ).encode()
+            manifest.write_bytes(baseline)
+            guard = _GeneratedAndroidManifestGuard(manifest)
+            changed = baseline.replace(b"peers-touch", b"other-scheme")
+            manifest.write_bytes(changed)
+
+            with self.assertRaises(ProvisioningError):
+                guard.restore()
+
+            self.assertEqual(manifest.read_bytes(), changed)
+
+    def test_provisioner_does_not_own_gate_or_session_execution(self) -> None:
+        self.assertFalse(
+            hasattr(mobile_simulator_module, "run_simulator_gate")
+        )
+        self.assertFalse(hasattr(mobile_simulator_module, "_manifest_object"))
+        self.assertFalse(hasattr(mobile_simulator_module, "AppiumSession"))
+
+    def test_desktop_profile_id_bounds_long_cross_station_environment(self) -> None:
+        # Regression: the 35-char cross-station environment id plus a 16-hex
+        # run id and the desktop client id produced a 66-char profile that
+        # native bootstrap rejected (active_profile::MAX_PROFILE_LEN = 64).
+        environment_id = (
+            mobile_simulator_module.SOCIAL_CROSS_STATION_MIXED_ENVIRONMENT_ID
+        )
+        run_id = "0a94dfce3b01c1df"
+        profile = mobile_simulator_module.ChatMixedNativeProvisioner._desktop_profile_id(
+            environment_id, run_id, "desktop-alice"
+        )
+
+        # Only the environment prefix is bounded; the run id and client id
+        # carry per-run uniqueness and survive whole.
+        self.assertEqual(
+            profile,
+            "social-cross-station-mobile-deskt"
+            "-0a94dfce3b01c1df-desktop-alice",
+        )
+        self.assertEqual(
+            len(profile),
+            mobile_simulator_module.ChatMixedNativeProvisioner.DESKTOP_PROFILE_ID_MAX_LEN,
+        )
+        self.assertTrue(
+            all(char.isalnum() or char in "-_." for char in profile),
+            profile,
+        )
+        self.assertTrue(profile.endswith(f"-{run_id}-desktop-alice"))
+
+    def test_desktop_profile_id_is_unchanged_when_it_fits(self) -> None:
+        profile = mobile_simulator_module.ChatMixedNativeProvisioner._desktop_profile_id(
+            "chat-mixed-native", "0a94dfce3b01c1df", "desktop-bob"
+        )
+        self.assertEqual(
+            profile, "chat-mixed-native-0a94dfce3b01c1df-desktop-bob"
+        )
+        self.assertLessEqual(
+            len(profile),
+            mobile_simulator_module.ChatMixedNativeProvisioner.DESKTOP_PROFILE_ID_MAX_LEN,
+        )
+
+    def test_desktop_profile_id_remains_distinct_per_client(self) -> None:
+        environment_id = (
+            mobile_simulator_module.SOCIAL_CROSS_STATION_MIXED_ENVIRONMENT_ID
+        )
+        run_id = "0a94dfce3b01c1df"
+        builder = mobile_simulator_module.ChatMixedNativeProvisioner._desktop_profile_id
+        profiles = {
+            builder(environment_id, run_id, client_id)
+            for client_id in ("desktop-alice", "desktop-bob")
+        }
+        self.assertEqual(len(profiles), 2)
+
+    def test_desktop_profile_id_rejects_suffix_that_overflows_limit(self) -> None:
+        # A 60-char run id makes the suffix alone longer than the 64-char
+        # boundary, so no prefix truncation can produce a valid profile.
+        with self.assertRaises(ValueError):
+            mobile_simulator_module.ChatMixedNativeProvisioner._desktop_profile_id(
+                "env", "a" * 60, "desktop-alice"
+            )
+
+
+class MobileStationLifecycleSimulatorProvisionerTests(unittest.TestCase):
+    def test_lifecycle_projector_keeps_scope_and_digests_nested_device_ids(
+        self,
+    ) -> None:
+        scope = {"deviceId": "device-one", "group": {}}
+        self.assertIs(
+            MobileStationLifecycleSimulatorProvisioner
+            ._project_lifecycle_harness_result(
+                "lifecycle.scope.read",
+                scope,
+            ),
+            scope,
+        )
+        self.assertIs(
+            mobile_simulator_module.ChatMixedNativeProvisioner
+            ._project_chat_harness_result(
+                "lifecycle.scope.read",
+                scope,
+            ),
+            scope,
+        )
+
+        projected = (
+            MobileStationLifecycleSimulatorProvisioner
+            ._project_lifecycle_harness_result(
+                "session.logout",
+                {
+                    "runtime": {"deviceId": "device-one"},
+                    "winningDeviceId": "device-two",
+                },
+            )
+        )
+
+        self.assertEqual(
+            projected,
+            {
+                "runtime": {
+                    "deviceIdentityDigest": hashlib.sha256(
+                        b"device-one"
+                    ).hexdigest(),
+                },
+                "winningDeviceIdentityDigest": hashlib.sha256(
+                    b"device-two"
+                ).hexdigest(),
+            },
+        )
+
+    def setUp(self) -> None:
+        self.contract_path = (
+            ENVIRONMENTS_DIR / "mobile-station-lifecycle-simulator.yaml"
+        )
+        self.contract = EnvironmentContract.from_yaml(self.contract_path)
+        self.evidence_run = FakeEvidenceRun()
+        equipment = patch(
+            "tooling.acceptance.provisioners.station_equipment.equip_station_profiles",
+        )
+        self.station_equipment = equipment.start()
+        self.addCleanup(equipment.stop)
+
+    def _attestation(self, service_id: str) -> ServiceAttestation:
+        return ServiceAttestation(
+            service_id=service_id,
+            service_kind="station",
+            environment_id=STATION_LIFECYCLE_ENVIRONMENT_ID,
+            deployment_environment=f"deploy-{service_id}",
+            endpoint=f"https://{service_id}.example",
+            live_commit="a" * 40,
+            workspace_digest="clean",
+            protocol_digest="b" * 64,
+            artifact_ref=ArtifactRef(
+                workspace_id="a" * 16,
+                gate_id="mobile-simulator-station-lifecycle-e2e",
+                run_id=self.evidence_run.run_id,
+                path=f"runtime/services/{service_id}/attestation.json",
+                sha256="c" * 64,
+                media_type="application/json",
+            ).to_dict(),
+            produced_at="2026-09-09T00:00:00+00:00",
+            producer="station-deployment",
+            runtime_identity=(
+                "peer-primary"
+                if service_id == "station-primary"
+                else "peer-secondary"
+            ),
+        )
+
+    def _base_manifest(self) -> object:
+        return _with_simulator_resources(
+            dataclasses.replace(
+                new_manifest(
+                    environment_id="mobile-simulator",
+                    gate_id="mobile-simulator-station-lifecycle-e2e",
+                    requested_profile="mobile-simulator",
+                    resolved_profile="mobile-simulator",
+                    slot=0,
+                    commit="a" * 40,
+                    worktree="/tmp/worktree",
+                    workspace_digest="dirty:test",
+                ),
+                state=ProvisioningState.FIXTURE_READY,
+                clients=(
+                    ClientRuntime(
+                        actor="simulator",
+                        runtime="tauri-ios-simulator",
+                        worktree="/tmp/worktree",
+                        gateway_port=1,
+                        renderer_port=2,
+                        webdriver_port=3,
+                        profile="sim-ios",
+                        storage_root="/tmp/sim-ios",
+                    ),
+                    ClientRuntime(
+                        actor="peer-simulator",
+                        runtime="tauri-ios-simulator",
+                        worktree="/tmp/worktree",
+                        gateway_port=4,
+                        renderer_port=5,
+                        webdriver_port=6,
+                        profile="sim-ios-peer",
+                        storage_root="/tmp/sim-ios-peer",
+                    ),
+                ),
+            ),
+            {
+                "appium": {
+                    "serverUrl": "http://127.0.0.1:4723",
+                    "serverVersion": "2.19.0",
+                    "expectedServerVersion": "2.19.0",
+                    "drivers": {
+                        "ios": {
+                            "identity": "appium-xcuitest-driver",
+                            "automationName": "XCUITest",
+                            "version": "9.10.5",
+                            "expectedVersion": "9.10.5",
+                        },
+                    },
+                },
+                "applications": {
+                    "ios": {
+                        "artifact": "/tmp/mobile.app",
+                        "sha256": "d" * 64,
+                        "id": "com.peers.touch.mobile",
+                        "callbackScheme": "peers-touch",
+                    },
+                },
+                "clients": {
+                    "sim-ios": {
+                        "platform": "ios",
+                        "role": "simulator",
+                        "runtime": "tauri-ios-simulator",
+                        "deviceRole": "simulator",
+                        "profile": "sim-ios",
+                        "device": "raw-ios-udid",
+                        "storageRoot": "/tmp/sim-ios",
+                        "ports": {
+                            "wda-local": 8101,
+                            "mjpeg": 9101,
+                            "webview": 9511,
+                        },
+                    },
+                    "sim-ios-peer": {
+                        "platform": "ios",
+                        "role": "peer-simulator",
+                        "runtime": "tauri-ios-simulator",
+                        "deviceRole": "peer-simulator",
+                        "profile": "sim-ios-peer",
+                        "device": "raw-ios-peer-udid",
+                        "storageRoot": "/tmp/sim-ios-peer",
+                        "ports": {
+                            "wda-local": 8102,
+                            "mjpeg": 9201,
+                            "webview": 9512,
+                        },
+                    },
+                },
+                "harness": {},
+                "proofScope": {},
+            },
+        )
+
+    @staticmethod
+    def _service_environment() -> dict[str, str]:
+        return {
+            "PT_MOBILE_STATION_PRIMARY_URL": (
+                "https://station-primary.example"
+            ),
+            "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "deploy-primary",
+            "PT_MOBILE_STATION_SECONDARY_URL": (
+                "https://station-secondary.example"
+            ),
+            "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "deploy-secondary",
+        }
+
+    @staticmethod
+    def _reviewed_station_profile(profile: str) -> tuple[Path, dict[str, str]]:
+        if profile not in {"primary", "secondary"}:
+            raise AssertionError(f"Unexpected Profile: {profile}")
+        return (
+            Path(f"/canonical/{profile}/profile.env.example"),
+            {
+                "PT_STATION_MODE": "remote",
+                "PT_STATION_URL": f"https://station-{profile}.example",
+                "PT_STATION_DEPLOY_ENV": f"deploy-{profile}",
+            },
+        )
+
+    def test_accepts_and_injects_explicit_station_profiles(self) -> None:
+        bindings = {
+            "station-primary": "four",
+            "station-secondary": "fiveArm",
+        }
+        provisioner = get_provisioner(
+            self.contract,
+            station_profiles=bindings,
+        )
+        station_profiles = {
+            "four": {
+                "PT_STATION_MODE": "remote",
+                "PT_STATION_URL": "https://four.example",
+                "PT_STATION_DEPLOY_ENV": "station-four",
+            },
+            "fiveArm": {
+                "PT_STATION_MODE": "remote",
+                "PT_STATION_URL": "https://five.example",
+                "PT_STATION_DEPLOY_ENV": "station-five-arm",
+            },
+        }
+
+        with patch(
+            "tooling.acceptance.provisioners.mobile_simulator."
+            "resolve_reviewed_profile_environment",
+            side_effect=lambda profile_name: (
+                Path(f"/canonical/{profile_name}/profile.env.example"),
+                station_profiles[profile_name],
+            ),
+        ):
+            merged = provisioner._inject_station_profile_bindings({})
+
+        self.assertEqual(provisioner._required_station_profiles(), bindings)
+        self.assertEqual(
+            merged,
+            {
+                "PT_MOBILE_STATION_PRIMARY_URL": "https://four.example",
+                "PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV": "station-four",
+                "PT_MOBILE_STATION_SECONDARY_URL": "https://five.example",
+                "PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV": "station-five-arm",
+            },
+        )
+
+    def test_appium_transport_uses_capability_timeout(self) -> None:
+        provisioner = MobileStationLifecycleSimulatorProvisioner(
+            self.contract,
+        )
+        provisioner._base_manifest = self._base_manifest()
+        provisioner.bind_evidence_run(self.evidence_run)  # type: ignore[arg-type]
+        provisioner._manifest = provisioner._base_manifest
+
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_e2e."
+            "UrllibAppiumTransport"
+        ) as transport:
+            session = provisioner._new_appium_session("sim-ios-peer")
+
+        transport.assert_called_once_with(
+            "http://127.0.0.1:4723",
+            timeout_seconds=SIMULATOR_CAPABILITY_TIMEOUT_SECONDS,
+        )
+        self.assertIs(session.transport, transport.return_value)
+
+    def test_service_attestation_uses_remote_source_owner(self) -> None:
+        provisioner = MobileStationLifecycleSimulatorProvisioner(
+            self.contract,
+        )
+        bindings = resolve_mobile_service_bindings(
+            self.contract,
+            self.contract_path,
+            environment=self._service_environment(),
+        )
+
+        with (
+            patch.object(provisioner, "_station_ready", return_value=True),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "produce_station_attestation",
+                side_effect=lambda **kwargs: self._attestation(
+                    kwargs["service_id"]
+                ),
+            ) as producer,
+        ):
+            services = provisioner._attest_services("run-id", bindings)
+
+        self.assertEqual(
+            set(services),
+            {"station-primary", "station-secondary"},
+        )
+        for call in producer.call_args_list:
+            self.assertIs(
+                call.kwargs["remote_source_identity_provider"],
+                mobile_simulator_module.resolve_remote_source_identity,
+            )
+
+    def test_preflight_attests_both_targets_before_authorization_block(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        class Base:
+            def __init__(self, _contract: EnvironmentContract) -> None:
+                events.append("base-created")
+
+        provisioner = MobileStationLifecycleSimulatorProvisioner(
+            self.contract,
+            base_factory=Base,
+            station_profiles={"station-primary": "primary", "station-secondary": "secondary"},
+        )
+        provisioner.bind_evidence_run(self.evidence_run)  # type: ignore[arg-type]
+
+        def verify_target(_url: str, deployment: str) -> None:
+            events.append(f"target:{deployment}")
+
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator.resolve_reviewed_profile_environment",
+                side_effect=self._reviewed_station_profile,
+            ),
+            patch.dict(
+                "os.environ",
+                self._service_environment(),
+                clear=False,
+            ),
+            patch.object(
+                provisioner,
+                "acquire_profile_lease",
+                side_effect=lambda resource, _owner: events.append(
+                    f"profile-lease:{resource}"
+                ),
+            ),
+            patch.object(
+                provisioner,
+                "acquire_remote_git_source_lease",
+                side_effect=lambda resource, _owner: events.append(
+                    f"source-lease:{resource}"
+                ),
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+                side_effect=verify_target,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "bound_reset_profiles",
+                side_effect=lambda _profiles: contextlib.nullcontext(),
+            ),
+            patch.object(
+                provisioner,
+                "_attest_services",
+                side_effect=lambda *_: (
+                    events.append("source-attest")
+                    or {
+                        service_id: self._attestation(service_id)
+                        for service_id in (
+                            "station-primary",
+                            "station-secondary",
+                        )
+                    }
+                ),
+            ),
+        ):
+            manifest = provisioner.provision(
+                "mobile-simulator-station-lifecycle-e2e"
+            )
+
+        self.assertEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(
+            manifest.blocked_resource,
+            "station.reset:mobile-station-lifecycle-alice",
+        )
+        blocked_payload = manifest.to_dict()
+        self.assertEqual(
+            set(blocked_payload["services"]),
+            {"station-primary", "station-secondary"},
+        )
+        self.assertEqual(
+            blocked_payload["profile"]["resolvedName"],
+            STATION_LIFECYCLE_ENVIRONMENT_ID,
+        )
+        self.assertTrue(blocked_payload["cleanup"]["registered"])
+        self.assertEqual(
+            events,
+            [
+                "profile-lease:deploy-primary",
+                "source-lease:deploy-primary",
+                "profile-lease:deploy-secondary",
+                "source-lease:deploy-secondary",
+                "target:deploy-primary",
+                "target:deploy-secondary",
+                "source-attest",
+            ],
+        )
+        self.assertNotIn("base-created", events)
+
+    def test_runtime_binding_rejects_duplicate_station_targets(self) -> None:
+        environment = self._service_environment()
+        environment["PT_MOBILE_STATION_SECONDARY_URL"] = environment[
+            "PT_MOBILE_STATION_PRIMARY_URL"
+        ]
+
+        with self.assertRaises(BlockedError) as raised, patch.dict(
+            "os.environ",
+            environment,
+            clear=True,
+        ):
+            resolve_mobile_service_bindings(
+                self.contract,
+                self.contract_path,
+            )
+
+        self.assertEqual(
+            raised.exception.resource,
+            "service-binding:mobile-station-lifecycle-simulator:"
+            "duplicate-endpoint",
+        )
+
+    def test_composes_base_resets_only_alice_and_cleans_up_in_reverse(
+        self,
+    ) -> None:
+        events: list[str] = []
+        base_manifest = self._base_manifest()
+
+        class Base:
+            def __init__(self, _contract: EnvironmentContract) -> None:
+                self.evidence_run = None
+
+            def bind_evidence_run(self, run: object) -> None:
+                self.evidence_run = run
+
+            def provision(self, _gate_id: str) -> object:
+                events.append("base-provision")
+                return base_manifest
+
+            @staticmethod
+            def cleanup() -> tuple[str, ...]:
+                events.append("base-cleanup")
+                return ()
+
+        provisioner = MobileStationLifecycleSimulatorProvisioner(
+            self.contract,
+            base_factory=Base,
+            station_profiles={"station-primary": "primary", "station-secondary": "secondary"},
+        )
+        provisioner.bind_evidence_run(self.evidence_run)  # type: ignore[arg-type]
+
+        def acquire_profile(resource: str, _owner: str) -> None:
+            provisioner.register_cleanup(
+                f"profile:{resource}",
+                lambda resource=resource: events.append(
+                    f"release-profile:{resource}"
+                ),
+            )
+
+        def acquire_source(resource: str, _owner: str) -> None:
+            provisioner.register_cleanup(
+                f"source:{resource}",
+                lambda resource=resource: events.append(
+                    f"release-source:{resource}"
+                ),
+            )
+
+        reset_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def reset(
+            deployment: str,
+            actors: tuple[str, ...],
+            *,
+            reset_authorized: bool,
+        ) -> None:
+            self.assertTrue(reset_authorized)
+            reset_calls.append((deployment, actors))
+
+        binding_entries: list[tuple[str, ...]] = []
+
+        @contextlib.contextmanager
+        def record_bound_profiles(profiles: object) -> object:
+            binding_entries.append(tuple(sorted(profiles)))  # type: ignore[arg-type]
+            yield
+
+        services = {
+            service_id: self._attestation(service_id)
+            for service_id in ("station-primary", "station-secondary")
+        }
+        with (
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator.resolve_reviewed_profile_environment",
+                side_effect=self._reviewed_station_profile,
+            ),
+            patch.dict(
+                "os.environ",
+                self._service_environment(),
+                clear=False,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "require_station_reset_authority",
+                return_value={"validation": "current"},
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "bound_reset_profiles",
+                side_effect=record_bound_profiles,
+            ),
+            patch.object(
+                provisioner,
+                "acquire_profile_lease",
+                side_effect=acquire_profile,
+            ),
+            patch.object(
+                provisioner,
+                "acquire_remote_git_source_lease",
+                side_effect=acquire_source,
+            ),
+            patch.object(
+                provisioner,
+                "_attest_services",
+                return_value=services,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "verify_reset_target",
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "reset_fixture",
+                side_effect=reset,
+            ),
+            patch(
+                "tooling.acceptance.provisioners.mobile_simulator."
+                "resolve_actor_identity",
+                return_value=SimpleNamespace(
+                    role="alice",
+                    account_ref="station-account:alice@p.t",
+                    ptid="ptid:alice",
+                    device_policy="single-active-session",
+                    display_name="Canonical Alice",
+                    federated_handle="@alice@station.example",
+                    home_station_peer_id="station-alice",
+                ),
+            ) as resolve_actor,
+        ):
+            manifest = provisioner.provision(
+                "mobile-simulator-station-lifecycle-e2e"
+            )
+            context = provisioner.create_gate_launch_context(
+                gate_id="mobile-simulator-station-lifecycle-e2e",
+                evidence_run_id=self.evidence_run.run_id,
+                provisioning_run_id=manifest.run_id,
+                required_capabilities=(SIMULATOR_APPIUM_CAPABILITY_ID,),
+            )
+            self.assertEqual(
+                context._request_timeout_seconds,
+                STATION_LIFECYCLE_CAPABILITY_IDLE_TIMEOUT_SECONDS,
+            )
+            context.quiesce()
+            context_cleanup = context.close()
+            setup_resets = list(reset_calls)
+            completed = provisioner.cleanup()
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertTrue(context_cleanup.succeeded)
+        # One binding context during the provision pre-check, one during
+        # fixture preparation, and one per reverse cleanup target; every
+        # entry must authorize both distinct Stations.
+        self.assertEqual(
+            binding_entries,
+            [
+                ("primary", "secondary"),
+                ("primary", "secondary"),
+                ("primary", "secondary"),
+                ("primary", "secondary"),
+            ],
+        )
+        payload = manifest.to_dict()
+        self.assertNotEqual(
+            manifest.run_id,
+            getattr(base_manifest, "run_id"),
+        )
+        self.assertEqual(
+            set(payload["services"]),
+            {"station-primary", "station-secondary"},
+        )
+        self.assertNotIn("relay", payload["services"])
+        self.assertEqual(
+            {
+                client["id"]: tuple(client["required_service_roles"])
+                for client in payload["clients"]
+            },
+            {
+                "sim-ios": (
+                    "station-primary",
+                    "station-secondary",
+                ),
+                "sim-ios-peer": ("station-primary",),
+            },
+        )
+        self.assertEqual(
+            setup_resets,
+            [
+                ("deploy-primary", ("alice",)),
+                ("deploy-secondary", ("alice",)),
+            ],
+        )
+        self.assertEqual(
+            resolve_actor.call_args_list,
+            [
+                call(
+                    "https://station-primary.example",
+                    "deploy-primary",
+                    "alice",
+                ),
+                call(
+                    "https://station-secondary.example",
+                    "deploy-secondary",
+                    "alice",
+                ),
+            ],
+        )
+        resources = payload["mobileSimulator"]
+        self.assertNotIn("serverUrl", resources["appium"])
+        self.assertNotIn("artifact", resources["applications"]["ios"])
+        self.assertNotIn("device", resources["clients"]["sim-ios"])
+        self.assertNotIn("device", resources["clients"]["sim-ios-peer"])
+        self.assertEqual(
+            completed[:4],
+            (
+                "appium-sessions",
+                "actor-fixture:station-secondary",
+                "actor-fixture:station-primary",
+                "mobile-simulator-base",
+            ),
+        )
+        self.assertEqual(
+            completed[-4:],
+            (
+                "source:deploy-secondary",
+                "profile:deploy-secondary",
+                "source:deploy-primary",
+                "profile:deploy-primary",
+            ),
+        )
+        self.assertLess(
+            events.index("base-cleanup"),
+            events.index("release-source:deploy-secondary"),
+        )
+
+    def test_parent_create_bound_session_resolves_topology_and_emits_proof(
+        self,
+    ) -> None:
+        services = {
+            service_id: self._attestation(service_id)
+            for service_id in ("station-primary", "station-secondary")
+        }
+        manifest = dataclasses.replace(
+            new_manifest(
+                environment_id=STATION_LIFECYCLE_ENVIRONMENT_ID,
+                gate_id="mobile-simulator-station-lifecycle-e2e",
+                requested_profile="profile",
+                resolved_profile="profile",
+                slot=7,
+                commit="a" * 40,
+                worktree="/tmp/worktree",
+                workspace_digest="dirty:test",
+            ),
+            state=ProvisioningState.FIXTURE_READY,
+            services=services,
+            clients=(
+                ClientRuntime(
+                    id="sim-ios",
+                    actor="alice",
+                    runtime="tauri-ios-simulator",
+                    required_service_roles=(
+                        "station-primary",
+                        "station-secondary",
+                    ),
+                    service_bindings=self.contract.clients[
+                        0
+                    ].service_bindings,
+                    worktree="/tmp/worktree",
+                    gateway_port=1,
+                    renderer_port=2,
+                    webdriver_port=3,
+                    profile="sim-ios",
+                    storage_root="/tmp/sim-ios",
+                ),
+                ClientRuntime(
+                    id="sim-ios-peer",
+                    actor="alice",
+                    runtime="tauri-ios-simulator",
+                    required_service_roles=("station-primary",),
+                    service_bindings=self.contract.clients[
+                        1
+                    ].service_bindings,
+                    worktree="/tmp/worktree",
+                    gateway_port=4,
+                    renderer_port=5,
+                    webdriver_port=6,
+                    profile="sim-ios-peer",
+                    storage_root="/tmp/sim-ios-peer",
+                ),
+            ),
+        ).to_dict()
+        sessions: dict[str, FakeParentSimulatorSession] = {}
+        handler = MobileSimulatorAppiumCapabilityHandler(
+            manifest=manifest,
+            artifact_writer=self.evidence_run,
+            session_factory=lambda client_id: sessions.setdefault(
+                client_id,
+                FakeParentSimulatorSession(client_id),
+            ),
+            harness_actions=tuple(STATION_LIFECYCLE_HARNESS_ACTIONS),
+            sensitive_values=(
+                "https://station-primary.example",
+                "https://station-secondary.example",
+                "raw-device-sim-ios",
+                "raw-session-sim-ios",
+            ),
+            verifier_source_digest="d" * 64,
+        )
+        cancellation = threading.Event()
+
+        first = handler.invoke(
+            "create_bound_session",
+            {
+                "clientId": "sim-ios",
+                "launchOptions": {},
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        second = handler.invoke(
+            "select_binding",
+            {
+                "clientId": "sim-ios",
+                "bindingRole": "station-secondary",
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        authenticated = handler.invoke(
+            "authenticate_fixture_actor",
+            {"clientId": "sim-ios"},
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        cleaned = handler.invoke(
+            "harness_action",
+            {
+                "clientId": "sim-ios",
+                "action": "cleanup",
+                "actionPayload": {},
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        page_source = handler.invoke(
+            "capture_page_source",
+            {
+                "clientId": "sim-ios",
+                "captureId": "receiver-visible",
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        screenshot = handler.invoke(
+            "capture_screenshot",
+            {
+                "clientId": "sim-ios",
+                "captureId": "receiver-visible",
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        clicked = handler.invoke(
+            "semantic_click",
+            {
+                "clientId": "sim-ios",
+                "selector": '[data-acceptance-id="compose"]',
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        observed = handler.invoke(
+            "semantic_observe",
+            {
+                "clientId": "sim-ios",
+                "selector": '[data-post-id="post-1"]',
+                "expectedText": "private text",
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+        updated = handler.invoke(
+            "semantic_set_value",
+            {
+                "clientId": "sim-ios",
+                "selector": "textarea",
+                "value": "private text",
+            },
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=cancellation,
+        )
+
+        session = sessions["sim-ios"]
+        station_calls = [
+            (action, payload)
+            for action, payload in session.calls
+            if action in {"station.add", "station.select"}
+        ]
+        self.assertEqual(
+            station_calls,
+            [
+                (
+                    "station.add",
+                    {
+                        "url": "https://station-primary.example",
+                        "routeType": "direct",
+                    },
+                ),
+                (
+                    "station.add",
+                    {
+                        "url": "https://station-secondary.example",
+                        "routeType": "direct",
+                    },
+                ),
+                (
+                    "station.select",
+                    {"stationPeerId": "peer-primary"},
+                ),
+                (
+                    "station.select",
+                    {"stationPeerId": "peer-secondary"},
+                ),
+            ],
+        )
+        self.assertEqual(first["launchGeneration"], 1)
+        self.assertEqual(second["launchGeneration"], 1)
+        self.assertEqual(
+            set(first["bindingProofs"]),
+            {"station-primary", "station-secondary"},
+        )
+        serialized = json.dumps(first, sort_keys=True)
+        self.assertNotIn("https://station-primary.example", serialized)
+        self.assertNotIn("raw-device-sim-ios", serialized)
+        self.assertNotIn("raw-session-sim-ios", serialized)
+        serialized_authentication = json.dumps(
+            authenticated,
+            sort_keys=True,
+        )
+        self.assertNotIn("password", serialized_authentication.lower())
+        self.assertNotIn("email", serialized_authentication.lower())
+        self.assertEqual(
+            authenticated["value"]["login"]["session"]["actorPtid"],
+            "ptid:alice",
+        )
+        self.assertEqual(
+            cleaned["value"]["oauthPurge"]["secureStorage"],
+            {
+                "activeAttemptIndexAbsent": True,
+                "attemptSecretRecordAbsent": True,
+                "currentSessionIndexAbsent": True,
+                "credentialRecordAbsent": True,
+                "publicProjectionAbsent": True,
+            },
+        )
+        self.assertEqual(
+            page_source["pageSource"]["path"],
+            (
+                "runtime/mobile-simulator/evidence/receiver-visible/"
+                "sim-ios/web-dom.html"
+            ),
+        )
+        self.assertEqual(
+            screenshot["screenshot"]["path"],
+            (
+                "runtime/mobile-simulator/evidence/receiver-visible/"
+                "sim-ios/screenshot.png"
+            ),
+        )
+        self.assertTrue(clicked["observation"]["activated"])
+        self.assertTrue(observed["observation"]["matched"])
+        self.assertTrue(updated["observation"]["updated"])
+        self.assertNotIn(
+            "private text",
+            json.dumps(
+                {
+                    "clicked": clicked,
+                    "observed": observed,
+                    "updated": updated,
+                },
+                sort_keys=True,
+            ),
+        )
+        proofs = [
+            value
+            for _path, value, role in self.evidence_run.writes
+            if role and role.startswith("mobile-simulator-binding-proof/")
+        ]
+        self.assertEqual(len(proofs), 2)
+        self.assertTrue(
+            all(proof["verificationStatus"] == "VERIFIED" for proof in proofs)
+        )
+        self.assertEqual(
+            {proof["declaredServiceId"] for proof in proofs},
+            {"station-primary", "station-secondary"},
+        )
+        handler.project_response(
+            "create_bound_session",
+            {
+                "requestId": "request",
+                "status": "OK",
+                "result": first,
+                "error": None,
+            },
+        )
+        handler.project_response(
+            "harness_action",
+            {
+                "requestId": "cleanup-request",
+                "status": "OK",
+                "result": cleaned,
+                "error": None,
+            },
+        )
+        handler.project_response(
+            "capture_page_source",
+            {
+                "requestId": "page-source-request",
+                "status": "OK",
+                "result": page_source,
+                "error": None,
+            },
+        )
+        handler.project_response(
+            "capture_screenshot",
+            {
+                "requestId": "screenshot-request",
+                "status": "OK",
+                "result": screenshot,
+                "error": None,
+            },
+        )
+        handler.project_response(
+            "semantic_observe",
+            {
+                "requestId": "semantic-observe-request",
+                "status": "OK",
+                "result": observed,
+                "error": None,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "raw authority"):
+            handler.project_response(
+                "harness_action",
+                {
+                    "requestId": "unsafe-request",
+                    "status": "OK",
+                    "result": {
+                        "clientId": "sim-ios",
+                        "value": {"deviceId": "unscoped-device"},
+                    },
+                    "error": None,
+                },
+            )
+        self.assertTrue(handler.close().closed)
+
+
+class FakeIOSResources:
+    """A consumer contract fixture, never native resource proof."""
+
+    def __init__(self, executor, env):
+        self.executor = executor
+        self.env = env
+        self.bindings = {}
+
+    def acquire(self, clients):
+        for index, client in enumerate(clients):
+            device_name = IOS_PEER_DEVICE_NAME if client.endswith("peer") else IOS_DEVICE_NAME
+            if client in IOS_LAYOUT_CLIENTS:
+                device_name = IOS_LAYOUT_CLIENTS[client][0]
+            self.bindings[client] = {
+                "id": f"fixture-resource-{client}", "providerId": f"fixture-udid-{client}",
+                "udid": f"fixture-udid-{client}", "name": device_name, "runtime": IOS_RUNTIME,
+                "sharedProfiles": [{"profile": "fixture-profile", "purpose": client}],
+            }
+        return self.bindings
+
+    def boot(self, client):
+        udid = self.bindings[client]["providerId"]
+        for command in (("xcrun", "simctl", "boot", udid), ("xcrun", "simctl", "bootstatus", udid, "-b")):
+            result = self.executor.run(command, cwd=self.executor.repo_root, env=self.env, timeout=180)
+            if result.returncode:
+                raise BlockedError(reason="fixture boot failed", resource="mobile-simulator:physical-device")
+
+    def build_source(self):
+        return getattr(self.executor, "ios_resource_source", {"head": "a" * 40, "workspaceDigest": "sha256:" + "b" * 64})
+
+    def child_environment(self):
+        return {"PT_MACHINE_LEASE_STACK_JSON": "[]"}
+
+    def install(self, udid, artifact, bundle_id, target_file):
+        result = self.executor.run(("xcrun", "simctl", "install", udid, artifact),
+                                   cwd=self.executor.repo_root, env=self.env, timeout=180)
+        if result.returncode:
+            raise BlockedError(reason="fixture install failed", resource="mobile-simulator:ios-install")
+
+    def release(self):
+        self.executor.events.append("release:ios-physical-leases")
+
+
+class MobileSimulatorProvisionerTests(unittest.TestCase):
+    driver_bytes = b"synthetic chromedriver executable\n"
+    driver_version = "124.0.6367.82"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.repo_root = self.root / "repo"
+        self.repo_root.mkdir()
+        self.android_manifest = (
+            self.repo_root / ANDROID_MANIFEST_RELATIVE_PATH
+        )
+        self.android_manifest.parent.mkdir(parents=True)
+        self.android_manifest_baseline = (
+            "<activity>\n"
+            f"  {mobile_simulator_module.ANDROID_DEEP_LINK_MARKER}\n"
+            '  <data android:path="/callback" />\n'
+            f"  {mobile_simulator_module.ANDROID_DEEP_LINK_MARKER}\n"
+            "</activity>\n"
+        )
+        self.android_manifest.write_text(
+            self.android_manifest_baseline,
+            encoding="utf-8",
+        )
+        self.ndk_home = _write_valid_ndk(
+            self.root / "android-sdk" / "ndk" / "27.0.11902837"
+        )
+        self.environment = patch.dict(
+            "os.environ",
+            {
+                "ANDROID_HOME": str(self.root / "android-sdk"),
+                "ANDROID_SDK_ROOT": str(self.root / "android-sdk"),
+                "NDK_HOME": str(self.ndk_home),
+            },
+            clear=False,
+        )
+        self.environment.start()
+        self.executor = FakeCommandExecutor(self.repo_root)
+        resource_caller = patch.object(
+            mobile_simulator_module.MobileIOSResources, "from_environment",
+            side_effect=lambda root, env: FakeIOSResources(self.executor, env),
+        )
+        resource_caller.start()
+        self.addCleanup(resource_caller.stop)
+        self.contract = EnvironmentContract.from_yaml(
+            ENVIRONMENTS_DIR / "mobile-simulator.yaml"
+        )
+        self.contract_payload = json.loads(
+            (
+                ENVIRONMENTS_DIR / "mobile-simulator.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        self.contract_payload["appium"]["chromedriver"]["artifacts"] = [
+            {
+                "browser_major": 124,
+                "driver_version": self.driver_version,
+                "source": (
+                    "https://storage.googleapis.com/chrome-for-testing-public/"
+                    "synthetic/chromedriver"
+                ),
+                "platform": "darwin",
+                "arch": "arm64",
+                "android_abis": [ANDROID_ABI],
+                "sha256": hashlib.sha256(self.driver_bytes).hexdigest(),
+                "cache_target": (
+                    f"{self.driver_version}/darwin-arm64/chromedriver"
+                ),
+                "artifact_kind": "executable",
+                "executable_member": "",
+                "executable_target": (
+                    f"{self.driver_version}/darwin-arm64/chromedriver"
+                ),
+            }
+        ]
+        self.contract_path = self.root / "mobile-simulator.json"
+        self.cache_root = self.root / "external-runtime-cache"
+        self.fetches: list[str] = []
+        self._write_contract()
+        self._write_cached_driver(self.driver_bytes)
+        self.provisioner = self._new_provisioner()
+
+    def _write_contract(self) -> None:
+        self.contract_path.write_text(
+            json.dumps(self.contract_payload),
+            encoding="utf-8",
+        )
+
+    def _write_cached_driver(self, content: bytes) -> Path:
+        relative = self.contract_payload["appium"]["chromedriver"][
+            "artifacts"
+        ][0]["cache_target"]
+        path = self.cache_root / "chromedriver" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        path.chmod(0o755)
+        return path
+
+    def _new_provisioner(self) -> TestMobileSimulatorProvisioner:
+        return TestMobileSimulatorProvisioner(
+            self.contract,
+            executor=self.executor,
+            repo_root=self.repo_root,
+            runtime_base=self.root / "runtime",
+            runtime_cache_base=self.cache_root,
+            contract_path=self.contract_path,
+            artifact_fetcher=self._fetch_driver,
+            status_reader=lambda url, timeout: {
+                "value": {"build": {"version": "2.19.0"}}
+            },
+            sleep=lambda _: None,
+        )
+
+    def _fetch_driver(self, source: str, destination: Path) -> None:
+        self.fetches.append(source)
+        destination.write_bytes(self.driver_bytes)
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def test_resource_session_uses_owner_startup_timeout(self) -> None:
+        manifest = self.provisioner.provision("mobile-simulator-access-e2e")
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        selected = TestSelectedMobileSimulatorProvisioner(
+            self.contract,
+            clients=load_mobile_simulator_spec(self.contract_path).clients,
+            runtime_source_commit="1" * 40,
+            executor=self.executor,
+            repo_root=self.repo_root,
+            contract_path=self.contract_path,
+        )
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_e2e."
+            "UrllibAppiumTransport"
+        ) as transport:
+            session = selected.create_appium_session(manifest, "sim-ios")
+
+        transport.assert_called_once_with(
+            manifest.simulator_resources["appium"]["serverUrl"],
+            timeout_seconds=SIMULATOR_CAPABILITY_TIMEOUT_SECONDS,
+        )
+        self.assertIs(session.transport, transport.return_value)
+        self.assertEqual(
+            session.device.identifier,
+            manifest.simulator_resources["clients"]["sim-ios"]["device"],
+        )
+
+    def test_provision_discovers_builds_deploys_and_emits_appium_manifest(
+        self,
+    ) -> None:
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        payload = manifest.to_dict()
+        self.assertEqual(payload["services"], {})
+        self.assertEqual(payload["credentialRefs"], [])
+        self.assertNotIn("actorManifest", payload)
+        self.assertEqual(
+            {
+                client["runtime"]
+                for client in payload["clients"]
+            },
+            {"tauri-ios-simulator"},
+        )
+
+        resources = payload["mobileSimulator"]
+        self.assertTrue(resources["appium"]["owned"])
+        self.assertEqual(
+            resources["appium"]["serverVersion"],
+            "2.19.0",
+        )
+        self.assertEqual(
+            resources["appium"]["expectedServerVersion"],
+            "2.19.0",
+        )
+        self.assertEqual(
+            resources["appium"]["drivers"]["ios"]["expectedVersion"],
+            "9.10.5",
+        )
+        self.assertEqual(set(resources["appium"]["drivers"]), {"ios"})
+        self.assertEqual(
+            set(resources["clients"]),
+            {"sim-ios", "sim-ios-peer"},
+        )
+        self.assertEqual(
+            resources["clients"]["sim-ios"]["deviceRole"],
+            "primary-simulator",
+        )
+        self.assertEqual(
+            resources["clients"]["sim-ios-peer"]["deviceRole"],
+            "peer-simulator",
+        )
+        self.assertNotIn("chromedriver", resources)
+        self.assertNotEqual(
+            resources["clients"]["sim-ios"]["device"],
+            resources["clients"]["sim-ios-peer"]["device"],
+        )
+        create_commands = [
+            command
+            for command in self.executor.commands
+            if command[:3] == ("xcrun", "simctl", "create")
+        ]
+        self.assertEqual(create_commands, [])
+        self.assertTrue(all(client["sharedProfiles"] for client in resources["clients"].values()))
+        self.assertNotIn(
+            ("xcrun", "simctl", "list", "--json"),
+            self.executor.commands,
+        )
+        for client_id in ("sim-ios", "sim-ios-peer"):
+            udid = resources["clients"][client_id]["device"]
+            uninstall = (
+                "xcrun",
+                "simctl",
+                "uninstall",
+                udid,
+                "com.peers.touch.mobile",
+            )
+            install = (
+                "xcrun",
+                "simctl",
+                "install",
+                udid,
+                resources["applications"]["ios"]["artifact"],
+            )
+            self.assertNotIn(uninstall, self.executor.commands)
+            self.assertIn(install, self.executor.commands)
+        self.assertFalse(
+            any(
+                "physical-device" in " ".join(command)
+                for command in self.executor.commands
+            )
+        )
+        self.assertTrue(
+            all(
+                environment.get("VITE_ACCEPTANCE_HARNESS") == "1"
+                for environment in self.executor.environments
+            )
+        )
+        self.assertEqual(
+            self.android_manifest.read_text(encoding="utf-8"),
+            self.android_manifest_baseline,
+        )
+        ios_assets = (
+            self.repo_root
+            / "apps"
+            / "mobile"
+            / "src-tauri"
+            / "gen"
+            / "apple"
+            / "assets"
+        )
+        self.assertEqual(
+            (ios_assets / "index.html").read_text(encoding="utf-8"),
+            FIXTURE_WEB_INDEX_HTML,
+        )
+        self.assertTrue((ios_assets / "assets" / "main.js").is_file())
+        self.assertTrue(
+            (ios_assets / "assets" / FIXTURE_REGISTRY_CHUNK).is_file()
+        )
+        self.assertEqual(self.fetches, [])
+        self.assertEqual(
+            self.executor.ios_asset_payloads,
+            [FIXTURE_WEB_INDEX_HTML],
+        )
+        self.assertTrue(
+            (self.repo_root / IOS_WEB_ASSETS_RELATIVE_PATH / "index.html").is_file()
+        )
+
+        self.assertEqual(set(resources["applications"]), {"ios"})
+        application = resources["applications"]["ios"]
+        self.assertTrue(Path(application["artifact"]).exists())
+        self.assertEqual(len(application["sha256"]), 64)
+        build_identities = [
+            json.loads(environment["PT_MOBILE_BUILD_IDENTITY_JSON"])
+            for environment in self.executor.environments
+            if "PT_MOBILE_BUILD_IDENTITY_JSON" in environment
+        ]
+        self.assertEqual(len(build_identities), 2)
+        self.assertEqual(build_identities[0], build_identities[1])
+        self.assertEqual(application["buildIdentity"], build_identities[0])
+        self.assertEqual(
+            build_identities[0]["sourceCommit"],
+            "a" * 40,
+        )
+        self.assertEqual(
+            build_identities[0]["workspaceState"],
+            "dirty",
+        )
+        self.assertEqual(
+            build_identities[0]["workspaceDigest"],
+            "sha256:" + ("b" * 64),
+        )
+
+        for client_id, (platform, _, _) in EXPECTED_CLIENTS.items():
+            client = resources["clients"][client_id]
+            application = resources["applications"][platform]
+            driver = resources["appium"]["drivers"][platform]
+            session = SimulatorAppiumSession(
+                transport=object(),  # type: ignore[arg-type]
+                client_id=client_id,
+                platform=platform,
+                automation_name=driver["automationName"],
+                device=SimulatorDeviceTarget(
+                    platform=platform,
+                    identifier=client["device"],
+                    role=client["deviceRole"],
+                ),
+                build=SimulatorBuildTarget(
+                    platform=platform,
+                    artifact=Path(application["artifact"]),
+                    application_id=application["id"],
+                ),
+                callback_scheme=application["callbackScheme"],
+                ports=client["ports"],
+                chromedriver_executable=(
+                    client.get("appiumCapabilities", {}).get(
+                        "appium:chromedriverExecutable",
+                        "",
+                    )
+                ),
+            )
+            self.assertEqual(session.device.identifier, client["device"])
+            self.assertEqual(session.chromedriver_executable, "")
+
+    def test_ios_build_boot_and_deploy_run_concurrently(self) -> None:
+        original_run = self.executor.run
+        lock = threading.Lock()
+        active = {"bootstatus": 0, "install": 0, "xcodebuild": 0}
+        maximum = {"bootstatus": 0, "install": 0, "xcodebuild": 0}
+        build_boot_overlap = False
+
+        def delayed_run(
+            command: tuple[str, ...] | list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str],
+            timeout: float,
+        ) -> CommandResult:
+            normalized = tuple(command)
+            stage = None
+            if normalized[:3] == ("xcrun", "simctl", "bootstatus"):
+                stage = "bootstatus"
+            elif normalized[:3] == ("xcrun", "simctl", "install"):
+                stage = "install"
+            elif normalized[:1] == ("xcodebuild",):
+                stage = "xcodebuild"
+            if stage is None:
+                return original_run(
+                    normalized,
+                    cwd=cwd,
+                    env=env,
+                    timeout=timeout,
+                )
+
+            nonlocal build_boot_overlap
+            with lock:
+                active[stage] += 1
+                maximum[stage] = max(maximum[stage], active[stage])
+                if active["bootstatus"] and active["xcodebuild"]:
+                    build_boot_overlap = True
+            try:
+                time.sleep(0.05)
+                return original_run(
+                    normalized,
+                    cwd=cwd,
+                    env=env,
+                    timeout=timeout,
+                )
+            finally:
+                with lock:
+                    active[stage] -= 1
+
+        self.executor.run = delayed_run  # type: ignore[method-assign]
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertEqual(maximum["bootstatus"], 2)
+        self.assertEqual(maximum["install"], 2)
+        self.assertTrue(build_boot_overlap)
+        self.provisioner.cleanup()
+
+    def test_ios_build_cache_is_source_bound_and_survives_run_cleanup(
+        self,
+    ) -> None:
+        first = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+        first_payload = first.to_dict()["mobileSimulator"]
+        first_artifact = Path(first_payload["applications"]["ios"]["artifact"])
+        first_build_identity = first_payload["applications"]["ios"][
+            "buildIdentity"
+        ]
+        first_derived_data = next(
+            Path(command[command.index("-derivedDataPath") + 1])
+            for command in self.executor.commands
+            if command[:1] == ("xcodebuild",)
+        )
+
+        self.assertTrue(first_artifact.exists())
+        self.assertIn(
+            (self.root / "runtime").resolve(),
+            first_artifact.resolve().parents,
+        )
+        self.assertIn(
+            (self.cache_root / "ios-build").resolve(),
+            first_derived_data.parents,
+        )
+
+        self.provisioner.cleanup()
+
+        self.assertFalse(first_artifact.exists())
+        self.assertTrue(first_derived_data.exists())
+
+        self.provisioner = self._new_provisioner()
+        second = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+        second_artifact = Path(
+            second.to_dict()["mobileSimulator"]["applications"]["ios"][
+                "artifact"
+            ]
+        )
+        second_build_identity = second.to_dict()["mobileSimulator"][
+            "applications"
+        ]["ios"]["buildIdentity"]
+        derived_data_paths = [
+            Path(command[command.index("-derivedDataPath") + 1])
+            for command in self.executor.commands
+            if command[:1] == ("xcodebuild",)
+        ]
+
+        self.assertEqual(derived_data_paths, [first_derived_data])
+        self.assertEqual(
+            self.executor.commands.count(
+                ("pnpm", "--dir", "apps/mobile", "run", "build")
+            ),
+            1,
+        )
+        self.assertNotEqual(second_artifact, first_artifact)
+        self.assertTrue(second_artifact.exists())
+        self.assertEqual(second_build_identity, first_build_identity)
+        self.provisioner.cleanup()
+        self.assertTrue(first_derived_data.exists())
+
+    def test_ios_build_cache_rebuilds_after_artifact_tampering(self) -> None:
+        self.provisioner.provision("mobile-simulator-access-e2e")
+        xcode_command = next(
+            command
+            for command in self.executor.commands
+            if command[:1] == ("xcodebuild",)
+        )
+        derived_data = Path(
+            xcode_command[xcode_command.index("-derivedDataPath") + 1]
+        )
+        cached_binary = next(derived_data.glob("**/*.app/Peers"))
+        self.provisioner.cleanup()
+        cached_binary.write_text("tampered\n", encoding="utf-8")
+
+        self.provisioner = self._new_provisioner()
+        self.provisioner.provision("mobile-simulator-access-e2e")
+
+        self.assertEqual(
+            sum(
+                command[:1] == ("xcodebuild",)
+                for command in self.executor.commands
+            ),
+            2,
+        )
+        self.provisioner.cleanup()
+
+    def test_ios_build_cache_changes_with_source_identity(self) -> None:
+        spec = load_mobile_simulator_spec(self.contract_path)
+        manifest = self.provisioner._new_base_manifest(
+            "mobile-simulator-access-e2e"
+        )
+        changed = dataclasses.replace(
+            manifest,
+            workspace_digest="sha256:changed",
+        )
+
+        first = self.provisioner._ios_incremental_build_root(manifest, spec)
+        second = self.provisioner._ios_incremental_build_root(changed, spec)
+
+        self.assertNotEqual(first, second)
+        cache_root = (self.cache_root / "ios-build").resolve()
+        self.assertIn(cache_root, first.parents)
+        self.assertIn(cache_root, second.parents)
+
+    def test_cleanup_releases_resources_in_reverse_acquisition_order(
+        self,
+    ) -> None:
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+        runtime_root = Path(
+            manifest.to_dict()["mobileSimulator"]["clients"]["sim-ios"][
+                "storageRoot"
+            ]
+        ).parents[1]
+        clients = manifest.to_dict()["mobileSimulator"]["clients"]
+        primary_udid = clients["sim-ios"]["device"]
+        peer_udid = clients["sim-ios-peer"]["device"]
+        ios_assets = (
+            self.repo_root
+            / "apps"
+            / "mobile"
+            / "src-tauri"
+            / "gen"
+            / "apple"
+            / "assets"
+        )
+
+        completed = self.provisioner.cleanup()
+
+        self.assertFalse(runtime_root.exists())
+        self.assertFalse(
+            (self.repo_root / IOS_WEB_ASSETS_RELATIVE_PATH).exists()
+        )
+        self.assertLess(completed.index("appium-process"), completed.index("machine-resources:ios-leases"))
+        self.assertFalse(any(item.startswith(("application-uninstall:ios:", "simulator-shutdown:", "simulator-delete:")) for item in completed))
+        self.assertIn("release:ios-physical-leases", self.executor.events)
+        self.assertEqual(
+            completed[-1],
+            "environment-lease:mobile-simulator",
+        )
+        self.assertIn("stop:appium", self.executor.events)
+        self.assertNotIn("stop:emulator", self.executor.events)
+
+    def test_cleanup_restores_preexisting_generated_apple_assets(self) -> None:
+        assets = self.repo_root / IOS_WEB_ASSETS_RELATIVE_PATH
+        assets.mkdir(parents=True)
+        (assets / "legacy.txt").write_text("preserve-me\n", encoding="utf-8")
+
+        self.provisioner.provision("mobile-simulator-access-e2e")
+
+        self.assertFalse((assets / "legacy.txt").exists())
+        self.assertEqual(
+            (assets / "index.html").read_text(encoding="utf-8"),
+            FIXTURE_WEB_INDEX_HTML,
+        )
+
+        self.provisioner.cleanup()
+
+        self.assertEqual(
+            (assets / "legacy.txt").read_text(encoding="utf-8"),
+            "preserve-me\n",
+        )
+        self.assertFalse((assets / "index.html").exists())
+
+    def test_ios_build_binds_cargo_to_immutable_dist_snapshot(self) -> None:
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+
+        web_envs = [
+            environment
+            for command, environment in zip(
+                self.executor.commands, self.executor.environments
+            )
+            if command == ("pnpm", "--dir", "apps/mobile", "run", "build")
+        ]
+        self.assertTrue(web_envs)
+        self.assertNotIn(
+            IOS_TAURI_FRONTEND_CONFIG_ENV,
+            {key for environment in web_envs for key in environment},
+        )
+
+        xcode_envs = [
+            environment
+            for command, environment in zip(
+                self.executor.commands, self.executor.environments
+            )
+            if command[:1] == ("xcodebuild",)
+        ]
+        self.assertTrue(xcode_envs)
+        override_paths = {
+            environment[IOS_TAURI_FRONTEND_CONFIG_ENV]
+            for environment in xcode_envs
+        }
+        self.assertEqual(len(override_paths), 1)
+        override_path = Path(override_paths.pop())
+        self.assertEqual(
+            override_path.name, IOS_TAURI_FRONTEND_CONFIG_FILENAME
+        )
+        override = json.loads(override_path.read_text(encoding="utf-8"))
+        frontend_dist = Path(override["build"]["frontendDist"])
+        self.assertEqual(
+            frontend_dist.name, IOS_WEB_DIST_SNAPSHOT_DIRNAME
+        )
+        self.assertEqual(
+            (frontend_dist / "index.html").read_text(encoding="utf-8"),
+            FIXTURE_WEB_INDEX_HTML,
+        )
+        self.assertTrue(
+            (frontend_dist / "assets" / FIXTURE_REGISTRY_CHUNK).is_file()
+        )
+
+        # The run-owned snapshot must stay immutable even when a concurrent
+        # worktree web build overwrites the mutable dist directory.
+        worktree_dist = self.repo_root / MOBILE_WEB_DIST_RELATIVE_PATH
+        (worktree_dist / "assets" / "contaminated.js").write_text(
+            "stale\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            (frontend_dist / "assets" / "contaminated.js").exists()
+        )
+        self.provisioner.cleanup()
+
+    def test_ios_build_blocks_when_native_embedding_diverges(self) -> None:
+        self.executor = FakeCommandExecutor(
+            self.repo_root,
+            embed_staged_assets=False,
+        )
+        self.provisioner = self._new_provisioner()
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(
+            manifest.blocked_resource,
+            IOS_EMBEDDED_WEB_ASSETS_RESOURCE,
+        )
+        self.provisioner.cleanup()
+
+    def test_missing_android_toolchain_does_not_block_dual_ios(
+        self,
+    ) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "NDK_HOME": "",
+                "ANDROID_HOME": "",
+                "ANDROID_SDK_ROOT": "",
+            },
+            clear=False,
+        ):
+            manifest = self.provisioner.provision(
+                "mobile-simulator-access-e2e"
+            )
+
+        self.assertNotEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(
+            {client.profile for client in manifest.clients},
+            {"sim-ios", "sim-ios-peer"},
+        )
+
+    def test_ios_selection_failure_blocks_before_build(
+        self,
+    ) -> None:
+        with patch.object(FakeIOSResources, "acquire", side_effect=BlockedError(
+            reason="explicit readable selection is missing", resource="mobile-simulator:resource-selection"
+        )):
+            manifest = self.provisioner.provision("mobile-simulator-access-e2e")
+
+        self.assertEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(
+            manifest.blocked_resource,
+            "mobile-simulator:resource-selection",
+        )
+        self.assertFalse(
+            any(
+                command[0] in {"xcodebuild", "appium"}
+                for command in self.executor.commands
+            )
+        )
+        self.provisioner.cleanup()
+
+    def test_absent_chromedriver_does_not_block_required_ios(self) -> None:
+        self._write_cached_driver(self.driver_bytes).unlink()
+        self.contract_payload["appium"]["chromedriver"]["acquisition"][
+            "enabled"
+        ] = False
+        self._write_contract()
+        self.provisioner = self._new_provisioner()
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertNotIn("chromedriver", manifest.to_dict()["mobileSimulator"])
+        self.assertEqual(self.fetches, [])
+        self.provisioner.cleanup()
+
+    def test_contract_without_browser_major_does_not_block_required_ios(
+        self,
+    ) -> None:
+        self.contract_payload["appium"]["chromedriver"]["artifacts"] = []
+        self.contract_payload["appium"]["chromedriver"]["acquisition"][
+            "enabled"
+        ] = False
+        self._write_contract()
+        self.provisioner = self._new_provisioner()
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertNotIn("chromedriver", manifest.to_dict()["mobileSimulator"])
+        self.provisioner.cleanup()
+
+    def test_chromedriver_checksum_does_not_block_required_ios(self) -> None:
+        self._write_cached_driver(b"tampered")
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertNotIn("chromedriver", manifest.to_dict()["mobileSimulator"])
+        self.provisioner.cleanup()
+
+    def test_chromedriver_acquisition_is_not_run_for_required_ios(
+        self,
+    ) -> None:
+        self._write_cached_driver(self.driver_bytes).unlink()
+        self.contract_payload["appium"]["chromedriver"]["acquisition"][
+            "enabled"
+        ] = True
+        self._write_contract()
+        self.provisioner = self._new_provisioner()
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        resources = manifest.to_dict()["mobileSimulator"]
+        self.assertNotIn("chromedriver", resources)
+        self.assertEqual(self.fetches, [])
+        self.assertFalse(
+            any(
+                self.repo_root == path or self.repo_root in path.parents
+                for path in self.cache_root.rglob("*")
+            )
+        )
+        self.provisioner.cleanup()
+
+    def test_browser_major_does_not_block_required_ios(self) -> None:
+        self.executor.browser_versions["com.google.android.webview"] = (
+            "125.0.6422.0"
+        )
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertNotIn("chromedriver", manifest.to_dict()["mobileSimulator"])
+        self.provisioner.cleanup()
+
+    def test_appium_driver_version_mismatch_blocks_before_server_start(
+        self,
+    ) -> None:
+        self.contract_payload["appium"]["drivers"]["ios"][
+            "expected_version"
+        ] = "9.10.4"
+        self._write_contract()
+        self.provisioner = self._new_provisioner()
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(
+            manifest.blocked_resource,
+            "mobile-simulator:appium-driver-version:ios",
+        )
+        self.assertNotIn("stop:appium", self.executor.events)
+        self.provisioner.cleanup()
+
+    def test_appium_server_version_mismatch_blocks(self) -> None:
+        self.provisioner = TestMobileSimulatorProvisioner(
+            self.contract,
+            executor=self.executor,
+            repo_root=self.repo_root,
+            runtime_base=self.root / "runtime",
+            runtime_cache_base=self.cache_root,
+            contract_path=self.contract_path,
+            artifact_fetcher=self._fetch_driver,
+            status_reader=lambda url, timeout: {
+                "value": {"build": {"version": "2.18.0"}}
+            },
+            sleep=lambda _: None,
+        )
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(
+            manifest.blocked_resource,
+            "mobile-simulator:appium-server-version",
+        )
+        self.provisioner.cleanup()
+
+    def test_unsupported_emulator_abi_does_not_block_required_ios(self) -> None:
+        artifact = self.contract_payload["appium"]["chromedriver"][
+            "artifacts"
+        ][0]
+        artifact["android_abis"] = ["x86_64"]
+        self._write_contract()
+        self.provisioner = self._new_provisioner()
+
+        manifest = self.provisioner.provision(
+            "mobile-simulator-access-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        self.assertNotIn("chromedriver", manifest.to_dict()["mobileSimulator"])
+        self.provisioner.cleanup()
+
+    def test_selected_build_preserves_exact_dirty_source_identity(self) -> None:
+        spec = load_mobile_simulator_spec(self.contract_path)
+        provisioner = TestSelectedMobileSimulatorProvisioner(
+            self.contract, clients=spec.clients, runtime_source_commit="1" * 40,
+            executor=self.executor, repo_root=self.repo_root,
+            contract_path=self.contract_path,
+        )
+        dirty = "sha256:" + "d" * 64
+        with patch.object(provisioner, "_git_workspace_digest", return_value=dirty):
+            manifest = provisioner._new_base_manifest("selected-source")
+            identities = [
+                provisioner._platform_build_identity(
+                    manifest, platform=platform, command_env={},
+                ) for platform in ("ios", "android")
+            ]
+        for identity in identities:
+            self.assertEqual(identity["sourceCommit"], manifest.source_commit)
+            self.assertEqual(identity["workspaceState"], "dirty")
+            self.assertEqual(identity["workspaceDigest"], dirty)
+        self.assertEqual(self.executor.events, [])
+
+    def test_selected_build_rejects_runtime_or_workspace_source_drift(self) -> None:
+        spec = load_mobile_simulator_spec(self.contract_path)
+        provisioner = TestSelectedMobileSimulatorProvisioner(
+            self.contract, clients=spec.clients, runtime_source_commit="1" * 40,
+            executor=self.executor, repo_root=self.repo_root,
+            contract_path=self.contract_path,
+        )
+        manifest = provisioner._new_base_manifest("selected-source")
+        for candidate in (
+            dataclasses.replace(manifest, source_commit="2" * 40),
+            dataclasses.replace(manifest, workspace_digest="sha256:" + "d" * 64),
+        ):
+            with self.subTest(candidate=candidate.source_commit):
+                with self.assertRaises(BlockedError) as failure:
+                    provisioner._platform_build_identity(
+                        candidate, platform="ios", command_env={},
+                    )
+                self.assertEqual(failure.exception.resource, "mobile-simulator:source-identity")
+        with patch.object(provisioner, "_git_commit", return_value="2" * 40):
+            blocked = provisioner.provision("selected-source")
+        self.assertEqual(blocked.state, ProvisioningState.BLOCKED)
+        self.assertEqual(blocked.blocked_resource, "mobile-simulator:source-identity")
+        self.assertEqual(self.executor.events, [])
+
+    def test_selected_build_rejects_input_drift_before_installation(self) -> None:
+        spec = load_mobile_simulator_spec(self.contract_path)
+        provisioner = TestSelectedMobileSimulatorProvisioner(
+            self.contract, clients=spec.clients, runtime_source_commit="1" * 40,
+            executor=self.executor, repo_root=self.repo_root,
+            runtime_base=self.root / "selected-runtime",
+            runtime_cache_base=self.cache_root, contract_path=self.contract_path,
+            sleep=lambda _: None,
+        )
+        observed: set[str] = set()
+
+        def digest(platform: str) -> str:
+            first = platform not in observed
+            observed.add(platform)
+            return "sha256:" + ("a" if first else "b") * 64
+
+        with patch.object(provisioner, "_build_inputs_digest", side_effect=digest):
+            manifest = provisioner.provision("selected-source")
+        self.assertEqual(manifest.state, ProvisioningState.BLOCKED)
+        self.assertEqual(manifest.blocked_resource, "mobile-simulator:source-identity")
+        self.assertFalse(any("install" in command for command in self.executor.commands))
+        completed = provisioner.cleanup()
+        self.assertIn("storage:mobile-simulator", completed)
+
+    def test_secure_content_provisioner_owns_selected_platform_clients(
+        self,
+    ) -> None:
+        runtime_source_commit = "1" * 40
+        clients = (
+            mobile_simulator_module.SimulatorClientSpec(
+                id="ios_alice",
+                platform="ios",
+                role="alice",
+                runtime="tauri-ios-simulator",
+                port_roles=("wda-local", "mjpeg", "webview"),
+                storage_root="<runtime-home>/ios-alice",
+            ),
+            mobile_simulator_module.SimulatorClientSpec(
+                id="android_bob",
+                platform="android",
+                role="bob",
+                runtime="tauri-android-emulator",
+                port_roles=("system", "mjpeg", "webview"),
+                storage_root="<runtime-home>/android-bob",
+            ),
+        )
+        provisioner = TestSelectedMobileSimulatorProvisioner(
+            self.contract,
+            clients=clients,
+            runtime_source_commit=runtime_source_commit,
+            executor=self.executor,
+            repo_root=self.repo_root,
+            runtime_base=self.root / "secure-content-runtime",
+            runtime_cache_base=self.cache_root,
+            contract_path=self.contract_path,
+            artifact_fetcher=self._fetch_driver,
+            status_reader=lambda url, timeout: {
+                "value": {"build": {"version": "2.19.0"}}
+            },
+            sleep=lambda _: None,
+        )
+
+        self.executor.ios_resource_source = {"head": runtime_source_commit, "workspaceDigest": "clean"}
+        manifest = provisioner.provision("sc-dj-mobile-matrix")
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        payload = manifest.to_dict()
+        resources = payload["mobileSimulator"]
+        self.assertEqual(
+            {client["profile"] for client in payload["clients"]},
+            {"ios_alice", "android_bob"},
+        )
+        self.assertEqual(
+            set(resources["applications"]),
+            {"ios", "android"},
+        )
+        self.assertEqual(
+            set(resources["appium"]["drivers"]),
+            {"ios", "android"},
+        )
+        build_identities = [
+            json.loads(environment["PT_MOBILE_BUILD_IDENTITY_JSON"])
+            for environment in self.executor.environments
+            if "PT_MOBILE_BUILD_IDENTITY_JSON" in environment
+        ]
+        self.assertEqual(
+            [identity["platform"] for identity in build_identities],
+            ["android", "android", "ios", "ios"],
+        )
+        self.assertEqual(build_identities[0], build_identities[1])
+        self.assertEqual(build_identities[2], build_identities[3])
+        self.assertNotEqual(build_identities[0], build_identities[2])
+        self.assertTrue(
+            all(
+                identity["sourceCommit"] == runtime_source_commit
+                and identity["workspaceState"] == "clean"
+                and identity["workspaceDigest"] == "clean"
+                and identity["harnessEnabled"] is True
+                for identity in build_identities
+            )
+        )
+        self.assertEqual(
+            {
+                platform: application["buildIdentity"]
+                for platform, application in resources[
+                    "applications"
+                ].items()
+            },
+            {
+                "android": build_identities[0],
+                "ios": build_identities[2],
+            },
+        )
+        self.assertNotEqual(
+            resources["clients"]["ios_alice"]["device"],
+            resources["clients"]["android_bob"]["device"],
+        )
+        self.assertNotEqual(
+            resources["clients"]["ios_alice"]["storageRoot"],
+            resources["clients"]["android_bob"]["storageRoot"],
+        )
+
+        completed = provisioner.cleanup()
+
+        self.assertLess(
+            completed.index("appium-process"),
+            completed.index("storage:mobile-simulator"),
+        )
+        self.assertIn("machine-resources:ios-leases", completed)
+        self.assertFalse(any(item.startswith(("simulator-shutdown:", "simulator-delete:")) for item in completed))
+        self.assertTrue(
+            any(
+                item.startswith("emulator-process:android_bob:")
+                for item in completed
+            )
+        )
+
+
+class MobileIOSLayoutSimulatorProvisionerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.executor = FakeCommandExecutor(self.root)
+        resource_caller = patch.object(
+            mobile_simulator_module.MobileIOSResources, "from_environment",
+            side_effect=lambda root, env: FakeIOSResources(self.executor, env),
+        )
+        resource_caller.start()
+        self.addCleanup(resource_caller.stop)
+        self.contract_path = (
+            ENVIRONMENTS_DIR / "mobile-ios-layout-simulator.yaml"
+        )
+        self.contract = EnvironmentContract.from_yaml(self.contract_path)
+        self.provisioner = FakeMobileIOSLayoutSimulatorProvisioner(
+            self.contract,
+            executor=self.executor,
+            repo_root=self.root,
+            runtime_base=self.root / "runtime",
+            contract_path=self.contract_path,
+            base_contract_path=ENVIRONMENTS_DIR / "mobile-simulator.yaml",
+            status_reader=lambda url, timeout: {
+                "value": {"build": {"version": "2.19.0"}}
+            },
+            sleep=lambda _: None,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_registry_resolves_ios_layout_provisioner(self) -> None:
+        self.assertIsInstance(
+            get_provisioner(self.contract),
+            MobileIOSLayoutSimulatorProvisioner,
+        )
+
+    def test_provision_emits_current_iphone_cell_without_android_resources(
+        self,
+    ) -> None:
+        manifest = self.provisioner.provision(
+            "mobile-ios-simulator-layout-accessibility-e2e"
+        )
+
+        self.assertEqual(manifest.state, ProvisioningState.FIXTURE_READY)
+        payload = manifest.to_dict()
+        resources = payload["mobileSimulator"]
+        self.assertEqual(set(resources["applications"]), {"ios"})
+        self.assertEqual(set(resources["appium"]["drivers"]), {"ios"})
+        self.assertEqual(
+            {
+                client_id: (
+                    client["deviceName"],
+                    client["viewportRole"],
+                )
+                for client_id, client in resources["clients"].items()
+            },
+            IOS_LAYOUT_CLIENTS,
+        )
+        self.assertEqual(
+            {
+                client["runtime"]
+                for client in payload["clients"]
+            },
+            {"tauri-ios-simulator"},
+        )
+        device_id = resources["clients"]["sim-ios-current"]["device"]
+        flattened = "\n".join(
+            " ".join(command) for command in self.executor.commands
+        )
+        self.assertNotIn("emulator -list-avds", flattened)
+        self.assertNotIn(" tauri android ", f" {flattened} ")
+        self.assertNotIn("adb ", flattened)
+
+        completed = self.provisioner.cleanup()
+        self.assertEqual(
+            sum(
+                item.startswith("application-uninstall:ios:")
+                for item in completed
+            ),
+            0,
+        )
+        self.assertIn("machine-resources:ios-leases", completed)
+        self.assertFalse(any(item.startswith(("simulator-shutdown:", "simulator-delete:")) for item in completed))
+
+
+class MobileNativeOutputCaptureTests(unittest.TestCase):
+    def test_owned_output_generations_are_redacted_and_written_once(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            written: list[tuple[str, bytes, dict[str, Any]]] = []
+            owner = SimpleNamespace(
+                _raw_authority_values=lambda: ("test-session-secret",),
+                evidence_run=SimpleNamespace(write_bytes=lambda path, data, **kwargs:
+                                             written.append((path, data, kwargs))),
+            )
+            from tooling.acceptance.gates.mobile.simulator_native_output import ios_native_output_callbacks
+            launch, capture = ios_native_output_callbacks(
+                directory=Path(raw) / "native-output", client_id="sim-ios", device="owned-simulator",
+                application_id="com.peers.touch.mobile", writer=owner.evidence_run,
+                sensitive_values=owner._raw_authority_values(),
+            )
+            with patch.object(mobile_simulator_module.subprocess, "run",
+                              return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
+                for generation in (1, 2):
+                    launch()
+                    argv = run.call_args.args[0]
+                    self.assertEqual(argv[-2:], ("owned-simulator", "com.peers.touch.mobile"))
+                    self.assertIn("--terminate-running-process", argv)
+                    root = Path(raw) / "native-output"
+                    (root / f"{generation}-stdout.log").write_text("station-route test-session-secret failed")
+                    (root / f"{generation}-stderr.log").write_text("native diagnostic")
+                    capture()
+                    capture()
+                    self.assertEqual(len(written), generation * 2)
+                self.assertEqual(run.call_count, 2)
+            self.assertEqual(len({path for path, _, _ in written}), 4)
+            self.assertTrue(all(b"test-session-secret" not in data for _, data, _ in written))
+            self.assertIn(b"station-route", written[0][1])
+            self.assertEqual(written[0][2]["role"], "mobile-native-stdout/sim-ios/1")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

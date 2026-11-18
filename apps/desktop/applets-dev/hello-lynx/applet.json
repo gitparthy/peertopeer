@@ -1,0 +1,25 @@
+{
+  "id": "hello-lynx",
+  "name": "Hello Lynx",
+  "version": "0.1.0",
+  "description": "Minimal POC to verify Lynx for Web in Tauri",
+  "author": "peers-touch",
+  "permissions": [
+    "system.getInfo",
+    "storage.get",
+    "storage.set",
+    "lifecycle.destroy"
+  ],
+  "capabilities": [],
+  "targetPlatforms": ["desktop"],
+  "load": {
+    "desktop": {
+      "type": "lynx-web",
+      "entry": "main.lynx.bundle"
+    }
+  },
+  "bridge": {
+    "protocol": "peers-touch.applet.bridge",
+    "version": "1.0.0"
+  }
+}

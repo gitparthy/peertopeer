@@ -1,0 +1,639 @@
+use data_encoding::BASE32_NOPAD;
+use ed25519_dalek::pkcs8::{DecodePublicKey, EncodePublicKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use prost::Message;
+use reqwest::Method;
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::application::station_runtime::client::StationClient;
+use crate::infrastructure::station_registry::StationRegistry;
+use crate::model::actor::{ActorDeviceRef, ActorSigningKeyVerificationSource,
+    ActorEndpointManifest, ActorEndpointManifestSigningInput};
+use crate::model::federation::{ActorProfileEnvelope, FederationResolveView, ListFederationContextsResponse};
+use crate::secure_content::SecureContentSession;
+
+const PROFILE_MAX_LIFETIME_MS: i64 = 60 * 60 * 1_000;
+const PROFILE_CLOCK_SKEW_MS: i64 = 30_000;
+const FEDERATION_KEY_ID_LENGTH: usize = 26;
+
+#[derive(Clone)]
+pub struct TrustedStationSigningKey {
+    pub key_id: String,
+    pub verifying_key: VerifyingKey,
+}
+
+/// Verify the original Identity-owner manifest against an independently
+/// pinned Home Station key. This is the bootstrap for a retained Actor root;
+/// subsequent root changes must be rejected by the consuming local store.
+pub fn verify_actor_identity_manifest(manifest: &ActorEndpointManifest,
+    trusted: &TrustedStationSigningKey, actor: &str, now_ms: i64) -> Result<Vec<u8>, String> {
+    let invalid = || "ACTOR_IDENTITY_INVALID_PROOF".to_string();
+    let owner = manifest.actor.as_ref().ok_or_else(invalid)?;
+    let timestamp_ms = |time: &prost_types::Timestamp| -> Result<i64, String> {
+        if time.nanos < 0 || time.nanos >= 1_000_000_000 { return Err(invalid()); }
+        time.seconds.checked_mul(1000).and_then(|s| s.checked_add(i64::from(time.nanos / 1_000_000)))
+            .ok_or_else(invalid)
+    };
+    let issued = timestamp_ms(manifest.issued_at.as_ref().ok_or_else(invalid)?)?;
+    let expires = timestamp_ms(manifest.expires_at.as_ref().ok_or_else(invalid)?)?;
+    if manifest.encoded_len() > station_trust::MAX_SIGNED_CONTROL_BYTES ||
+        manifest.active_endpoints.len() > 256 ||
+        manifest.format_version != 1 || manifest.manifest_id.trim().is_empty() ||
+        actor.is_empty() || owner.ptid != actor || manifest.home_station_peer_id.trim().is_empty() ||
+        manifest.directory_version == 0 || manifest.actor_profile_version == 0 ||
+        manifest.actor_identity_public_key.len() != 32 || manifest.signing_key_id != trusted.key_id ||
+        expires <= issued || expires.saturating_sub(issued) > 3_600_000 ||
+        expires <= now_ms || issued > now_ms.saturating_add(60_000) || manifest.active_endpoints.is_empty() {
+        return Err(invalid());
+    }
+    let mut previous = "";
+    for entry in &manifest.active_endpoints {
+        let endpoint = entry.endpoint.as_ref().ok_or_else(invalid)?;
+        if endpoint.actor.as_ref() != Some(owner) || endpoint.device_id.trim().is_empty() ||
+            endpoint.device_id.trim() != endpoint.device_id || entry.signing_key_id.trim().is_empty() ||
+            entry.public_material_sha256.is_empty() || (!previous.is_empty() && previous >= endpoint.device_id.as_str()) ||
+            entry.public_material_sha256.iter().any(|h| h.len() != 32) ||
+            entry.public_material_sha256.windows(2).any(|p| p[0] >= p[1]) {
+            return Err(invalid());
+        }
+        previous = &endpoint.device_id;
+    }
+    let input = ActorEndpointManifestSigningInput{
+        format_version: manifest.format_version, manifest_id: manifest.manifest_id.clone(),
+        actor: manifest.actor.clone(), home_station_peer_id: manifest.home_station_peer_id.clone(),
+        directory_version: manifest.directory_version, active_endpoints: manifest.active_endpoints.clone(),
+        issued_at: manifest.issued_at, expires_at: manifest.expires_at,
+        signing_key_id: manifest.signing_key_id.clone(),
+        actor_identity_public_key: manifest.actor_identity_public_key.clone(),
+        actor_profile_version: manifest.actor_profile_version,
+    };
+    let signature = Signature::from_slice(&manifest.station_signature).map_err(|_| invalid())?;
+    trusted.verifying_key.verify(&input.encode_to_vec(), &signature).map_err(|_| invalid())?;
+    Ok(manifest.actor_identity_public_key.clone())
+}
+
+pub fn current_session_sender_signing_key(
+    session: &SecureContentSession,
+    sender: &ActorDeviceRef,
+    signing_key_id: &str,
+) -> Result<Option<VerifyingKey>, String> {
+    if sender.actor.as_ref().map(|actor| actor.ptid.as_str())
+        != Some(session.key.actor_ptid.as_str())
+        || sender.device_id != session.key.device_id
+        || signing_key_id != session.signing_key_id
+    {
+        return Ok(None);
+    }
+    let secrets = session.begin_request()?;
+    secrets
+        .secrets
+        .signing_key
+        .as_ref()
+        .map(|key| Some(key.verifying_key()))
+        .ok_or_else(|| "Secure Content sender signing key is unavailable".to_string())
+}
+
+pub fn verify_profile_actor_device_signing_key(
+    envelope: &ActorProfileEnvelope,
+    trusted_station: &TrustedStationSigningKey,
+    expected_handle: &str,
+    expected_station_peer_id: &str,
+    expected_sender: &ActorDeviceRef,
+    expected_signing_key_id: &str,
+    committed_at_unix_ms: i64,
+    now_unix_ms: i64,
+) -> Result<VerifyingKey, String> {
+    let profile_station = verify_profile_envelope(
+        envelope,
+        expected_handle,
+        expected_station_peer_id,
+        now_unix_ms,
+    )?;
+    if profile_station.key_id != trusted_station.key_id
+        || profile_station.verifying_key != trusted_station.verifying_key
+    {
+        return Err("Actor profile is not signed by the pinned Station key".to_string());
+    }
+    let actor = expected_sender
+        .actor
+        .as_ref()
+        .ok_or_else(|| "Secure Content sender actor is unavailable".to_string())?;
+    let profile_ptid = envelope
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.peers_touch.as_ref())
+        .map(|identity| identity.network_id.as_str())
+        .unwrap_or_default();
+    if actor.ptid.trim().is_empty()
+        || profile_ptid != actor.ptid
+        || expected_sender.device_id.trim().is_empty()
+        || expected_signing_key_id.trim().is_empty()
+        || committed_at_unix_ms <= 0
+    {
+        return Err("Actor profile sender identity is invalid".to_string());
+    }
+
+    let mut matches = envelope.device_signing_keys.iter().filter(|key| {
+        key.actor_ptid == actor.ptid
+            && key.actor_device_id == expected_sender.device_id
+            && key.home_station_peer_id == expected_station_peer_id
+            && key.signing_key_id == expected_signing_key_id
+    });
+    let key = matches.next().ok_or_else(|| {
+        "Actor profile does not expose the required sender signing key".to_string()
+    })?;
+    if matches.next().is_some()
+        || key.ed25519_public_key.len() != 32
+        || key.profile_version <= 0
+        || key.valid_from_unix_ms <= 0
+        || key.valid_from_unix_ms > committed_at_unix_ms
+        || (key.revoked_at_unix_ms != 0
+            && (key.revoked_at_unix_ms <= key.valid_from_unix_ms
+                || committed_at_unix_ms >= key.revoked_at_unix_ms))
+        || !matches!(
+            ActorSigningKeyVerificationSource::try_from(key.verification_source).ok(),
+            Some(ActorSigningKeyVerificationSource::VerifiedProfile)
+                | Some(ActorSigningKeyVerificationSource::VerifiedLocator)
+        )
+    {
+        return Err("Actor profile sender signing key is not valid at commit time".to_string());
+    }
+    VerifyingKey::from_bytes(
+        key.ed25519_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Actor profile sender signing key is invalid".to_string())?,
+    )
+    .map_err(|_| "Actor profile sender signing key is invalid".to_string())
+}
+
+pub fn resolve_station_signing_key(
+    station_client: &StationClient,
+    registry: &StationRegistry,
+    station_peer_id: &str,
+    actor_handle: &str,
+    token: &str,
+    device_id: &str,
+) -> Result<TrustedStationSigningKey, String> {
+    resolve_station_signing_key_for_actor(station_client, registry, station_peer_id,
+        actor_handle, token, device_id, None)
+}
+
+pub fn resolve_station_signing_key_for_actor(
+    station_client: &StationClient, registry: &StationRegistry, station_peer_id: &str,
+    actor_handle: &str, token: &str, device_id: &str, expected_actor: Option<&str>,
+) -> Result<TrustedStationSigningKey, String> {
+    require_authenticated_station_transport(station_client)?;
+    if let Some(pin) = registry
+        .federation_signing_key_pin(station_peer_id)
+        .map_err(|error| format!("load Station Federation signing-key pin: {error}"))?
+    {
+        if pin.station_peer_id != station_peer_id {
+            return Err("pinned Station Federation key belongs to another peer".to_string());
+        }
+        let verifying_key = VerifyingKey::from_bytes(&pin.ed25519_public_key)
+            .map_err(|_| "pinned Station Federation signing key is invalid".to_string())?;
+        return Ok(TrustedStationSigningKey {
+            key_id: pin.signing_key_id,
+            verifying_key,
+        });
+    }
+
+    let canonical_handle = crate::secure_content::adapter::canonical_federated_handle(actor_handle)
+        .ok_or_else(|| "ACTOR_IDENTITY_INVALID_PROOF".to_string())?;
+    let envelope = load_actor_profile_envelope(station_client, station_peer_id,
+        &canonical_handle, token, device_id, expected_actor)?;
+    let trusted =
+        verify_profile_envelope(&envelope, &canonical_handle, station_peer_id, current_unix_ms())?;
+    if let Some(actor) = expected_actor {
+        if envelope.profile.as_ref().and_then(|p| p.peers_touch.as_ref())
+            .map(|p| p.network_id.as_str()) != Some(actor) {
+            return Err("ACTOR_IDENTITY_INVALID_PROOF".into());
+        }
+    }
+    registry
+        .pin_or_verify_federation_signing_key(
+            station_peer_id,
+            &trusted.key_id,
+            trusted.verifying_key.to_bytes(),
+        )
+        .map_err(|error| format!("pin Station Federation signing key: {error}"))?;
+    Ok(trusted)
+}
+
+fn load_actor_profile_envelope(
+    client: &StationClient, home: &str, handle: &str, token: &str, device: &str,
+    expected_actor: Option<&str>,
+) -> Result<ActorProfileEnvelope, String> {
+    if client.active_station_peer_id().as_deref() == Some(home) {
+        return client.request_proto_for_device::<(), ActorProfileEnvelope>(
+            Method::GET, "/actor/federation/profile", token,
+            Some(&[("handle", handle.to_string())]), None, device,
+        ).map_err(|error| format!("load Station Federation profile: {error}"));
+    }
+    // Remote profiles resolve through the existing Federation owner. The local
+    // profile endpoint serves local Actors only. Every remote attempt has an
+    // explicit actor-visible Federation scope; none creates a global directory.
+    let contexts: ListFederationContextsResponse = client.request_proto_for_device::<(), _>(
+        Method::GET, "/sub-federation/contexts", token, None, None, device,
+    ).map_err(|error| format!("load Federation profile contexts: {error}"))?;
+    if contexts.contexts.len() > 32 {
+        return Err("Station Federation profile contexts exceed the read budget".into());
+    }
+    for context in contexts.contexts {
+        if context.status != "active" || context.federation_id.trim().is_empty() {
+            continue;
+        }
+        let query = [("federation_id", context.federation_id.clone()), ("handle", handle.to_string())];
+        let response = client.request_proto_for_device::<(), FederationResolveView>(
+            Method::GET, "/actor/federation/resolve", token, Some(&query), None, device,
+        );
+        let view = match response {
+            Ok(view) => view,
+            Err(error) if matches!(error.kind,
+                crate::application::station_runtime::client::StationClientErrorKind::HttpStatus(404)) => continue,
+            Err(error) => return Err(format!("resolve Home Station Federation profile: {error}")),
+        };
+        return resolved_profile_envelope(view, &context.federation_id, home, handle, expected_actor);
+    }
+    Err("Station Federation profile is unavailable in the Actor's contexts".into())
+}
+
+fn resolved_profile_envelope(
+    view: FederationResolveView, federation: &str, home: &str, handle: &str,
+    expected_actor: Option<&str>,
+) -> Result<ActorProfileEnvelope, String> {
+    let envelope = view.signed_profile.ok_or("Station Federation profile proof is missing")?;
+    if view.federation_id != federation || view.federated_handle != handle
+        || view.home_station_peer_id != home || envelope.home_station_peer_id != home
+        || envelope.federated_handle != handle || view.signing_key_kid != envelope.signing_key_kid
+        || view.profile != envelope.profile || view.home_station_domain != envelope.home_station_domain
+        || view.issued_at_unix_ms != envelope.issued_at_unix_ms
+        || view.expires_at_unix_ms != envelope.expires_at_unix_ms
+        || expected_actor.is_some_and(|actor| envelope.profile.as_ref()
+            .and_then(|profile| profile.peers_touch.as_ref()).map(|info| info.network_id.as_str()) != Some(actor))
+    {
+        return Err("ACTOR_IDENTITY_INVALID_PROOF".into());
+    }
+    Ok(envelope)
+}
+
+pub(crate) fn require_authenticated_station_transport(
+    station_client: &StationClient,
+) -> Result<(), String> {
+    let origin = station_client
+        .active_endpoint_origin()
+        .ok_or_else(|| "Secure Content Station transport is unavailable".to_string())?;
+    require_authenticated_station_origin(&origin)
+}
+
+fn require_authenticated_station_origin(origin: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(origin)
+        .map_err(|_| "Secure Content Station URL is invalid".to_string())?;
+    if url.host_str().is_none() {
+        return Err("Secure Content Station URL has no host".to_string());
+    }
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "Secure Content Station transport requires a canonical HTTP or HTTPS origin"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_profile_envelope(
+    envelope: &ActorProfileEnvelope,
+    expected_handle: &str,
+    expected_station_peer_id: &str,
+    now_unix_ms: i64,
+) -> Result<TrustedStationSigningKey, String> {
+    if expected_handle.trim().is_empty()
+        || envelope.federated_handle != expected_handle
+        || envelope.home_station_peer_id != expected_station_peer_id
+        || envelope.home_station_domain.trim().is_empty()
+        || envelope.profile.is_none()
+        || envelope.signing_key_pem.trim().is_empty()
+        || envelope.signing_key_kid.trim().is_empty()
+        || envelope.signature.len() != 64
+    {
+        return Err("Station Federation profile identity is invalid".to_string());
+    }
+    if envelope.expires_at_unix_ms <= envelope.issued_at_unix_ms
+        || envelope
+            .expires_at_unix_ms
+            .saturating_sub(envelope.issued_at_unix_ms)
+            > PROFILE_MAX_LIFETIME_MS
+        || envelope.issued_at_unix_ms > now_unix_ms.saturating_add(PROFILE_CLOCK_SKEW_MS)
+        || envelope.expires_at_unix_ms < now_unix_ms.saturating_sub(PROFILE_CLOCK_SKEW_MS)
+    {
+        return Err("Station Federation profile is stale".to_string());
+    }
+
+    let verifying_key = VerifyingKey::from_public_key_pem(&envelope.signing_key_pem)
+        .map_err(|_| "Station Federation profile signing key is invalid".to_string())?;
+    let derived_key_id = federation_signing_key_id(&verifying_key)?;
+    if envelope.signing_key_kid != derived_key_id {
+        return Err("Station Federation profile signing-key fingerprint mismatched".to_string());
+    }
+
+    let signature = Signature::from_slice(&envelope.signature)
+        .map_err(|_| "Station Federation profile signature is invalid".to_string())?;
+    let mut unsigned = envelope.clone();
+    unsigned.signature.clear();
+    verifying_key
+        .verify(&unsigned.encode_to_vec(), &signature)
+        .map_err(|_| "Station Federation profile signature is invalid".to_string())?;
+
+    Ok(TrustedStationSigningKey {
+        key_id: derived_key_id,
+        verifying_key,
+    })
+}
+
+fn federation_signing_key_id(key: &VerifyingKey) -> Result<String, String> {
+    let document = key
+        .to_public_key_der()
+        .map_err(|_| "encode Station Federation signing key".to_string())?;
+    let encoded = BASE32_NOPAD.encode(&Sha256::digest(document.as_bytes()));
+    Ok(encoded[..FEDERATION_KEY_ID_LENGTH].to_ascii_lowercase())
+}
+
+fn current_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signed_profile(
+        signing_key: &SigningKey,
+        handle: &str,
+        station_peer_id: &str,
+        now_unix_ms: i64,
+    ) -> ActorProfileEnvelope {
+        let verifying_key = signing_key.verifying_key();
+        let mut envelope = ActorProfileEnvelope {
+            federated_handle: handle.to_string(),
+            home_station_peer_id: station_peer_id.to_string(),
+            home_station_domain: "station.test:443".to_string(),
+            profile: Some(crate::model::actor::ActorProfile {
+                peers_touch: Some(crate::model::actor::PeersTouchInfo {
+                    network_id: "ptid:alice".to_string(),
+                }),
+                ..Default::default()
+            }),
+            issued_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms: now_unix_ms + 300_000,
+            signature: Vec::new(),
+            signing_key_pem: verifying_key.to_public_key_pem(Default::default()).unwrap(),
+            signing_key_kid: federation_signing_key_id(&verifying_key).unwrap(),
+            device_signing_keys: Vec::new(),
+        };
+        envelope.signature = signing_key
+            .sign(&envelope.encode_to_vec())
+            .to_bytes()
+            .to_vec();
+        envelope
+    }
+
+    fn resign_profile(envelope: &mut ActorProfileEnvelope, signing_key: &SigningKey) {
+        envelope.signature.clear();
+        envelope.signature = signing_key
+            .sign(&envelope.encode_to_vec())
+            .to_bytes()
+            .to_vec();
+    }
+
+    fn sender_key(
+        signing_key: &SigningKey,
+        revoked_at_unix_ms: i64,
+    ) -> crate::model::actor::VerifiedActorDeviceSigningKey {
+        crate::model::actor::VerifiedActorDeviceSigningKey {
+            actor_ptid: "ptid:alice".to_string(),
+            actor_device_id: "device-1".to_string(),
+            home_station_peer_id: "station-1".to_string(),
+            signing_key_id: "sender-key-1".to_string(),
+            ed25519_public_key: signing_key.verifying_key().to_bytes().to_vec(),
+            profile_version: 7,
+            verification_source: ActorSigningKeyVerificationSource::VerifiedProfile as i32,
+            valid_from_unix_ms: 1_800_000_000_000,
+            revoked_at_unix_ms,
+        }
+    }
+
+    fn sender() -> ActorDeviceRef {
+        ActorDeviceRef {
+            actor: Some(crate::model::actor::ActorRef {
+                ptid: "ptid:alice".to_string(),
+                acct: "@alice@station.test".to_string(),
+                kind: crate::model::actor::ActorKind::Person as i32,
+            }),
+            device_id: "device-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn verifies_profile_key_identity_before_returning_trust_anchor() {
+        let now = 1_900_000_000_000;
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let envelope = signed_profile(&signing_key, "@alice@station.test", "station-1", now);
+
+        let trusted =
+            verify_profile_envelope(&envelope, "@alice@station.test", "station-1", now).unwrap();
+
+        assert_eq!(trusted.key_id, envelope.signing_key_kid);
+        assert_eq!(trusted.verifying_key, signing_key.verifying_key());
+    }
+
+    #[test]
+    fn remote_resolution_requires_original_proof_bound_to_context_and_actor() {
+        let now = 1_900_000_000_000;
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let envelope = signed_profile(&signing_key, "@alice@station.test", "station-1", now);
+        let view = FederationResolveView {
+            federation_id: "federation-1".into(),
+            federated_handle: envelope.federated_handle.clone(),
+            home_station_peer_id: envelope.home_station_peer_id.clone(),
+            home_station_domain: envelope.home_station_domain.clone(),
+            profile: envelope.profile.clone(),
+            signing_key_kid: envelope.signing_key_kid.clone(),
+            issued_at_unix_ms: envelope.issued_at_unix_ms,
+            expires_at_unix_ms: envelope.expires_at_unix_ms,
+            signed_profile: Some(envelope.clone()),
+            ..Default::default()
+        };
+        let resolved = resolved_profile_envelope(view.clone(), "federation-1",
+            "station-1", "@alice@station.test", Some("ptid:alice")).unwrap();
+        assert_eq!(resolved, envelope);
+        assert!(resolved_profile_envelope(view.clone(), "federation-2",
+            "station-1", "@alice@station.test", Some("ptid:alice")).is_err());
+        assert!(resolved_profile_envelope(view.clone(), "federation-1",
+            "station-2", "@alice@station.test", Some("ptid:alice")).is_err());
+        assert!(resolved_profile_envelope(view.clone(), "federation-1",
+            "station-1", "@alice@station.test", Some("ptid:bob")).is_err());
+        let mut missing = view.clone();
+        missing.signed_profile = None;
+        assert!(resolved_profile_envelope(missing, "federation-1",
+            "station-1", "@alice@station.test", Some("ptid:alice")).is_err());
+        let mut changed = view;
+        changed.signing_key_kid = "substituted-key".into();
+        assert!(resolved_profile_envelope(changed, "federation-1",
+            "station-1", "@alice@station.test", Some("ptid:alice")).is_err());
+    }
+
+    #[test]
+    fn remote_profile_hint_uses_original_account_canonicalization() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let envelope = signed_profile(&signing_key, "@alice@station.test", "station-1", 1_900_000_000_000);
+        let view = FederationResolveView {
+            federation_id: "federation-1".into(),
+            federated_handle: envelope.federated_handle.clone(),
+            home_station_peer_id: envelope.home_station_peer_id.clone(),
+            home_station_domain: envelope.home_station_domain.clone(),
+            profile: envelope.profile.clone(),
+            signing_key_kid: envelope.signing_key_kid.clone(),
+            issued_at_unix_ms: envelope.issued_at_unix_ms,
+            expires_at_unix_ms: envelope.expires_at_unix_ms,
+            signed_profile: Some(envelope.clone()),
+            ..Default::default()
+        };
+        for acct in ["alice@station.test", "@alice@station.test", "Alice@Station.Test"] {
+            let handle = crate::secure_content::adapter::canonical_federated_handle(acct).unwrap();
+            let resolved = resolved_profile_envelope(view.clone(), "federation-1",
+                "station-1", &handle, Some("ptid:alice")).unwrap();
+            assert_eq!(resolved, envelope);
+        }
+        for invalid in ["", "alice", "@alice", "alice@@station.test", " alice@station.test"] {
+            assert!(crate::secure_content::adapter::canonical_federated_handle(invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_profile_signed_by_a_substituted_key_or_station() {
+        let now = 1_900_000_000_000;
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let mut envelope = signed_profile(&signing_key, "@alice@station.test", "station-1", now);
+        envelope.home_station_peer_id = "station-attacker".to_string();
+
+        assert!(
+            verify_profile_envelope(&envelope, "@alice@station.test", "station-1", now).is_err()
+        );
+
+        let attacker = SigningKey::from_bytes(&[8; 32]);
+        envelope = signed_profile(&signing_key, "@alice@station.test", "station-1", now);
+        envelope.signature = attacker
+            .sign(&{
+                let mut unsigned = envelope.clone();
+                unsigned.signature.clear();
+                unsigned.encode_to_vec()
+            })
+            .to_bytes()
+            .to_vec();
+        assert!(
+            verify_profile_envelope(&envelope, "@alice@station.test", "station-1", now).is_err()
+        );
+    }
+
+    #[test]
+    fn secure_content_profile_sender_key_is_exact_and_commit_time_bound() {
+        let now = 1_900_000_000_000;
+        let station_key = SigningKey::from_bytes(&[7; 32]);
+        let device_key = SigningKey::from_bytes(&[8; 32]);
+        let mut envelope = signed_profile(&station_key, "@alice@station.test", "station-1", now);
+        envelope.device_signing_keys = vec![sender_key(&device_key, now - 10_000)];
+        resign_profile(&mut envelope, &station_key);
+        let trusted = TrustedStationSigningKey {
+            key_id: federation_signing_key_id(&station_key.verifying_key()).unwrap(),
+            verifying_key: station_key.verifying_key(),
+        };
+
+        assert_eq!(
+            verify_profile_actor_device_signing_key(
+                &envelope,
+                &trusted,
+                "@alice@station.test",
+                "station-1",
+                &sender(),
+                "sender-key-1",
+                now - 20_000,
+                now,
+            )
+            .unwrap(),
+            device_key.verifying_key()
+        );
+        assert!(verify_profile_actor_device_signing_key(
+            &envelope,
+            &trusted,
+            "@alice@station.test",
+            "station-1",
+            &sender(),
+            "sender-key-1",
+            now,
+            now,
+        )
+        .is_err());
+        assert!(verify_profile_actor_device_signing_key(
+            &envelope,
+            &trusted,
+            "@alice@station.test",
+            "station-1",
+            &sender(),
+            "sender-key-substituted",
+            now - 20_000,
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_content_profile_rejects_substituted_sender_key() {
+        let now = 1_900_000_000_000;
+        let station_key = SigningKey::from_bytes(&[7; 32]);
+        let device_key = SigningKey::from_bytes(&[8; 32]);
+        let attacker_key = SigningKey::from_bytes(&[6; 32]);
+        let mut envelope = signed_profile(&station_key, "@alice@station.test", "station-1", now);
+        envelope.device_signing_keys = vec![sender_key(&device_key, 0)];
+        resign_profile(&mut envelope, &station_key);
+        envelope.device_signing_keys[0].ed25519_public_key =
+            attacker_key.verifying_key().to_bytes().to_vec();
+        let trusted = TrustedStationSigningKey {
+            key_id: federation_signing_key_id(&station_key.verifying_key()).unwrap(),
+            verifying_key: station_key.verifying_key(),
+        };
+
+        assert!(verify_profile_actor_device_signing_key(
+            &envelope,
+            &trusted,
+            "@alice@station.test",
+            "station-1",
+            &sender(),
+            "sender-key-1",
+            now - 1,
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_content_transport_accepts_user_selected_http_or_https() {
+        assert!(require_authenticated_station_origin("https://station.test").is_ok());
+        assert!(require_authenticated_station_origin("http://127.0.0.1:18080").is_ok());
+        assert!(require_authenticated_station_origin("http://localhost:18080").is_ok());
+        assert!(require_authenticated_station_origin("http://station.test").is_ok());
+        assert!(require_authenticated_station_origin("ftp://station.test").is_err());
+        assert!(require_authenticated_station_origin("http://station.test/path").is_err());
+    }
+}

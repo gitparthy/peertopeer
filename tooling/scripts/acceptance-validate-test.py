@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+"""Tests for Acceptance domain structural validation."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+SCRIPT_PATH = Path(__file__).with_name("acceptance-validate.py")
+SPEC = importlib.util.spec_from_file_location("acceptance_validate", SCRIPT_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class CurrentAggregateDependencyContractTests(unittest.TestCase):
+    def test_proven_domain_validators_depend_on_their_domain_gates(self) -> None:
+        repo_root = SCRIPT_PATH.parents[2]
+        acceptance_root = SCRIPT_PATH.parents[1] / "acceptance"
+        catalog = MODULE.load(acceptance_root / "gates.yaml")["gates"]
+        capabilities = {
+            capability["id"]: capability
+            for path in sorted((acceptance_root / "capabilities").glob("*.yaml"))
+            for capability in MODULE.load(path)["capabilities"]
+        }
+        domain_index = MODULE.load(acceptance_root / "domains" / "index.yaml")
+
+        checked = []
+        for domain in domain_index["domains"]:
+            if domain["status"] != "active" or domain["id"] == "agent":
+                continue
+            profile = MODULE.load(repo_root / domain["profile"])
+            gate_id = profile["validation_gate_id"]
+            definition = catalog[gate_id]
+            if "--require-proven" not in definition["command"]:
+                continue
+            expected = {
+                required_gate
+                for capability_id in profile["capabilities"]
+                for required_gate in capabilities[capability_id]["required_gates"]
+            }
+            dependencies = definition["dependsOn"]
+            with self.subTest(domain=domain["id"], gate_id=gate_id):
+                self.assertEqual(set(dependencies), expected)
+                self.assertEqual(len(dependencies), len(expected))
+            checked.append(domain["id"])
+
+        self.assertEqual(
+            set(checked),
+            {
+                "applet",
+                "chat",
+                "desktop-shell",
+                "federation",
+                "mobile",
+                "social",
+                "station-access",
+                "station-dashboard",
+            },
+        )
+
+    def test_evidence_consumers_declare_their_source_dependencies(self) -> None:
+        from tooling.acceptance.gates.chat import lifecycle_ccu_aggregate
+        from tooling.acceptance.gates.chat_storage import (
+            batch_clear_aggregate,
+            governance_aggregate,
+        )
+        from tooling.acceptance.gates.station_access import (
+            lifecycle_aggregate,
+            relay_aggregate,
+            relay_attachment_lifecycle_e2e,
+            session_class_e2e,
+        )
+        from tooling.acceptance.gates.unified_client import (
+            architecture_aggregate,
+        )
+        from tooling.acceptance.gates.x_config import aggregate as x_config_aggregate
+
+        catalog = MODULE.load(
+            SCRIPT_PATH.parents[1] / "acceptance" / "gates.yaml"
+        )["gates"]
+        expected = {
+            "x-config-api-aggregate-e2e": list(
+                x_config_aggregate.REQUIRED_GATES
+            ),
+            "unified-client-architecture-aggregate": [
+                spec.gate_id for spec in architecture_aggregate.CHILD_GATES
+            ],
+            "station-access-lifecycle-aggregate-e2e": [
+                spec.gate_id for spec in lifecycle_aggregate.PRECEDING_GATES
+            ],
+            "station-access-session-class-e2e": [
+                spec.gate_id for spec in session_class_e2e.PRECEDING_GATES
+            ],
+            "station-access-relay-security-e2e": [
+                spec.gate_id for spec in relay_aggregate.SECURITY_GATES
+            ],
+            "unified-relay-station-access-aggregate-e2e": [
+                relay_aggregate.SECURITY_GATE_ID,
+                *[
+                    spec.gate_id
+                    for spec in relay_aggregate.UNIFIED_GATES[
+                        len(relay_aggregate.SECURITY_GATES):
+                    ]
+                    if spec.gate_id != relay_aggregate.SECURITY_GATE_ID
+                ],
+            ],
+            "chat-storage-batch-clear-aggregate-e2e": [
+                spec.gate_id for spec in batch_clear_aggregate.PRECEDING_GATES
+            ],
+            "chat-storage-governance-aggregate-e2e": [
+                spec.gate_id for spec in governance_aggregate.PRECEDING_GATES
+            ],
+            "chat-lifecycle-ccu-aggregate-e2e": [
+                spec.gate_id for spec in lifecycle_ccu_aggregate.PRECEDING_GATES
+            ],
+            relay_attachment_lifecycle_e2e.AGGREGATE_GATE_ID: [
+                spec.gate_id
+                for spec in
+                relay_attachment_lifecycle_e2e.RelayAttachmentAggregateGate.preceding_gates
+            ],
+        }
+        expected.update({
+            gate_id: [relay_attachment_lifecycle_e2e.SUITE_GATE_ID]
+            for gate_id in relay_attachment_lifecycle_e2e.PROJECTION_GATE_IDS
+        })
+
+        for gate_id, dependencies in expected.items():
+            with self.subTest(gate_id=gate_id):
+                self.assertEqual(catalog[gate_id]["dependsOn"], dependencies)
+
+
+class GateLaunchContractTests(unittest.TestCase):
+    def test_rejects_duplicate_gate_catalog_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gates_path = Path(temp_dir) / "gates.yaml"
+            gates_path.write_text(
+                '{"gates":{"finalizer-gate":{"evidenceFinalizer":{},'
+                '"evidenceFinalizer":{}}}}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "duplicate key"):
+                MODULE.load(gates_path)
+
+            gates_path.write_text(
+                '{"gates":{"finalizer-gate":{"timeout_seconds":1e999}}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid number"):
+                MODULE.load(gates_path)
+
+    def test_accepts_each_canonical_launch_form(self) -> None:
+        MODULE.validate_gate_catalog(
+            {
+                "legacy-gate": {
+                    "command": "python3 legacy_gate.py",
+                    "environment": "local",
+                    "tier": "ci-cheap",
+                },
+                "context-gate": {
+                    "argv": ["python3", "-m", "example.gate"],
+                    "ephemeralCapabilities": [
+                        "example.echo",
+                        "example.deny",
+                    ],
+                    "environment": "local",
+                    "tier": "ci-cheap",
+                },
+            },
+            {"legacy-gate", "context-gate"},
+        )
+
+    def test_discovers_registered_environment_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            environment_dir = acceptance_root / "environments"
+            environment_dir.mkdir()
+            (environment_dir / "synthetic-runtime.yaml").write_text(
+                '{"id":"synthetic-runtime"}\n',
+                encoding="utf-8",
+            )
+
+            MODULE.validate_gate_catalog(
+                {
+                    "environment-gate": {
+                        "command": "true",
+                        "environment": "synthetic-runtime",
+                        "tier": "env-evidence",
+                    }
+                },
+                {"environment-gate"},
+                acceptance_root=acceptance_root,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "invalid environment"):
+                MODULE.validate_gate_catalog(
+                    {
+                        "unknown-environment-gate": {
+                            "command": "true",
+                            "environment": "not-registered",
+                            "tier": "env-evidence",
+                        }
+                    },
+                    {"unknown-environment-gate"},
+                    acceptance_root=acceptance_root,
+                )
+
+    def test_rejects_invalid_launch_forms(self) -> None:
+        cases = [
+            (
+                {},
+                "exactly one of command or argv",
+            ),
+            (
+                {"command": "true", "argv": ["true"]},
+                "exactly one of command or argv",
+            ),
+            (
+                {"command": ""},
+                "command must be a non-empty string",
+            ),
+            (
+                {"argv": []},
+                "argv must be a non-empty list of non-empty strings",
+            ),
+            (
+                {"argv": ["python3", ""]},
+                "argv must be a non-empty list of non-empty strings",
+            ),
+        ]
+
+        for launch, expected_error in cases:
+            with self.subTest(launch=launch):
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    MODULE.validate_gate_catalog(
+                        {
+                            "invalid-gate": {
+                                **launch,
+                                "environment": "local",
+                                "tier": "ci-cheap",
+                            }
+                        },
+                        {"invalid-gate"},
+                    )
+
+    def test_rejects_invalid_ephemeral_capabilities(self) -> None:
+        cases = [
+            (
+                {
+                    "command": "true",
+                    "ephemeralCapabilities": ["example.echo"],
+                },
+                "ephemeralCapabilities requires argv",
+            ),
+            (
+                {
+                    "argv": ["true"],
+                    "ephemeralCapabilities": [],
+                },
+                "unique, non-empty list of non-empty strings",
+            ),
+            (
+                {
+                    "argv": ["true"],
+                    "ephemeralCapabilities": ["example.echo", "example.echo"],
+                },
+                "unique, non-empty list of non-empty strings",
+            ),
+            (
+                {
+                    "argv": ["true"],
+                    "ephemeralCapabilities": ["example.echo", 1],
+                },
+                "unique, non-empty list of non-empty strings",
+            ),
+            (
+                {
+                    "argv": ["node", "gate.js"],
+                    "ephemeralCapabilities": ["example.echo"],
+                },
+                "requires a Python module, script, or -c argv",
+            ),
+        ]
+
+        for launch, expected_error in cases:
+            with self.subTest(launch=launch):
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    MODULE.validate_gate_catalog(
+                        {
+                            "invalid-gate": {
+                                **launch,
+                                "environment": "local",
+                                "tier": "ci-cheap",
+                            }
+                        },
+                        {"invalid-gate"},
+                    )
+
+    def test_argv_gate_participates_in_inheritance_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            module_path = (
+                repo_root
+                / "tooling"
+                / "acceptance"
+                / "gates"
+                / "example"
+                / "gate.py"
+            )
+            module_path.parent.mkdir(parents=True)
+            module_path.write_text("def main():\n    return 0\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ACCEPTANCE_GATE_CONTRACT_VIOLATION",
+            ):
+                MODULE.validate_gate_inheritance(
+                    repo_root,
+                    {
+                        "context-gate": {
+                            "argv": [
+                                "python3",
+                                "-m",
+                                "tooling.acceptance.gates.example.gate",
+                            ]
+                        }
+                    },
+                    {"context-gate"},
+                )
+
+
+class GateLifecycleResolutionTests(unittest.TestCase):
+    def validate_source(self, source: str, shared: str = "") -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            package = repo_root / "tooling/acceptance/gates/example"
+            package.mkdir(parents=True)
+            (package / "gate.py").write_text(source, encoding="utf-8")
+            (package / "shared.py").write_text(shared, encoding="utf-8")
+            MODULE.validate_gate_inheritance(
+                repo_root,
+                {"example": {"argv": [
+                    "python3", "-m", "tooling.acceptance.gates.example.gate",
+                ]}},
+                {"example"},
+            )
+
+    def test_resolves_shared_aliased_base_without_importing_module(self) -> None:
+        self.validate_source(
+            "from .shared import SharedGate as Gate\n"
+            "def main():\n    return Gate().execute()\n",
+            "from tooling.acceptance.core import AcceptanceGate as Base\n"
+            "raise RuntimeError('validator must never execute this import')\n"
+            "class SharedGate(Base):\n    pass\n",
+        )
+
+    def test_rejects_marker_unused_import_and_cyclic_bases(self) -> None:
+        for source, shared in [
+            ("# AcceptanceGate\n\ndef main():\n    return 0\n", ""),
+            ("from tooling.acceptance.core import AcceptanceGate\n", ""),
+            ("from .shared import Gate\nGate().execute()\n",
+             "from .gate import Gate\n"),
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    RuntimeError, "ACCEPTANCE_GATE_CONTRACT_VIOLATION",
+                ):
+                    self.validate_source(source, shared)
+
+    def test_direct_session_requires_observed_source_write_and_completion(self) -> None:
+        prefix = (
+            "from tooling.acceptance.core import ArtifactSession, source_identity\n"
+            "def main():\n"
+            "    observed = source_identity(root)\n"
+        )
+        complete = (
+            "    with ArtifactSession(source=observed) as session:\n"
+            "        session.write_json('reports/result.json', {})\n"
+            "        session.complete(status='passed')\n"
+        )
+        self.validate_source(prefix + complete)
+        for source in [
+            prefix + complete.replace("source=observed", "source=claimed"),
+            prefix + complete.replace("        session.complete(status='passed')\n", ""),
+            prefix + complete.replace("        session.write_json('reports/result.json', {})\n", ""),
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    RuntimeError, "ACCEPTANCE_GATE_CONTRACT_VIOLATION",
+                ):
+                    self.validate_source(source)
+
+
+class FinalizerContractTests(unittest.TestCase):
+    def test_no_declaration_and_no_config_is_not_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            (acceptance_root / "capabilities").mkdir()
+
+            self.assertEqual(
+                MODULE.validate_finalizer_contracts(acceptance_root, {}),
+                {},
+            )
+
+    def test_rejects_catalog_config_without_protected_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            (acceptance_root / "capabilities").mkdir()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "has no protected requiredEvidenceFinalizers mapping",
+            ):
+                MODULE.validate_finalizer_contracts(
+                    acceptance_root,
+                    {
+                        "synthetic-gate": {
+                            "evidenceFinalizer": {
+                                "id": "synthetic.finalizer",
+                                "timeoutSeconds": 30,
+                                "inputByteLimit": 4096,
+                            }
+                        }
+                    },
+                )
+
+
+class DomainContractClosureTests(unittest.TestCase):
+    SOURCE = {
+        "commit": "current-head",
+        "workspaceDigest": "clean",
+        "canonicalWorktreeHash": "0123456789abcdef",
+    }
+
+    def setUp(self) -> None:
+        isolated_environment = {
+            key: value
+            for key, value in MODULE.os.environ.items()
+            if key != "PT_ACCEPTANCE_CURRENT_RESULTS"
+        }
+        environment_patch = mock.patch.dict(
+            MODULE.os.environ,
+            isolated_environment,
+            clear=True,
+        )
+        environment_patch.start()
+        self.addCleanup(environment_patch.stop)
+        source_patch = mock.patch.object(
+            MODULE,
+            "source_identity",
+            return_value=self.SOURCE,
+        )
+        source_patch.start()
+        self.addCleanup(source_patch.stop)
+
+    def latest_store(self, content: str) -> mock.Mock:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        run_path = Path(temp_dir.name) / "run.json"
+        run_path.write_text(content, encoding="utf-8")
+        store = mock.Mock()
+        store.latest_artifact_ref.return_value = object()
+        store.resolve.return_value = run_path
+        return store
+
+    def qualified_result(self, store, result):
+        from tooling.acceptance.core import EvidenceStore
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name)
+        repo = base / "repo"
+        repo.mkdir()
+        evidence = EvidenceStore(base / "artifacts", worktree=repo)
+        sealed = {
+            **result, "cleanupStatus": "not-required",
+            "secretScan": {
+                "status": "passed", "scannedHighEntropyValues": 0,
+                "scannedCredentialValues": 0, "redactedArtifacts": [],
+            },
+        }
+        run = evidence.begin_run(sealed["id"], source=self.SOURCE)
+        run.write_json("report.json", sealed, role="report")
+        run.finalize(result=sealed)
+        reference = run.manifest_ref.to_dict()
+        run.close()
+        store.workspace_id = evidence.workspace_id
+        store.read_run_manifest = evidence.read_run_manifest
+        store.validate_proof_authority = evidence.validate_proof_authority
+        return {**sealed, "runManifest": reference}
+
+    def test_current_results_fail_closed_on_non_authoritative_json(self) -> None:
+        store = self.latest_store(
+            json.dumps({"source": self.SOURCE, "results": []})
+        )
+        source = json.dumps(self.SOURCE, separators=(",", ":"))
+        invalid_results = (
+            f'{{"source":{source},"results":['
+            '{"id":"gate","status":"failed","status":"passed"}]}',
+            f'{{"source":{source},"results":['
+            '{"id":"gate","status":"passed","duration":NaN}]}',
+            f'{{"source":{source},"results":['
+            '{"id":"gate","status":"passed"},'
+            '{"id":"gate","status":"failed"}]}',
+            f'{{"source":{source},"results":'
+            '{"id":"gate","status":"passed"}}',
+        )
+
+        for current_results in invalid_results:
+            with (
+                self.subTest(current_results=current_results),
+                mock.patch.dict(
+                    MODULE.os.environ,
+                    {"PT_ACCEPTANCE_CURRENT_RESULTS": current_results},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "invalid current Acceptance results",
+                ):
+                    MODULE.latest_passed_gates(store, "", False)
+
+    def test_current_labels_without_original_manifest_are_not_proof(self) -> None:
+        store = self.latest_store(json.dumps({"source": self.SOURCE, "results": []}))
+        envelope = {
+            "source": self.SOURCE,
+            "results": [{
+                "id": "control", "status": "passed",
+                "completionStatus": "DONE", "proofStatus": "PROVEN",
+            }],
+        }
+        with mock.patch.dict(
+            MODULE.os.environ,
+            {"PT_ACCEPTANCE_CURRENT_RESULTS": json.dumps(envelope)},
+        ):
+            self.assertEqual(MODULE.latest_passed_gates(store, "", False), set())
+
+    def test_current_results_reject_stale_source_identity(self) -> None:
+        store = self.latest_store(
+            json.dumps({"source": self.SOURCE, "results": []})
+        )
+        current_results = json.dumps(
+            {
+                "source": {
+                    **self.SOURCE,
+                    "commit": "stale-head",
+                },
+                "results": [],
+            }
+        )
+
+        with (
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"PT_ACCEPTANCE_CURRENT_RESULTS": current_results},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "current Acceptance results source does not match current source",
+            ),
+        ):
+            MODULE.latest_passed_gates(store, "", False)
+
+    def test_latest_results_fail_closed_on_non_authoritative_json(self) -> None:
+        for latest_run in (
+            '{"results":[{"id":"gate","status":"failed","status":"passed"}]}',
+            '{"results":[{"id":"gate","status":"passed","duration":NaN}]}',
+        ):
+            with self.subTest(latest_run=latest_run):
+                store = self.latest_store(latest_run)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "invalid latest Acceptance run",
+                ):
+                    MODULE.latest_passed_gates(store, "", False)
+
+    def test_latest_results_reject_stale_source_identity(self) -> None:
+        store = self.latest_store(
+            json.dumps(
+                {
+                    "source": {
+                        **self.SOURCE,
+                        "commit": "stale-head",
+                    },
+                    "results": [
+                        {
+                            "id": "stale-gate",
+                            "status": "passed",
+                            "completionStatus": "DONE",
+                            "proofStatus": "PROVEN",
+                        }
+                    ],
+                }
+            )
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "latest Acceptance run source does not match current source",
+        ):
+            MODULE.latest_passed_gates(store, "", True)
+
+    def test_structural_validation_ignores_stale_proof_results(self) -> None:
+        store = self.latest_store(
+            json.dumps(
+                {
+                    "source": {
+                        **self.SOURCE,
+                        "commit": "stale-head",
+                    },
+                    "results": [
+                        {
+                            "id": "stale-gate",
+                            "status": "passed",
+                            "completionStatus": "DONE",
+                            "proofStatus": "PROVEN",
+                        }
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(
+            MODULE.latest_passed_gates(store, "", False),
+            set(),
+        )
+
+    def test_current_results_supersede_stale_latest_source_identity(self) -> None:
+        store = self.latest_store(
+            json.dumps(
+                {
+                    "source": {
+                        **self.SOURCE,
+                        "commit": "stale-head",
+                    },
+                    "results": [
+                        {
+                            "id": "stale-gate",
+                            "status": "passed",
+                            "completionStatus": "DONE",
+                            "proofStatus": "PROVEN",
+                        }
+                    ],
+                }
+            )
+        )
+        current_results = json.dumps(
+            {
+                "source": self.SOURCE,
+                "results": [
+                    self.qualified_result(store, {
+                        "id": "current-gate",
+                        "status": "passed",
+                        "completionStatus": "DONE",
+                        "proofStatus": "PROVEN",
+                    })
+                ],
+            }
+        )
+
+        with mock.patch.dict(
+            MODULE.os.environ,
+            {"PT_ACCEPTANCE_CURRENT_RESULTS": current_results},
+        ):
+            self.assertEqual(
+                MODULE.latest_passed_gates(store, "", True),
+                {"current-gate"},
+            )
+
+    def test_current_results_admit_only_unique_proven_gate_results(self) -> None:
+        store = self.latest_store(
+            json.dumps(
+                {
+                    "source": self.SOURCE,
+                    "results": [
+                        {
+                            "id": "superseded-gate",
+                            "status": "passed",
+                            "completionStatus": "DONE",
+                            "proofStatus": "PROVEN",
+                        }
+                    ]
+                }
+            )
+        )
+        current_results = json.dumps(
+            {
+                "source": self.SOURCE,
+                "results": [
+                    self.qualified_result(store, {
+                        "id": "proven-gate",
+                        "status": "passed",
+                        "completionStatus": "DONE",
+                        "proofStatus": "PROVEN",
+                        "duration_seconds": 0.125,
+                    }),
+                    {
+                        "id": "partial-gate",
+                        "status": "passed",
+                        "completionStatus": "PARTIAL",
+                        "proofStatus": "UNPROVEN",
+                    },
+                    {
+                        "id": "dry-run-gate",
+                        "status": "dry-run",
+                    },
+                    {
+                        "id": "superseded-gate",
+                        "status": "failed",
+                        "completionStatus": "PARTIAL",
+                        "proofStatus": "UNPROVEN",
+                    },
+                ],
+            }
+        )
+
+        with mock.patch.dict(
+            MODULE.os.environ,
+            {"PT_ACCEPTANCE_CURRENT_RESULTS": current_results},
+        ):
+            self.assertEqual(
+                MODULE.latest_passed_gates(store, "", False),
+                {"proven-gate"},
+            )
+
+    def test_infra_validation_selects_only_core_self_validation(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE, "latest_passed_gates",
+                side_effect=AssertionError("structure must not read runtime evidence"),
+            ) as evidence_read,
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"PT_ACCEPTANCE_CURRENT_RESULTS": "{invalid-runtime-proof"},
+            ),
+        ):
+            report, results = MODULE.validate_infra(
+                MODULE.REPO_ROOT,
+                MODULE.REPO_ROOT / "tooling/acceptance",
+                False,
+                object(),
+                "acceptance-infra-validation",
+            )
+
+        evidence_read.assert_not_called()
+        self.assertEqual(report["scope"], "acceptance-infra")
+        self.assertTrue(results)
+        for result in results:
+            self.assertEqual(result["status"], "structurally_valid")
+            self.assertEqual(result["proof_assessment"], "not-evaluated")
+            self.assertIsNone(result["missing_run_gates"])
+            self.assertIsNone(result["dedicated_missing_gates"])
+        self.assertEqual(
+            {result["direction"] for result in results},
+            {"acceptance_core_self_validation"},
+        )
+        self.assertNotIn(
+            "business-domain-reverse-validation",
+            {result["id"] for result in results},
+        )
+
+    def test_requested_infra_proof_still_requires_evidence(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE, "latest_passed_gates",
+                side_effect=RuntimeError("invalid current Acceptance results"),
+            ) as evidence_read,
+            self.assertRaisesRegex(RuntimeError, "invalid current Acceptance results"),
+        ):
+            MODULE.validate_infra(
+                MODULE.REPO_ROOT,
+                MODULE.REPO_ROOT / "tooling/acceptance",
+                True,
+                object(),
+                "acceptance-infra-validation",
+            )
+        evidence_read.assert_called_once()
+        self.assertIs(evidence_read.call_args.args[2], True)
+
+    def test_structure_and_proof_cannot_supply_each_others_inputs(self) -> None:
+        for passed_gates, require_proven in ((set(), False), (None, True)):
+            with self.subTest(require_proven=require_proven):
+                with self.assertRaisesRegex(RuntimeError, "separate inputs"):
+                    MODULE.validate_capability(
+                        MODULE.REPO_ROOT,
+                        MODULE.REPO_ROOT / "tooling/acceptance",
+                        {}, [], {}, passed_gates, require_proven,
+                    )
+
+    def test_synthetic_plan_loads_sibling_script_dependencies(self) -> None:
+        result = MODULE.run_plan_for_paths(
+            MODULE.REPO_ROOT,
+            MODULE.REPO_ROOT / "tooling/acceptance",
+            ["tooling/acceptance/registry.yaml"],
+        )
+
+        self.assertIn("acceptance-framework", result["impacted_features"])
+        self.assertIn(
+            "acceptance-plan-self",
+            {gate["id"] for gate in result["selected_gates"]},
+        )
+
+    def test_dependency_closure_is_validated_and_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            capabilities = [{"id": "consumer-capability", "required_gates": ["consumer"]}]
+            gates = {
+                "consumer": {
+                    "command": "true", "environment": "local",
+                    "tier": "ci-structure", "dependsOn": ["producer"],
+                },
+                "producer": {
+                    "command": "true", "environment": "home-station",
+                    "tier": "env-evidence",
+                },
+            }
+            with self.assertRaisesRegex(RuntimeError, "PROVISIONING_WIRING_MISSING"):
+                MODULE.validate_domain_contract_closure(
+                    acceptance_root, "synthetic", capabilities, [], gates, "",
+                )
+            gates["producer"].update(environment="local", tier="ci-structure")
+            self.assertEqual(
+                MODULE.validate_domain_contract_closure(
+                    acceptance_root, "synthetic", capabilities, [], gates, "",
+                ),
+                {"producer", "consumer"},
+            )
+
+    def test_rejects_missing_gate_wiring_and_environment_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            capabilities = [
+                {
+                    "id": "chat-capability",
+                    "features": ["chat-feature"],
+                    "required_gates": ["native-gate"],
+                }
+            ]
+            features = [
+                {
+                    "id": "chat-feature",
+                    "required_gates": ["native-gate", "missing-gate"],
+                }
+            ]
+            gate_defs = {
+                "native-gate": {
+                    "environment": "native-tauri-embedded-webdriver",
+                }
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"STRUCTURAL_GAP[\s\S]*missing-gate"
+                r"[\s\S]*PROVISIONING_WIRING_MISSING"
+                r"[\s\S]*ENVIRONMENT_CONTRACT_MISSING",
+            ):
+                MODULE.validate_domain_contract_closure(
+                    acceptance_root,
+                    "chat",
+                    capabilities,
+                    features,
+                    gate_defs,
+                    "",
+                )
+
+    def test_rejects_invalid_environment_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            environments = acceptance_root / "environments"
+            environments.mkdir()
+            (environments / "home-station.yaml").write_text(
+                "{invalid",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ENVIRONMENT_CONTRACT_INVALID",
+            ):
+                MODULE.validate_domain_contract_closure(
+                    acceptance_root,
+                    "chat",
+                    [
+                        {
+                            "id": "chat-capability",
+                            "features": ["chat-feature"],
+                            "required_gates": ["native-gate"],
+                        }
+                    ],
+                    [{"id": "chat-feature", "required_gates": ["native-gate"]}],
+                    {
+                        "native-gate": {
+                            "environment": "home-station",
+                            "provisioner": "home-station",
+                        }
+                    },
+                    "",
+                )
+
+    def test_rejects_environment_contract_id_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            environments = acceptance_root / "environments"
+            environments.mkdir()
+            (environments / "home-station.yaml").write_text(
+                '{"id": "different-environment"}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"ENVIRONMENT_CONTRACT_INVALID[\s\S]*does not match",
+            ):
+                MODULE.validate_domain_contract_closure(
+                    acceptance_root,
+                    "chat",
+                    [
+                        {
+                            "id": "chat-capability",
+                            "features": ["chat-feature"],
+                            "required_gates": ["native-gate"],
+                        }
+                    ],
+                    [{"id": "chat-feature", "required_gates": ["native-gate"]}],
+                    {
+                        "native-gate": {
+                            "environment": "home-station",
+                            "provisioner": "home-station",
+                        }
+                    },
+                    "",
+                )
+
+    def test_rejects_unregistered_provisioner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            environments = acceptance_root / "environments"
+            environments.mkdir()
+            (environments / "remote-testnet.yaml").write_text(
+                '{"id": "remote-testnet"}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "PROVISIONER_UNREGISTERED",
+            ):
+                MODULE.validate_domain_contract_closure(
+                    acceptance_root,
+                    "federation",
+                    [
+                        {
+                            "id": "federation-capability",
+                            "features": ["federation-feature"],
+                            "required_gates": ["federation-gate"],
+                        }
+                    ],
+                    [
+                        {
+                            "id": "federation-feature",
+                            "required_gates": ["federation-gate"],
+                        }
+                    ],
+                    {
+                        "federation-gate": {
+                            "environment": "remote-testnet",
+                            "provisioner": "remote-testnet",
+                        }
+                    },
+                    "",
+                )
+
+    def test_accepts_registered_non_local_environment_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_root = Path(temp_dir)
+            environments = acceptance_root / "environments"
+            environments.mkdir()
+            (environments / "home-station.yaml").write_text(
+                '{"id": "home-station"}\n',
+                encoding="utf-8",
+            )
+
+            required_gates = MODULE.validate_domain_contract_closure(
+                acceptance_root,
+                "chat",
+                [
+                    {
+                        "id": "chat-capability",
+                        "features": ["chat-feature"],
+                        "required_gates": ["native-gate"],
+                    }
+                ],
+                [{"id": "chat-feature", "required_gates": ["native-gate"]}],
+                {
+                    "native-gate": {
+                        "command": "true",
+                        "environment": "home-station",
+                        "provisioner": "home-station",
+                        "tier": "env-evidence",
+                    }
+                },
+                "",
+            )
+
+            self.assertEqual(required_gates, {"native-gate"})
+
+    def test_validate_domain_ignores_invalid_unrelated_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            acceptance_root = repo_root / "tooling" / "acceptance"
+            for directory in ("domains", "capabilities", "features"):
+                (acceptance_root / directory).mkdir(parents=True, exist_ok=True)
+            (repo_root / "selected").mkdir(parents=True, exist_ok=True)
+            (repo_root / "selected" / "path.py").write_text("", encoding="utf-8")
+
+            self._write_json(
+                acceptance_root / "domains" / "selected.yaml",
+                {
+                    "id": "selected",
+                    "capabilities": ["selected-capability"],
+                    "validation_gate_id": "selected-validation",
+                },
+            )
+            self._write_json(
+                acceptance_root / "capabilities" / "selected.yaml",
+                {
+                    "capabilities": [
+                        {
+                            "id": "selected-capability",
+                            "domain": "selected",
+                            "direction": "acceptance_validates_product",
+                            "features": ["selected-feature"],
+                            "required_gates": ["selected-gate"],
+                            "synthetic_paths": ["selected/path.py"],
+                            "evidence": {
+                                "truth_sources": ["selected-truth"],
+                                "proven_by": ["selected-gate"],
+                                "proven_scope": ["selected behavior"],
+                                "unproven_scope": [],
+                            },
+                        }
+                    ]
+                },
+            )
+            self._write_json(
+                acceptance_root / "features" / "selected.yaml",
+                {
+                    "id": "selected-feature",
+                    "required_gates": ["selected-gate"],
+                },
+            )
+            self._write_json(
+                acceptance_root / "gates.yaml",
+                {
+                    "gates": {
+                        "selected-gate": {
+                            "command": "true",
+                            "environment": "local",
+                            "tier": "ci-cheap",
+                        },
+                        "selected-validation": {
+                            "command": "true",
+                            "environment": "local",
+                            "tier": "ci-structure",
+                        },
+                        "unrelated-invalid-gate": {
+                            "environment": "invalid-environment",
+                            "tier": "invalid-tier",
+                        },
+                    }
+                },
+            )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "latest_passed_gates",
+                    side_effect=AssertionError("structure must not read runtime evidence"),
+                ) as evidence_read,
+                mock.patch.object(
+                    MODULE,
+                    "run_plan_for_paths",
+                    return_value={
+                        "impacted_features": ["selected-feature"],
+                        "selected_gates": [{"id": "selected-gate"}],
+                    },
+                ),
+            ):
+                report, results = MODULE.validate_domain(
+                    repo_root,
+                    acceptance_root,
+                    "selected",
+                    False,
+                    object(),
+                )
+
+            evidence_read.assert_not_called()
+            self.assertEqual(report["domain"], "selected")
+            self.assertEqual(
+                report["artifactKind"],
+                "acceptance-domain-validation-report",
+            )
+            self.assertEqual(report["gate"], "selected-validation")
+            self.assertEqual(report["gateId"], "selected-validation")
+            self.assertEqual(report["phase"], "Acceptance Domain Validation")
+            self.assertEqual(report["bom"], ["selected-capability"])
+            self.assertEqual(report["spec"], ["selected-feature"])
+            self.assertEqual(results[0]["status"], "structurally_valid")
+            self.assertEqual(results[0]["proof_assessment"], "not-evaluated")
+            self.assertIsNone(results[0]["missing_run_gates"])
+            self.assertIsNone(results[0]["dedicated_missing_gates"])
+
+    @staticmethod
+    def _write_json(path: Path, value: object) -> None:
+        path.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

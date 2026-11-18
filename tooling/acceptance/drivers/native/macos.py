@@ -1,0 +1,2285 @@
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import json
+import math
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from tooling.acceptance.core.errors import BlockedError, DriverError
+from tooling.acceptance.core.resource_diagnostic import ResourceDiagnostic
+from tooling.acceptance.drivers.native.base import (
+    MouseAction,
+    NativeControlSnapshot,
+    NativeDesktopObservation,
+    NativeDesktopAdapter,
+    NativeFileChooserSnapshot,
+    NativeInputMode,
+    NativeKey,
+    NativeModifier,
+    NativeOperatorObservation,
+    NativeWindowBounds,
+    NativeWindowSnapshot,
+    NativeWindowStack,
+)
+from tooling.acceptance.drivers.native.macos_operator_probe import (
+    NATIVE_OBSERVATION_TIMEOUT_SECONDS,
+    OPERATOR_FOCUS_STABILITY_INTERVAL_SECONDS,
+    OPERATOR_FOCUS_STABILITY_TIMEOUT_SECONDS,
+    control_fields,
+)
+
+
+_CG_IMAGE_ALPHA_NONE = frozenset((0, 5, 6))
+_CG_IMAGE_ALPHA_FIRST = frozenset((2, 4))
+_CG_IMAGE_ALPHA_LAST = frozenset((1, 3))
+_CG_IMAGE_ALPHA_ONLY = 7
+_CG_BITMAP_BYTE_ORDER_MASK = 0x7000
+_CG_BITMAP_BYTE_ORDER_32_LITTLE = 0x2000
+
+
+def _pixel_buffer_has_visible_alpha(
+    content: bytes,
+    *,
+    width: int,
+    height: int,
+    bits_per_pixel: int,
+    bytes_per_row: int,
+    alpha_info: int,
+    bitmap_info: int,
+) -> bool:
+    """Return whether a CoreGraphics point sample contains a visible pixel."""
+    if alpha_info in _CG_IMAGE_ALPHA_NONE:
+        return True
+    if width <= 0 or height <= 0 or bits_per_pixel <= 0:
+        return True
+    if bits_per_pixel % 8 != 0:
+        return True
+
+    bytes_per_pixel = bits_per_pixel // 8
+    if bytes_per_pixel <= 0 or bytes_per_row < width * bytes_per_pixel:
+        return True
+
+    little_endian = (
+        bitmap_info & _CG_BITMAP_BYTE_ORDER_MASK
+    ) == _CG_BITMAP_BYTE_ORDER_32_LITTLE
+    if alpha_info in _CG_IMAGE_ALPHA_FIRST:
+        alpha_offset = bytes_per_pixel - 1 if little_endian else 0
+    elif alpha_info in _CG_IMAGE_ALPHA_LAST:
+        alpha_offset = 0 if little_endian else bytes_per_pixel - 1
+    elif alpha_info == _CG_IMAGE_ALPHA_ONLY:
+        alpha_offset = 0
+    else:
+        return True
+
+    required_size = (height - 1) * bytes_per_row + width * bytes_per_pixel
+    if len(content) < required_size:
+        return True
+    return any(
+        content[
+            row * bytes_per_row
+            + column * bytes_per_pixel
+            + alpha_offset
+        ]
+        > 0
+        for row in range(height)
+        for column in range(width)
+    )
+
+
+_ACCESSIBILITY_PROBE = r"""
+import ctypes
+import json
+import sys
+import time
+
+import AppKit
+from tooling.acceptance.drivers.native.macos_ax import AXReadSession
+
+process_id = int(sys.argv[1])
+application_services = ctypes.CDLL(
+    "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+)
+core_foundation = ctypes.CDLL(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+)
+CFRef = ctypes.c_void_p
+CFIndex = ctypes.c_long
+CFTypeID = ctypes.c_ulong
+UTF8 = 0x08000100
+
+application_services.AXUIElementCreateApplication.argtypes = [ctypes.c_int32]
+application_services.AXUIElementCreateApplication.restype = CFRef
+application_services.AXUIElementCreateSystemWide.restype = CFRef
+application_services.AXUIElementCopyAttributeValue.argtypes = [
+    CFRef,
+    CFRef,
+    ctypes.POINTER(CFRef),
+]
+application_services.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+application_services.AXUIElementSetMessagingTimeout.argtypes = [
+    CFRef,
+    ctypes.c_float,
+]
+application_services.AXUIElementSetMessagingTimeout.restype = ctypes.c_int32
+application_services.AXUIElementSetAttributeValue.argtypes = [CFRef, CFRef, CFRef]
+application_services.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+application_services.AXUIElementPerformAction.argtypes = [CFRef, CFRef]
+application_services.AXUIElementPerformAction.restype = ctypes.c_int32
+application_services.AXValueCreate.argtypes = [ctypes.c_int32, ctypes.c_void_p]
+application_services.AXValueCreate.restype = CFRef
+core_foundation.CFStringCreateWithCString.argtypes = [
+    CFRef,
+    ctypes.c_char_p,
+    ctypes.c_uint32,
+]
+core_foundation.CFStringCreateWithCString.restype = CFRef
+core_foundation.CFStringGetTypeID.restype = CFTypeID
+core_foundation.CFBooleanGetTypeID.restype = CFTypeID
+core_foundation.CFArrayGetTypeID.restype = CFTypeID
+core_foundation.CFGetTypeID.argtypes = [CFRef]
+core_foundation.CFGetTypeID.restype = CFTypeID
+core_foundation.CFStringGetLength.argtypes = [CFRef]
+core_foundation.CFStringGetLength.restype = CFIndex
+core_foundation.CFStringGetMaximumSizeForEncoding.argtypes = [
+    CFIndex,
+    ctypes.c_uint32,
+]
+core_foundation.CFStringGetMaximumSizeForEncoding.restype = CFIndex
+core_foundation.CFStringGetCString.argtypes = [
+    CFRef,
+    ctypes.c_char_p,
+    CFIndex,
+    ctypes.c_uint32,
+]
+core_foundation.CFStringGetCString.restype = ctypes.c_bool
+core_foundation.CFBooleanGetValue.argtypes = [CFRef]
+core_foundation.CFBooleanGetValue.restype = ctypes.c_bool
+core_foundation.CFArrayGetCount.argtypes = [CFRef]
+core_foundation.CFArrayGetCount.restype = CFIndex
+core_foundation.CFArrayGetValueAtIndex.argtypes = [CFRef, CFIndex]
+core_foundation.CFArrayGetValueAtIndex.restype = CFRef
+core_foundation.CFRelease.argtypes = [CFRef]
+reads = AXReadSession(
+    application_services, core_foundation, deadline=time.monotonic() + 1.5,
+)
+copy_attribute = reads.copy_attribute
+set_attribute = reads.set_attribute
+perform_action = reads.perform_action
+
+
+def decode_text(value):
+    if (
+        not value
+        or core_foundation.CFGetTypeID(value)
+        != core_foundation.CFStringGetTypeID()
+    ):
+        return ""
+    size = (
+        core_foundation.CFStringGetMaximumSizeForEncoding(
+            core_foundation.CFStringGetLength(value),
+            UTF8,
+        )
+        + 1
+    )
+    buffer = ctypes.create_string_buffer(size)
+    if not core_foundation.CFStringGetCString(value, buffer, size, UTF8):
+        return ""
+    return buffer.value.decode("utf-8")
+
+
+def decode_boolean(value):
+    return bool(
+        value
+        and core_foundation.CFGetTypeID(value)
+        == core_foundation.CFBooleanGetTypeID()
+        and core_foundation.CFBooleanGetValue(value)
+    )
+
+
+def array_items(value):
+    if (
+        not value
+        or core_foundation.CFGetTypeID(value)
+        != core_foundation.CFArrayGetTypeID()
+    ):
+        return []
+    return [
+        core_foundation.CFArrayGetValueAtIndex(value, index)
+        for index in range(core_foundation.CFArrayGetCount(value))
+    ]
+
+
+def copied_text(element, name):
+    value = copy_attribute(element, name)
+    try:
+        return decode_text(value)
+    finally:
+        if value:
+            core_foundation.CFRelease(value)
+
+
+def copied_boolean(element, name):
+    value = copy_attribute(element, name)
+    try:
+        return decode_boolean(value)
+    finally:
+        if value:
+            core_foundation.CFRelease(value)
+
+
+application = application_services.AXUIElementCreateApplication(process_id)
+windows_value = copy_attribute(application, "AXWindows", required=True)
+windows = array_items(windows_value)
+front_window = next(
+    (window for window in windows if copied_boolean(window, "AXMain")),
+    windows[0] if windows else None,
+)
+operation = sys.argv[2] if len(sys.argv) > 2 else "inspect"
+if operation != "inspect":
+    if front_window is None:
+        raise RuntimeError("main window is absent")
+    if operation == "position":
+        class CGPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+        point = CGPoint(*json.loads(sys.argv[3]))
+        position = application_services.AXValueCreate(1, ctypes.byref(point))
+        if not position:
+            raise RuntimeError("cannot create AX window position")
+        try:
+            set_attribute(front_window, "AXPosition", position)
+        finally:
+            core_foundation.CFRelease(position)
+    elif operation == "activate":
+        true_value = CFRef.in_dll(core_foundation, "kCFBooleanTrue")
+        set_attribute(application, "AXFrontmost", true_value)
+        set_attribute(front_window, "AXMain", true_value)
+        perform_action(front_window, "AXRaise")
+    elif operation == "close":
+        close_button = copy_attribute(front_window, "AXCloseButton", required=True)
+        try:
+            perform_action(close_button, "AXPress")
+        finally:
+            core_foundation.CFRelease(close_button)
+    else:
+        raise RuntimeError(f"unsupported Accessibility operation: {operation}")
+    sys.stdout.write(json.dumps({"operation": operation}))
+    core_foundation.CFRelease(windows_value)
+    core_foundation.CFRelease(application)
+    raise SystemExit(0)
+focused = copy_attribute(application, "AXFocusedUIElement")
+sheet_count = 0
+for window in windows:
+    sheets_value = copy_attribute(window, "AXSheets")
+    try:
+        sheet_count += len(array_items(sheets_value))
+    finally:
+        if sheets_value:
+            core_foundation.CFRelease(sheets_value)
+frontmost_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+result = {
+    "role": copied_text(focused, "AXRole") if focused else "",
+    "subrole": copied_text(focused, "AXSubrole") if focused else "",
+    "title": copied_text(focused, "AXTitle") if focused else "",
+    "value": copied_text(focused, "AXValue") if focused else "",
+    "windowCount": len(windows),
+    "sheetCount": sheet_count,
+    "frontmost": copied_boolean(application, "AXFrontmost"),
+    "mainWindow": (
+        copied_boolean(front_window, "AXMain") if front_window else False
+    ),
+    "focusedWindow": (
+        copied_boolean(front_window, "AXFocused") if front_window else False
+    ),
+    "actualFrontmostPid": (
+        int(frontmost_app.processIdentifier()) if frontmost_app else -1
+    ),
+}
+sys.stdout.write(json.dumps(result))
+if windows_value:
+    core_foundation.CFRelease(windows_value)
+if focused:
+    core_foundation.CFRelease(focused)
+core_foundation.CFRelease(application)
+"""
+
+_ACTIVATION_PROBE = r"""
+import json
+import sys
+
+import AppKit
+
+application = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(
+    int(sys.argv[1])
+)
+if application is None:
+    raise SystemExit("Native actor process is unavailable")
+workspace = AppKit.NSWorkspace.sharedWorkspace()
+frontmost_before = workspace.frontmostApplication()
+target_active_before = bool(application.isActive())
+options = (
+    AppKit.NSApplicationActivateAllWindows
+    | AppKit.NSApplicationActivateIgnoringOtherApps
+)
+request_accepted = bool(application.activateWithOptions_(options))
+frontmost_after = workspace.frontmostApplication()
+sys.stdout.write(
+    json.dumps(
+        {
+            "activationMode": "uncoordinated-fallback",
+            "activationPolicy": int(application.activationPolicy()),
+            "finishedLaunching": bool(application.isFinishedLaunching()),
+            "hidden": bool(application.isHidden()),
+            "targetActiveBefore": target_active_before,
+            "requestAccepted": request_accepted,
+            "targetActiveAfter": bool(application.isActive()),
+            "frontmostPidBefore": (
+                int(frontmost_before.processIdentifier())
+                if frontmost_before is not None
+                else -1
+            ),
+            "frontmostPidAfter": (
+                int(frontmost_after.processIdentifier())
+                if frontmost_after is not None
+                else -1
+            ),
+        }
+    )
+)
+"""
+
+_NATIVE_AX_SUPPORT = r"""
+import ctypes
+import json
+import sys
+import time
+from pathlib import Path
+
+from tooling.acceptance.drivers.native.macos_ax import (
+    AXReadSession, NativeAXActionUnavailable, NativeAXReadUnavailable,
+)
+from tooling.acceptance.drivers.native.macos_workspace import frontmost_pid
+
+application_services = ctypes.CDLL(
+    "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+)
+core_foundation = ctypes.CDLL(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+)
+CFRef = ctypes.c_void_p
+CFIndex = ctypes.c_long
+CFTypeID = ctypes.c_ulong
+UTF8 = 0x08000100
+
+application_services.AXUIElementCreateApplication.argtypes = [ctypes.c_int32]
+application_services.AXUIElementCreateApplication.restype = CFRef
+application_services.AXUIElementCopyAttributeValue.argtypes = [
+    CFRef,
+    CFRef,
+    ctypes.POINTER(CFRef),
+]
+application_services.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+application_services.AXUIElementIsAttributeSettable.argtypes = [
+    CFRef,
+    CFRef,
+    ctypes.POINTER(ctypes.c_bool),
+]
+application_services.AXUIElementIsAttributeSettable.restype = ctypes.c_int32
+application_services.AXUIElementSetAttributeValue.argtypes = [
+    CFRef,
+    CFRef,
+    CFRef,
+]
+application_services.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+application_services.AXUIElementPerformAction.argtypes = [CFRef, CFRef]
+application_services.AXUIElementPerformAction.restype = ctypes.c_int32
+application_services.AXUIElementSetMessagingTimeout.argtypes = [
+    CFRef,
+    ctypes.c_float,
+]
+application_services.AXUIElementSetMessagingTimeout.restype = ctypes.c_int32
+core_foundation.CFStringCreateWithCString.argtypes = [
+    CFRef,
+    ctypes.c_char_p,
+    ctypes.c_uint32,
+]
+core_foundation.CFStringCreateWithCString.restype = CFRef
+core_foundation.CFStringGetTypeID.restype = CFTypeID
+core_foundation.CFBooleanGetTypeID.restype = CFTypeID
+core_foundation.CFBooleanGetValue.argtypes = [CFRef]
+core_foundation.CFBooleanGetValue.restype = ctypes.c_bool
+core_foundation.CFArrayGetTypeID.restype = CFTypeID
+core_foundation.CFGetTypeID.argtypes = [CFRef]
+core_foundation.CFGetTypeID.restype = CFTypeID
+core_foundation.CFStringGetLength.argtypes = [CFRef]
+core_foundation.CFStringGetLength.restype = CFIndex
+core_foundation.CFStringGetMaximumSizeForEncoding.argtypes = [
+    CFIndex,
+    ctypes.c_uint32,
+]
+core_foundation.CFStringGetMaximumSizeForEncoding.restype = CFIndex
+core_foundation.CFStringGetCString.argtypes = [
+    CFRef,
+    ctypes.c_char_p,
+    CFIndex,
+    ctypes.c_uint32,
+]
+core_foundation.CFStringGetCString.restype = ctypes.c_bool
+core_foundation.CFArrayGetCount.argtypes = [CFRef]
+core_foundation.CFArrayGetCount.restype = CFIndex
+core_foundation.CFArrayGetValueAtIndex.argtypes = [CFRef, CFIndex]
+core_foundation.CFArrayGetValueAtIndex.restype = CFRef
+core_foundation.CFArrayCreate.argtypes = [
+    CFRef,
+    ctypes.POINTER(CFRef),
+    CFIndex,
+    CFRef,
+]
+core_foundation.CFArrayCreate.restype = CFRef
+core_foundation.CFRetain.argtypes = [CFRef]
+core_foundation.CFRetain.restype = CFRef
+core_foundation.CFRelease.argtypes = [CFRef]
+reads = (
+    None if sys.argv[1] == "observation-scope" else AXReadSession(
+        application_services, core_foundation,
+        deadline=time.monotonic() + (29 if sys.argv[1].isdigit() else 2.5),
+    )
+)
+
+
+def create_string(name):
+    return reads.string(name)
+
+
+def perform_action(element, name):
+    return reads.perform_action(element, name)
+
+
+def copy_attribute(element, name, *, required=False, deadline=None):
+    return reads.copy_attribute(element, name, required=required, deadline=deadline)
+
+
+def decode_text(value):
+    if (
+        not value
+        or core_foundation.CFGetTypeID(value)
+        != core_foundation.CFStringGetTypeID()
+    ):
+        return ""
+    size = (
+        core_foundation.CFStringGetMaximumSizeForEncoding(
+            core_foundation.CFStringGetLength(value),
+            UTF8,
+        )
+        + 1
+    )
+    buffer = ctypes.create_string_buffer(size)
+    if not core_foundation.CFStringGetCString(
+        value,
+        buffer,
+        size,
+        UTF8,
+    ):
+        return ""
+    return buffer.value.decode("utf-8")
+
+
+def array_items(value):
+    if (
+        not value
+        or core_foundation.CFGetTypeID(value)
+        != core_foundation.CFArrayGetTypeID()
+    ):
+        return []
+    return [
+        core_foundation.CFArrayGetValueAtIndex(value, index)
+        for index in range(core_foundation.CFArrayGetCount(value))
+    ]
+
+
+def copied_text(element, name, *, deadline=None):
+    value = copy_attribute(element, name, deadline=deadline)
+    try:
+        return decode_text(value)
+    finally:
+        if value:
+            core_foundation.CFRelease(value)
+
+
+def copied_boolean(element, name, *, deadline=None):
+    value = copy_attribute(element, name, deadline=deadline)
+    try:
+        return bool(
+            value
+            and core_foundation.CFGetTypeID(value)
+            == core_foundation.CFBooleanGetTypeID()
+            and core_foundation.CFBooleanGetValue(value)
+        )
+    finally:
+        if value:
+            core_foundation.CFRelease(value)
+
+
+def attribute_is_settable(element, name):
+    key = create_string(name)
+    result = ctypes.c_bool()
+    try:
+        error = reads.read(
+            element, name,
+            lambda: application_services.AXUIElementIsAttributeSettable(
+                element, key, ctypes.byref(result),
+            ),
+        )
+        if error not in (0, -25205, -25212):
+            raise RuntimeError(f"{name} settable inspection failed: AX error {error}")
+    finally:
+        core_foundation.CFRelease(key)
+    return error == 0 and bool(result.value)
+
+
+def find_path(element, predicate, path=(), depth=0, *, roots=None):
+    paths = [(*path, root) for root in roots] if roots is not None else [(*path, element)]
+    owned_children = []
+    traversal_phase = "predicate"
+    sibling_index = 0
+    try:
+        while paths:
+            traversal_phase = "predicate"
+            for sibling_index, current_path in enumerate(paths):
+                if predicate(current_path[-1], current_path):
+                    return tuple(core_foundation.CFRetain(item) for item in current_path)
+            if depth >= 14:
+                return None
+            descendants = []
+            traversal_phase = "children"
+            for sibling_index, current_path in enumerate(paths):
+                children = copy_attribute(current_path[-1], "AXChildren")
+                if children:
+                    owned_children.append(children)
+                descendants.extend(
+                    (*current_path, child) for child in array_items(children)
+                )
+            paths = descendants
+            depth += 1
+    except NativeAXReadUnavailable as error:
+        error.observed.update({
+            "selectorTraversalPhase": traversal_phase,
+            "selectorDepth": depth,
+            "selectorSiblingIndex": sibling_index,
+            "selectorLevelWidth": len(paths),
+        })
+        raise
+    finally:
+        for children in owned_children:
+            core_foundation.CFRelease(children)
+    return None
+
+
+def release_path(path):
+    if path is None:
+        return
+    for element in path:
+        core_foundation.CFRelease(element)
+
+
+class NativeAXWindowsUnavailable(RuntimeError):
+    def __init__(self, status, value_present, window_count, elapsed_seconds):
+        self.observed = {
+            "axStatus": status, "valuePresent": value_present,
+            "ownerWindowCount": window_count,
+            "axReadElapsedSeconds": elapsed_seconds,
+        }
+        super().__init__("Native file chooser owner windows are unavailable")
+
+
+def open_panel(application):
+    reads.begin_observation()
+    started = time.monotonic()
+    try:
+        windows_value = copy_attribute(application, "AXWindows", required=True)
+    except NativeAXReadUnavailable as error:
+        observed = error.observed
+        raise NativeAXWindowsUnavailable(
+            observed["axStatus"], observed["valuePresent"], None,
+            observed["axReadElapsedSeconds"],
+        ) from error
+    elapsed = time.monotonic() - started
+    owned_sheets = []
+    lookup_phase = "window-identifier"
+    root_kind = "window"
+    root_index = 0
+    try:
+        windows = array_items(windows_value)
+        if not windows:
+            raise NativeAXWindowsUnavailable(0, True, 0, elapsed)
+        for root_index, window in enumerate(windows):
+            if copied_text(window, "AXIdentifier") in ("open-panel", "OKButton"):
+                return core_foundation.CFRetain(window)
+        # An attached NSOpenPanel belongs to AXSheets. Returning its document
+        # window makes selection walk the unrelated WKWebView as well. Keep
+        # the actual sheet root after verifying its native OKButton.
+        sheets = []
+        lookup_phase = "sheets"
+        for root_index, window in enumerate(windows):
+            value = copy_attribute(window, "AXSheets")
+            if value:
+                owned_sheets.append(value)
+                sheets.extend(array_items(value))
+        for roots in (sheets, windows):
+            if not roots:
+                continue
+            root_kind = "sheet" if roots is sheets else "window"
+            lookup_phase = "root-identifier"
+            for root_index, root in enumerate(roots):
+                if copied_text(root, "AXIdentifier") in ("open-panel", "OKButton"):
+                    return core_foundation.CFRetain(root)
+            # AppKit can expose the same OKButton directly on the panel.
+            # Verify that native object before walking a wide XPC file list.
+            lookup_phase = "default-button"
+            for root_index, root in enumerate(roots):
+                button = copy_attribute(root, "AXDefaultButton")
+                try:
+                    if button and copied_text(button, "AXIdentifier") == "OKButton":
+                        return core_foundation.CFRetain(root)
+                finally:
+                    if button:
+                        core_foundation.CFRelease(button)
+            lookup_phase = "control-tree"
+            target = find_path(
+                None,
+                lambda element, path: (
+                    len(path) > 1 and copied_text(element, "AXIdentifier") == "OKButton"
+                ),
+                roots=roots,
+            )
+            if target is not None:
+                try:
+                    return core_foundation.CFRetain(target[0])
+                finally:
+                    release_path(target)
+        return None
+    except NativeAXReadUnavailable as error:
+        error.observed.update({
+            "selectorLookupPhase": lookup_phase,
+            "selectorRootKind": root_kind,
+            "selectorRootIndex": root_index,
+        })
+        raise
+    finally:
+        for value in owned_sheets:
+            core_foundation.CFRelease(value)
+        if windows_value:
+            core_foundation.CFRelease(windows_value)
+
+
+def pointer_location():
+    class Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    core_graphics = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    core_graphics.CGEventCreate.argtypes = [CFRef]
+    core_graphics.CGEventCreate.restype = CFRef
+    core_graphics.CGEventGetLocation.argtypes = [CFRef]
+    core_graphics.CGEventGetLocation.restype = Point
+    event = core_graphics.CGEventCreate(None)
+    if not event:
+        raise RuntimeError("cannot create pointer-location event")
+    try:
+        point = core_graphics.CGEventGetLocation(event)
+        return {"x": float(point.x), "y": float(point.y)}
+    finally:
+        core_foundation.CFRelease(event)
+
+
+def read_control(process_id, *, deadline=None, focus_refs=None):
+    reads.begin_observation()
+    application = application_services.AXUIElementCreateApplication(process_id)
+    focused = windows_value = window = None
+    try:
+        focused = copy_attribute(application, "AXFocusedUIElement", deadline=deadline)
+        if focus_refs is None:
+            windows_value = copy_attribute(application, "AXWindows", required=True, deadline=deadline)
+            windows = array_items(windows_value)
+            sheet_count = 0
+            for enumerated_window in windows:
+                sheets = copy_attribute(enumerated_window, "AXSheets", deadline=deadline)
+                try:
+                    sheet_count += len(array_items(sheets))
+                finally:
+                    if sheets:
+                        core_foundation.CFRelease(sheets)
+        window = copy_attribute(application, "AXFocusedWindow", deadline=deadline)
+        if window is None:
+            window = copy_attribute(application, "AXMainWindow", deadline=deadline)
+        result = {
+            "role": copied_text(focused, "AXRole", deadline=deadline) if focused else "",
+            "subrole": copied_text(focused, "AXSubrole", deadline=deadline) if focused else "",
+        }
+        # Scoped keyboard focus compares actual CF objects and identity flags.
+        # Display values and window enumeration do not participate in that
+        # proof and must not spend its one-second two-sample deadline.
+        if focus_refs is None:
+            result.update({
+                "title": copied_text(focused, "AXTitle", deadline=deadline) if focused else "",
+                "value": copied_text(focused, "AXValue", deadline=deadline) if focused else "",
+                "windowCount": len(windows), "sheetCount": sheet_count,
+            })
+        result.update({
+            "frontmost": copied_boolean(application, "AXFrontmost", deadline=deadline),
+            "mainWindow": copied_boolean(window, "AXMain", deadline=deadline) if window else False,
+            "focusedWindow": copied_boolean(window, "AXFocused", deadline=deadline) if window else False,
+            "actualFrontmostPid": frontmost_pid(),
+        })
+        if focus_refs is not None:
+            focus_refs.extend((focused, window))
+            focused = window = None
+        return result
+    except NativeAXReadUnavailable as error:
+        error.observed["actualControlRequestPid"] = process_id
+        raise
+    finally:
+        if windows_value:
+            core_foundation.CFRelease(windows_value)
+        if focused:
+            core_foundation.CFRelease(focused)
+        if window:
+            core_foundation.CFRelease(window)
+        core_foundation.CFRelease(application)
+
+
+def panel_presence(process_id):
+    application = application_services.AXUIElementCreateApplication(process_id)
+    panel = None
+    try:
+        panel = open_panel(application)
+        return {"processId": process_id, "present": panel is not None}
+    finally:
+        if panel:
+            core_foundation.CFRelease(panel)
+        core_foundation.CFRelease(application)
+"""
+
+_NATIVE_OBSERVATION_BODY = r"""
+def observe_native(mode, process_id, focus_deadline, interval):
+    if mode == "pointer":
+        return {"pointer": pointer_location()}
+    if mode == "control":
+        return {"control": read_control(process_id)}
+    if mode == "panel":
+        return {"panel": panel_presence(process_id)}
+    raise ValueError("unsupported unscoped observation mode")
+"""
+
+_NATIVE_OBSERVATION_PROBE = _NATIVE_AX_SUPPORT + _NATIVE_OBSERVATION_BODY + r"""
+try:
+    result = observe_native(
+        sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]),
+    )
+except Exception as error:
+    failure = error.__traceback__
+    while failure is not None and failure.tb_next is not None:
+        failure = failure.tb_next
+    result = {"error": {
+        "reason": "macOS native observation failed", "expected": {},
+        "observed": {
+            "errorType": type(error).__name__,
+            "failureFunction": failure.tb_frame.f_code.co_name if failure else "",
+            "failureLine": failure.tb_lineno if failure else None,
+            **(error.observed if isinstance(
+                error, (NativeAXWindowsUnavailable, NativeAXReadUnavailable),
+            ) else {}),
+        },
+    }}
+print(json.dumps(result))
+"""
+
+_FILE_CHOOSER_SELECTION_PROBE = _NATIVE_AX_SUPPORT + r"""
+process_id = int(sys.argv[1])
+target_path = Path(sys.argv[2]).expanduser().resolve()
+home = Path.home().resolve()
+try:
+    path_parts = target_path.relative_to(home).parts
+except ValueError:
+    raise SystemExit("Native file chooser target must be under the user home")
+if not target_path.is_file() or not path_parts:
+    raise SystemExit("Native file chooser target is not a file")
+application = application_services.AXUIElementCreateApplication(process_id)
+
+
+def find_in_panel(predicate):
+    panel = open_panel(application)
+    if panel is None:
+        return None
+    try:
+        return find_path(panel, predicate)
+    finally:
+        core_foundation.CFRelease(panel)
+
+
+def wait_for_path(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = find_in_panel(predicate)
+        if result is not None:
+            return result
+        time.sleep(0.05)
+    return None
+
+
+class ListSelectionUnsupported(RuntimeError):
+    # The panel browser advertises selection but rejects the AX mutation.
+    pass
+
+
+def select_visible_item(filename):
+    item_path = wait_for_path(
+        lambda element, _: (
+            copied_text(element, "AXFilename") == filename
+        ),
+        5.0,
+    )
+    button_path = wait_for_path(
+        lambda element, _: (
+            copied_text(element, "AXIdentifier") == "OKButton"
+        ),
+        2.0,
+    )
+    if item_path is None or button_path is None:
+        release_path(item_path)
+        release_path(button_path)
+        # The current browser view exposes no walkable/committable row;
+        # fall back to exact-PID search commit instead of failing the cell.
+        raise ListSelectionUnsupported(
+            f"Native file chooser item is unavailable: {filename}"
+        )
+    try:
+        selection_container_index = next(
+            (
+                index
+                for index in range(len(item_path) - 1, -1, -1)
+                if attribute_is_settable(item_path[index], "AXSelectedRows")
+                or attribute_is_settable(item_path[index], "AXSelectedChildren")
+            ),
+            None,
+        )
+        if (
+            selection_container_index is None
+            or selection_container_index + 1 >= len(item_path)
+        ):
+            raise ListSelectionUnsupported(
+                "no mutable AX list selection container"
+            )
+        selection_attribute = (
+            "AXSelectedRows"
+            if attribute_is_settable(item_path[selection_container_index], "AXSelectedRows")
+            else "AXSelectedChildren"
+        )
+        selection_item = item_path[selection_container_index + 1]
+        values = (CFRef * 1)(selection_item)
+        selection = core_foundation.CFArrayCreate(
+            None,
+            values,
+            1,
+            None,
+        )
+        try:
+            # The browser list advertises AXSelectedChildren but the XPC
+            # service rejects the mutation with -25205. Report it so the
+            # driver falls back to the location-field path instead of
+            # weakening any other failure.
+            try:
+                reads.set_attribute(
+                    item_path[selection_container_index],
+                    selection_attribute,
+                    selection,
+                )
+            except NativeAXActionUnavailable as error:
+                if error.observed["axStatus"] != -25205:
+                    raise
+                raise ListSelectionUnsupported(str(error)) from error
+        finally:
+            core_foundation.CFRelease(selection)
+        perform_action(button_path[-1], "AXPress")
+    finally:
+        release_path(item_path)
+        release_path(button_path)
+
+
+def search_in_panel(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            panel = open_panel(application)
+        except NativeAXWindowsUnavailable:
+            panel = None
+        if panel is not None:
+            try:
+                found = find_path(panel, predicate)
+            finally:
+                core_foundation.CFRelease(panel)
+            if found is not None:
+                return found
+        time.sleep(0.1)
+    return None
+
+
+def collect_panel_paths(predicate, depth_limit=14):
+    try:
+        panel = open_panel(application)
+    except NativeAXWindowsUnavailable:
+        return []
+    if panel is None:
+        return []
+    found = []
+    owned = []
+    frontier = [(panel,)]
+    depth = 0
+    try:
+        while frontier and depth <= depth_limit:
+            descendants = []
+            for path in frontier:
+                if predicate(path[-1], path):
+                    found.append(
+                        tuple(core_foundation.CFRetain(node) for node in path)
+                    )
+                children = copy_attribute(path[-1], "AXChildren")
+                if children:
+                    owned.append(children)
+                descendants.extend(
+                    (*path, child) for child in array_items(children)
+                )
+            frontier = descendants
+            depth += 1
+    finally:
+        for children in owned:
+            core_foundation.CFRelease(children)
+        core_foundation.CFRelease(panel)
+    return found
+
+
+def commit_search_field(search_element):
+    # Confirmation targets this process-owned Search field once. A missing
+    # reply is an unknown action outcome, not permission to replay it or send
+    # Return to the operator's foreground application.
+    perform_action(search_element, "AXConfirm")
+
+
+def select_file_via_search(filename):
+    # macOS Search results expose an AXOutline ("ListView") whose
+    # AXSelectedRows mutation is accepted, unlike the XPC-hosted column
+    # browser's AXSelectedChildren (-25205). Commit the field through
+    # AXConfirm and require one exact filename match; ambiguous matches
+    # remain unsupported and never select an arbitrary row.
+    search = search_in_panel(
+        lambda element, _: copied_text(element, "AXIdentifier") == "Search",
+        8.0,
+    )
+    if search is None:
+        return False, "search-field-unavailable"
+    try:
+        value = core_foundation.CFStringCreateWithCString(
+            None, filename.encode("utf-8"), UTF8,
+        )
+        try:
+            reads.set_attribute(search[-1], "AXValue", value)
+            commit_search_field(search[-1])
+        finally:
+            core_foundation.CFRelease(value)
+    finally:
+        release_path(search)
+
+    deadline = time.monotonic() + 8.0
+    rows = []
+    while time.monotonic() < deadline:
+        rows = collect_panel_paths(
+            lambda element, _: copied_text(element, "AXFilename") == filename,
+        )
+        if rows:
+            break
+        time.sleep(0.2)
+    if not rows:
+        return False, "search-no-match"
+    if len(rows) != 1:
+        for row in rows:
+            release_path(row)
+        return False, "search-multiple-matches"
+
+    row = rows[0]
+    try:
+        container_index = next(
+            (
+                index
+                for index in range(len(row) - 1, -1, -1)
+                if attribute_is_settable(row[index], "AXSelectedRows")
+                or attribute_is_settable(row[index], "AXSelectedChildren")
+            ),
+            None,
+        )
+        if container_index is None:
+            return False, "search-selection-unsupported"
+        attribute = (
+            "AXSelectedRows"
+            if attribute_is_settable(row[container_index], "AXSelectedRows")
+            else "AXSelectedChildren"
+        )
+        values = (CFRef * 1)(row[container_index + 1])
+        selection = core_foundation.CFArrayCreate(None, values, 1, None)
+        try:
+            reads.set_attribute(
+                row[container_index], attribute, selection,
+            )
+        finally:
+            core_foundation.CFRelease(selection)
+    finally:
+        release_path(row)
+
+    button = search_in_panel(
+        lambda element, _: copied_text(element, "AXIdentifier") == "OKButton",
+        2.0,
+    )
+    if button is None:
+        return False, "search-confirm-unavailable"
+    try:
+        perform_action(button[-1], "AXPress")
+    finally:
+        release_path(button)
+
+    close_deadline = time.monotonic() + 5.0
+    while time.monotonic() < close_deadline:
+        if open_panel(application) is None:
+            return True, ""
+        time.sleep(0.05)
+    return False, "search-panel-remained-open"
+
+
+try:
+    home_path = wait_for_path(
+        lambda element, path: (
+            copied_text(element, "AXRole") == "AXStaticText"
+            and any(
+                copied_text(ancestor, "AXRole") == "AXOutline"
+                and copied_text(ancestor, "AXDescription") == "sidebar"
+                for ancestor in path
+            )
+            and copied_text(element, "AXValue") == home.name
+        ),
+        5.0,
+    )
+    if home_path is None:
+        raise RuntimeError("Native file chooser home sidebar item is unavailable")
+    # The XPC-hosted NSOpenPanel advertises AXOpen on its sidebar rows but the
+    # action returns -25205. Select Home through the outline's real
+    # AXSelectedRows mutation. A panel already rooted at Home needs no
+    # navigation; the first filename wait proves the resulting location.
+    try:
+        outline_index = next(
+            (
+                index
+                for index, ancestor in enumerate(home_path[:-1])
+                if copied_text(ancestor, "AXRole") == "AXOutline"
+                and copied_text(ancestor, "AXDescription") == "sidebar"
+            ),
+            None,
+        )
+        if outline_index is not None:
+            values = (CFRef * 1)(home_path[outline_index + 1])
+            selection = core_foundation.CFArrayCreate(None, values, 1, None)
+            try:
+                reads.set_attribute(
+                    home_path[outline_index], "AXSelectedRows", selection,
+                )
+            except RuntimeError:
+                if find_in_panel(
+                    lambda element, _: (
+                        copied_text(element, "AXFilename") == path_parts[0]
+                    )
+                ) is None:
+                    raise RuntimeError(
+                        "Native file chooser Home sidebar selection is unavailable"
+                    )
+            finally:
+                core_foundation.CFRelease(selection)
+    finally:
+        release_path(home_path)
+
+    for index, part in enumerate(path_parts):
+        select_visible_item(part)
+        if index + 1 < len(path_parts):
+            next_part = wait_for_path(
+                lambda element, _: (
+                    copied_text(element, "AXFilename")
+                    == path_parts[index + 1]
+                ),
+                5.0,
+            )
+            if next_part is None:
+                raise RuntimeError(
+                    "Native file chooser did not navigate to "
+                    f"{part}"
+                )
+            release_path(next_part)
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        panel = open_panel(application)
+        if panel is None:
+            break
+        core_foundation.CFRelease(panel)
+        time.sleep(0.05)
+    else:
+        raise RuntimeError(
+            "Native file chooser remained open after file selection"
+        )
+except ListSelectionUnsupported:
+    committed, search_reason = select_file_via_search(path_parts[-1])
+    if not committed:
+        core_foundation.CFRelease(application)
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "selected": False,
+                    "reason": search_reason,
+                    "path": str(target_path),
+                }
+            )
+        )
+        raise SystemExit(0)
+except Exception as error:
+    failure_frames = []
+    failure = error.__traceback__
+    while failure is not None:
+        failure_frames.append({
+            "function": failure.tb_frame.f_code.co_name,
+            "line": failure.tb_lineno,
+        })
+        failure = failure.tb_next
+    core_foundation.CFRelease(application)
+    raise SystemExit(json.dumps({
+        "errorType": type(error).__name__,
+        "message": str(error),
+        "targetProcessId": process_id,
+        "failureFrames": failure_frames,
+        "observed": (
+            error.observed
+            if isinstance(error, (NativeAXReadUnavailable, NativeAXActionUnavailable))
+            else {}
+        ),
+    }, sort_keys=True))
+
+core_foundation.CFRelease(application)
+sys.stdout.write(
+    json.dumps(
+        {
+            "selected": True,
+            "path": str(target_path),
+            "pathParts": list(path_parts),
+            "control": read_control(process_id),
+        }
+    )
+)
+"""
+
+_WINDOW_STACK_PROBE = r"""
+import json
+import sys
+
+from tooling.acceptance.drivers.native.macos import (
+    _pixel_buffer_has_visible_alpha,
+)
+
+try:
+    import Quartz
+
+    point_x = float(sys.argv[1])
+    point_y = float(sys.argv[2])
+    windows = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly,
+        Quartz.kCGNullWindowID,
+    )
+    owners = []
+    for index, window in enumerate(windows):
+        bounds = window.get(Quartz.kCGWindowBounds) or {}
+        left = float(bounds.get("X", 0))
+        top = float(bounds.get("Y", 0))
+        width = float(bounds.get("Width", 0))
+        height = float(bounds.get("Height", 0))
+        if not (
+            left <= point_x < left + width
+            and top <= point_y < top + height
+        ):
+            continue
+        window_id = int(window.get(Quartz.kCGWindowNumber, 0))
+        sample = Quartz.CGWindowListCreateImage(
+            Quartz.CGRectMake(point_x, point_y, 1, 1),
+            Quartz.kCGWindowListOptionIncludingWindow,
+            window_id,
+            Quartz.kCGWindowImageBoundsIgnoreFraming,
+        )
+        if sample is not None:
+            provider = Quartz.CGImageGetDataProvider(sample)
+            sample_content = (
+                Quartz.CGDataProviderCopyData(provider)
+                if provider is not None
+                else None
+            )
+            if (
+                sample_content is not None
+                and not _pixel_buffer_has_visible_alpha(
+                    bytes(sample_content),
+                    width=int(Quartz.CGImageGetWidth(sample)),
+                    height=int(Quartz.CGImageGetHeight(sample)),
+                    bits_per_pixel=int(
+                        Quartz.CGImageGetBitsPerPixel(sample)
+                    ),
+                    bytes_per_row=int(
+                        Quartz.CGImageGetBytesPerRow(sample)
+                    ),
+                    alpha_info=int(Quartz.CGImageGetAlphaInfo(sample)),
+                    bitmap_info=int(Quartz.CGImageGetBitmapInfo(sample)),
+                )
+            ):
+                continue
+        owners.append(
+            {
+                "index": index,
+                "ownerPid": int(window.get(Quartz.kCGWindowOwnerPID, 0)),
+                "ownerName": str(window.get(Quartz.kCGWindowOwnerName, "")),
+                "windowName": str(window.get(Quartz.kCGWindowName, "")),
+                "layer": int(window.get(Quartz.kCGWindowLayer, 0)),
+                "alpha": float(window.get(Quartz.kCGWindowAlpha, 0)),
+                "bounds": {
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                },
+            }
+        )
+    print(json.dumps({"windows": owners[:16]}))
+except Exception as error:
+    print(json.dumps({"error": f"{type(error).__name__}: {error}"}))
+"""
+
+_KEY_CODES = {
+    NativeKey.A: 0,
+    NativeKey.C: 8,
+    NativeKey.G: 5,
+    NativeKey.L: 37,
+    NativeKey.V: 9,
+    NativeKey.COMMA: 43,
+    NativeKey.DELETE: 51,
+    NativeKey.ENTER: 36,
+    NativeKey.TAB: 48,
+    NativeKey.ESCAPE: 53,
+}
+_MODIFIER_CODES = {
+    NativeModifier.PRIMARY: (55, 0x00100000),
+    NativeModifier.SHIFT: (56, 0x00020000),
+}
+_MOUSE_EVENT_TYPES = {
+    MouseAction.LEFT_DOWN: 1,
+    MouseAction.LEFT_UP: 2,
+    MouseAction.MOVE: 5,
+    MouseAction.LEFT_DRAG: 6,
+}
+_MEDIA_PERMISSION_ALLOW_BUTTON_IDENTIFIER = "action-button-1"
+
+
+@dataclass(frozen=True)
+class MacOSStatusItemSnapshot:
+    role: str
+    subrole: str
+    title: str
+    help: str
+    position: tuple[float, float]
+    size: tuple[float, float]
+    menu_items: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "role": self.role,
+            "subrole": self.subrole,
+            "title": self.title,
+            "help": self.help,
+            "position": {
+                "x": self.position[0],
+                "y": self.position[1],
+            },
+            "size": {
+                "width": self.size[0],
+                "height": self.size[1],
+            },
+            "menuItems": list(self.menu_items),
+        }
+
+
+_SEMANTIC_SELECTION_UNAVAILABLE_REASONS = frozenset(
+    (
+        "list-selection-unsupported",
+        "search-field-unavailable",
+        "search-no-match",
+        "search-multiple-matches",
+        "search-selection-unsupported",
+        "search-confirm-unavailable",
+        "search-panel-remained-open",
+    )
+)
+
+
+class MacOSNativeDesktopAdapter(NativeDesktopAdapter):
+    def __init__(
+        self,
+        input_mode: NativeInputMode = NativeInputMode.SEMANTIC_NON_INTRUSIVE,
+    ) -> None:
+        self._input_mode = input_mode
+        self._operator_scope = None
+
+    @property
+    def input_mode(self) -> NativeInputMode:
+        return self._input_mode
+
+    @property
+    def platform(self) -> str:
+        return "macos"
+
+    @staticmethod
+    def _native_observation(
+        mode: str, process_id: int = 0, *,
+        timeout_seconds: float = NATIVE_OBSERVATION_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
+        focus_deadline = time.monotonic() + OPERATOR_FOCUS_STABILITY_TIMEOUT_SECONDS
+        details: dict[str, object] = {}
+        try:
+            completed = subprocess.run(
+                (
+                    sys.executable, "-c", _NATIVE_OBSERVATION_PROBE,
+                    mode, str(process_id), str(focus_deadline),
+                    str(OPERATOR_FOCUS_STABILITY_INTERVAL_SECONDS),
+                ),
+                capture_output=True, text=True, timeout=timeout_seconds, check=True,
+            )
+            value = json.loads(completed.stdout)
+            if not isinstance(value, dict):
+                raise ValueError("observation is not an object")
+            if "error" in value:
+                details = value["error"] if isinstance(value["error"], dict) else {}
+                raise ValueError("native observation failed")
+            keys = {
+                "pointer": {"pointer"}, "control": {"control"}, "panel": {"panel"},
+            }[mode]
+            if set(value) != keys or any(
+                not isinstance(payload, dict) for payload in value.values()
+            ):
+                raise ValueError("invalid native observation shape")
+            return value
+        except (
+            OSError, subprocess.SubprocessError, ValueError,
+            KeyError, TypeError, DriverError,
+        ) as error:
+            resource = (
+                "native-file-chooser" if mode == "panel"
+                else "runtime-cell-operator-focus"
+            )
+            raise BlockedError(
+                reason=str(details.get("reason") or (
+                    "macOS native observation timed out"
+                    if isinstance(error, subprocess.TimeoutExpired)
+                    else "macOS native observation failed"
+                )),
+                resource=resource,
+                diagnostic=ResourceDiagnostic.observed(
+                    owner="macos-native-driver", resource=resource,
+                    expected={
+                        **dict(details.get("expected") or {}),
+                        "operation": mode, "processId": process_id,
+                        "timeoutSeconds": timeout_seconds,
+                        "focusTimeoutSeconds": OPERATOR_FOCUS_STABILITY_TIMEOUT_SECONDS,
+                    },
+                    observed={
+                        **dict(details.get("observed") or {}),
+                        "errorType": (
+                            dict(details.get("observed") or {}).get("errorType")
+                            or type(error).__name__
+                        ),
+                        "adapterErrorType": type(error).__name__,
+                        "returnCode": getattr(error, "returncode", None),
+                    },
+                    recovery_action=(
+                        "Repair the bounded exact-PID native observation and "
+                        "qualify the same Cell. Preserve the original operator "
+                        "baseline and timeout; do not restore focus or rebaseline."
+                    ),
+                ),
+            ) from error
+
+    def pointer_location(self) -> dict[str, object]:
+        return self._native_observation("pointer")["pointer"]
+
+    def snapshot_operator_state(self) -> dict[str, object]:
+        if self._operator_scope is None:
+            with self.observe_operator() as observation:
+                return dict(observation.baseline)
+        return dict(self._operator_scope.observe("operator", 0).operator_state)
+
+    def observe_operator(
+        self, *, deadline_monotonic: float | None = None,
+    ) -> NativeOperatorObservation:
+        from tooling.acceptance.drivers.native.macos_operator import OperatorScope
+
+        if self._operator_scope is not None:
+            raise DriverError("Native operator observation is already active")
+        self._operator_scope = OperatorScope(
+            _NATIVE_AX_SUPPORT, deadline_monotonic=deadline_monotonic,
+        )
+        try:
+            return NativeOperatorObservation(self)
+        except BaseException as error:
+            try:
+                self.close_operator_observation()
+            except (BlockedError, DriverError) as cleanup:
+                error.add_note(f"Operator scope cleanup failed: {type(cleanup).__name__}")
+            raise
+
+    def close_operator_observation(self) -> None:
+        scope = self._operator_scope
+        if scope is not None:
+            try:
+                scope.close()
+            finally:
+                if scope._closed:
+                    self._operator_scope = None
+
+    def snapshot_operator_and_file_chooser(
+        self, process_id: int,
+    ) -> NativeDesktopObservation:
+        process_id = self._validated_process_id(process_id)
+        if self._operator_scope is None:
+            raise DriverError("Combined observation requires an active operator scope")
+        return self._operator_scope.observe("operator-panel", process_id)
+
+    def activate_process(self, process_id: int) -> None:
+        self.require_exclusive_input("activate macOS process")
+        process_id = self._validated_process_id(process_id)
+        try:
+            appkit_activation = subprocess.run(
+                (sys.executable, "-c", _ACTIVATION_PROBE, str(process_id)),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DriverError("Native actor AppKit activation timed out") from error
+        if appkit_activation.returncode != 0:
+            raise DriverError(
+                "Native actor AppKit activation failed: "
+                f"{appkit_activation.stderr.strip() or appkit_activation.stdout.strip()}"
+            )
+        self._accessibility(process_id, "activate")
+        state = self._accessibility(process_id)
+        if (
+            state["frontmost"] is not True
+            or state["actualFrontmostPid"] != process_id
+        ):
+            raise DriverError(
+                f"Native actor process {process_id} did not become frontmost"
+            )
+
+    def position_main_window(
+        self,
+        process_id: int,
+        point: tuple[float, float],
+    ) -> None:
+        process_id = self._validated_process_id(process_id)
+        x, y = (float(value) for value in point)
+        if not all(math.isfinite(value) for value in (x, y)):
+            raise DriverError("macOS main-window position is invalid")
+        self._accessibility(process_id, "position", json.dumps((x, y)))
+
+    def status_item_snapshot(
+        self,
+        process_id: int,
+        *,
+        expected_help: str,
+    ) -> MacOSStatusItemSnapshot:
+        process_id = self._validated_process_id(process_id)
+        if not expected_help or "\t" in expected_help or "\n" in expected_help:
+            raise DriverError("macOS status-item help text is invalid")
+        script = f"""
+        tell application "System Events"
+          set targetProcess to first application process whose unix id is {process_id}
+          set targetItem to missing value
+          repeat with targetBar in menu bars of targetProcess
+            repeat with candidateItem in menu bar items of targetBar
+              try
+                if help of candidateItem is {json.dumps(expected_help)} then
+                  set targetItem to candidateItem
+                  exit repeat
+                end if
+              end try
+            end repeat
+            if targetItem is not missing value then exit repeat
+          end repeat
+          if targetItem is missing value then error "status item not found"
+          set itemTitle to ""
+          try
+            set itemTitle to title of targetItem as text
+          end try
+          set itemPosition to position of targetItem
+          set itemSize to size of targetItem
+          set menuTitles to ""
+          if (count of menus of targetItem) > 0 then
+            repeat with targetMenuItem in menu items of menu 1 of targetItem
+              try
+                set menuTitle to title of targetMenuItem as text
+                if menuTitle is not "" then
+                  if menuTitles is not "" then set menuTitles to menuTitles & "|"
+                  set menuTitles to menuTitles & menuTitle
+                end if
+              end try
+            end repeat
+          end if
+          return (role of targetItem as text) & tab & ¬
+            (subrole of targetItem as text) & tab & itemTitle & tab & ¬
+            (help of targetItem as text) & tab & ¬
+            (item 1 of itemPosition as text) & tab & ¬
+            (item 2 of itemPosition as text) & tab & ¬
+            (item 1 of itemSize as text) & tab & ¬
+            (item 2 of itemSize as text) & tab & menuTitles
+        end tell
+        """
+        output = self._run_osascript(script, "status-item inspection")
+        fields = output.split("\t")
+        if len(fields) != 9:
+            raise DriverError(
+                "macOS status-item inspection returned an invalid shape"
+            )
+        try:
+            position = (float(fields[4]), float(fields[5]))
+            size = (float(fields[6]), float(fields[7]))
+        except ValueError as error:
+            raise DriverError(
+                "macOS status-item geometry is invalid"
+            ) from error
+        return MacOSStatusItemSnapshot(
+            role=fields[0],
+            subrole=fields[1],
+            title=fields[2],
+            help=fields[3],
+            position=position,
+            size=size,
+            menu_items=tuple(
+                item for item in fields[8].split("|") if item
+            ),
+        )
+
+    def window_state(self, process_id: int) -> dict[str, object]:
+        process_id = self._validated_process_id(process_id)
+        value = self._accessibility(process_id)
+        return {
+            key: value[key]
+            for key in ("windowCount", "frontmost", "mainWindow", "focusedWindow")
+        }
+
+    def hide_main_window(
+        self,
+        process_id: int,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> dict[str, object]:
+        process_id = self._validated_process_id(process_id)
+        self._accessibility(process_id, "close")
+        return self._wait_for_window_count(
+            process_id,
+            expected_visible=False,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def show_main_window_from_status_item(
+        self,
+        process_id: int,
+        *,
+        expected_help: str,
+        menu_item_title: str,
+        timeout_seconds: float = 10.0,
+    ) -> dict[str, object]:
+        process_id = self._validated_process_id(process_id)
+        for value in (expected_help, menu_item_title):
+            if not value or "\n" in value:
+                raise DriverError("macOS status-item action text is invalid")
+        script = f"""
+        tell application "System Events"
+          set targetProcess to first application process whose unix id is {process_id}
+          set targetItem to missing value
+          repeat with targetBar in menu bars of targetProcess
+            repeat with candidateItem in menu bar items of targetBar
+              try
+                if help of candidateItem is {json.dumps(expected_help)} then
+                  set targetItem to candidateItem
+                  exit repeat
+                end if
+              end try
+            end repeat
+            if targetItem is not missing value then exit repeat
+          end repeat
+          if targetItem is missing value then error "status item not found"
+          click targetItem
+          click menu item {json.dumps(menu_item_title)} of menu 1 of targetItem
+        end tell
+        """
+        self._run_osascript(script, "status-item Show action")
+        return self._wait_for_window_count(
+            process_id,
+            expected_visible=True,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _wait_for_window_count(
+        self,
+        process_id: int,
+        *,
+        expected_visible: bool,
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + timeout_seconds
+        last_state: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            last_state = self.window_state(process_id)
+            visible = int(last_state["windowCount"]) > 0
+            if visible == expected_visible:
+                if not expected_visible or (
+                    last_state["frontmost"] is True
+                    and last_state["mainWindow"] is True
+                    and last_state["focusedWindow"] is True
+                ):
+                    return last_state
+            time.sleep(0.1)
+        raise DriverError(
+            "macOS main-window visibility did not reach the expected state: "
+            f"{last_state}"
+        )
+
+    @staticmethod
+    def _run_osascript(script: str, operation: str) -> str:
+        completed = subprocess.run(
+            ("osascript", "-e", script),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError(
+                f"macOS {operation} failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        return completed.stdout.strip()
+
+    def post_mouse(
+        self,
+        actions: tuple[MouseAction, ...],
+        point: tuple[float, float],
+    ) -> None:
+        self.require_exclusive_input("post macOS global mouse event")
+
+        class CGPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+        core_graphics, core_foundation = self._event_frameworks()
+        core_graphics.CGEventCreateMouseEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            CGPoint,
+            ctypes.c_uint32,
+        ]
+        core_graphics.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+        native_point = CGPoint(*point)
+        for action in actions:
+            event = core_graphics.CGEventCreateMouseEvent(
+                None,
+                _MOUSE_EVENT_TYPES[action],
+                native_point,
+                0,
+            )
+            if not event:
+                raise DriverError(
+                    "CoreGraphics failed to create Native mouse event"
+                )
+            core_graphics.CGEventPost(0, event)
+            core_foundation.CFRelease(event)
+
+    def post_scroll(
+        self,
+        point: tuple[float, float],
+        *,
+        delta_y: int,
+    ) -> None:
+        self.require_exclusive_input("post macOS global scroll event")
+        if type(delta_y) is not int or not -(2**31 - 1) <= delta_y <= 2**31 - 1:
+            raise ValueError("Native pixel scroll delta must be a signed 32-bit integer")
+        if delta_y == 0:
+            raise ValueError("Native pixel scroll delta must not be zero")
+
+        class CGPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+        core_graphics, core_foundation = self._event_frameworks()
+        core_graphics.CGEventCreateScrollWheelEvent2.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+        ]
+        core_graphics.CGEventCreateScrollWheelEvent2.restype = ctypes.c_void_p
+        core_graphics.CGEventSetLocation.argtypes = [ctypes.c_void_p, CGPoint]
+        # kCGScrollEventUnitPixel=0; CoreGraphics positive deltas move upward.
+        event = core_graphics.CGEventCreateScrollWheelEvent2(
+            None, 0, 1, -delta_y, 0, 0,
+        )
+        if not event:
+            raise DriverError("CoreGraphics failed to create Native scroll event")
+        try:
+            self.post_mouse((MouseAction.MOVE,), point)
+            core_graphics.CGEventSetLocation(event, CGPoint(*point))
+            core_graphics.CGEventPost(0, event)
+        finally:
+            core_foundation.CFRelease(event)
+
+    def post_key(
+        self,
+        key: NativeKey,
+        *,
+        modifiers: tuple[NativeModifier, ...] = (),
+        text: str = "",
+        private_source: bool = False,
+    ) -> None:
+        self.require_exclusive_input("post macOS global keyboard event")
+        core_graphics, core_foundation = self._event_frameworks()
+        core_graphics.CGEventCreateKeyboardEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint16,
+            ctypes.c_bool,
+        ]
+        core_graphics.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        core_graphics.CGEventSourceCreate.argtypes = [ctypes.c_int32]
+        core_graphics.CGEventSourceCreate.restype = ctypes.c_void_p
+        core_graphics.CGEventSetFlags.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        core_graphics.CGEventKeyboardSetUnicodeString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_uint16),
+        ]
+        encoded = text.encode("utf-16-le")
+        unicode_units = (ctypes.c_uint16 * (len(encoded) // 2)).from_buffer_copy(
+            encoded
+        )
+        source = (
+            core_graphics.CGEventSourceCreate(-1)
+            if modifiers or private_source
+            else None
+        )
+        if (modifiers or private_source) and not source:
+            raise DriverError(
+                "CoreGraphics failed to create Native private event source"
+            )
+
+        active_flags = 0
+
+        def post(key_code: int, pressed: bool, flags: int) -> None:
+            event = core_graphics.CGEventCreateKeyboardEvent(
+                source,
+                key_code,
+                pressed,
+            )
+            if not event:
+                raise DriverError(
+                    "CoreGraphics failed to create Native keyboard event"
+                )
+            try:
+                if flags:
+                    core_graphics.CGEventSetFlags(event, flags)
+                if text and key_code == _KEY_CODES[key]:
+                    core_graphics.CGEventKeyboardSetUnicodeString(
+                        event,
+                        len(unicode_units),
+                        unicode_units,
+                    )
+                core_graphics.CGEventPost(0, event)
+            finally:
+                core_foundation.CFRelease(event)
+
+        try:
+            for modifier in modifiers:
+                modifier_key, modifier_flag = _MODIFIER_CODES[modifier]
+                active_flags |= modifier_flag
+                post(modifier_key, True, active_flags)
+            post(_KEY_CODES[key], True, active_flags)
+            post(_KEY_CODES[key], False, active_flags)
+            for modifier in reversed(modifiers):
+                modifier_key, modifier_flag = _MODIFIER_CODES[modifier]
+                active_flags &= ~modifier_flag
+                post(modifier_key, False, active_flags)
+        finally:
+            if source:
+                core_foundation.CFRelease(source)
+
+    def reveal_file_chooser_location(self) -> None:
+        self.post_key(
+            NativeKey.G,
+            modifiers=(NativeModifier.PRIMARY, NativeModifier.SHIFT),
+        )
+
+    def reveal_file_chooser_location_to_process(
+        self,
+        process_id: int,
+    ) -> NativeControlSnapshot | None:
+        process_id = self._validated_process_id(process_id)
+        owner = self.focused_control(process_id)
+        # A standalone NSOpenPanel is key while its app-level AXFrontmost can
+        # read false. Accept the real ownership signal: the system frontmost
+        # process is the owner and its panel is the main window.
+        if owner.actual_frontmost_pid != process_id:
+            raise DriverError(
+                "Native file chooser shortcut target is not frontmost: "
+                f"{owner.to_dict()}"
+            )
+        if not (owner.frontmost or owner.main_window):
+            raise DriverError(
+                "Native file chooser shortcut target has no key panel: "
+                f"{owner.to_dict()}"
+            )
+        self.reveal_file_chooser_location()
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            control = self.focused_control(process_id)
+            if control.kind == "text-field":
+                return control
+            time.sleep(0.05)
+        return None
+
+    def select_file_chooser_path_to_process(
+        self,
+        process_id: int,
+        path: str,
+    ) -> NativeControlSnapshot | None:
+        process_id = self._validated_process_id(process_id)
+        target = Path(path).expanduser().resolve()
+        if not target.is_file():
+            raise DriverError(
+                f"Native file chooser target is missing: {target}"
+            )
+        try:
+            target.relative_to(Path.home().resolve())
+        except ValueError as error:
+            raise DriverError(
+                "Native file chooser target must be staged under the user home"
+            ) from error
+        try:
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-c",
+                    _FILE_CHOOSER_SELECTION_PROBE,
+                    str(process_id),
+                    str(target),
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DriverError(
+                "Native file chooser Accessibility selection timed out"
+            ) from error
+        if completed.returncode != 0:
+            raise DriverError(
+                "Native file chooser Accessibility selection failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        try:
+            result = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise DriverError(
+                "Native file chooser returned an invalid selection result: "
+                f"{completed.stdout!r}"
+            ) from error
+        if (
+            isinstance(result, dict)
+            and result.get("selected") is False
+            and result.get("reason") in _SEMANTIC_SELECTION_UNAVAILABLE_REASONS
+            and result.get("path") == str(target)
+        ):
+            # Only an isolated exclusive caller may use its native fallback.
+            # Semantic callers cannot commit this outcome; retain the exact
+            # reason instead of waiting for an already-unavailable selection.
+            if self.input_mode is NativeInputMode.SEMANTIC_NON_INTRUSIVE:
+                raise BlockedError(
+                    reason=f"Native file chooser semantic selection unavailable: {result['reason']}",
+                    resource="desktop-native-file-chooser",
+                    diagnostic=ResourceDiagnostic.observed(
+                        owner="macos-native-file-chooser",
+                        resource="desktop-native-file-chooser",
+                        recovery_action=(
+                            "Repair the recorded semantic selection at the original "
+                            "Native Driver, then repeat the same prepared Journey."
+                        ),
+                        expected={
+                            "selected": True,
+                            "requestedPathSha256": hashlib.sha256(str(target).encode()).hexdigest(),
+                        },
+                        observed={
+                            "selected": False,
+                            "selectionReason": result["reason"],
+                            "targetProcessId": process_id,
+                            "inputMode": self.input_mode.value,
+                        },
+                    ),
+                )
+            return None
+        if (
+            not isinstance(result, dict)
+            or result.get("selected") is not True
+            or result.get("path") != str(target)
+        ):
+            raise DriverError(
+                f"Native file chooser did not select the staged path: {result!r}"
+            )
+        try:
+            control = self._control_snapshot(result["control"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise DriverError("Native file selection returned no control observation") from error
+        return NativeControlSnapshot(
+            kind="file-selection",
+            value=str(target),
+            window_count=control.window_count,
+            dialog_count=control.dialog_count,
+            frontmost=control.frontmost,
+            main_window=control.main_window,
+            focused_window=control.focused_window,
+            actual_frontmost_pid=control.actual_frontmost_pid,
+            platform_role=control.platform_role,
+            platform_subrole=control.platform_subrole,
+            error=control.error,
+        )
+
+    def file_chooser_state_to_process(
+        self, process_id: int,
+    ) -> NativeFileChooserSnapshot:
+        process_id = self._validated_process_id(process_id)
+        value = self._native_observation("panel", process_id)
+        return self._file_chooser_snapshot(value["panel"], process_id)
+
+    @staticmethod
+    def _file_chooser_snapshot(
+        value: dict[str, object], process_id: int,
+    ) -> NativeFileChooserSnapshot:
+        try:
+            if (
+                not isinstance(value, dict) or set(value) != {"processId", "present"}
+                or type(value["processId"]) is not int or value["processId"] != process_id
+                or type(value["present"]) is not bool
+            ):
+                raise ValueError("invalid chooser observation")
+            return NativeFileChooserSnapshot(process_id, value["present"])
+        except ValueError as error:
+            raise BlockedError(
+                reason="Native file chooser Accessibility observation failed",
+                resource="native-file-chooser",
+                diagnostic=ResourceDiagnostic.observed(
+                    owner="macos-native-driver", resource="native-file-chooser",
+                    expected={"processId": process_id, "timeoutSeconds": 3},
+                    observed={"errorType": type(error).__name__},
+                    recovery_action=(
+                        "Repair the bounded exact-PID AX observation and requalify "
+                        "the same Cell; do not infer panel state from window counts."
+                    ),
+                ),
+            ) from error
+
+    def accept_media_capture_permission_to_process(
+        self,
+        process_id: int,
+    ) -> bool:
+        self.require_exclusive_input("accept macOS media capture permission")
+        process_id = self._validated_process_id(process_id)
+        try:
+            self.activate_process(process_id)
+        except DriverError as error:
+            if "did not become frontmost" not in str(error):
+                raise
+        script = f"""
+        tell application "System Events"
+          tell first application process whose unix id is {process_id}
+            repeat with candidateWindow in windows
+              repeat with candidateSheet in sheets of candidateWindow
+                repeat with candidateButton in buttons of candidateSheet
+                  try
+                    if (value of attribute "AXIdentifier" of candidateButton as text) is "{_MEDIA_PERMISSION_ALLOW_BUTTON_IDENTIFIER}" then
+                      click candidateButton
+                      return "pressed"
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end repeat
+            return "missing"
+          end tell
+        end tell
+        """
+        try:
+            completed = subprocess.run(
+                ("osascript", "-e", script),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        if completed.returncode != 0:
+            raise DriverError(
+                "Native media-capture permission action failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        result = completed.stdout.strip()
+        if result == "pressed":
+            return True
+        if result == "missing":
+            return False
+        raise DriverError(
+            "Native media-capture permission action returned an invalid result: "
+            f"{result!r}"
+        )
+
+    def dismiss_owned_dialog_to_process(
+        self,
+        process_id: int,
+        button_title: str = "Cancel",
+        *,
+        window_titles: tuple[str, ...] = ("Save", "Open", "Select File"),
+        raise_if_missing: bool = True,
+    ) -> bool:
+        """Press a dialog button inside one process via a native AX click.
+
+        Two instances of the same app bundle can coexist in the isolated GUI
+        session. A global synthetic Escape is routed to the process that owns
+        the key window, which may be the other instance. The click is scoped
+        to the target process and its dialog window, so the dismissal cannot
+        land on a sibling instance.
+        """
+        self.require_exclusive_input("dismiss macOS native dialog")
+        process_id = self._validated_process_id(process_id)
+        try:
+            completed = subprocess.run(
+                (
+                    sys.executable, "-m",
+                    "tooling.acceptance.drivers.native.macos_panels",
+                    str(process_id), button_title, json.dumps(window_titles),
+                ),
+                capture_output=True, text=True, check=False, timeout=12,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DriverError("Native dialog AX inspection timed out") from error
+        if completed.returncode != 0:
+            raise DriverError(
+                "Native dialog AX inspection failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        try:
+            result = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise DriverError("Native dialog AX inspection returned invalid JSON") from error
+        if not isinstance(result, dict) or not isinstance(result.get("pressed"), bool):
+            raise DriverError("Native dialog AX inspection returned an invalid result")
+        if result["pressed"]:
+            return True
+        if raise_if_missing:
+            raise DriverError(f"Native dialog button not found: {result}")
+        return False
+
+    @staticmethod
+    def _accessibility(
+        process_id: int,
+        operation: str = "inspect",
+        *arguments: str,
+    ) -> dict[str, object]:
+        try:
+            completed = subprocess.run(
+                (
+                    sys.executable, "-c", _ACCESSIBILITY_PROBE,
+                    str(process_id), operation, *arguments,
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DriverError("Native Accessibility probe timed out") from error
+        if completed.returncode != 0:
+            raise DriverError(
+                f"Native Accessibility {operation} failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        try:
+            value = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise DriverError("Native Accessibility returned invalid JSON") from error
+        if not isinstance(value, dict):
+            raise DriverError("Native Accessibility returned an invalid result")
+        if operation == "inspect":
+            for key in ("frontmost", "mainWindow", "focusedWindow"):
+                if not isinstance(value.get(key), bool):
+                    raise DriverError(f"Native Accessibility returned invalid {key}")
+            for key in ("windowCount", "sheetCount", "actualFrontmostPid"):
+                if type(value.get(key)) is not int:
+                    raise DriverError(f"Native Accessibility returned invalid {key}")
+        elif value.get("operation") != operation:
+            raise DriverError("Native Accessibility returned an unexpected operation")
+        return value
+
+    def focused_control(self, process_id: int) -> NativeControlSnapshot:
+        process_id = self._validated_process_id(process_id)
+        try:
+            return self._control_snapshot(
+                self._native_observation("control", process_id, timeout_seconds=2)["control"],
+            )
+        except (BlockedError, KeyError, TypeError, ValueError) as error:
+            return NativeControlSnapshot(error=str(error))
+
+    @staticmethod
+    def _control_snapshot(value: dict[str, object]) -> NativeControlSnapshot:
+        return NativeControlSnapshot(**control_fields(value))
+
+    def window_stack_at_point(
+        self,
+        point: tuple[float, float],
+    ) -> NativeWindowStack:
+        completed = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                _WINDOW_STACK_PROBE,
+                str(point[0]),
+                str(point[1]),
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return NativeWindowStack(
+                error=completed.stderr.strip()
+                or f"window stack probe exited {completed.returncode}"
+            )
+        try:
+            value = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return NativeWindowStack(
+                error=f"invalid window stack probe: {completed.stdout!r}"
+            )
+        if not isinstance(value, dict):
+            return NativeWindowStack(error="invalid window stack")
+        error = str(value.get("error") or "")
+        windows: list[NativeWindowSnapshot] = []
+        for raw_window in value.get("windows") or []:
+            if not isinstance(raw_window, dict):
+                continue
+            raw_bounds = raw_window.get("bounds")
+            bounds = raw_bounds if isinstance(raw_bounds, dict) else {}
+            windows.append(
+                NativeWindowSnapshot(
+                    index=int(raw_window.get("index") or 0),
+                    owner_pid=int(raw_window.get("ownerPid") or 0),
+                    owner_name=str(raw_window.get("ownerName") or ""),
+                    window_name=str(raw_window.get("windowName") or ""),
+                    layer=int(raw_window.get("layer") or 0),
+                    alpha=float(raw_window.get("alpha") or 0),
+                    bounds=NativeWindowBounds(
+                        left=float(bounds.get("left") or 0),
+                        top=float(bounds.get("top") or 0),
+                        width=float(bounds.get("width") or 0),
+                        height=float(bounds.get("height") or 0),
+                    ),
+                )
+            )
+        return NativeWindowStack(windows=tuple(windows), error=error)
+
+    def mouse_button_down(self) -> bool:
+        core_graphics = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        core_graphics.CGEventSourceButtonState.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_uint32,
+        ]
+        core_graphics.CGEventSourceButtonState.restype = ctypes.c_bool
+        return bool(core_graphics.CGEventSourceButtonState(0, 0))
+
+    def capture_screenshot(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        completed = subprocess.run(
+            ("/usr/sbin/screencapture", "-x", str(path)),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not path.is_file():
+            raise DriverError(
+                "macOS desktop screenshot failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+
+    def read_clipboard(self) -> bytes:
+        completed = subprocess.run(
+            ("/usr/bin/pbpaste",),
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError("Native file chooser could not read the clipboard")
+        return completed.stdout
+
+    def write_clipboard(self, value: bytes) -> None:
+        completed = subprocess.run(
+            ("/usr/bin/pbcopy",),
+            input=value,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError("Native file chooser could not write the clipboard")
+
+    @staticmethod
+    def _event_frameworks() -> tuple[ctypes.CDLL, ctypes.CDLL]:
+        core_graphics = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        core_graphics.CGEventPost.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+        return core_graphics, core_foundation
+
+    @staticmethod
+    def _validated_process_id(process_id: int) -> int:
+        try:
+            value = int(process_id)
+        except (TypeError, ValueError) as error:
+            raise DriverError(
+                f"Native process ID is invalid: {process_id!r}"
+            ) from error
+        if value <= 0:
+            raise DriverError(f"Native process ID must be positive: {value}")
+        return value

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "plan": "closure-mp-w11",
+  "description": "Machine-readable closure contract for MP-W11 Atomic Cutover And Completion Audit. Every deliverable here must be mechanically verified. No AI discretion over what counts as done.\n",
+  "closure_contract": "MP-W11",
+  "claimed_runtime_cell": "desktop-linux-native",
+  "selected_gates": [
+    {"id": "chat-w11-forbidden-scan", "timeout_seconds": 60, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-w11-duplicate-scan", "timeout_seconds": 60, "required_by": ["closure:MP-W11"]},
+    {"id": "station-messaging-unit", "timeout_seconds": 600, "required_by": ["closure:MP-W11"]},
+    {"id": "messaging-platform-contract", "timeout_seconds": 120, "required_by": ["closure:MP-W11"]},
+    {"id": "desktop-check", "timeout_seconds": 600, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-visible-static", "timeout_seconds": 300, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-product-closure-e2e", "timeout_seconds": 3600, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-two-client-e2e", "timeout_seconds": 1800, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-interactions-e2e", "timeout_seconds": 3600, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-contact-message-resilience-e2e", "timeout_seconds": 600, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-typing-e2e", "timeout_seconds": 1800, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-multi-device-e2e", "timeout_seconds": 1800, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-recovery-e2e", "timeout_seconds": 2400, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-native-group-mls-e2e", "timeout_seconds": 2400, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-lifecycle-onboarding-e2e", "timeout_seconds": 1800, "required_by": ["closure:MP-W11"]},
+    {"id": "station-access-federation-boundary-e2e", "timeout_seconds": 2400, "required_by": ["closure:MP-W11"]},
+    {"id": "acceptance-plan-self", "timeout_seconds": 30, "required_by": ["closure:MP-W11"]},
+    {"id": "acceptance-infra-validation", "timeout_seconds": 120, "required_by": ["closure:MP-W11"]},
+    {"id": "acceptance-runtime-provisioning-self", "timeout_seconds": 180, "required_by": ["closure:MP-W11"]},
+    {"id": "desktop-dev-runtime-isolation-static", "timeout_seconds": 60, "required_by": ["closure:MP-W11"]},
+    {"id": "proto-build", "timeout_seconds": 600, "required_by": ["closure:MP-W11"]},
+    {"id": "chat-w11-completion-audit", "timeout_seconds": 60, "required_by": ["closure:MP-W11"]}
+  ]
+}

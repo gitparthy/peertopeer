@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+package peers_touch.model.chat.v1;
+
+import "domain/actor/actor.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model/chat;chat";
+
+// ============================================================================
+// v1 Unified Conversation Contract
+//
+// Single source of truth for the unified Conversation wire model.
+// Both direct (1:1) and group conversations share this skeleton;
+// business projections (group membership, direct session) are separate.
+//
+// Current governing design:
+// docs/architecture/domains/chat/messaging/data-model.md.
+// MP-D09 owns the unified Conversation framework, MP-D10 the hard cut, and
+// MP-D11 the control-plane / attachment-data-plane separation.
+// ============================================================================
+
+// --- Conversation ---
+
+// A conversation is the durable identity of a chat — direct or group.
+// It does NOT hold messages; it holds metadata and lifecycle.
+message Conversation {
+  string conversation_id = 1;
+  ConversationKind kind = 2;
+  string authority_station_peer_id = 3;
+  int64 membership_epoch = 4;
+  ConversationStatus status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+
+  // Group-only fields (empty for direct).
+  string name = 10;
+  string description = 11;
+  string avatar_cid = 12;
+  string owner_ptid = 13;
+  int32 max_members = 14;
+  GroupVisibilityV1 visibility = 15;
+  reserved 16;
+  int64 mls_epoch = 17;
+  string federation_id = 18;
+  int64 authority_epoch = 19;
+  // Discriminator for the conversation authorization scope. LOCAL carries
+  // an empty federation_id; FEDERATION requires federation_id to be set.
+  ConversationScopeKind scope_kind = 20;
+}
+
+message ConversationPublicHead {
+  string conversation_id = 1;
+  ConversationPublicHeadSource source = 2;
+  string federation_id = 3;
+  string authority_station_peer_id = 4;
+  int64 authority_epoch = 5;
+  int64 group_seq = 6;
+  bytes event_hash = 7;
+  int64 membership_epoch = 8;
+  int64 mls_epoch = 9;
+  string transition_id = 10;
+  bytes commit_sha256 = 11;
+  string status = 12;
+  ConversationScopeKind scope_kind = 13;
+}
+
+// ConversationScopeKind discriminates the two authorization scopes a
+// conversation can live under. LOCAL is derived from Actor Home-Station
+// ownership and never crosses stations; FEDERATION references a real
+// Federation resource id carried in federation_id.
+enum ConversationScopeKind {
+  CONVERSATION_SCOPE_KIND_UNSPECIFIED = 0;
+  CONVERSATION_SCOPE_KIND_LOCAL = 1;
+  CONVERSATION_SCOPE_KIND_FEDERATION = 2;
+}
+
+enum ConversationPublicHeadSource {
+  CONVERSATION_PUBLIC_HEAD_SOURCE_UNSPECIFIED = 0;
+  CONVERSATION_PUBLIC_HEAD_SOURCE_AUTHORITY = 1;
+  CONVERSATION_PUBLIC_HEAD_SOURCE_FOLLOWER = 2;
+}
+
+enum ConversationKind {
+  CONVERSATION_KIND_UNSPECIFIED = 0;
+  CONVERSATION_KIND_DIRECT = 1;
+  CONVERSATION_KIND_GROUP = 2;
+}
+
+enum ConversationStatus {
+  CONVERSATION_STATUS_UNSPECIFIED = 0;
+  CONVERSATION_STATUS_ACTIVE = 1;
+  CONVERSATION_STATUS_DISSOLVED = 2;
+  CONVERSATION_STATUS_DEGRADED_READ_ONLY = 3;
+  CONVERSATION_STATUS_ORPHANED_READ_ONLY = 4;
+}
+
+enum GroupVisibilityV1 {
+  GROUP_VISIBILITY_V1_UNSPECIFIED = 0;
+  GROUP_VISIBILITY_V1_PUBLIC = 1;
+  GROUP_VISIBILITY_V1_PRIVATE = 2;
+}
+
+// --- Conversation Member ---
+
+message ConversationMember {
+  string conversation_id = 1;
+  string ptid = 2;
+  MemberRole role = 3;
+  MemberStatus member_status = 4;
+  string actor_home_station_peer_id = 5;
+  string actor_home_station_domain = 6;
+  google.protobuf.Timestamp joined_at = 7;
+  string invited_by_ptid = 8;
+
+  // Per-member settings
+  string nickname = 10;
+  bool muted = 11;
+  google.protobuf.Timestamp muted_until = 12;
+
+  // Read projection of the member's actor kind. Conversation-level signal
+  // (alongside per-message delivery security) used to suppress the E2EE lock
+  // for AGENT members in service-plaintext bot conversations.
+  peers_touch.model.actor.v1.ActorKind actor_kind = 13;
+}
+
+enum MemberRole {
+  MEMBER_ROLE_UNSPECIFIED = 0;
+  MEMBER_ROLE_MEMBER = 1;
+  MEMBER_ROLE_ADMIN = 2;
+  MEMBER_ROLE_OWNER = 3;
+}
+
+enum MemberStatus {
+  MEMBER_STATUS_UNSPECIFIED = 0;
+  MEMBER_STATUS_ACTIVE = 1;
+  MEMBER_STATUS_LEFT = 2;
+  MEMBER_STATUS_REMOVED = 3;
+  MEMBER_STATUS_INVITED = 4;
+}
+
+// --- Message State Machine ---
+
+// Canonical message delivery states (D-10).
+// local_queued -> submitted -> committed -> home_delivered -> device_delivered -> read
+enum MessageDeliveryState {
+  MESSAGE_DELIVERY_STATE_UNSPECIFIED = 0;
+  MESSAGE_DELIVERY_STATE_LOCAL_QUEUED = 1;
+  MESSAGE_DELIVERY_STATE_SUBMITTED = 2;
+  MESSAGE_DELIVERY_STATE_COMMITTED = 3;
+  MESSAGE_DELIVERY_STATE_HOME_DELIVERED = 4;
+  MESSAGE_DELIVERY_STATE_DEVICE_DELIVERED = 5;
+  MESSAGE_DELIVERY_STATE_READ = 6;
+  MESSAGE_DELIVERY_STATE_FAILED = 7;
+}
+
+// D-15 device-scoped MLS leaf identity. Its deterministic protobuf bytes are
+// the complete OpenMLS BasicCredential.identity. PTID-only credentials are not
+// valid after the hard cutover.
+message MlsDeviceCredential {
+  uint32 version = 1;
+  string ptid = 2;
+  string device_id = 3;
+}
+
+// D-16 actor authorization for a different active MLS leaf to commit LEAVE.
+message MlsLeaveIntent {
+  uint32 version = 1;
+  string intent_id = 2;
+  string federation_id = 3;
+  string authority_station_peer_id = 4;
+  int64 authority_epoch = 5;
+  string home_station_peer_id = 6;
+  string conversation_id = 7;
+  string actor_ptid = 8;
+  string actor_device_id = 9;
+  string actor_signing_key_id = 10;
+  int64 observed_membership_epoch = 11;
+  int64 observed_mls_epoch = 12;
+  int64 created_at_unix_ms = 13;
+  int64 expires_at_unix_ms = 14;
+  bytes actor_signature = 15;
+  int64 authority_sequence = 16;
+  bytes authority_hash = 17;
+}
+
+// Exact deterministic protobuf input signed by the departing actor device.
+message MlsLeaveIntentSigningInput {
+  uint32 version = 1;
+  string intent_id = 2;
+  string federation_id = 3;
+  string authority_station_peer_id = 4;
+  int64 authority_epoch = 5;
+  string home_station_peer_id = 6;
+  string conversation_id = 7;
+  string actor_ptid = 8;
+  string actor_device_id = 9;
+  string actor_signing_key_id = 10;
+  int64 observed_membership_epoch = 11;
+  int64 observed_mls_epoch = 12;
+  int64 created_at_unix_ms = 13;
+  int64 expires_at_unix_ms = 14;
+  int64 authority_sequence = 15;
+  bytes authority_hash = 16;
+}
+
+message MembershipTransitionChange {
+  string ptid = 1;
+  string actor_home_station_peer_id = 2;
+  MembershipTransitionAction action = 3;
+  MemberRole role = 4;
+  string device_id = 5;
+}
+
+enum MembershipTransitionAction {
+  MEMBERSHIP_TRANSITION_ACTION_UNSPECIFIED = 0;
+  MEMBERSHIP_TRANSITION_ACTION_ADD = 1;
+  MEMBERSHIP_TRANSITION_ACTION_REMOVE = 2;
+  MEMBERSHIP_TRANSITION_ACTION_LEAVE = 3;
+  MEMBERSHIP_TRANSITION_ACTION_ROLE_CHANGE = 4;
+  MEMBERSHIP_TRANSITION_ACTION_ADD_DEVICE = 5;
+  MEMBERSHIP_TRANSITION_ACTION_REMOVE_DEVICE = 6;
+}
+
+enum ConversationCommandKind {
+  CONVERSATION_COMMAND_KIND_UNSPECIFIED = 0;
+  CONVERSATION_COMMAND_KIND_SEND_MESSAGE = 1;
+  CONVERSATION_COMMAND_KIND_EDIT_MESSAGE = 2;
+  CONVERSATION_COMMAND_KIND_RETRACT_MESSAGE = 3;
+  CONVERSATION_COMMAND_KIND_DISSOLVE = 4;
+  CONVERSATION_COMMAND_KIND_UPDATE_SETTINGS = 5;
+  CONVERSATION_COMMAND_KIND_REACT = 6;
+  CONVERSATION_COMMAND_KIND_PIN_MESSAGE = 7;
+  CONVERSATION_COMMAND_KIND_MEMBERSHIP_TRANSITION = 8;
+  CONVERSATION_COMMAND_KIND_MEMBER_AUTHORITY = 9;
+  CONVERSATION_COMMAND_KIND_HIDE_MESSAGE_FOR_ACTOR = 10;
+  CONVERSATION_COMMAND_KIND_MODERATE_MESSAGE = 11;
+  CONVERSATION_COMMAND_KIND_FORWARD_MESSAGE = 12;
+}
+
+enum ConversationCommandRejectCode {
+  CONVERSATION_COMMAND_REJECT_CODE_UNSPECIFIED = 0;
+  CONVERSATION_COMMAND_REJECT_CODE_INVALID_PROPOSAL = 1;
+  CONVERSATION_COMMAND_REJECT_CODE_INVALID_STATION_TOKEN = 2;
+  CONVERSATION_COMMAND_REJECT_CODE_INACTIVE_FEDERATION_STATION = 3;
+  CONVERSATION_COMMAND_REJECT_CODE_ACTOR_KEY_UNAVAILABLE = 4;
+  CONVERSATION_COMMAND_REJECT_CODE_ACTOR_KEY_REVOKED = 5;
+  CONVERSATION_COMMAND_REJECT_CODE_INVALID_ACTOR_SIGNATURE = 6;
+  CONVERSATION_COMMAND_REJECT_CODE_COMMAND_HASH_MISMATCH = 7;
+  CONVERSATION_COMMAND_REJECT_CODE_FIELD_BINDING_MISMATCH = 8;
+  CONVERSATION_COMMAND_REJECT_CODE_NOT_AUTHORITY = 9;
+  CONVERSATION_COMMAND_REJECT_CODE_PERMISSION_DENIED = 10;
+  CONVERSATION_COMMAND_REJECT_CODE_MEMBERSHIP_EPOCH_STALE = 11;
+  CONVERSATION_COMMAND_REJECT_CODE_MLS_EPOCH_MISMATCH = 12;
+  CONVERSATION_COMMAND_REJECT_CODE_COMMAND_CONFLICT = 13;
+  CONVERSATION_COMMAND_REJECT_CODE_COMMAND_EXPIRED = 14;
+  CONVERSATION_COMMAND_REJECT_CODE_GROUP_READ_ONLY = 15;
+  CONVERSATION_COMMAND_REJECT_CODE_PAYLOAD_TOO_LARGE = 16;
+  CONVERSATION_COMMAND_REJECT_CODE_TOO_MANY_RECIPIENTS = 17;
+  CONVERSATION_COMMAND_REJECT_CODE_RATE_LIMITED = 18;
+  CONVERSATION_COMMAND_REJECT_CODE_UNSUPPORTED_COMMAND = 19;
+  CONVERSATION_COMMAND_REJECT_CODE_STALE_DELIVERY_PLAN = 20;
+  CONVERSATION_COMMAND_REJECT_CODE_CONVERSATION_STATE = 21;
+  CONVERSATION_COMMAND_REJECT_CODE_SENDER_UNAUTHORIZED = 22;
+  CONVERSATION_COMMAND_REJECT_CODE_DELIVERY_SET = 23;
+  CONVERSATION_COMMAND_REJECT_CODE_AUTHORITY_PLAN_STALE = 24;
+  CONVERSATION_COMMAND_REJECT_CODE_AUTHORITY_PLAN_EXPIRED = 25;
+  CONVERSATION_COMMAND_REJECT_CODE_TARGET_NOT_MEMBER = 26;
+  CONVERSATION_COMMAND_REJECT_CODE_OWNER_PROTECTED = 27;
+  CONVERSATION_COMMAND_REJECT_CODE_AUTHORITY_HEAD_STALE = 28;
+  CONVERSATION_COMMAND_REJECT_CODE_MEMBER_COMMAND_EXPIRED = 29;
+  CONVERSATION_COMMAND_REJECT_CODE_MEMBER_MUTED = 30;
+}
+
+enum ConversationCommandSubmissionState {
+  CONVERSATION_COMMAND_SUBMISSION_STATE_UNSPECIFIED = 0;
+  CONVERSATION_COMMAND_SUBMISSION_STATE_HOME_ACCEPTED = 1;
+  CONVERSATION_COMMAND_SUBMISSION_STATE_SUBMITTED = 2;
+  CONVERSATION_COMMAND_SUBMISSION_STATE_RETRY_WAIT = 3;
+  CONVERSATION_COMMAND_SUBMISSION_STATE_ACCEPTED = 4;
+  CONVERSATION_COMMAND_SUBMISSION_STATE_TERMINAL_REJECTED = 5;
+}
+
+// --- Message Receipt ---
+
+message MessageReceipt {
+  string conversation_id = 1;
+  string message_id = 2;
+  string ptid = 3;
+  string device_id = 4;
+  ReceiptType receipt_type = 5;
+  google.protobuf.Timestamp ts = 6;
+}
+
+enum ReceiptType {
+  RECEIPT_TYPE_UNSPECIFIED = 0;
+  RECEIPT_TYPE_DELIVERED = 1;
+  RECEIPT_TYPE_READ = 2;
+}

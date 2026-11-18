@@ -1,0 +1,335 @@
+import { create } from '@bufbuild/protobuf';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { MobileAuthSession } from '../auth/authSession';
+import {
+  MobileDurableCommandEnvelopeV2Schema,
+  MobileDurableCommandState,
+} from '../../gen/proto/domain/mobile/reliability_pb';
+import { FriendRequestState } from '../../gen/proto/domain/social/relationship_pb';
+import {
+  applyReliabilityProjectionCheckpoints,
+  listReliabilityCommands,
+  readReliabilityRuntimeStatus,
+  type CommandProjection,
+} from '../../runtimes/commandRuntime';
+import { messagingCreateDirect } from '../../services/mobileCommands';
+import { createSocialGateway } from '../../services/gateways/socialGateway';
+import { normalizeFriendRequest } from './socialNormalizers';
+import {
+  actorDisplayName,
+  projectAcceptedContacts,
+  projectOutgoingRequests,
+  projectPendingInboundRequests,
+} from './socialProjection';
+import { useSocialStore } from './socialStore';
+
+vi.mock('../../services/mobileCommands', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../services/mobileCommands')>(),
+  messagingCreateDirect: vi.fn(),
+}));
+vi.mock('../../runtimes/commandRuntime', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../runtimes/commandRuntime')>(),
+  applyReliabilityProjectionCheckpoints: vi.fn(),
+  readReliabilityRuntimeStatus: vi.fn(),
+  listReliabilityCommands: vi.fn(),
+}));
+
+const session: MobileAuthSession = {
+  stationPeerId: 'station-a',
+  stationUrl: 'https://station.example',
+  sessionId: 'session-a',
+  deviceId: 'device-a',
+  lifecycleGeneration: 1,
+  actorRef: { ptid: 'ptid:alice' },
+  authenticatedAt: 1,
+};
+const accepted = normalizeFriendRequest({
+  requestId: 'request-a',
+  senderPtid: 'ptid:alice',
+  receiverPtid: 'ptid:bob',
+  senderHomeStationPeerId: 'station-a',
+  receiverHomeStationPeerId: 'station-a',
+  receiverDisplayName: 'Bob',
+  senderDisplayName: 'Alice',
+  federationId: 'fed-a',
+  status: FriendRequestState.ACCEPTED,
+});
+
+describe('Contacts relationship and Direct journey', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useSocialStore.setState(useSocialStore.getInitialState(), true);
+    useSocialStore.setState({
+      authSession: session,
+      currentUserPtid: session.actorRef.ptid,
+      socialGateway: createSocialGateway(session),
+      friendRequests: [accepted],
+      refreshSessions: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.mocked(messagingCreateDirect).mockResolvedValue({
+      conversationId: 'conversation-authoritative',
+      commandId: 'command-direct',
+      state: 'projected',
+    });
+    vi.mocked(applyReliabilityProjectionCheckpoints).mockResolvedValue(1);
+  });
+
+  it('projects accepted friends even when no conversation exists', () => {
+    expect(useSocialStore.getState().sessions).toEqual([]);
+    expect(projectAcceptedContacts([accepted], 'ptid:alice', {})).toEqual([{
+      peerPtid: 'ptid:bob',
+      peerName: 'Bob',
+      peerAvatar: '',
+      peerOnline: false,
+      federationIds: ['fed-a'],
+    }]);
+    expect(projectOutgoingRequests([accepted], 'ptid:alice')).toEqual([]);
+  });
+
+  it('uses a readable actor handle when relationship data omits a display name', () => {
+    const actorPtid = 'ptid:v1:actor:peers:p:alice:12203e0f255f835ecd0abd93aa0ea6f1';
+    expect(actorDisplayName('', actorPtid)).toBe('Alice');
+    expect(actorDisplayName(actorPtid, actorPtid)).toBe('Alice');
+    expect(actorDisplayName('Alice Chen', actorPtid)).toBe('Alice Chen');
+    expect(projectAcceptedContacts([
+      {
+        ...accepted,
+        senderDisplayName: '',
+        senderPtid: actorPtid,
+      },
+    ], 'ptid:bob', {})).toEqual([
+      expect.objectContaining({
+        peerPtid: actorPtid,
+        peerName: 'Alice',
+      }),
+    ]);
+  });
+
+  it('keeps inbound and outbound pending requests distinct from contacts', () => {
+    const pending = { ...accepted, status: FriendRequestState.PENDING };
+    expect(projectPendingInboundRequests([pending], 'ptid:bob')).toEqual([pending]);
+    expect(projectOutgoingRequests([pending], 'ptid:bob')).toEqual([]);
+    expect(projectOutgoingRequests([pending], 'ptid:alice')).toEqual([pending]);
+    expect(projectAcceptedContacts([pending], 'ptid:bob', {})).toEqual([]);
+  });
+
+  it('projects incoming accepted peers and retains each accepted Federation scope', () => {
+    expect(projectAcceptedContacts([
+      accepted,
+      { ...accepted, federationId: 'fed-b' },
+      { ...accepted, federationId: 'fed-b' },
+      { ...accepted, senderPtid: 'ptid:other', receiverPtid: 'ptid:another' },
+    ], 'ptid:bob', { 'ptid:alice': true })).toEqual([{
+      peerPtid: 'ptid:alice',
+      peerName: 'Alice',
+      peerAvatar: '',
+      peerOnline: true,
+      federationIds: ['fed-a', 'fed-b'],
+    }]);
+  });
+
+  it('does not fabricate a Federation when the accepted projection lacks one', () => {
+    expect(projectAcceptedContacts([{ ...accepted, federationId: '' }], 'ptid:alice', {})[0])
+      .toMatchObject({ peerPtid: 'ptid:bob', federationIds: [] });
+    expect(projectAcceptedContacts([accepted], null, {})).toEqual([]);
+  });
+
+  it('submits Direct through the native owner without consuming Messaging freshness', async () => {
+    await expect(useSocialStore.getState().openDirectConversation('ptid:bob', 'fed-a'))
+      .resolves.toBe('conversation-authoritative');
+    expect(messagingCreateDirect).toHaveBeenCalledWith({
+      stationPeerId: 'station-a',
+      actorPtid: 'ptid:alice',
+      deviceId: 'device-a',
+      lifecycleGeneration: 1,
+      peerPtid: 'ptid:bob',
+    });
+    expect(useSocialStore.getState().refreshSessions).not.toHaveBeenCalled();
+  });
+
+  it('does not fabricate a Direct projection from the submission result', async () => {
+    await expect(useSocialStore.getState().openDirectConversation('ptid:bob', 'fed-a'))
+      .resolves.toBe('conversation-authoritative');
+    expect(useSocialStore.getState().sessions).toEqual([]);
+  });
+
+  it('delegates scope derivation to the Station instead of rejecting locally', async () => {
+    // The client no longer gates Direct creation on an accepted contact or a
+    // client-chosen federation; the Station derives Local/Federation scope and
+    // enforces relationship policy.
+    useSocialStore.setState({ friendRequests: [{ ...accepted, status: FriendRequestState.PENDING }] });
+    await expect(useSocialStore.getState().openDirectConversation('ptid:bob', 'guessed'))
+      .resolves.toBe('conversation-authoritative');
+    expect(messagingCreateDirect).toHaveBeenCalledWith(expect.objectContaining({
+      peerPtid: 'ptid:bob',
+    }));
+  });
+
+  it('does not return a conversation ID to a replacement account', async () => {
+    vi.mocked(messagingCreateDirect).mockImplementation(async () => {
+      useSocialStore.setState({ authSession: { ...session, sessionId: 'replacement' } });
+      return { conversationId: 'old-scope', commandId: 'command', state: 'projected' };
+    });
+    await expect(useSocialStore.getState().openDirectConversation('ptid:bob', 'fed-a'))
+      .rejects.toThrow('mobile.social.notAuthenticated');
+    expect(useSocialStore.getState().refreshSessions).not.toHaveBeenCalled();
+  });
+
+  it('rejects an empty conversation ID instead of navigating to an invented session', async () => {
+    vi.mocked(messagingCreateDirect).mockResolvedValue({
+      conversationId: '', commandId: 'command', state: 'pending',
+    });
+    await expect(useSocialStore.getState().openDirectConversation('ptid:bob', 'fed-a'))
+      .rejects.toThrow('mobile.contacts.openChatFailed');
+  });
+
+  it.each(['acceptFriendRequest', 'rejectFriendRequest'] as const)(
+    '%s never invents a terminal relationship from an unresolved command',
+    async (action) => {
+      const request = { ...accepted, status: FriendRequestState.PENDING };
+      const gateway = createSocialGateway(session);
+      vi.spyOn(gateway, action).mockResolvedValue({
+        ok: true,
+        data: {
+          command: {
+            commandId: 'command',
+            requestId: request.requestId,
+            payloadSha256: [],
+            state: 'unknown-outcome',
+            checkpointReady: false,
+          },
+        },
+      });
+      useSocialStore.setState({
+        authSession: { ...session, actorRef: { ptid: 'ptid:bob' } },
+        currentUserPtid: 'ptid:bob',
+        socialGateway: gateway,
+        friendRequests: [request],
+      });
+      await expect(useSocialStore.getState()[action](request.requestId))
+        .rejects.toThrow('mobile.contacts.requestUnconfirmed');
+      expect(useSocialStore.getState().friendRequests).toEqual([request]);
+    },
+  );
+
+  it.each([
+    ['acceptFriendRequest', FriendRequestState.ACCEPTED],
+    ['rejectFriendRequest', FriendRequestState.REJECTED],
+  ] as const)(
+    '%s delegates checkpoint consumption to the runtime owner',
+    async (action, status) => {
+      const request = { ...accepted, status: FriendRequestState.PENDING };
+      const resolved = { ...request, status };
+      const gateway = createSocialGateway(session);
+      vi.spyOn(gateway, action).mockResolvedValue({
+        ok: true,
+        data: {
+          request: resolved,
+          command: {
+            commandId: 'command',
+            requestId: request.requestId,
+            payloadSha256: [1, 2, 3],
+            state: 'committed',
+            checkpointReady: true,
+          },
+        },
+      });
+      vi.mocked(readReliabilityRuntimeStatus).mockResolvedValue({
+        active: true,
+        stationPeerId: 'station-a',
+        actorPtid: 'ptid:bob',
+        runtimeGeneration: 7,
+        admissionOpen: true,
+        pendingCommands: 0,
+        unknownCommands: 0,
+        draftCount: 0,
+        archivedLegacyFiles: 0,
+        commandCapacity: {
+          recordCount: 0,
+          recordLimit: 512,
+          byteUsage: 0,
+          byteLimit: 16_777_216,
+          exhaustionCauses: [],
+        },
+      });
+      const reconcile = vi.fn().mockResolvedValue(undefined);
+      useSocialStore.setState({
+        authSession: { ...session, actorRef: { ptid: 'ptid:bob' } },
+        currentUserPtid: 'ptid:bob',
+        socialGateway: gateway,
+        friendRequests: [request],
+        refreshFriendRequests: vi.fn().mockResolvedValue(undefined),
+        reconcile,
+      });
+
+      await expect(
+        useSocialStore.getState()[action](request.requestId),
+      ).resolves.toBeUndefined();
+
+      expect(applyReliabilityProjectionCheckpoints).toHaveBeenCalledWith(
+        'station-a',
+        'ptid:bob',
+        7,
+        expect.any(Function),
+      );
+      expect(reconcile).toHaveBeenCalledOnce();
+      expect(useSocialStore.getState().friendRequests).toEqual([resolved]);
+    },
+  );
+
+  it('preserves an unresolved native command instead of creating a duplicate', async () => {
+    const gateway = useSocialStore.getState().socialGateway!;
+    const send = vi.spyOn(gateway, 'sendFriendRequest');
+    vi.mocked(readReliabilityRuntimeStatus).mockResolvedValue({
+      active: true, stationPeerId: 'station-a', actorPtid: 'ptid:alice',
+      runtimeGeneration: 1, admissionOpen: true, pendingCommands: 0,
+      unknownCommands: 1, draftCount: 0, archivedLegacyFiles: 0,
+      commandCapacity: {
+        recordCount: 1,
+        recordLimit: 512,
+        byteUsage: 1024,
+        byteLimit: 16_777_216,
+        exhaustionCauses: [],
+      },
+    });
+    const command: CommandProjection = {
+      commandId: 'existing-command', orderingKey: 'peer-bob', state: 'unknown-outcome',
+      attemptCount: 1, typedLastError: 5, createdAtMs: 1, updatedAtMs: 2, nextAttemptAtMs: null,
+      envelope: create(MobileDurableCommandEnvelopeV2Schema, {
+        state: MobileDurableCommandState.UNRESOLVED,
+        payload: { case: 'friendRequest', value: { body: {
+          federationId: 'fed-a', sender: { ptid: 'ptid:alice' }, receiver: { ptid: 'ptid:bob' },
+        } } },
+      }),
+    };
+    vi.mocked(listReliabilityCommands).mockResolvedValue([command]);
+    await expect(useSocialStore.getState().sendFriendRequest('ptid:bob', 'station-a', 'fed-a'))
+      .rejects.toThrow('mobile.contacts.requestUnconfirmed');
+    expect(send).not.toHaveBeenCalled();
+    expect(listReliabilityCommands).toHaveBeenCalledWith('station-a', 'ptid:alice', 1);
+  });
+
+  it('fences overlapping send intent before asynchronous ledger inspection', async () => {
+    let resolveStatus!: (value: Awaited<ReturnType<typeof readReliabilityRuntimeStatus>>) => void;
+    vi.mocked(readReliabilityRuntimeStatus).mockReturnValue(new Promise((resolve) => {
+      resolveStatus = resolve;
+    }));
+    const first = useSocialStore.getState().sendFriendRequest('ptid:bob', 'station-a', 'fed-a');
+    await expect(useSocialStore.getState().sendFriendRequest('ptid:bob', 'station-a', 'fed-a'))
+      .rejects.toThrow('mobile.contacts.requestUnconfirmed');
+    expect(readReliabilityRuntimeStatus).toHaveBeenCalledOnce();
+    resolveStatus({
+      active: false, runtimeGeneration: 0, admissionOpen: false,
+      pendingCommands: 0, unknownCommands: 0, draftCount: 0, archivedLegacyFiles: 0,
+      commandCapacity: {
+        recordCount: 0,
+        recordLimit: 512,
+        byteUsage: 0,
+        byteLimit: 16_777_216,
+        exhaustionCauses: [],
+      },
+    });
+    await expect(first).rejects.toThrow('mobile.social.notAuthenticated');
+  });
+});

@@ -1,0 +1,538 @@
+import { create } from '@bufbuild/protobuf';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import {
+  ConversationKind,
+  ConversationMemberSchema,
+  ConversationSchema,
+  ConversationStatus,
+  MemberRole,
+  MemberStatus,
+} from '../gen/proto/domain/chat/conversation_pb';
+import { MessageType } from '../gen/proto/domain/chat/chat_pb';
+import { ActorKind } from '../gen/proto/domain/actor/actor_pb';
+import { resolveMessageSearchTargets, useSocialChatStore } from './socialChat';
+import { useSessionStore } from './session';
+import type { AccountProfile } from '../services/desktop_api';
+import {
+  directConversationDisplayName,
+  projectDesktopIMMessage,
+  visibleConversationUnread,
+  type DesktopServiceMessage,
+  type SocialMessage,
+} from './socialProjection';
+
+function peerProfile(kind: ActorKind): AccountProfile {
+  return {
+    id: 'ptid:peer:bob',
+    profile_revision: 1,
+    username: 'bob',
+    acct: 'bob',
+    display_name: 'Bob',
+    note: '',
+    url: '',
+    avatar: '',
+    header: '',
+    locked: false,
+    created_at: '',
+    statuses_count: 0,
+    following_count: 0,
+    followers_count: 0,
+    region: '',
+    timezone: '',
+    tags: [],
+    links: [],
+    default_visibility: '',
+    manually_approves_followers: false,
+    message_permission: '',
+    auto_expire_days: 0,
+    federated_handle: '',
+    home_station_peer_id: '',
+    home_station_domain: '',
+    discoverability: 'hidden',
+    kind,
+    peers_touch: { network_id: 'ptid:peer:bob' },
+  };
+}
+
+describe('social chat conversation projection', () => {
+  beforeEach(() => {
+    useSocialChatStore.getState().reset();
+    useSocialChatStore.setState({
+      currentUserPtid: 'ptid:peer:alice',
+      conversations: [
+        create(ConversationSchema, {
+          conversationId: 'direct-conversation',
+          kind: ConversationKind.DIRECT,
+          authorityStationPeerId: 'station-four',
+          federationId: 'federation-chat',
+          status: ConversationStatus.ACTIVE,
+        }),
+        create(ConversationSchema, {
+          conversationId: 'group-conversation',
+          kind: ConversationKind.GROUP,
+          authorityStationPeerId: 'station-four',
+          federationId: 'federation-chat',
+          status: ConversationStatus.ACTIVE,
+          name: 'Group',
+        }),
+      ],
+      conversationMembers: {
+        'direct-conversation': [
+          create(ConversationMemberSchema, {
+            conversationId: 'direct-conversation',
+            ptid: 'ptid:peer:alice',
+            role: MemberRole.MEMBER,
+            memberStatus: MemberStatus.ACTIVE,
+          }),
+          create(ConversationMemberSchema, {
+            conversationId: 'direct-conversation',
+            ptid: 'ptid:peer:bob',
+            role: MemberRole.MEMBER,
+            memberStatus: MemberStatus.ACTIVE,
+          }),
+        ],
+      },
+    });
+  });
+
+  afterEach(() => {
+    useSocialChatStore.getState().reset();
+  });
+
+  it('applies optimistic group name and avatar preview overrides to the projection', () => {
+    const state = useSocialChatStore.getState();
+    state.setConversationAvatarPreview('group', 'group-conversation', 'tauri://localhost/local-picked.png');
+    useSocialChatStore.setState((current) => ({
+      conversationDisplayOverrides: {
+        ...current.conversationDisplayOverrides,
+        'group:group-conversation': {
+          ...current.conversationDisplayOverrides['group:group-conversation'],
+          name: 'Renamed Group',
+        },
+      },
+    }));
+
+    let group = useSocialChatStore.getState()
+      .getIMConversations()
+      .find((conversation) => conversation.id === 'group-conversation');
+    expect(group?.title).toBe('Renamed Group');
+    expect(group?.avatar).toBe('tauri://localhost/local-picked.png');
+
+    // Clearing the avatar preview falls back to the server-projected avatar.
+    useSocialChatStore.getState()
+      .setConversationAvatarPreview('group', 'group-conversation', null);
+    group = useSocialChatStore.getState()
+      .getIMConversations()
+      .find((conversation) => conversation.id === 'group-conversation');
+    expect(group?.title).toBe('Renamed Group');
+    expect(group?.avatar).toBe('');
+  });
+
+  it('projects server description, owner and canonical name for a group', () => {
+    useSocialChatStore.setState({
+      conversations: [
+        create(ConversationSchema, {
+          conversationId: 'group-conversation',
+          kind: ConversationKind.GROUP,
+          status: ConversationStatus.ACTIVE,
+          name: 'Server Group',
+          description: 'Quarterly planning',
+          ownerPtid: 'ptid:peer:alice',
+        }),
+      ],
+    });
+
+    const group = useSocialChatStore.getState()
+      .getIMConversations()
+      .find((conversation) => conversation.id === 'group-conversation');
+
+    expect(group?.canonicalName).toBe('Server Group');
+    expect(group?.description).toBe('Quarterly planning');
+    expect(group?.ownerPtid).toBe('ptid:peer:alice');
+  });
+
+  it('applies the local remark to the title while exposing the canonical name', () => {
+    useSocialChatStore.setState({
+      conversationLocalState: {
+        'group:group-conversation': { remark: 'My private alias' },
+      },
+    });
+
+    const group = useSocialChatStore.getState()
+      .getIMConversations()
+      .find((conversation) => conversation.id === 'group-conversation');
+
+    expect(group?.title).toBe('My private alias');
+    expect(group?.canonicalName).toBe('Group');
+  });
+
+  it('retains Conversation authority for Direct and Group UI projections', () => {
+    const conversations = useSocialChatStore.getState().getIMConversations();
+
+    expect(conversations).toHaveLength(2);
+    expect(conversations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'direct-conversation',
+        authorityStationId: 'station-four',
+        federationId: 'federation-chat',
+      }),
+      expect.objectContaining({
+        id: 'group-conversation',
+        authorityStationId: 'station-four',
+        federationId: 'federation-chat',
+      }),
+    ]));
+  });
+
+  it('derives message-search targets from canonical Conversation projections', () => {
+    const conversations = useSocialChatStore.getState().conversations;
+
+    expect(resolveMessageSearchTargets(
+      conversations,
+      'friend',
+      'direct-conversation',
+    )).toEqual([{
+      conversationId: 'direct-conversation',
+      scope: 'friend',
+    }]);
+    expect(resolveMessageSearchTargets(conversations)).toEqual([
+      { conversationId: 'direct-conversation', scope: 'friend' },
+      { conversationId: 'group-conversation', scope: 'group' },
+    ]);
+  });
+
+  it('classifies a direct conversation as a bot from the peer actor kind', () => {
+    useSessionStore.setState({
+      authenticated: true,
+      currentUser: {
+        actorPtid: 'ptid:peer:alice',
+        name: 'Alice',
+        email: 'alice@test',
+        loginMethod: 'password',
+      },
+    });
+
+    expect(useSocialChatStore.getState().isAutomatedConversation('direct-conversation')).toBe(false);
+
+    useSocialChatStore.setState({
+      peerProfiles: { 'ptid:peer:bob': peerProfile(ActorKind.PERSON) },
+    });
+    expect(useSocialChatStore.getState().isAutomatedConversation('direct-conversation')).toBe(false);
+
+    useSocialChatStore.setState({
+      peerProfiles: { 'ptid:peer:bob': peerProfile(ActorKind.AGENT) },
+    });
+    expect(useSocialChatStore.getState().isAutomatedConversation('direct-conversation')).toBe(true);
+
+    useSocialChatStore.setState({
+      peerProfiles: { 'ptid:peer:bob': peerProfile(ActorKind.SERVICE) },
+    });
+    expect(useSocialChatStore.getState().isAutomatedConversation('direct-conversation')).toBe(true);
+  });
+
+  it('keeps an immediate background preview ephemeral and conversation-scoped', () => {
+    const store = useSocialChatStore.getState();
+    store.setConversationBackgroundPreview(
+      'friend',
+      'direct-conversation',
+      'asset://localhost/background.png',
+    );
+
+    expect(useSocialChatStore.getState().conversationBackgroundPreviews).toEqual({
+      'friend:direct-conversation': 'asset://localhost/background.png',
+    });
+
+    useSocialChatStore.getState().setConversationBackgroundPreview(
+      'friend',
+      'direct-conversation',
+      null,
+    );
+    expect(useSocialChatStore.getState().conversationBackgroundPreviews).toEqual({});
+  });
+
+  it('removes a durably hidden message from the cached projection', () => {
+    const visible = {
+      ulid: 'message-visible',
+      senderPtid: 'ptid:peer:bob',
+      content: 'visible',
+      type: MessageType.TEXT,
+      attachments: [],
+    } satisfies SocialMessage;
+    const hidden = {
+      ulid: 'message-hidden',
+      senderPtid: 'ptid:peer:bob',
+      content: 'hidden',
+      type: MessageType.TEXT,
+      attachments: [],
+    } satisfies SocialMessage;
+    useSocialChatStore.setState({
+      messages: {
+        'direct-conversation': [visible, hidden],
+      },
+      lastPreviews: {
+        'direct-conversation': {
+          content: hidden.content,
+          type: hidden.type,
+          senderPtid: hidden.senderPtid,
+        },
+      },
+      openThreadRootUlid: hidden.ulid,
+    });
+
+    useSocialChatStore.getState().applyMessageMutation(
+      'direct-conversation',
+      hidden.ulid,
+      'DELETE',
+      {
+        newContent: '',
+        newCiphertext: new Uint8Array(),
+        mutatedTsUnixMs: 0,
+      },
+    );
+
+    const state = useSocialChatStore.getState();
+    expect(state.messages['direct-conversation']).toEqual([visible]);
+    expect(state.lastPreviews['direct-conversation']).toEqual({
+      content: visible.content,
+      type: visible.type,
+      senderPtid: visible.senderPtid,
+    });
+    expect(state.openThreadRootUlid).toBeNull();
+  });
+
+  it('drops a committed conversation clear from every cached message projection', () => {
+    const root = {
+      ulid: 'message-root',
+      senderPtid: 'ptid:peer:bob',
+      content: 'root',
+      type: MessageType.TEXT,
+      attachments: [],
+    } satisfies SocialMessage;
+    const reply = {
+      ulid: 'message-reply',
+      senderPtid: 'ptid:peer:bob',
+      content: 'reply',
+      type: MessageType.TEXT,
+      attachments: [],
+      threadRootUlid: root.ulid,
+    } satisfies SocialMessage;
+    const unrelated = {
+      ulid: 'message-unrelated',
+      senderPtid: 'ptid:peer:bob',
+      content: 'unrelated',
+      type: MessageType.TEXT,
+      attachments: [],
+    } satisfies SocialMessage;
+    const directThreadKey = `friend:direct-conversation:${root.ulid}`;
+    const unrelatedThreadKey = `group:group-conversation:${unrelated.ulid}`;
+    useSocialChatStore.setState({
+      activeTab: 'friend',
+      activeSessionUlid: 'direct-conversation',
+      messages: {
+        'direct-conversation': [root],
+        'group-conversation': [unrelated],
+      },
+      threadMessages: {
+        [directThreadKey]: [reply],
+        [unrelatedThreadKey]: [unrelated],
+      },
+      threadCounts: {
+        [directThreadKey]: {
+          rootUlid: root.ulid,
+          replyCount: 1,
+          latestReplyUlid: reply.ulid,
+          latestReplyAt: 10,
+          unreadCount: 0,
+        },
+        [unrelatedThreadKey]: {
+          rootUlid: unrelated.ulid,
+          replyCount: 1,
+          latestReplyUlid: unrelated.ulid,
+          latestReplyAt: 20,
+          unreadCount: 0,
+        },
+      },
+      reactions: {
+        [root.ulid]: [{ actorPtid: 'ptid:peer:alice', emoji: 'ok' }],
+        [reply.ulid]: [{ actorPtid: 'ptid:peer:alice', emoji: 'ok' }],
+        [unrelated.ulid]: [{ actorPtid: 'ptid:peer:alice', emoji: 'ok' }],
+      },
+      pinnedMessages: {
+        [root.ulid]: { actorPtid: 'ptid:peer:alice', pinnedAt: 10 },
+        [unrelated.ulid]: { actorPtid: 'ptid:peer:alice', pinnedAt: 20 },
+      },
+      lastPreviews: {
+        'direct-conversation': {
+          content: root.content,
+          type: root.type,
+          senderPtid: root.senderPtid,
+        },
+        'group-conversation': {
+          content: unrelated.content,
+          type: unrelated.type,
+          senderPtid: unrelated.senderPtid,
+        },
+      },
+      messageHasMore: { 'direct-conversation': true },
+      messageNextBeforeSequence: { 'direct-conversation': 7 },
+      messageLoadingMore: { 'direct-conversation': true },
+      openThreadRootUlid: root.ulid,
+    });
+
+    useSocialChatStore.getState().clearConversationProjection('direct-conversation');
+
+    const state = useSocialChatStore.getState();
+    expect(state.messages['direct-conversation']).toEqual([]);
+    expect(state.messages['group-conversation']).toEqual([unrelated]);
+    expect(state.threadMessages[directThreadKey]).toBeUndefined();
+    expect(state.threadMessages[unrelatedThreadKey]).toEqual([unrelated]);
+    expect(state.threadCounts[directThreadKey]).toBeUndefined();
+    expect(state.threadCounts[unrelatedThreadKey]).toBeDefined();
+    expect(state.reactions[root.ulid]).toBeUndefined();
+    expect(state.reactions[reply.ulid]).toBeUndefined();
+    expect(state.reactions[unrelated.ulid]).toBeDefined();
+    expect(state.pinnedMessages[root.ulid]).toBeUndefined();
+    expect(state.pinnedMessages[unrelated.ulid]).toBeDefined();
+    expect(state.lastPreviews['direct-conversation']).toBeUndefined();
+    expect(state.lastPreviews['group-conversation']).toBeDefined();
+    expect(state.messageHasMore['direct-conversation']).toBe(false);
+    expect(state.messageNextBeforeSequence['direct-conversation']).toBeNull();
+    expect(state.messageLoadingMore['direct-conversation']).toBe(false);
+    expect(state.openThreadRootUlid).toBeNull();
+  });
+
+  it('preserves native service-message identity and typed rendering content', () => {
+    const serviceMessage: DesktopServiceMessage = {
+      eventId: 'event-service-1',
+      eventSequence: 7,
+      messageId: 'message-service-1',
+      senderPtid: 'ptid:service:ci',
+      fallbackText: 'Build completed',
+      sourceNamespace: 'ci.build',
+      content: {
+        primary: {
+          kind: 'event',
+          eventType: 'ci.task.state',
+          title: 'Build completed',
+          body: 'All checks passed',
+          subject: {
+            kind: 'build',
+            id: 'build-42',
+            executionId: 'run-7',
+          },
+          taskState: {
+            revision: '2',
+            state: 4,
+          },
+        },
+        attachments: [],
+      },
+      timestampUnixMs: 1_760_500_000_000,
+    };
+    const projected = projectDesktopIMMessage(
+      'friend',
+      'direct-conversation',
+      {
+        ulid: serviceMessage.messageId,
+        senderPtid: serviceMessage.senderPtid,
+        senderDeviceId: 'station-system',
+        content: serviceMessage.fallbackText,
+        type: MessageType.SYSTEM,
+        attachments: [],
+        serviceMessage,
+      },
+    );
+
+    expect(projected).toMatchObject({
+      id: serviceMessage.messageId,
+      ulid: serviceMessage.messageId,
+      conversationId: 'direct-conversation',
+      senderPtid: serviceMessage.senderPtid,
+      content: serviceMessage.fallbackText,
+      serviceMessage: {
+        eventId: serviceMessage.eventId,
+        eventSequence: serviceMessage.eventSequence,
+        sourceNamespace: 'ci.build',
+      },
+    });
+    expect(projected.serviceMessage?.content?.primary).toMatchObject({
+      kind: 'event',
+      title: 'Build completed',
+      taskState: { revision: '2', state: 4 },
+    });
+  });
+
+  it('projects a one-member direct as self-direct from the authenticated profile', () => {
+    useSocialChatStore.setState({
+      currentUserProfile: {
+        actorPtid: 'ptid:peer:alice',
+        username: 'alice',
+        displayName: 'Alice Self',
+        avatar: 'tauri://localhost/self.png',
+      },
+      conversations: [
+        create(ConversationSchema, {
+          conversationId: 'self-direct-conversation',
+          kind: ConversationKind.DIRECT,
+          authorityStationPeerId: 'station-four',
+          status: ConversationStatus.ACTIVE,
+        }),
+      ],
+      conversationMembers: {
+        'self-direct-conversation': [
+          create(ConversationMemberSchema, {
+            conversationId: 'self-direct-conversation',
+            ptid: 'ptid:peer:alice',
+            role: MemberRole.OWNER,
+            memberStatus: MemberStatus.ACTIVE,
+          }),
+        ],
+      },
+    });
+
+    const self = useSocialChatStore.getState()
+      .getIMConversations()
+      .find((conversation) => conversation.id === 'self-direct-conversation');
+
+    expect(self).toMatchObject({
+      kind: 'friend',
+      peerPtid: 'ptid:peer:alice',
+      selfDirect: true,
+      title: 'Alice Self',
+      avatar: 'tauri://localhost/self.png',
+    });
+  });
+
+  it('leaves a two-member direct unmarked as self-direct', () => {
+    const pair = useSocialChatStore.getState()
+      .getIMConversations()
+      .find((conversation) => conversation.id === 'direct-conversation');
+    expect(pair?.selfDirect).toBe(false);
+    expect(pair?.peerPtid).toBe('ptid:peer:bob');
+  });
+
+  it('resolves the Direct display name with a localized self fallback', () => {
+    expect(directConversationDisplayName(
+      { title: 'Alice', selfDirect: true },
+      'Saved Messages',
+      'Unknown',
+    )).toBe('Alice');
+    expect(directConversationDisplayName(
+      { title: '  ', selfDirect: true },
+      'Saved Messages',
+      'Unknown',
+    )).toBe('Saved Messages');
+    expect(directConversationDisplayName(
+      { title: '', selfDirect: false },
+      'Saved Messages',
+      'Unknown',
+    )).toBe('Unknown');
+  });
+
+  it('keeps unread truth while suppressing visible alerts by local preference', () => {
+    expect(visibleConversationUnread(2, undefined)).toBe(2);
+    expect(visibleConversationUnread(2, { muted: true })).toBe(0);
+    expect(visibleConversationUnread(2, { alertEnabled: false })).toBe(0);
+  });
+});

@@ -1,0 +1,82 @@
+pub mod account;
+pub mod actor;
+pub mod admin;
+pub mod agent_events;
+pub mod agent_growth;
+pub mod agent_logical_artifact;
+pub mod agent_orchestration;
+pub mod agent_turn;
+pub mod agent_workspace;
+pub mod agent_workspace_fs;
+pub mod agents;
+pub mod applets;
+pub mod auth;
+pub mod bot;
+pub mod capability_authority;
+pub mod channels;
+pub mod conversation;
+pub mod cron;
+pub mod crypto;
+pub mod desktop_capture;
+pub mod device_link;
+pub mod login_approval;
+pub mod evaluation;
+pub mod federation;
+pub mod frontend_log;
+pub mod browser;
+pub mod terminal;
+pub mod frontend_telemetry;
+pub mod home;
+pub mod host_events;
+pub mod i18n;
+pub mod ice;
+pub mod key_exchange;
+pub mod mcp;
+pub mod memory;
+pub mod messaging;
+pub mod messaging_files;
+pub mod messaging_recovery;
+pub mod x_config;
+
+pub(crate) mod asset_preview;
+
+pub mod native_surface;
+pub mod notebook;
+pub mod notification;
+pub mod oauth2;
+pub mod oss;
+pub mod presence;
+pub mod profile;
+pub mod provider;
+pub mod realtime;
+pub mod runtime_evidence;
+pub mod search;
+pub mod skills;
+pub mod skills_market;
+pub mod social;
+pub mod station;
+pub mod system;
+pub mod tools;
+
+use crate::contracts::StubPayload;
+use crate::contracts::CONTRACT_VERSION;
+use crate::error::{AppResult, ErrorCode};
+
+pub fn not_implemented(command: &str) -> AppResult<StubPayload> {
+    AppResult::fail(
+        ErrorCode::NotImplemented,
+        "error.command.notImplemented",
+        Some(serde_json::json!({ "command": command })),
+    )
+}
+
+#[tauri::command]
+pub fn meta_contract_version() -> AppResult<StubPayload> {
+    AppResult::success(StubPayload {
+        command: "meta_contract_version".to_string(),
+        status: serde_json::json!({
+            "version": CONTRACT_VERSION
+        })
+        .to_string(),
+    })
+}

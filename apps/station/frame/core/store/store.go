@@ -1,0 +1,67 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"gorm.io/gorm"
+)
+
+// region Errors
+
+// ErrDBNotFound is returned when the requested database is not found in the rdsMap.
+var ErrDBNotFound = errors.New("database not found")
+var ErrStoreNotDefined = errors.New("store not defined")
+var ErrStoreInitFailed = func(name string) error { return fmt.Errorf("store[%s] init failed", name) }
+var ErrStoreAlreadyInjected = errors.New("store already injected")
+
+// endregion
+
+var (
+	store    Store
+	initLock sync.Mutex
+)
+
+type Store interface {
+	Init(ctx context.Context, opts ...option.Option) error
+	RDS(ctx context.Context, opts ...RDSDMLOption) (*gorm.DB, error)
+	Name() string
+}
+
+// GetRDS returns a GORM DB instance from the injected store.
+func GetRDS(ctx context.Context, opts ...RDSDMLOption) (*gorm.DB, error) {
+	st, err := GetStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return st.RDS(ctx, opts...)
+}
+
+// GetStore returns the injected Store.
+func GetStore(ctx context.Context, opts ...GetOption) (Store, error) {
+	if store == nil {
+		return nil, ErrStoreNotDefined
+	}
+	return store, nil
+}
+
+// InjectStore is the entry point for saving Store implement for the application.
+// It must be used after completing the initialization of Store.
+// We use the store injected to access RDS or other resources.
+// InjectStore stores a Store implementation for global access.
+func InjectStore(ctx context.Context, s Store) (err error) {
+	initLock.Lock()
+	defer initLock.Unlock()
+
+	if store != nil {
+		return ErrStoreAlreadyInjected
+	}
+
+	store = s
+
+	return
+}

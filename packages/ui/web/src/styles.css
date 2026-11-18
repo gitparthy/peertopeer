@@ -1,0 +1,591 @@
+.pt-ui{font-family:var(--pt-font);color:var(--pt-text);font-size:14px;line-height:1.5;min-width:0}
+.pt-ui-content{min-width:0;min-height:0;display:contents}
+.pt-ui *{box-sizing:border-box}
+.pt-ui button,.pt-ui input,.pt-ui textarea,.pt-ui select{font:inherit}
+.pt-ui :where(button,a,input,textarea,select,[tabindex]):focus{outline:none}
+.pt-ui :where(button,a,input,textarea,select,[tabindex]):focus-visible{outline:2px solid var(--pt-focus);outline-offset:2px}
+.pt-ui :where(button,input,textarea,select):disabled,.pt-ui :where(button,[role=button])[aria-disabled='true']{cursor:not-allowed}
+/* B19: unavailable commands remain in the tab order; aria-disabled carries state. */
+/* Visually-hidden accessibility utility. It is applied directly ON controls
+   (e.g. a .pt-button context-menu anchor), so its declarations must outrank
+   every component chrome rule regardless of stylesheet order. Attribute +
+   class compound selectors raise specificity without !important:
+   (0,3,0) beats any single-attribute component rule such as
+   .pt-button[data-density=compact] (0,2,0). */
+.pt-sr-only,
+.pt-sr-only.pt-sr-only[class]{
+  position:absolute;width:1px;height:1px;min-height:0;padding:0;margin:-1px;
+  overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);
+  white-space:nowrap;border:0;
+}
+.pt-button{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:var(--pt-space-xs);min-height:var(--pt-control-normal);padding:0 var(--pt-space-sm);border:1px solid var(--pt-borderStrong);border-radius:var(--pt-radius-md);background:var(--pt-surface);color:var(--pt-text);cursor:pointer;flex-shrink:0;vertical-align:middle;transition:background var(--pt-motion-fast) var(--pt-motion-standard),border-color var(--pt-motion-fast) var(--pt-motion-standard),color var(--pt-motion-fast) var(--pt-motion-standard),box-shadow var(--pt-motion-fast) var(--pt-motion-standard)}
+.pt-button[aria-disabled='true']{pointer-events:none}
+.pt-button:hover:not([aria-disabled='true']){background:var(--pt-subtle);border-color:var(--pt-primary)}
+.pt-button[data-density=compact]{min-height:var(--pt-control-compact);font-size:12px;border-radius:var(--pt-radius-sm)}
+.pt-button[data-density=comfortable]{min-height:var(--pt-control-comfortable)}
+.pt-button[data-emphasis=primary]{background:var(--pt-primary);color:var(--pt-onPrimary);border-color:var(--pt-primary)}
+.pt-button[data-emphasis=primary]:hover:not([aria-disabled='true']){background:var(--pt-primaryHover)}
+.pt-button[data-emphasis=quiet],.pt-button[data-emphasis=inline]{border-color:transparent;background:transparent}
+.pt-button[data-emphasis=inline]{color:var(--pt-primary);padding:0;min-height:auto}
+/* Danger always tints the text/icon; only framed (secondary/primary) buttons
+   paint the red resting border. quiet/inline danger stays a flat menu/sheet
+   row — a red outline box there contradicts the flat action language and was
+   inconsistent with its own transparent hover border. */
+.pt-button[data-tone=danger]{color:var(--pt-danger)}
+.pt-button[data-tone=danger]:not([data-emphasis=quiet]):not([data-emphasis=inline]){border-color:var(--pt-danger)}
+.pt-button[data-tone=danger][data-emphasis=primary]{background:var(--pt-danger);color:var(--pt-surface)}
+.pt-button[aria-disabled='true']{color:var(--pt-secondary);background:var(--pt-subtle);border-color:var(--pt-border)}
+/* Flat disabled quiet/inline rows: muted text only, never a gray box/border
+   (menu and long-press sheet rows stay flat in every state, incl. disabled). */
+.pt-button[data-emphasis=quiet][aria-disabled='true'],
+.pt-button[data-emphasis=inline][aria-disabled='true']{background:transparent;border-color:transparent}
+.pt-button[aria-pressed=true]{background:var(--pt-primarySubtle);color:var(--pt-primary);border-color:var(--pt-primary)}
+/* A pressed/selected control keeps its selected fill while hovered. The
+   generic hover rule is (0,3,0) — :not([aria-disabled]) contributes an
+   attribute — so without these (0,4,0)/(0,5,0) rules it repaints a selected
+   option with the track color and the selection visually disappears (notably
+   Segmented: the active pill blends into its own track on mouse-over). */
+.pt-button[aria-pressed=true]:hover:not([aria-disabled='true']){background:var(--pt-primarySubtle)}
+.pt-button[data-emphasis=primary][aria-pressed=true]:hover:not([aria-disabled='true']){background:var(--pt-primaryHover)}
+/* Must out-specify the generic hover rule above (0,3,0): quiet/inline chrome
+   never paints a border, including while hovered/pressed/disabled-released. */
+.pt-button[data-emphasis=quiet]:hover:not([aria-disabled='true']),
+.pt-button[data-emphasis=inline]:hover:not([aria-disabled='true']),
+.pt-button[data-emphasis=quiet]:active:not([aria-disabled='true']),
+.pt-button[data-emphasis=quiet][aria-pressed=true],
+.pt-button[data-emphasis=inline][aria-pressed=true]{border-color:transparent}
+.pt-button-content{display:flex;align-items:center;justify-content:center;gap:var(--pt-space-xs);min-width:0;white-space:normal}
+.pt-button[data-execution=pending]>.pt-button-content,.pt-button[data-execution=recovering]>.pt-button-content{visibility:hidden}
+.pt-button-pending{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+.pt-button[data-full-width=true]{width:100%}
+.pt-button[data-appearance=identity]{width:var(--pt-avatar-navigation-size);height:var(--pt-avatar-navigation-size);min-height:var(--pt-avatar-navigation-size);padding:0;border:0;border-radius:var(--pt-avatar-navigation-radius);overflow:hidden;background:transparent;box-shadow:none}
+.pt-button[data-appearance=identity]:hover:not([aria-disabled=true]),.pt-button[data-appearance=identity]:active:not([aria-disabled=true]),.pt-button[data-appearance=identity][aria-pressed=true]{background:transparent;border-color:transparent}
+.pt-button[data-appearance=identity]>.pt-button-content{width:100%;height:100%;gap:0}
+/* B07: keep the permanent label in flow so the transient "copied" state cannot resize the button. */
+.pt-copy-label{position:relative;display:inline-flex;align-items:center;justify-content:center}
+.pt-copy-permanent{display:inline-flex}
+.pt-is-hidden-visually{visibility:hidden}
+.pt-copy-transient{position:absolute;inset:0;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}
+.pt-icon-button{width:var(--pt-control-normal);padding:0}
+.pt-icon-button>.pt-button-content{width:100%}
+.pt-icon-button[data-density=compact]{width:var(--pt-control-compact)}
+.pt-icon-button[data-density=comfortable]{width:var(--pt-control-comfortable)}
+.pt-link{color:var(--pt-primary);text-decoration:underline;text-underline-offset:3px}
+button.pt-link{border:0;background:transparent;font:inherit;padding:var(--pt-space-xxs) var(--pt-space-xs);cursor:pointer;border-radius:var(--pt-radius-xs)}
+button.pt-link:hover:not(:disabled){background:var(--pt-subtle)}
+.pt-link[data-emphasis=quiet]{text-decoration:none}
+.pt-spinner{display:inline-block;width:18px;height:18px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:pt-spin 1s linear infinite;flex-shrink:0}
+@keyframes pt-spin{to{transform:rotate(360deg)}}
+.pt-action-group{display:flex;align-items:center;gap:var(--pt-space-xs)}
+.pt-action-group{flex-wrap:wrap}
+/* B11: SplitButton is one continuous contour; the two trigger areas join with a shared edge. */
+.pt-split-button{display:inline-flex;align-items:stretch;gap:0;flex-shrink:0}
+.pt-split-main{display:inline-flex}
+.pt-split-main>.pt-button{border-top-right-radius:0;border-bottom-right-radius:0}
+.pt-split-trigger{display:inline-flex;margin-left:-1px}
+.pt-split-trigger .pt-icon-button{border-top-left-radius:0;border-bottom-left-radius:0;height:100%}
+.pt-overlay-host{position:relative;z-index:1000}
+/* Raised layers are frosted glass in the north-star material: the fill is the
+   translucent --pt-raised, so it MUST carry the backdrop blur — otherwise a
+   ~.68 white overlay over the scrim reads as muddy grey with washed-out text.
+   BottomSheet already owned this; dialog/menu/popover/drawer share the same
+   raised-surface contract, so the blur lives on the base class. */
+.pt-overlay{position:fixed;background:var(--pt-raised);color:var(--pt-text);border:1px solid var(--pt-glass-border,var(--pt-border));border-radius:var(--pt-radius-md);box-shadow:var(--pt-shadow-float);max-width:calc(100vw - var(--pt-space-xs));overflow:auto;-webkit-backdrop-filter:blur(var(--pt-glass-blur,0));backdrop-filter:blur(var(--pt-glass-blur,0))}
+/* Floating layers enter as one continuous surface: fade + 2px rise + a
+   hair of scale, with the shared surface-out easing. This is the motion
+   signature of raised layers; it lives on the primitive so every menu,
+   popover and dialog inherits it instead of animating per page. */
+@keyframes pt-surface-in{from{opacity:0;transform:translateY(2px) scale(.985)}to{opacity:1;transform:none}}
+.pt-overlay.pt-popover,.pt-overlay.pt-menu{animation:pt-surface-in var(--pt-motion-surface) var(--pt-motion-out) both}
+.pt-modal-layer{animation:pt-scrim-in var(--pt-motion-surface) var(--pt-motion-out) both}
+@keyframes pt-scrim-in{from{opacity:0}to{opacity:1}}
+.pt-overlay.pt-dialog,.pt-overlay.pt-drawer{animation:pt-surface-in var(--pt-motion-surface) var(--pt-motion-out) both}
+@media (prefers-reduced-motion: reduce){
+  .pt-overlay.pt-popover,.pt-overlay.pt-menu,.pt-overlay.pt-dialog,.pt-overlay.pt-drawer,.pt-modal-layer{animation:none}
+}
+.pt-popover{padding:var(--pt-space-sm);min-width:180px}
+.pt-tooltip{padding:var(--pt-space-xxs) var(--pt-space-xs);font-size:12px;pointer-events:none;max-width:280px}
+.pt-tooltip-trigger{display:inline-flex}
+.pt-menu{min-width:180px;padding:var(--pt-space-xxs)}
+/* Menu rows are BLOCK-level on purpose: an inline-flex row would let the
+   shrink-to-fit popup compute max-content as if every row sat on one
+   unbreakable line, stretching the menu to the sum of all rows instead of
+   the widest one. */
+.pt-menu .pt-menu-item{display:flex;width:100%;justify-content:flex-start;text-align:left;min-height:var(--pt-control-menu);padding:0 10px;font-size:13px}
+.pt-menu-item .pt-button-content{justify-content:flex-start}
+/* Command groups are divided by a full-bleed hairline (Feishu parity). */
+.pt-menu-separator{height:1px;margin:var(--pt-space-xxs) calc(-1 * var(--pt-space-xxs));padding:0;background:var(--pt-border);border:0}
+/* Menu rows are a flat list, even when unavailable: disabled never paints a
+   bordered chip (that reads as a nested button). Unavailability is carried by
+   muted text + aria-disabled/reason only. */
+.pt-menu .pt-menu-item[aria-disabled='true']{
+  background:transparent;border-color:transparent;color:var(--pt-muted);pointer-events:none
+}
+.pt-menu .pt-menu-item[aria-disabled='true']:hover{background:transparent;border-color:transparent}
+.pt-modal-layer{position:fixed;inset:0;background:var(--pt-scrim);display:flex;align-items:center;justify-content:center;padding:var(--pt-space-lg);z-index:1}
+/* Non-modal overlays portal into the same host as siblings of the modal
+   scrim; with auto z-index they paint UNDER the scrim, so a popover/menu/
+   select opened from inside a dialog could not receive pointer events.
+   Keep them one level above any modal layer; ties resolve by DOM order
+   (the later-registered overlay paints on top). */
+.pt-overlay-host .pt-popover,
+.pt-overlay-host .pt-menu,
+.pt-overlay-host .pt-tooltip{z-index:2}
+.pt-dialog{position:relative;max-height:calc(100dvh - var(--pt-space-xl));max-width:100%;display:flex;flex-direction:column;border-radius:var(--pt-radius-xl);background:var(--pt-glass-surface-modal,var(--pt-raised))}
+.pt-dialog-header{display:flex;align-items:center;gap:var(--pt-space-xs);padding:var(--pt-space-md);flex-shrink:0;border-bottom:1px solid var(--pt-border)}
+.pt-dialog-header h2{font-size:16px;font-weight:600;margin:0;flex:1;overflow-wrap:anywhere}
+.pt-dialog-description{padding:var(--pt-space-sm) var(--pt-space-md);color:var(--pt-secondary)}
+.pt-dialog-body{padding:var(--pt-space-md);min-height:0;overflow:auto}
+.pt-dialog-footer{display:flex;justify-content:flex-end;gap:var(--pt-space-xs);padding:var(--pt-space-md);border-top:1px solid var(--pt-border);flex-wrap:wrap}
+.pt-drawer-layer{padding:0;justify-content:flex-end}
+.pt-drawer{position:absolute;top:0;right:0;height:100%;display:flex;flex-direction:column;border-radius:0;border-left:1px solid var(--pt-border)}
+.pt-drawer-left{right:auto;left:0}
+.pt-drawer-bottom{top:auto;bottom:0;height:auto;max-height:85dvh;border-radius:var(--pt-radius-xl) var(--pt-radius-xl) 0 0}
+/* ── Bottom sheet (mobile touch surface) ──────────────────────────────── */
+@keyframes pt-sheet-in{from{transform:translateY(100%)}to{transform:none}}
+.pt-sheet-layer{padding:0;align-items:flex-end;justify-content:flex-end}
+.pt-overlay.pt-bottom-sheet{
+  animation:pt-sheet-in var(--pt-motion-normal) var(--pt-motion-out) both;
+  position:absolute;left:0;right:0;bottom:0;top:auto;
+  width:100%;max-width:none;max-height:88dvh;
+  border:0;border-top:1px solid var(--pt-glass-border,var(--pt-border));
+  border-radius:var(--pt-radius-2xl,var(--pt-radius-xl)) var(--pt-radius-2xl,var(--pt-radius-xl)) 0 0;
+  background:var(--pt-glass-surface,var(--pt-raised));
+  -webkit-backdrop-filter:blur(var(--pt-glass-blur,0));backdrop-filter:blur(var(--pt-glass-blur,0));
+  box-shadow:var(--pt-glass-shadow,var(--pt-shadow-float));
+  overflow:hidden;
+  padding:8px 14px calc(14px + env(safe-area-inset-bottom,0px));
+  display:flex;flex-direction:column;
+}
+@media (prefers-reduced-motion: reduce){.pt-overlay.pt-bottom-sheet{animation:none}}
+.pt-sheet-grip{
+  flex-shrink:0;align-self:center;width:38px;height:4px;border-radius:999px;
+  background:var(--pt-border-strong);margin:2px 0 8px;
+}
+.pt-sheet-title{margin:0 2px 10px;font-size:15px;font-weight:650;text-align:center;color:var(--pt-text)}
+.pt-sheet-body{min-height:0;overflow-y:auto;padding:0 2px}
+.pt-sheet-actions{display:flex;flex-direction:column;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--pt-border)}
+.pt-sheet-action{justify-content:center}
+/* Glass material utility: frosted card on the neutral paper floor. The
+   surface is translucent by token role; blur and hairline come from the
+   north-star material tokens and stay hue-free. */
+.pt-glass{
+  background:var(--pt-glass-surface,var(--pt-surface));
+  border:1px solid var(--pt-glass-border,var(--pt-border));
+  -webkit-backdrop-filter:blur(var(--pt-glass-blur,0));backdrop-filter:blur(var(--pt-glass-blur,0));
+  box-shadow:var(--pt-glass-shadow,var(--pt-shadow-rest));
+}
+.pt-glass-alt{
+  background:var(--pt-glass-surface-alt,var(--pt-subtle));
+  border:1px solid var(--pt-glass-border,var(--pt-border));
+  -webkit-backdrop-filter:blur(var(--pt-glass-blur,0));backdrop-filter:blur(var(--pt-glass-blur,0));
+}
+/* ── Mobile product chrome ────────────────────────────────────────────── */
+/* Status bar: real iOS proportions — a 54px row whose time and indicators
+   optically center on the Dynamic Island pill. SF-ish device typography, not
+   the product font. The row paints no surface of its own. */
+.pt-mobile-statusbar{
+  position:relative;flex-shrink:0;
+  height:54px;padding:0 23px 0 27px;
+  display:flex;align-items:center;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Segoe UI",sans-serif;
+  font-size:15px;font-weight:600;letter-spacing:-.01em;color:var(--pt-text);
+}
+.pt-mobile-statusbar-time{position:relative;z-index:2}
+.pt-mobile-island{
+  position:absolute;top:11px;left:50%;transform:translateX(-50%);
+  width:122px;height:37px;border-radius:999px;background:#000;z-index:1;
+}
+/* Indicator cluster is anchored to BOTH edges: a hard left bound at the
+   island's right edge + 10px prevents the bars ever sliding under the
+   Dynamic Island (content width varies by carrier/locale), the right edge
+   owns the margin. Content right-aligns inside that band. */
+.pt-mobile-statusbar-indicators{
+  position:absolute;z-index:2;top:0;bottom:0;
+  left:calc(50% + 71px);right:23px;
+  display:inline-flex;align-items:center;justify-content:flex-end;gap:3px;
+  font-size:11.5px;font-weight:500;letter-spacing:0;
+}
+.pt-mobile-statusbar-carrier{font-size:11.5px;font-weight:500;line-height:1}
+.pt-mobile-statusbar-indicators svg{display:block}
+.pt-mobile-statusbar-battery-label{font-size:11.5px;font-weight:500;line-height:1;margin-left:2px}
+.pt-status-battery-fill[data-low]{fill:var(--pt-danger)}
+/* Navigation bar: back / centered title / trailing actions. The two side
+   columns stay equal width so the title is optically centered. */
+.pt-mobile-navbar{
+  flex-shrink:0;min-height:52px;padding:6px 8px 8px 12px;
+  display:flex;align-items:center;gap:8px;
+}
+.pt-mobile-navbar-side{flex:0 0 44px;display:inline-flex;align-items:center}
+.pt-mobile-navbar-actions{flex-basis:auto;flex:0 0 auto;justify-content:flex-end;gap:2px}
+.pt-mobile-navbar-title{
+  margin:0;flex:1 1 0;min-width:0;text-align:center;
+  font-size:16.5px;font-weight:650;letter-spacing:-.01em;color:var(--pt-text);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+/* Bottom tab bar: frosted glass dock pinned to the screen bottom. Icon-only
+   tiles; the current location reads purely from the pine tile. */
+.pt-mobile-tabbar{
+  flex-shrink:0;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;
+  padding:6px 8px calc(8px + env(safe-area-inset-bottom,0px));
+  border-top:1px solid var(--pt-glass-border,var(--pt-border));
+  background:var(--pt-glass-surface-alt,var(--pt-canvas));
+  -webkit-backdrop-filter:blur(var(--pt-glass-blur,0));backdrop-filter:blur(var(--pt-glass-blur,0));
+}
+.pt-mobile-tab{display:flex;align-items:center;justify-content:center;min-height:44px}
+/* Current surface = pine, same grammar as the desktop rail: solid pine tile,
+   on-accent glyph. */
+.pt-mobile-tab .pt-icon-button[data-tab-active]{
+  background:var(--pt-accent);color:var(--pt-onAccent);
+  box-shadow:0 10px 24px -14px rgba(20,24,22,.55);
+}
+.pt-mobile-tab .pt-icon-button[data-tab-active]:hover{background:var(--pt-accent)}
+/* Unread count: danger pill pinned on the tile, canvas ring. */
+.pt-mobile-tab .pt-badge{position:relative}
+.pt-mobile-tab .pt-badge-count{
+  position:absolute;top:-4px;right:-6px;min-width:16px;height:16px;padding:0 4.5px;
+  border:1.5px solid var(--pt-canvas);border-radius:999px;
+  background:var(--pt-danger);color:#fff;font-size:10px;font-weight:650;line-height:13px;
+}
+.pt-field{display:flex;flex-direction:column;gap:var(--pt-space-xxs);min-width:0}
+.pt-field-label{font-weight:500;display:flex;gap:var(--pt-space-xxs)}
+.pt-field-frame{display:flex;align-items:center;justify-content:var(--pt-field-justify,flex-start);min-height:var(--pt-control-normal);min-width:0;gap:var(--pt-field-gap,var(--pt-space-xs));padding:0 var(--pt-field-xpad,var(--pt-space-sm));background:var(--pt-surface);border:1px solid var(--pt-borderStrong);border-radius:var(--pt-radius-md)}
+.pt-field-frame:focus-within{border-color:var(--pt-focus);box-shadow:0 0 0 2px var(--pt-primarySubtle)}
+.pt-field-frame[data-invalid=true]{border-color:var(--pt-danger)}
+.pt-field-frame[data-disabled=true]{background:var(--pt-subtle);color:var(--pt-secondary)}
+.pt-field-frame[data-appearance=search]{
+  border-color:var(--pt-border);
+  transition:border-color var(--pt-motion-surface) var(--pt-motion-searchFocus),box-shadow var(--pt-motion-surface) var(--pt-motion-searchFocus);
+}
+.pt-field-frame[data-appearance=search]:focus-within:not([data-disabled=true]):not([data-invalid=true]){
+  border-color:color-mix(in srgb,var(--pt-accent) 32%,var(--pt-border));
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--pt-accent) 9%,transparent);
+}
+.pt-field-frame[data-appearance=search][data-invalid=true]:focus-within{box-shadow:0 0 0 2px var(--pt-dangerSubtle)}
+.pt-field-frame[data-appearance=search][data-reveal=true]{animation:pt-search-reveal var(--pt-motion-searchReveal) ease-out}
+.pt-field-frame[data-appearance=search][data-density=compact]{min-height:var(--pt-control-searchCompact)}
+.pt-field-frame[data-appearance=search][data-density=compact] .pt-input{min-height:24px;padding:0;font-size:13px}
+.pt-field-frame[data-density=comfortable]{min-height:var(--pt-control-comfortable)}
+.pt-field-frame[data-density=comfortable] .pt-input{font-size:16px}
+@media(pointer:coarse){.pt-field-frame[data-appearance=search] .pt-input{font-size:16px}}
+@keyframes pt-search-reveal{from{opacity:0}to{opacity:1}}
+@media(prefers-reduced-motion:reduce){
+  .pt-field-frame[data-appearance=search]{transition:none}
+  .pt-field-frame[data-appearance=search][data-reveal=true]{animation:none}
+}
+.pt-field-frame :where(input,textarea,select):focus-visible{outline:none}
+.pt-field-frame :where(.pt-field-frame){border:0;border-radius:0;box-shadow:none;padding:0;background:transparent}
+/* Buttons embedded in a field are quiet chrome, never a second bordered box
+   breaking the field edge (clear affordance, search submit). */
+.pt-field-frame .pt-button{flex:none;border-color:transparent;background:transparent}
+.pt-field-frame .pt-button:hover:not([aria-disabled='true']){background:var(--pt-subtle);border-color:transparent}
+/* Multi-line fields stack textarea then a single-line counter row so the
+   native resize grip never collides with the character count. */
+.pt-field-frame[data-multiline=true]{flex-direction:column;align-items:stretch;gap:0;padding:0}
+.pt-field-frame[data-multiline=true] .pt-textarea{padding:var(--pt-space-xs) var(--pt-space-sm)}
+.pt-input,.pt-textarea,.pt-native-select{display:block;width:100%;min-width:0;min-height:var(--pt-control-normal);padding:var(--pt-space-xs) 0;line-height:1.5;color:inherit;background:transparent;border:0;outline:0}
+.pt-textarea{resize:vertical;min-height:80px}
+/* Native date affordance tamed to the token ink instead of the OS glyph. */
+.pt-input[type='date']::-webkit-calendar-picker-indicator,.pt-input[type='datetime-local']::-webkit-calendar-picker-indicator,.pt-input[type='time']::-webkit-calendar-picker-indicator{-webkit-mask:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2'/%3E%3Cpath d='M16 2v4M8 2v4M3 10h18'/%3E%3C/svg%3E") center/16px no-repeat;mask:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2'/%3E%3Cpath d='M16 2v4M8 2v4M3 10h18'/%3E%3C/svg%3E") center/16px no-repeat;background-color:var(--pt-secondary);opacity:1;width:16px;height:16px;cursor:pointer;padding:0}
+.pt-field-description{font-size:12px;color:var(--pt-secondary)}
+.pt-field-error{font-size:12px;color:var(--pt-danger)}
+.pt-check-label{display:inline-flex;align-items:center;gap:var(--pt-space-xs);min-height:var(--pt-control-normal);cursor:pointer}
+.pt-check-label input{accent-color:var(--pt-primary);width:16px;height:16px;flex-shrink:0}
+/* Switch is an intrinsic 44x26 pill control: fixed width even inside
+   stretchy flex/grid parents; the knob travels by transform. */
+.pt-switch-row{display:inline-flex;align-items:center;gap:var(--pt-space-xs);min-height:var(--pt-control-normal)}
+.pt-switch-label{font-size:14px;color:var(--pt-text);user-select:none}
+/* Switch: a dense 36x20 binary control, not the 44x26 iOS pill. On carries
+   the neutral action ink (role token --pt-switch-on, overridable per skin);
+   hue stays reserved for semantic meaning. The knob is a crisp white that
+   travels by transform with the surface-out easing. The button is the hit
+   target and stays transparent; the track span owns the compact visual pill
+   so coarse-pointer hit areas can grow to 44x44 without resizing it. */
+.pt-switch{position:relative;align-self:flex-start;flex:0 0 auto;width:36px;height:20px;padding:0;border:0;background:transparent;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
+.pt-switch-track{position:relative;width:36px;height:20px;flex:0 0 auto;border-radius:999px;background:var(--pt-borderStrong);transition:background var(--pt-motion-surface) var(--pt-motion-out)}
+.pt-switch:hover:not(:disabled) .pt-switch-track{background:var(--pt-muted)}
+.pt-switch[aria-checked=true] .pt-switch-track{background:var(--pt-switch-on,var(--pt-primary))}
+.pt-switch[aria-checked=true]:hover:not(:disabled){filter:brightness(1.06)}
+.pt-switch-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:var(--pt-white);border-radius:50%;box-shadow:0 1px 2px rgba(0,0,0,.28);transition:transform var(--pt-motion-surface) var(--pt-motion-out)}
+.pt-switch[aria-checked=true] .pt-switch-thumb{transform:translateX(16px)}
+.pt-switch:focus-visible{outline:2px solid var(--pt-focus);outline-offset:2px}
+.pt-switch:disabled{opacity:.55;cursor:not-allowed}
+.pt-select-trigger{width:100%;display:flex;justify-content:space-between;font-weight:400;min-width:0}
+.pt-select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The options panel shrink-fits its widest item (max-content) while never
+   going narrower than the trigger (panel min-width, set per-instance). A
+   fixed floor here is what produced ~150px of dead space beside 2-character
+   options. */
+.pt-select-popover{min-width:0;padding:var(--pt-space-xxs)}
+.pt-select-panel{width:max-content;min-width:100%}
+.pt-select-options{max-height:280px;overflow:auto;width:max-content;min-width:100%}
+.pt-select-option{display:flex;align-items:center;gap:var(--pt-space-xs);width:100%;min-height:var(--pt-control-row);padding:0 var(--pt-space-xs);border:0;border-radius:var(--pt-radius-sm);text-align:left;background:transparent;color:var(--pt-text);cursor:pointer;white-space:nowrap}
+/* Ghost select: inside a flat settings/list row the trigger is a quiet
+   action, not a bordered input box. Resting state is transparent; only hover
+   /open paints the neutral well. The field-box appearance stays available
+   via appearance="field" for real forms. */
+.pt-select[data-appearance=ghost] .pt-select-trigger{
+  min-height:var(--pt-control-row);
+  background:transparent;
+  border-color:transparent;
+  border-radius:var(--pt-radius-sm);
+  font-weight:400;
+}
+.pt-select[data-appearance=ghost] .pt-select-trigger:hover,
+.pt-select[data-appearance=ghost] .pt-select-trigger[aria-expanded=true]{
+  background:var(--pt-subtle);
+  border-color:transparent;
+}
+.pt-select-option[aria-selected=true]{background:var(--pt-primarySubtle);color:var(--pt-primary)}
+.pt-select-option:disabled{color:var(--pt-secondary)}
+.pt-choice-group,.pt-segmented{display:flex;align-items:center;gap:var(--pt-space-xs);flex-wrap:wrap}
+.pt-segmented{position:relative;padding:var(--pt-space-xxs);gap:var(--pt-space-xxs);background:var(--pt-subtle);border-radius:var(--pt-radius-md)}
+.pt-segmented>.pt-button{min-width:0;flex-shrink:1;border-color:transparent;white-space:nowrap}
+.pt-segmented>.pt-button .pt-button-content{white-space:nowrap}
+.pt-segmented[data-full-width=true]>.pt-button{flex:1}
+/* Off-screen intrinsic-width probe for the icon-only cramp decision. It
+   mirrors the real option row gap and never shrinks, so its scrollWidth is
+   the stable "fully labelled" width regardless of the live collapsed state. */
+.pt-segmented__measure{position:absolute;left:0;top:0;height:0;width:max-content;overflow:hidden;visibility:hidden;pointer-events:none;display:flex;gap:var(--pt-space-xxs);white-space:nowrap}
+/* Each probe item must reproduce the .pt-button box model — horizontal
+   padding, icon/label gap and 1px border — or the intrinsic width is
+   under-counted and cramp never fires (measured 324 vs real ~467). */
+.pt-segmented__measure-item{display:inline-flex;align-items:center;flex:0 0 auto;white-space:nowrap;gap:var(--pt-space-xs);padding:0 var(--pt-space-sm);border:1px solid transparent}
+/* Cramp-able groups stay on one line: spatial squeeze swaps labels for icons,
+   it never wraps buttons onto a second row. Text-only groups keep the base
+   flex-wrap:wrap fallback because they cannot collapse. */
+.pt-segmented[data-crampable='true']{flex-wrap:nowrap}
+/* Spatial squeeze: labels collapse to leading icons. The span (not the icon)
+   is hidden so the control keeps its squircle tile and centered glyph.
+   The tiles then keep a FIXED compact footprint and the island slides
+   horizontally instead of continuously squashing the icons — squeeze must
+   step (labelled → fixed icon tiles → host compact menu), never distort. */
+.pt-segmented[data-icon-only='true']{flex-wrap:nowrap;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none}
+.pt-segmented[data-icon-only='true']::-webkit-scrollbar{display:none}
+.pt-segmented[data-icon-only='true'] .pt-segmented__label{display:none}
+.pt-segmented[data-icon-only='true']>.pt-button{
+  justify-content:center;gap:0;
+  flex:0 0 auto;width:var(--pt-control-compact);min-width:var(--pt-control-compact);padding:0;
+}
+/* Scrollable island: never wraps; the group scrolls in one line and keeps
+   peer elements' relative positions under spatial squeeze. Options keep
+   intrinsic width; the scroll gutter is invisible, clipping at the pill edge. */
+.pt-segmented[data-scrollable]{flex-wrap:nowrap;overflow-x:auto;overscroll-behavior-x:contain;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.pt-segmented[data-scrollable]::-webkit-scrollbar{display:none}
+.pt-segmented[data-scrollable]>.pt-button{flex:0 0 auto}
+.pt-segmented>.pt-button:focus-visible{outline-offset:-3px;z-index:1}
+.pt-form{display:flex;flex-direction:column;gap:var(--pt-space-md)}
+.pt-form-section{border:0;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--pt-space-sm)}
+.pt-form-section legend{font-size:15px;font-weight:600;margin-bottom:var(--pt-space-xs)}
+.pt-tag{display:inline-flex;align-items:center;gap:var(--pt-space-xxs);padding:2px var(--pt-space-xs);border:1px solid var(--pt-border);border-radius:var(--pt-radius-xs);background:var(--pt-subtle);color:var(--pt-secondary);font-size:12px;max-width:100%;vertical-align:middle;white-space:nowrap;flex:0 0 auto}
+.pt-tag[data-tone=danger],.pt-alert[data-tone=danger]{color:var(--pt-danger)}
+.pt-tag[data-tone=success],.pt-alert[data-tone=success]{color:var(--pt-success)}
+.pt-tag[data-tone=warning],.pt-alert[data-tone=warning]{color:var(--pt-warning)}
+.pt-tag[data-tone=info],.pt-alert[data-tone=info]{color:var(--pt-info)}
+.pt-alert{display:flex;gap:var(--pt-space-sm);padding:var(--pt-space-sm);background:var(--pt-subtle);border:1px solid currentColor;border-radius:var(--pt-radius-md);align-items:flex-start}
+/* Inline alert: a state rail, not a bordered callout card. The 2px inset
+   rail carries the tone color (currentColor); no outer border, small radius,
+   quieter padding. Used for in-flow status like backup/recovery notices. */
+.pt-alert[data-variant=inline]{
+  border:0;border-radius:var(--pt-radius-sm);
+  padding:10px 12px;
+  box-shadow:inset 2px 0 0 currentColor;
+}
+.pt-alert[data-variant=inline] .pt-alert-title{font-size:13px}
+.pt-alert-body{flex:1;min-width:0}
+.pt-alert-title{font-weight:600}
+.pt-alert-description{color:var(--pt-secondary);margin-top:var(--pt-space-xxs)}
+.pt-card{background:var(--pt-surface);border:1px solid var(--pt-border);border-radius:var(--pt-radius-lg);min-width:0;box-shadow:var(--pt-shadow-rest)}
+/* flat: cards already inside a raised region (nested cards, in-dialog panels)
+   keep the hairline but drop the resting shadow to avoid double elevation. */
+.pt-card[data-flat="true"]{box-shadow:none}
+.pt-card-body,.pt-card>footer{padding:var(--pt-space-md)}
+.pt-card-header{display:flex;align-items:center;justify-content:space-between;gap:var(--pt-space-xs);padding:var(--pt-space-md);padding-bottom:var(--pt-space-sm)}
+.pt-card-title{font-size:15px;font-weight:600}
+.pt-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:var(--pt-space-sm);padding:var(--pt-space-xl);text-align:center;color:var(--pt-secondary)}
+.pt-badge{display:inline-flex;position:relative;align-items:center;gap:var(--pt-space-xxs);flex-shrink:0}
+/* Unread count is a neutral "new content" emphasis, not a fault: it uses the
+   ink action primitive. Destructive/attention alerts use the tone-driven dot
+   indicator (--pt-badge-indicator[data-tone=danger]), never the count pill. */
+.pt-badge-count{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;background:var(--pt-primary);color:var(--pt-onPrimary);font-size:11px;font-weight:600;min-width:18px;height:18px;padding:0 5px;border-radius:var(--pt-radius-full);font-variant-numeric:tabular-nums}
+.pt-badge:has(>:not(.pt-badge-count))>.pt-badge-count{position:absolute;top:-6px;right:-8px}
+/* Presence/trust dot: hue always states a fact (tone), never a brand fill. */
+.pt-badge-indicator{display:inline-block;width:8px;height:8px;border-radius:var(--pt-radius-full);background:var(--pt-info);flex-shrink:0}
+.pt-badge-indicator[data-tone=success]{background:var(--pt-success)}
+.pt-badge-indicator[data-tone=warning]{background:var(--pt-warning)}
+.pt-badge-indicator[data-tone=danger]{background:var(--pt-danger)}
+.pt-avatar{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;overflow:visible;background:var(--pt-primarySubtle);color:var(--pt-primary);font-weight:600;position:relative}
+.pt-avatar img{width:100%;height:100%;object-fit:cover;border-radius:inherit}
+/* Presence is a pine punctuation dot: live connection, not a success state.
+   Its ring takes the paper floor behind the avatar so it reads as pinned-on. */
+.pt-avatar-presence{position:absolute;right:-1px;bottom:-1px;width:26%;min-width:9px;max-width:12px;height:26%;min-height:9px;max-height:12px;border-radius:999px;background:var(--pt-accent);border:2px solid var(--pt-canvas);box-sizing:border-box}
+.pt-progress{display:flex;align-items:center;gap:var(--pt-space-xs)}
+.pt-progress progress{width:100%;height:8px;accent-color:var(--pt-primary);flex:1}
+.pt-skeleton{background:var(--pt-subtle);border-radius:var(--pt-radius-sm);color:transparent;min-height:16px}
+.pt-tabs{display:flex;flex-direction:column;min-width:0}
+.pt-tab-list{display:flex;gap:var(--pt-space-xxs);border-bottom:1px solid var(--pt-border);overflow:auto;flex-shrink:0}
+.pt-tab{border:0;border-radius:0;border-bottom:2px solid transparent;background:transparent;color:var(--pt-secondary);padding:var(--pt-space-xs) var(--pt-space-sm);cursor:pointer;white-space:nowrap}
+.pt-tab[aria-selected=true]{border-bottom-color:var(--pt-primary);color:var(--pt-primary)}
+.pt-tab-panel{min-width:0;padding-top:var(--pt-space-sm)}
+.pt-table-container{overflow:auto;border:1px solid var(--pt-border);border-radius:var(--pt-radius-md)}
+.pt-table{border-collapse:collapse;width:100%;text-align:left}
+.pt-table th,.pt-table td{padding:var(--pt-space-xs) var(--pt-space-sm);border-bottom:1px solid var(--pt-border);vertical-align:top}
+.pt-table th{background:var(--pt-subtle);font-weight:600}
+.pt-table tr:last-child td{border-bottom:0}
+.pt-list{list-style:none;padding:0;margin:0}
+.pt-list-item{display:flex;align-items:center;gap:var(--pt-space-sm);padding:var(--pt-space-sm) 0;border-bottom:1px solid var(--pt-border);min-width:0}
+.pt-list-meta{display:flex;align-items:center;gap:var(--pt-space-sm);flex:1;min-width:0}
+.pt-list-title{font-weight:500}
+.pt-list-description{color:var(--pt-secondary);font-size:12px}
+/* ---- Settings-style list primitive ------------------------------------
+   The structural answer to "flat, not carded SaaS": sections own a quiet
+   heading; rows separate by one full-bleed hairline and carry zero chrome
+   themselves. Pages compose rows; they never paint row boxes. inset groups
+   are the sanctioned exception (a well holds one related group). */
+.pt-list-section + .pt-list-section{margin-top:var(--pt-list-section-gap,var(--pt-space-lg))}
+.pt-list-heading{margin:0 0 var(--pt-list-heading-gap,var(--pt-space-xs));padding:0 var(--pt-space-xxs);display:flex;flex-direction:column;gap:2px}
+.pt-list-heading-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.pt-list-heading h3{margin:0;font-size:var(--pt-list-title-size,12px);font-weight:var(--pt-list-title-weight,500);color:var(--pt-list-title-color,var(--pt-secondary))}
+.pt-list-heading-desc{font-size:12px;color:var(--pt-muted)}
+.pt-list-heading-icon{display:none}
+/* An icon is opt-in semantic chrome (danger/trust), never decoration; it
+   aligns to the title's first line while the description wraps beneath. */
+.pt-list-heading[data-icon=true]{flex-direction:row;align-items:flex-start;gap:var(--pt-space-xs)}
+.pt-list-heading[data-icon=true] .pt-list-heading-icon{display:var(--pt-list-heading-icon-display,inline-flex);margin-top:1px;color:var(--pt-muted)}
+.pt-list-body{display:flex;flex-direction:column}
+.pt-list-row{
+  display:flex;align-items:center;gap:var(--pt-space-md);
+  min-height:40px;padding:var(--pt-list-row-y,7px) var(--pt-space-xxs);
+  border-top:1px solid var(--pt-border);
+}
+.pt-list-body>.pt-list-row:first-child{border-top:0}
+.pt-list-row-main{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
+.pt-list-row-icon{flex:none;display:inline-flex;color:var(--pt-muted)}
+.pt-list-row-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.pt-list-row-label{font-size:14px;line-height:1.35;color:var(--pt-text)}
+.pt-list-row-desc{font-size:12.5px;line-height:1.4;color:var(--pt-muted)}
+.pt-list-row-control{flex:none;display:flex;align-items:center;gap:var(--pt-space-xs);color:var(--pt-text)}
+/* Inset group: one well contains a related block; hairlines stay inside. */
+.pt-list-section[data-inset=true] .pt-list-body{
+  background:var(--pt-list-well,var(--pt-subtle));
+  border:1px solid var(--pt-list-well-border,transparent);
+  border-radius:var(--pt-list-well-radius,var(--pt-radius-md));
+  padding:0 var(--pt-space-sm);
+}
+.pt-list-section[data-inset=true] .pt-list-row{padding-left:var(--pt-space-xs);padding-right:var(--pt-space-xs)}
+.pt-divider{height:1px;border:0;background:var(--pt-border);margin:var(--pt-space-md) 0}
+.pt-code{font-family:var(--pt-mono);font-size:12px;overflow:auto;white-space:pre;padding:var(--pt-space-sm);background:var(--pt-subtle);border-radius:var(--pt-radius-md)}
+.pt-descriptions{display:grid;grid-template-columns:minmax(100px,.4fr) minmax(0,1fr);gap:var(--pt-space-xs) var(--pt-space-sm);margin:0}
+.pt-descriptions dt{color:var(--pt-secondary)}
+.pt-descriptions dd{margin:0;overflow-wrap:anywhere}
+.pt-toast-host{position:fixed;top:var(--pt-space-md);right:var(--pt-space-md);display:flex;flex-direction:column;gap:var(--pt-space-xs);max-width:calc(100vw - var(--pt-space-xl));z-index:2000;pointer-events:none}
+.pt-toast{pointer-events:auto;box-shadow:var(--pt-shadow-soft);background:var(--pt-raised);padding:var(--pt-space-sm);border-radius:var(--pt-radius-md);display:flex;gap:var(--pt-space-xs);align-items:center}
+.pt-toast[data-tone=danger]{color:var(--pt-danger)}
+.pt-document{overflow-wrap:anywhere;line-height:1.65}
+.pt-document>:first-child{margin-top:0}.pt-document>:last-child{margin-bottom:0}
+.pt-document pre,.pt-code pre,.pt-code-diff pre{margin:0;overflow:auto;font:12px/1.6 var(--pt-mono);white-space:pre}
+.pt-document pre,.pt-document :not(pre)>code{background:var(--pt-subtle);border-radius:var(--pt-radius-xs);padding:2px 4px}
+.pt-document blockquote{margin-inline:0;padding-inline-start:var(--pt-space-md);border-inline-start:3px solid var(--pt-borderStrong);color:var(--pt-secondary)}
+.pt-document table{border-collapse:collapse;width:100%;display:block;overflow:auto}
+.pt-document td,.pt-document th{border:1px solid var(--pt-border);padding:var(--pt-space-xs)}
+.pt-document a{color:var(--pt-primary)}.pt-document img{max-width:100%}
+.pt-code{white-space:normal;padding:0}
+.pt-code-toolbar{display:flex;align-items:center;justify-content:space-between;gap:var(--pt-space-sm);padding:var(--pt-space-xs) var(--pt-space-sm);font:12px var(--pt-font);color:var(--pt-secondary)}
+.pt-code pre,.pt-code-diff pre{padding:var(--pt-space-sm)}
+.pt-line-number{display:inline-block;min-width:3em;margin-right:var(--pt-space-sm);color:var(--pt-muted);user-select:none;text-align:right}
+.pt-code-diff{background:var(--pt-subtle);border-radius:var(--pt-radius-md);overflow:hidden}
+.pt-diff-line{display:block}.pt-diff-line[data-change=added]{background:color-mix(in srgb,var(--pt-success) 12%,transparent)}
+.pt-diff-line[data-change=removed]{background:color-mix(in srgb,var(--pt-danger) 12%,transparent)}
+.pt-diff-kind{display:inline-block;min-width:2em;color:var(--pt-secondary)}
+.pt-diagram{overflow:auto;margin:0}.pt-diagram svg{max-width:100%;height:auto}.pt-diagram figcaption{color:var(--pt-secondary);font-size:12px}
+.pt-shortcut{display:inline-flex;gap:var(--pt-space-xxs)}.pt-shortcut kbd{padding:2px 5px;border:1px solid var(--pt-border);border-radius:var(--pt-radius-xs);font:12px var(--pt-mono)}
+.pt-image-trigger{border:0;background:transparent;padding:0;cursor:zoom-in}.pt-image-viewport{overflow:auto;display:grid;place-items:center;min-height:240px;padding:var(--pt-space-xl)}
+.pt-image-viewport img{max-height:60vh;object-fit:contain}.pt-media-player video{width:100%;max-height:70vh}.pt-media-player audio{width:100%}
+.pt-call-control{display:flex;flex-direction:column;align-items:center;gap:10px;min-width:64px;max-width:100px;color:var(--pt-white)}
+.pt-call-control-button.pt-button{width:64px;height:64px;min-height:64px;border-radius:50%;border-color:transparent;background:color-mix(in srgb,var(--pt-white) 14%,transparent);color:var(--pt-white)}
+.pt-call-control-button.pt-button[data-tone=danger]{background:var(--pt-danger);color:var(--pt-white)}
+.pt-call-control[data-selected] .pt-call-control-button.pt-button{background:var(--pt-white);color:var(--pt-mediaStage)}
+.pt-call-control-label{font-size:12.5px;line-height:1.4;text-align:center;overflow-wrap:anywhere;color:var(--pt-mediaStageText)}
+/* File picking: the OS file input is visually hidden; the label carries a
+   fully custom dashed zone/button so no native "Choose File" chrome shows. */
+.pt-file-picker{display:inline-flex}
+.pt-file-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:var(--pt-control-compact);padding:0 var(--pt-space-md);border:1px solid var(--pt-borderStrong);border-radius:var(--pt-radius-md);background:var(--pt-surface);color:var(--pt-text);font-size:13px;font-weight:500;cursor:pointer;transition:border-color var(--pt-motion-fast),color var(--pt-motion-fast),background var(--pt-motion-fast)}
+.pt-file-picker:hover .pt-file-button{border-color:var(--pt-primary);color:var(--pt-primary)}
+/* Icon-only affordance for overlaying imagery (avatar/cover change): a small
+   translucent scrim rounded-square — assists without competing, and stays
+   inside the identity tile. It is NEVER a full circle (frame grammar §3:
+   identity/overlay markers are rounded-square, radius strictly < half). */
+.pt-file-picker[data-icon-only=true] .pt-file-button{width:30px;height:30px;min-height:30px;padding:0;border-radius:var(--pt-radius-md);border-color:transparent;background:color-mix(in srgb,#000 34%,transparent);color:#fff}
+.pt-file-picker[data-icon-only=true] .pt-file-button svg{width:15px;height:15px}
+.pt-file-picker[data-icon-only=true]:hover .pt-file-button{border-color:transparent;background:color-mix(in srgb,#000 48%,transparent);color:#fff}
+.pt-dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:var(--pt-space-sm);width:100%;padding:var(--pt-space-xl) var(--pt-space-lg);border:1.5px dashed var(--pt-borderStrong);border-radius:var(--pt-radius-lg);background:var(--pt-subtle);color:var(--pt-secondary);text-align:center;cursor:pointer;transition:border-color var(--pt-motion-fast),background var(--pt-motion-fast)}
+.pt-dropzone-glyph{display:inline-flex;color:var(--pt-muted)}
+.pt-dropzone:hover{border-color:var(--pt-primary)}
+.pt-dropzone[data-dragging=true]{border-color:var(--pt-primary);background:var(--pt-primarySubtle)}
+.pt-dropzone:focus-within{border-color:var(--pt-focus);box-shadow:0 0 0 2px var(--pt-primarySubtle)}
+.pt-dropzone[data-disabled=true]{opacity:.55;cursor:not-allowed}
+.pt-image-choices{display:flex;flex-wrap:wrap;gap:var(--pt-space-xs)}.pt-image-choices .pt-button-content{flex-direction:column}
+.pt-rich-editor{border:1px solid var(--pt-border);border-radius:var(--pt-radius-md);overflow:hidden}
+.pt-rich-editor-content{min-height:160px;padding:var(--pt-space-sm);line-height:1.6;outline-offset:-2px}
+.pt-rich-editor-content:focus-visible{outline:2px solid var(--pt-focus)}
+.pt-resizable{position:relative;flex:none;min-height:0;min-width:0}.pt-resizable-body{height:100%;overflow:auto}
+.pt-resize-handle{position:absolute;touch-action:none}.pt-resize-handle[data-axis=horizontal]{right:-4px;top:0;bottom:0;width:8px;cursor:col-resize}
+.pt-resize-handle[data-axis=vertical]{bottom:-4px;left:0;right:0;height:8px;cursor:row-resize}
+.pt-resize-handle:focus-visible{background:var(--pt-primarySubtle);outline:2px solid var(--pt-focus)}
+.pt-overflow-hint{position:relative;min-height:0}.pt-overflow-hint::before,.pt-overflow-hint::after{content:'';position:absolute;left:0;right:0;height:16px;pointer-events:none;z-index:1;opacity:0}
+.pt-overflow-hint::before{top:0;background:linear-gradient(var(--pt-surface),transparent)}.pt-overflow-hint::after{bottom:0;background:linear-gradient(transparent,var(--pt-surface))}
+.pt-overflow-hint[data-start]::before,.pt-overflow-hint[data-end]::after{opacity:1}
+.pt-surface-fade{position:relative}.pt-surface-fade::after{content:'';position:absolute;inset:auto 0 0;height:24px;pointer-events:none;background:linear-gradient(transparent,var(--pt-surface))}
+.pt-page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--pt-space-md)}
+.pt-page-header h1{margin:0;font-size:24px}.pt-page-header p{color:var(--pt-secondary);margin-bottom:0}
+.pt-panel-grip{cursor:move;touch-action:none;padding:var(--pt-space-xs);color:var(--pt-secondary);font-size:12px}
+.pt-calendar{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:var(--pt-space-xxs);margin-top:var(--pt-space-sm)}
+.pt-calendar-day{min-height:72px;padding:var(--pt-space-xs);border:1px solid var(--pt-border);display:flex;flex-direction:column;gap:var(--pt-space-xxs)}
+.pt-autocomplete-results{margin:0;padding:var(--pt-space-xxs);list-style:none;border:1px solid var(--pt-border);border-radius:var(--pt-radius-md);max-height:240px;overflow:auto}
+.pt-autocomplete-results [aria-selected=true]{background:var(--pt-primarySubtle)}.pt-autocomplete-results .pt-button{width:100%;justify-content:flex-start}
+.pt-field-frame[data-appearance=composer]{display:flex;align-items:flex-end;gap:var(--pt-space-xxs);min-width:0;padding:var(--pt-composer-inset);border-radius:var(--pt-composer-radius);background:var(--pt-subtle);border:1px solid var(--pt-border);transition:border-color var(--pt-motion-surface) var(--pt-motion-searchFocus),box-shadow var(--pt-motion-surface) var(--pt-motion-searchFocus)}
+.pt-field-frame[data-appearance=composer]:focus-within{border-color:color-mix(in srgb,var(--pt-accent) 32%,var(--pt-border));box-shadow:0 0 0 2px color-mix(in srgb,var(--pt-accent) 9%,transparent)}
+.pt-field-frame[data-appearance=composer][data-invalid=true]{border-color:var(--pt-danger)}
+.pt-ui .pt-field-frame[data-framing=embedded]{flex:1;min-width:0;min-height:0;border:0;background:transparent;box-shadow:none;padding:0}
+.pt-ui .pt-field-frame[data-framing=embedded]:focus-within{box-shadow:none}
+.pt-field-frame[data-framing=embedded] .pt-textarea{flex:none;min-height:var(--pt-textarea-min-height,0);max-height:var(--pt-textarea-max-height,none);width:100%;box-sizing:border-box;padding:var(--pt-textarea-padding,8px 4px);caret-color:var(--pt-textarea-caret-color,auto);resize:none}
+.pt-field-frame[data-framing=embedded] .pt-textarea[data-density=comfortable]{min-height:var(--pt-control-comfortable)}
+.pt-field-frame[data-appearance=composer] .pt-button[data-emphasis=primary]{background:var(--pt-primary);color:var(--pt-onPrimary)}
+.pt-field-frame[data-appearance=composer] .pt-button[data-emphasis=primary]:hover:not([aria-disabled=true]){background:var(--pt-primaryHover)}
+.pt-textarea[data-density=comfortable]{font-size:16px}
+.pt-slider{min-width:0}.pt-slider input{width:100%;accent-color:var(--pt-primary)}.pt-slider-ticks{display:flex;justify-content:space-between;font-size:11px;color:var(--pt-secondary)}
+.pt-select-group{padding:var(--pt-space-xs);font-size:12px;color:var(--pt-secondary)}
+.pt-character-count{white-space:nowrap;align-self:flex-end;padding:0 var(--pt-space-sm) 4px;font-size:12px;line-height:16px;color:var(--pt-secondary);font-variant-numeric:tabular-nums}
+/* Multiline bottom chrome: leading accessory (attach icon) and the counter
+   share ONE inside-frame rail, so a single action never occupies its own row
+   in empty space (craft rule: inline affordances into the owning field). */
+.pt-textarea-foot{display:flex;align-items:center;gap:var(--pt-space-xs);min-height:28px;padding:0 var(--pt-space-sm) 4px}
+.pt-textarea-foot .pt-character-count{margin-left:auto;align-self:auto;padding:0}
+.pt-textarea-accessory{display:inline-flex;align-items:center;gap:6px;min-width:0}
+/* The icon-only file affordance is a quiet in-field ghost here — the dark
+   scrim variant stays reserved for overlaying imagery (avatar/cover). */
+.pt-textarea-accessory .pt-file-picker[data-icon-only=true] .pt-file-button{width:28px;height:28px;min-height:28px;border-color:transparent;background:transparent;color:var(--pt-secondary)}
+.pt-textarea-accessory .pt-file-picker[data-icon-only=true]:hover .pt-file-button{border-color:transparent;background:var(--pt-subtle);color:var(--pt-text)}
+.pt-textarea-accessory .pt-file-picker[data-disabled=true] .pt-file-button{opacity:.45;pointer-events:none}
+.pt-textarea-accessory-count{font-size:12px;line-height:16px;color:var(--pt-secondary);font-variant-numeric:tabular-nums}
+.pt-choice-actions{display:flex;flex-direction:column;gap:var(--pt-space-xs)}
+.pt-emoji-picker{display:flex;flex-direction:column;gap:var(--pt-space-xxs);min-width:0}
+.pt-emoji-picker-label{font-size:12px;color:var(--pt-secondary)}
+.pt-emoji-picker-grid{display:grid;grid-template-columns:repeat(6,var(--pt-control-comfortable));gap:var(--pt-space-xxs)}
+.pt-emoji-picker-grid .pt-button{padding:0;font-size:21px}
+@media(prefers-reduced-motion:reduce){.pt-ui *{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media(pointer:coarse){.pt-ui .pt-icon-button,.pt-ui .pt-select-option,.pt-ui .pt-check-label,.pt-ui .pt-button,.pt-ui .pt-field-frame{min-height:var(--pt-control-comfortable)}.pt-ui .pt-icon-button,.pt-ui .pt-check-label{min-width:var(--pt-control-comfortable)}.pt-ui .pt-switch{width:var(--pt-control-comfortable);height:var(--pt-control-comfortable)}}
+/* TerminalSurface — presentational process output (no PTY ownership). */
+.pt-terminal{display:flex;flex-direction:column;min-width:0;border:1px solid var(--pt-border);border-radius:var(--pt-radius-md);background:var(--pt-subtle);overflow:hidden}
+.pt-terminal__bar{display:flex;align-items:center;gap:var(--pt-space-sm);padding:var(--pt-space-xxs) var(--pt-space-sm);border-bottom:1px solid var(--pt-border);font:12px var(--pt-font);color:var(--pt-secondary)}
+.pt-terminal__command{font-family:var(--pt-mono);font-size:12px;color:var(--pt-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46%}
+.pt-terminal__cwd{font-size:11px;color:var(--pt-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pt-terminal__spacer{flex:1}
+.pt-terminal__actions{display:inline-flex;align-items:center;gap:var(--pt-space-xxs)}
+.pt-terminal__viewport{margin:0;padding:var(--pt-space-xs) var(--pt-space-sm);overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.6 var(--pt-mono);color:var(--pt-secondary)}
+.pt-terminal__line{display:block}
+.pt-terminal__line--stdin{color:var(--pt-text)}
+.pt-terminal__line--stderr{color:var(--pt-danger)}
+.pt-terminal__line--system{color:var(--pt-muted);font-style:italic}
+.pt-terminal__prompt{color:var(--pt-primary);user-select:none}
+.pt-terminal__empty{color:var(--pt-muted)}

@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "domains": [
+    {
+      "id": "federation",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/federation.yaml",
+      "capabilities": "tooling/acceptance/capabilities/federation.yaml",
+      "coverage": "managed_domain",
+      "notes": "Federation product domain with local Station, Native Desktop, and Station Access proof; multi-Station runtime convergence remains unproven."
+    },
+    {
+      "id": "chat",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/chat.yaml",
+      "capabilities": "tooling/acceptance/capabilities/chat.yaml",
+      "coverage": "managed_domain",
+      "notes": "Third product domain. It validates user-path onboarding for chat persistence, realtime contracts, and Desktop typed surfaces without claiming full UI E2E."
+    },
+    {
+      "id": "mobile",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/mobile.yaml",
+      "capabilities": "tooling/acceptance/capabilities/mobile.yaml",
+      "coverage": "managed_domain",
+      "notes": "Structurally onboarded managed domain. Required product proof uses same-Station iOS Simulator cells and a Desktop-to-iOS cross-Station Social cell; Relay-backed, Android cross-Station, cross-mobile, and physical-device scope remains UNPROVEN."
+    },
+    {
+      "id": "social",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/social.yaml",
+      "capabilities": "tooling/acceptance/capabilities/social.yaml",
+      "coverage": "managed_domain",
+      "notes": "Private Moments managed domain. Formal proof covers Native Desktop and a required Desktop-to-iOS cross-Station cell; Android cross-platform, cross-mobile, and cross-Federation private delivery remain UNPROVEN."
+    },
+    {
+      "id": "desktop-shell",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/desktop-shell.yaml",
+      "capabilities": "tooling/acceptance/capabilities/desktop-shell.yaml",
+      "coverage": "managed_domain",
+      "notes": "Native Desktop process, window, menu, tray, focus, package, install, and cleanup domain. Formal proof includes macOS tray residency and the exact-source Linux user-install journey; unsupported Linux host prerequisites remain explicit environment blockers."
+    },
+    {
+      "id": "applet",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/applet.yaml",
+      "capabilities": "tooling/acceptance/capabilities/applet.yaml",
+      "coverage": "managed_domain",
+      "notes": "Managed domain with a local Desktop lifecycle contract and Gate. Python Core wrapper, native visible A-to-B-to-close-to-wakeup proof, and cross-platform Mobile remain incomplete or unproven; active means structurally onboarded, not product-ready."
+    },
+    {
+      "id": "station-dashboard",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/station-dashboard.yaml",
+      "capabilities": "tooling/acceptance/capabilities/station-dashboard.yaml",
+      "coverage": "managed_domain",
+      "notes": "Second product domain. It validates project-level acceptance onboarding without becoming an acceptance validation domain."
+    },
+    {
+      "id": "station-access",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/station-access.yaml",
+      "capabilities": "tooling/acceptance/capabilities/station-access.yaml",
+      "coverage": "managed_domain",
+      "notes": "Managed Station and Relay access domain covering signed identity, Access Gate, scope isolation, Federation context, and explicit Relay runtime security."
+    },
+    {
+      "id": "agent",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/agent.yaml",
+      "capabilities": "tooling/acceptance/capabilities/agent.yaml",
+      "coverage": "managed_domain",
+      "notes": "Modern Chat Agent domain. Station is the sole runtime/stream authority. Covers ContextLedger, ToolCall state machine, attachments, diagnostics, budgets, and Desktop surface."
+    },
+    {
+      "id": "oauth-login-broker",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/oauth-login-broker.yaml",
+      "capabilities": "tooling/acceptance/capabilities/oauth-login-broker.yaml",
+      "coverage": "managed_domain",
+      "notes": "Durable serverless OAuth broker with encrypted GitHub-backed records, provider refresh, key rotation, and authenticated read-only operator surfaces."
+    },
+    {
+      "id": "x-config",
+      "status": "active",
+      "profile": "tooling/acceptance/domains/x-config.yaml",
+      "capabilities": "tooling/acceptance/capabilities/x-config.yaml",
+      "coverage": "managed_domain",
+      "notes": "X Config managed domain. Current contract proof covers Broker-bound operator identity and Home SQLite session lifecycle; live Home restart/timing, signed publication, console, cleanup, and native client projection remain separate closures."
+    }
+  ]
+}

@@ -1,0 +1,334 @@
+// Package events implements the realtime canonical event stream
+// subserver — a single SSE endpoint per authenticated device-window
+// that multiplexes every kind of realtime event (messages, receipts,
+// presence, typing, future call signaling).
+//
+// See docs/architecture/shared/communication/event-stream.md for the wire
+// contract; this package owns the in-process EventBus that every
+// other Station subserver publishes to.
+package events
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/peers-labs/peers-touch/station/frame/core/logger"
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"github.com/peers-labs/peers-touch/station/frame/core/server"
+	"github.com/peers-labs/peers-touch/station/frame/core/store"
+	"github.com/peers-labs/peers-touch/station/frame/touch/actor"
+	realtime "github.com/peers-labs/peers-touch/station/frame/touch/model/realtime"
+	"gorm.io/gorm"
+)
+
+var installActorProfileHookOnce sync.Once
+
+// installActorProfileChangeHook bridges the frame actor write path into this
+// subserver's EventBus. It runs once per process; the frame layer invokes the
+// callback after a human actor's own profile mutation commits so all of that
+// actor's live device streams receive an ActorProfileChanged wake.
+func installActorProfileChangeHook() {
+	installActorProfileHookOnce.Do(func() {
+		actor.RegisterProfileChangedHook(func(actorPtid string, changedAtUnixMs int64) {
+			bus := GetBus()
+			if bus == nil {
+				return
+			}
+			ev := &realtime.StreamEvent{
+				Kind: &realtime.StreamEvent_ActorProfileChanged{
+					ActorProfileChanged: &realtime.ActorProfileChanged{
+						ActorPtid:       actorPtid,
+						ChangedTsUnixMs: changedAtUnixMs,
+					},
+				},
+			}
+			if _, err := bus.Publish(actorPtid, ev); err != nil {
+				logger.DefaultHelper.Warnf(
+					"events: actor profile change publish failed actor_ptid=%s: %v",
+					actorPtid, err,
+				)
+			}
+		})
+	})
+}
+
+const callResolutionSweepInterval = time.Second
+
+type eventsSubServer struct {
+	mu                   sync.RWMutex
+	status               server.Status
+	addrs                []string
+	bus                  EventBus
+	database             *gorm.DB
+	callResolution       *callResolutionStore
+	callResolutionCancel context.CancelFunc
+	callResolutionDone   chan struct{}
+}
+
+func (s *eventsSubServer) Init(ctx context.Context, opts ...option.Option) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.status = server.StatusStarting
+	rds, err := store.GetRDS(ctx)
+	if err != nil {
+		return err
+	}
+	eventBus, err := NewDurableEventBus(rds)
+	if err != nil {
+		return err
+	}
+	callResolution := newCallResolutionStore(rds)
+	if err := callResolution.AutoMigrate(); err != nil {
+		return err
+	}
+	s.bus = eventBus
+	s.database = rds
+	s.callResolution = callResolution
+	setGlobalBus(s.bus)
+	installActorProfileChangeHook()
+	return nil
+}
+
+func (s *eventsSubServer) Start(ctx context.Context, opts ...option.Option) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bus != nil {
+		if err := s.bus.Start(ctx); err != nil {
+			s.status = server.StatusError
+			return err
+		}
+	}
+	if s.callResolution != nil && s.callResolutionCancel == nil {
+		reaperContext, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		s.callResolutionCancel = cancel
+		s.callResolutionDone = done
+		go func() {
+			defer close(done)
+			s.reapCallResolutions(reaperContext)
+		}()
+	}
+	s.status = server.StatusRunning
+	return nil
+}
+
+func (s *eventsSubServer) Stop(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.bus != nil {
+		s.bus.Close()
+	}
+	if s.callResolutionCancel != nil {
+		s.callResolutionCancel()
+		<-s.callResolutionDone
+		s.callResolutionCancel = nil
+		s.callResolutionDone = nil
+	}
+	setGlobalBus(nil)
+	s.status = server.StatusStopped
+	return nil
+}
+
+func (s *eventsSubServer) Name() string               { return "events" }
+func (s *eventsSubServer) Type() server.SubserverType { return server.SubserverTypeHTTP }
+func (s *eventsSubServer) Address() server.SubserverAddress {
+	return server.SubserverAddress{Address: s.addrs}
+}
+func (s *eventsSubServer) Status() server.Status {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status
+}
+
+// ClusterReadiness verifies the durable cross-node Events backing and returns
+// its credential-free PostgreSQL identity.
+func (s *eventsSubServer) ClusterReadiness(
+	ctx context.Context,
+) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.status != server.StatusRunning || s.bus == nil || s.database == nil {
+		return "", fmt.Errorf("events: cluster runtime is not running")
+	}
+	if !s.database.Migrator().HasTable(&realtimeEventModel{}) ||
+		!s.database.Migrator().HasTable(&actorEventSequenceModel{}) {
+		return "", fmt.Errorf("events: durable cluster schema is incomplete")
+	}
+	return store.PostgresClusterIdentity(ctx, s.database)
+}
+
+func (s *eventsSubServer) reapCallResolutions(ctx context.Context) {
+	ticker := time.NewTicker(callResolutionSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			expired, err := s.callResolution.sweep(ctx)
+			if err != nil {
+				continue
+			}
+			for index := range expired {
+				s.fanOutNoAnswer(ctx, expired[index])
+			}
+		}
+	}
+}
+
+// NewEventsSubServer constructs the realtime events subserver. It is
+// registered on Station boot via app/main.go.
+func NewEventsSubServer(opts ...option.Option) server.Subserver {
+	return &eventsSubServer{
+		status: server.StatusStopped,
+		addrs:  []string{},
+	}
+}
+
+// ---------------------------------------------------------------------
+// Package-level bus access for other subservers.
+//
+// Other Station subservers (friend_chat, group_chat, presence, future
+// signaling) publish into the bus via GetBus(). The bus pointer is
+// installed during Init and cleared during Stop, so callers must
+// nil-check.
+// ---------------------------------------------------------------------
+
+var (
+	busMu     sync.RWMutex
+	globalBus EventBus
+)
+
+func setGlobalBus(b EventBus) {
+	busMu.Lock()
+	defer busMu.Unlock()
+	globalBus = b
+}
+
+// GetBus returns the live EventBus, or nil if the events subserver is
+// not running. Publish failures must be surfaced by durable domains:
+// realtime events are persisted by the events bus before fan-out, so a
+// silent skip would break the delivery contract.
+func GetBus() EventBus {
+	busMu.RLock()
+	defer busMu.RUnlock()
+	return globalBus
+}
+
+// PublishPeerSignal handles an inbound Federation-forwarded signal by
+// re-authorizing the sender/recipient pair and publishing to the local
+// EventBus. It satisfies the realtimeSignalPeerCapabilities interface
+// consumed by the federation peer route handler.
+func (s *eventsSubServer) PublishPeerSignal(
+	ctx context.Context,
+	recipientPTID string,
+	signal *realtime.CallSignal,
+) error {
+	if signal == nil || recipientPTID == "" {
+		return server.BadRequest("signal and recipient are required")
+	}
+	senderPTID := signal.GetFromActorPtid()
+	if isCallLifecycleSignal(signal.GetKind()) && signal.GetCallId() == "" {
+		return server.BadRequest("call lifecycle signal requires call_id")
+	}
+	if senderPTID != recipientPTID {
+		authorizer := getSignalAuthorizer()
+		if authorizer == nil {
+			logger.DefaultHelper.Warnf(
+				"events: peer signal authorizer not registered sender_ptid=%s",
+				senderPTID,
+			)
+			return server.NewHandlerError(503, "signal authorization unavailable")
+		}
+		allowed, err := authorizer.CanSignal(senderPTID, recipientPTID)
+		if err != nil {
+			return server.InternalErrorWithCause("signal authorization check", err)
+		}
+		if !allowed {
+			return server.Forbidden("not authorized to signal this recipient")
+		}
+	}
+	if signal.GetKind() == realtime.CallSignal_CALL_REQUEST {
+		if s.callResolution == nil {
+			return server.NewHandlerError(503, "call resolution unavailable")
+		}
+		if _, err := s.callResolution.open(
+			ctx,
+			senderPTID,
+			recipientPTID,
+			signal.GetSessionUlid(),
+			signal.GetCallId(),
+			callRequestDigest(
+				senderPTID,
+				recipientPTID,
+				signal.GetSessionUlid(),
+				signal.GetCallId(),
+				signal.GetPayload(),
+			),
+		); err != nil {
+			return callResolutionHandlerError(err)
+		}
+	}
+	bus := GetBus()
+	if bus == nil {
+		return server.NewHandlerError(503, "event bus not initialized")
+	}
+	ev := &realtime.StreamEvent{
+		Kind: &realtime.StreamEvent_Signaling{Signaling: signal},
+	}
+	if _, err := bus.Publish(recipientPTID, ev); err != nil {
+		logger.DefaultHelper.Warnf(
+			"events: peer signal publish failed recipient_ptid=%s: %v",
+			recipientPTID, err,
+		)
+		return server.InternalErrorWithCause("publish peer signal", err)
+	}
+
+	return nil
+}
+
+func (s *eventsSubServer) fanOutNoAnswer(
+	ctx context.Context,
+	record callResolutionModel,
+) {
+	signal := &realtime.CallSignal{
+		SessionUlid:   record.SessionULID,
+		FromActorPtid: record.CalleeActorPTID,
+		Kind:          realtime.CallSignal_CALL_NO_ANSWER,
+		CallId:        record.CallID,
+	}
+	if s.bus != nil {
+		if _, err := s.bus.Publish(
+			record.CalleeActorPTID,
+			streamEventForSignal(signal),
+		); err != nil {
+			logger.DefaultHelper.Warnf(
+				"events: no-answer fan-out failed call_id=%s actor_ptid=%s: %v",
+				record.CallID,
+				record.CalleeActorPTID,
+				err,
+			)
+		}
+	}
+	if record.CallerActorPTID == record.CalleeActorPTID {
+		return
+	}
+	if _, err := s.routeSignal(
+		ctx,
+		record.CalleeActorPTID,
+		record.CallerActorPTID,
+		record.SessionULID,
+		signal,
+	); err != nil {
+		logger.DefaultHelper.Warnf(
+			"events: no-answer fan-out failed call_id=%s actor_ptid=%s: %v",
+			record.CallID,
+			record.CallerActorPTID,
+			err,
+		)
+	}
+}

@@ -1,0 +1,1970 @@
+import { createHash, randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  machineLeasePath,
+  machineLeaseRoot,
+  machineRegistryLockPath,
+  machineRegistryPath,
+  repoRoot,
+  workspaceIdForRoot,
+  workspaceStatePath,
+} from '../lib/machine-dev-paths.mjs';
+import {
+  WorkspaceLifecycleLockError,
+  withWorkspaceLifecycleLockSync,
+} from './workspace-lifecycle-lock.mjs';
+import {
+  canonicalProviderId,
+  iosRequirement,
+  profileResourceRequirements,
+  readResourceState,
+} from './machine-dev-resource-contract.mjs';
+import { MachineDevError, canonicalize, fail } from './machine-dev-primitives.mjs';
+import { inspectGitWorkspace } from './git-workspace.mjs';
+
+export { MachineDevError, canonicalize, fail } from './machine-dev-primitives.mjs';
+export const MACHINE_REGISTRY_KIND = 'peers-touch-machine-dev-registry';
+export const MACHINE_REGISTRY_AUTHORITY = 'machine-control-plane';
+export const MACHINE_REGISTRY_SCHEMA_VERSION = 1;
+export const STATION_CAPABILITIES = new Set([
+  'station.connect',
+  'station.deploy',
+  'station.reset',
+]);
+export const LEASE_RESOURCE_KINDS = new Set([
+  'local.slot',
+  'simulator.ios',
+  'station.deploy',
+  'station.reset',
+]);
+
+const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
+const HEAD_PATTERN = /^[0-9a-f]{40,64}$/;
+const REGISTRY_LOCK_TIMEOUT_MS = 5_000;
+const REGISTRY_LOCK_HELD = Symbol('registryLockHeld');
+const PROFILE_VALUES = Symbol('profileValues');
+const REGISTRATION_KEYS = new Set([
+  'workspaceId',
+  'canonicalRoot',
+  'name',
+  'branch',
+  'profile',
+  'slot',
+  'allowedCapabilities',
+  'purpose',
+  'owner',
+  'registeredAt',
+  'updatedAt',
+  'updatedBy',
+]);
+const AUTHORITATIVE_REGISTRY_KEYS = new Set([
+  'schemaVersion',
+  'kind',
+  'authority',
+  'updatedAt',
+  'registrations',
+  // Bootstrap audit and D07 migration fields remain diagnostic until their
+  // owning workstream closes them. Runtime resolution never consumes them.
+  'generatedAt',
+  'machine',
+  'roots',
+  'environmentRepository',
+  'discovery',
+  'registrationState',
+  'runtime',
+  'acceptanceEvidenceMigration',
+]);
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function requiredText(value, field, maxLength = 1024) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    fail('INVALID_ARGUMENT', `${field} must be a non-empty string`, { field });
+  }
+  const normalized = value.trim();
+  if (
+    normalized.length > maxLength ||
+    normalized.includes('\0') ||
+    normalized.includes('\n')
+  ) {
+    fail('INVALID_ARGUMENT', `${field} is invalid`, { field });
+  }
+  return normalized;
+}
+
+function requiredIdentifier(value, field) {
+  const normalized = requiredText(value, field, 128);
+  if (!IDENTIFIER.test(normalized)) {
+    fail('INVALID_ARGUMENT', `${field} has an invalid identifier`, { field });
+  }
+  return normalized;
+}
+
+export function resetPolicyForProfile(profile) {
+  const profileId = requiredIdentifier(profile, 'profile');
+  return profileId.toLowerCase().endsWith('stable')
+    ? 'stable-protected'
+    : 'agent-resettable';
+}
+
+function requiredSlot(value) {
+  const slot = Number(value);
+  if (!Number.isInteger(slot) || slot < 0 || slot > 99) {
+    fail('INVALID_ARGUMENT', 'slot must be an integer within 0..99');
+  }
+  return slot;
+}
+
+function requiredBudget(value) {
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 86_400) {
+    fail(
+      'INVALID_ARGUMENT',
+      'budgetSeconds must be an integer within 1..86400',
+    );
+  }
+  return seconds;
+}
+
+function processStartIdentity(pid = process.pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const command =
+      process.platform === 'win32'
+        ? [
+            'powershell.exe',
+            [
+              '-NoLogo',
+              '-NoProfile',
+              '-NonInteractive',
+              '-Command',
+              `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString("o")`,
+            ],
+          ]
+        : ['ps', ['-o', 'lstart=', '-p', String(pid)]];
+    const value = execFileSync(command[0], command[1], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseCapabilities(value) {
+  const capabilities = Array.isArray(value)
+    ? value
+    : String(value ?? '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+  const unique = [...new Set(capabilities)];
+  for (const capability of unique) {
+    if (!STATION_CAPABILITIES.has(capability)) {
+      fail('INVALID_ARGUMENT', `unsupported Station capability: ${capability}`);
+    }
+  }
+  return unique.sort();
+}
+
+function normalizeIsoTimestamp(value, field) {
+  const parsed = Date.parse(value);
+  if (typeof value !== 'string' || !Number.isFinite(parsed)) {
+    fail('MACHINE_REGISTRY_INVALID', `${field} is invalid`);
+  }
+  return new Date(parsed).toISOString();
+}
+
+function validateIsoTimestamp(value, field) {
+  if (normalizeIsoTimestamp(value, field) !== value) {
+    fail('MACHINE_REGISTRY_INVALID', `${field} is not canonical`);
+  }
+}
+
+function gitValue(root, args, field, code = 'WORKTREE_IDENTITY_UNAVAILABLE') {
+  try {
+    return execFileSync('git', args, {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch (error) {
+    fail(code, `cannot resolve ${field}`, {
+      root,
+      cause: String(error),
+    });
+  }
+}
+
+export function captureWorkspace(workspaceRoot = repoRoot) {
+  let canonicalRoot;
+  try {
+    canonicalRoot = realpathSync.native(workspaceRoot);
+  } catch (error) {
+    fail('WORKTREE_IDENTITY_UNAVAILABLE', 'workspace root is unavailable', {
+      root: workspaceRoot,
+      cause: String(error),
+    });
+  }
+  const gitRoot = realpathSync.native(
+    gitValue(canonicalRoot, ['rev-parse', '--show-toplevel'], 'Git worktree root'),
+  );
+  if (gitRoot !== canonicalRoot) {
+    fail(
+      'WORKTREE_IDENTITY_MISMATCH',
+      'workspace root is not the Git worktree root',
+      { requested: canonicalRoot, actual: gitRoot },
+    );
+  }
+  const branch = gitValue(
+    canonicalRoot,
+    ['branch', '--show-current'],
+    'workspace branch',
+  );
+  if (!branch) {
+    fail('WORKTREE_IDENTITY_UNAVAILABLE', 'detached worktree is unsupported');
+  }
+  const head = gitValue(canonicalRoot, ['rev-parse', 'HEAD'], 'workspace HEAD');
+  if (!HEAD_PATTERN.test(head)) {
+    fail('WORKTREE_IDENTITY_UNAVAILABLE', 'workspace HEAD is invalid');
+  }
+  return {
+    workspaceId: workspaceIdForRoot(canonicalRoot),
+    canonicalRoot,
+    name: path.basename(canonicalRoot),
+    branch,
+    head,
+  };
+}
+
+function registrationIdentity(workspace) {
+  return {
+    workspaceId: workspace.workspaceId,
+    canonicalRoot: workspace.canonicalRoot,
+    name: workspace.name,
+    branch: workspace.branch,
+  };
+}
+
+function parseEnvFile(file, { literalOnly = false } = {}) {
+  const values = {};
+  const lines = readFileSync(file, 'utf8').split(/\r?\n/);
+  for (const [index, rawLine] of lines.entries()) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0) {
+      fail('PROFILE_UNAVAILABLE', 'profile contains an invalid assignment', {
+        file,
+        line: index + 1,
+      });
+    }
+    const key = line.slice(0, separator).trim();
+    let value = line.slice(separator + 1).trim();
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key)) {
+      fail('PROFILE_UNAVAILABLE', 'profile contains an invalid variable name', {
+        file,
+        line: index + 1,
+      });
+    }
+    if (Object.hasOwn(values, key)) {
+      fail('PROFILE_UNAVAILABLE', 'profile contains a duplicate variable', {
+        file,
+        line: index + 1,
+        key,
+      });
+    }
+    const quote = value[0];
+    const quoted = quote === "'" || quote === '"';
+    if (quoted) {
+      if (value.length < 2 || value.at(-1) !== quote) {
+        fail('PROFILE_UNAVAILABLE', 'profile contains an unterminated value', {
+          file,
+          line: index + 1,
+        });
+      }
+      value = value.slice(1, -1);
+    } else if (value.endsWith("'") || value.endsWith('"')) {
+      fail('PROFILE_UNAVAILABLE', 'profile contains an unmatched quote', {
+        file,
+        line: index + 1,
+      });
+    }
+    if (
+      literalOnly
+      && (
+        /[\u0000-\u001f\u007f]/.test(value)
+        || /[$`\\;&|<>(){}\[\]*?!~#'"]/.test(value)
+        || (!quoted && /\s/.test(value))
+      )
+    ) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile values must be shell-safe literals',
+        { file, line: index + 1, key },
+      );
+    }
+    values[key] = value;
+  }
+  return values;
+}
+
+function validateLocalProfileFile(workspaceRoot, file) {
+  const expectedRoot = path.resolve(
+    workspaceRoot,
+    '.local',
+    'dev',
+    'profiles',
+  );
+  try {
+    const rootMetadata = lstatSync(expectedRoot);
+    if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile root must be a real directory',
+        { profileRoot: expectedRoot },
+      );
+    }
+    const canonicalRoot = realpathSync.native(expectedRoot);
+    if (canonicalRoot !== expectedRoot) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile root must remain inside the worktree',
+        { profileRoot: expectedRoot, canonicalRoot },
+      );
+    }
+
+    const metadata = lstatSync(file);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile must be a non-symlink regular file',
+        { file },
+      );
+    }
+    const canonicalFile = realpathSync.native(file);
+    if (
+      canonicalFile !== path.resolve(file)
+      || path.dirname(canonicalFile) !== canonicalRoot
+    ) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile must be directly contained by the worktree profile root',
+        { file, canonicalFile, profileRoot: canonicalRoot },
+      );
+    }
+    if (
+      typeof process.getuid === 'function'
+      && metadata.uid !== process.getuid()
+    ) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile must be owned by the current user',
+        { file, ownerUid: metadata.uid },
+      );
+    }
+    if ((metadata.mode & 0o077) !== 0) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'local profile must not be accessible by group or other users',
+        { file, mode: (metadata.mode & 0o777).toString(8) },
+      );
+    }
+    return canonicalFile;
+  } catch (error) {
+    if (error instanceof MachineDevError) throw error;
+    fail('PROFILE_UNAVAILABLE', 'local profile cannot be validated', {
+      file,
+      cause: String(error),
+    });
+  }
+}
+
+// Worktree-local (compose/local) profiles are self-contained, so the sibling
+// tracked env repository is optional for them. Remote deploy definitions
+// require it and validate the non-null result at the call site.
+function tryResolveEnvRepository(workspaceRoot, requestedEnvRepo) {
+  const candidate = requestedEnvRepo
+    ? path.resolve(requestedEnvRepo)
+    : path.join(path.dirname(workspaceRoot), 'env');
+  let canonical;
+  try {
+    canonical = realpathSync(candidate);
+  } catch {
+    return null;
+  }
+  if (
+    gitValue(
+      canonical,
+      ['rev-parse', '--is-inside-work-tree'],
+      'environment repository',
+      'PROFILE_UNAVAILABLE',
+    ) !== 'true'
+  ) {
+    fail('PROFILE_UNAVAILABLE', 'environment repository is not a Git worktree', {
+      envRepo: canonical,
+    });
+  }
+  return canonical;
+}
+
+function trackedFile(envRepo, relative, label) {
+  gitValue(
+    envRepo,
+    ['ls-files', '--error-unmatch', relative],
+    label,
+    'PROFILE_UNAVAILABLE',
+  );
+}
+
+function requireCleanDefinition(envRepo, relativeDirectory, profile) {
+  const status = gitValue(
+    envRepo,
+    ['status', '--porcelain', '--untracked-files=all', '--', relativeDirectory],
+    'environment definition state',
+    'PROFILE_UNAVAILABLE',
+  );
+  if (status) {
+    fail(
+      'PROFILE_UNAVAILABLE',
+      'selected profile has dirty or untracked environment definitions',
+      { profile, changes: status.split('\n') },
+    );
+  }
+}
+
+function normalizedHost(url, field) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    fail('PROFILE_UNAVAILABLE', `${field} is not a valid URL`, { value: url });
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+    fail('PROFILE_UNAVAILABLE', `${field} must be an HTTP(S) URL`, {
+      value: url,
+    });
+  }
+  return parsed.hostname.toLowerCase();
+}
+
+function isLoopback(host) {
+  const normalized = host.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  return (
+    normalized === 'localhost' ||
+    normalized === '::1' ||
+    normalized === '0.0.0.0' ||
+    normalized.startsWith('127.')
+  );
+}
+
+function resolveDeployDefinition(envRepo, deployEnvironment) {
+  const matches = [];
+  const profilesRoot = path.join(envRepo, 'peers-touch');
+  if (existsSync(profilesRoot)) {
+    for (const entry of readdirSync(profilesRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(
+        profilesRoot,
+        entry.name,
+        'deploy',
+        `${deployEnvironment}.env.example`,
+      );
+      if (existsSync(candidate)) matches.push(candidate);
+    }
+  }
+  matches.sort();
+  if (matches.length !== 1) {
+    fail(
+      'PROFILE_UNAVAILABLE',
+      'deploy environment must resolve to exactly one tracked definition',
+      { deployEnvironment, matches },
+    );
+  }
+  const file = realpathSync(matches[0]);
+  const relative = path.relative(envRepo, file).replaceAll(path.sep, '/');
+  trackedFile(envRepo, relative, 'deploy environment');
+  const relativeDirectory = relative.split('/').slice(0, 2).join('/');
+  requireCleanDefinition(envRepo, relativeDirectory, relativeDirectory);
+  return { file, values: parseEnvFile(file) };
+}
+
+export function resolveProfileDefinition(options) {
+  const workspaceRoot = captureWorkspace(options.workspaceRoot ?? repoRoot)
+    .canonicalRoot;
+  const profile = requiredIdentifier(options.profile, 'profile');
+  const envRepo = tryResolveEnvRepository(workspaceRoot, options.envRepo);
+  const relativeDirectory = `peers-touch/${profile}`;
+  const relativeProfile = `${relativeDirectory}/profile.env.example`;
+  const localProfileFile = path.join(
+    workspaceRoot,
+    '.local',
+    'dev',
+    'profiles',
+    `${profile}.env`,
+  );
+  let profileFile;
+  let sourceState = 'tracked-clean';
+
+  if (envRepo && existsSync(path.join(envRepo, relativeProfile))) {
+    profileFile = path.join(envRepo, relativeProfile);
+    trackedFile(envRepo, relativeProfile, 'profile definition');
+    requireCleanDefinition(envRepo, relativeDirectory, profile);
+  } else if (existsSync(localProfileFile)) {
+    profileFile = validateLocalProfileFile(workspaceRoot, localProfileFile);
+    sourceState = 'local';
+  } else {
+    fail('PROFILE_UNAVAILABLE', 'selected profile does not exist', {
+      profile,
+      expected: envRepo
+        ? [path.join(envRepo, relativeProfile), localProfileFile]
+        : [localProfileFile],
+      hint: envRepo
+        ? undefined
+        : 'create a worktree-local profile with "make profile-init <name>" (no sibling env repository required)',
+    });
+  }
+
+  const values = parseEnvFile(profileFile, {
+    literalOnly: sourceState === 'local',
+  });
+  if (values.PT_DEV_PROFILE !== profile) {
+    fail('PROFILE_UNAVAILABLE', 'profile identity does not match its directory', {
+      selected: profile,
+      declared: values.PT_DEV_PROFILE ?? null,
+    });
+  }
+  const stationMode = requiredText(
+    values.PT_STATION_MODE,
+    'PT_STATION_MODE',
+    32,
+  );
+  if (!['local', 'compose', 'remote'].includes(stationMode)) {
+    fail('PROFILE_UNAVAILABLE', 'profile has an unsupported Station mode', {
+      stationMode,
+    });
+  }
+  const stationUrl = requiredText(
+    values.PT_STATION_URL,
+    'PT_STATION_URL',
+    2048,
+  );
+  const stationHost = normalizedHost(stationUrl, 'PT_STATION_URL');
+  const deployEnvironment = values.PT_STATION_DEPLOY_ENV?.trim() || null;
+  let deploy = null;
+  if (deployEnvironment) {
+    requiredIdentifier(deployEnvironment, 'PT_STATION_DEPLOY_ENV');
+    if (!envRepo) {
+      fail(
+        'PROFILE_UNAVAILABLE',
+        'PT_STATION_DEPLOY_ENV requires the tracked environment repository',
+        { profile, expectedRepository: '../env' },
+      );
+    }
+    deploy = resolveDeployDefinition(envRepo, deployEnvironment);
+  }
+
+  return {
+    profile,
+    profileFile,
+    sourceState,
+    envRepo,
+    resetPolicy: resetPolicyForProfile(profile),
+    stationMode,
+    stationUrl,
+    stationHost,
+    stationDeployEnvironment: deployEnvironment,
+    stationDeployFile: deploy?.file ?? null,
+    stationDeployHost: deploy?.values.PT_DEPLOY_HOST?.trim() || null,
+    resourceRequirements: profileResourceRequirements(values),
+    [PROFILE_VALUES]: values,
+  };
+}
+
+export function profileEnvironment(definition) {
+  const values = definition?.[PROFILE_VALUES];
+  if (!isObject(values)) {
+    fail(
+      'PROFILE_UNAVAILABLE',
+      'resolved profile environment is unavailable',
+    );
+  }
+  return { ...values };
+}
+
+function validateProfileCapabilities(definition, capabilities) {
+  if (
+    definition.resetPolicy === 'stable-protected' &&
+    capabilities.includes('station.reset')
+  ) {
+    fail(
+      'PROFILE_RESET_PROTECTED',
+      'stable profiles cannot grant autonomous Station reset',
+      {
+        profile: definition.profile,
+        resetPolicy: definition.resetPolicy,
+      },
+    );
+  }
+  const requiresStationMutation = capabilities.some((capability) =>
+    ['station.deploy', 'station.reset'].includes(capability),
+  );
+  if (!requiresStationMutation) return;
+  if (definition.stationMode !== 'remote') {
+    fail(
+      'PROFILE_UNAVAILABLE',
+      'Station deploy/reset requires a remote profile',
+      { stationMode: definition.stationMode },
+    );
+  }
+  if (isLoopback(definition.stationHost)) {
+    fail(
+      'PROFILE_UNAVAILABLE',
+      'Station deploy/reset rejects a loopback Station URL',
+      { stationUrl: definition.stationUrl },
+    );
+  }
+  if (
+    !definition.stationDeployEnvironment ||
+    !definition.stationDeployFile ||
+    !definition.stationDeployHost
+  ) {
+    fail(
+      'PROFILE_UNAVAILABLE',
+      'remote Station mutation requires one tracked deploy environment',
+      { profile: definition.profile },
+    );
+  }
+  if (
+    definition.stationHost.toLowerCase() !==
+    definition.stationDeployHost.toLowerCase()
+  ) {
+    fail('DEPLOY_TARGET_MISMATCH', 'profile and deploy target hosts differ', {
+      profileHost: definition.stationHost,
+      deployHost: definition.stationDeployHost,
+      deployEnvironment: definition.stationDeployEnvironment,
+    });
+  }
+}
+
+function normalizeRegistration(value) {
+  if (!isObject(value)) {
+    fail('MACHINE_REGISTRY_INVALID', 'registration must be an object');
+  }
+  const normalized = {
+    workspaceId: value.workspaceId,
+    canonicalRoot: value.canonicalRoot,
+    name: value.name,
+    branch: value.branch,
+    profile: value.profile,
+    slot: value.slot,
+    allowedCapabilities: value.allowedCapabilities,
+    purpose: value.purpose,
+    owner: value.owner,
+    registeredAt: value.registeredAt,
+    updatedAt: value.updatedAt,
+    updatedBy: value.updatedBy,
+  };
+  if (
+    !/^[0-9a-f]{16}$/.test(normalized.workspaceId) ||
+    !path.isAbsolute(normalized.canonicalRoot) ||
+    workspaceIdForCanonicalPath(normalized.canonicalRoot) !==
+      normalized.workspaceId ||
+    path.basename(normalized.canonicalRoot) !== normalized.name
+  ) {
+    fail('MACHINE_REGISTRY_INVALID', 'registration identity is invalid', {
+      workspaceId: normalized.workspaceId,
+    });
+  }
+  for (const field of ['name', 'branch', 'profile', 'purpose', 'owner', 'updatedBy']) {
+    requiredText(normalized[field], field);
+  }
+  normalized.slot = requiredSlot(normalized.slot);
+  normalized.allowedCapabilities = parseCapabilities(
+    normalized.allowedCapabilities,
+  );
+  normalized.registeredAt = normalizeIsoTimestamp(
+    normalized.registeredAt,
+    'registeredAt',
+  );
+  normalized.updatedAt = normalizeIsoTimestamp(
+    normalized.updatedAt,
+    'updatedAt',
+  );
+  return normalized;
+}
+
+function workspaceIdForCanonicalPath(canonicalRoot) {
+  return createHash('sha256')
+    .update(canonicalRoot)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function normalizeRegistrationCollection(registry, keys, normalize) {
+  const workspaceIds = new Set();
+  const slots = new Set();
+  registry.registrations = registry.registrations.map((entry) => {
+    if (
+      !isObject(entry) ||
+      Object.keys(entry).length !== keys.size ||
+      Object.keys(entry).some((key) => !keys.has(key))
+    ) {
+      fail('MACHINE_REGISTRY_INVALID', 'registration fields are invalid');
+    }
+    const normalized = normalize(entry);
+    if (workspaceIds.has(normalized.workspaceId)) {
+      fail('MACHINE_REGISTRY_INVALID', 'workspace is registered more than once');
+    }
+    if (slots.has(normalized.slot)) {
+      fail('MACHINE_REGISTRY_INVALID', 'local slot is allocated more than once');
+    }
+    workspaceIds.add(normalized.workspaceId);
+    slots.add(normalized.slot);
+    return normalized;
+  });
+  return registry;
+}
+
+function validateRegistry(registry) {
+  if (
+    !isObject(registry) ||
+    registry.schemaVersion !== MACHINE_REGISTRY_SCHEMA_VERSION ||
+    registry.kind !== MACHINE_REGISTRY_KIND ||
+    registry.authority !== MACHINE_REGISTRY_AUTHORITY ||
+    !Array.isArray(registry.registrations) ||
+    Object.keys(registry).some((key) => !AUTHORITATIVE_REGISTRY_KEYS.has(key))
+  ) {
+    fail('MACHINE_REGISTRY_INVALID', 'machine registry schema is invalid');
+  }
+  validateIsoTimestamp(registry.updatedAt, 'updatedAt');
+  return normalizeRegistrationCollection(
+    registry,
+    REGISTRATION_KEYS,
+    normalizeRegistration,
+  );
+}
+
+function parseRegistryDocument(file) {
+  if (!existsSync(file)) {
+    return null;
+  }
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    fail('MACHINE_REGISTRY_INVALID', 'machine registry is not valid JSON', {
+      cause: String(error),
+    });
+  }
+}
+
+function validateReadableHeader(registry) {
+  if (
+    registry?.schemaVersion !== MACHINE_REGISTRY_SCHEMA_VERSION ||
+    registry?.kind !== MACHINE_REGISTRY_KIND ||
+    !['observed-snapshot', MACHINE_REGISTRY_AUTHORITY].includes(
+      registry?.authority,
+    ) ||
+    !Array.isArray(registry.registrations)
+  ) {
+    fail('MACHINE_REGISTRY_INVALID', 'machine registry header is invalid');
+  }
+  return registry;
+}
+
+function requireRegistryAuthority(registry, requireAuthority) {
+  if (registry.authority !== MACHINE_REGISTRY_AUTHORITY) {
+    if (requireAuthority) {
+      fail(
+        'WORKSPACE_UNREGISTERED',
+        'machine registry is an observed snapshot, not runtime authority',
+      );
+    }
+    return registry;
+  }
+  return null;
+}
+
+function loadValidatedRegistry(file) {
+  const registry = parseRegistryDocument(file);
+  if (registry === null) return null;
+  validateReadableHeader(registry);
+  if (registry.authority !== MACHINE_REGISTRY_AUTHORITY) {
+    return registry;
+  }
+  return validateRegistry(registry);
+}
+
+export function readRegistry(file, { requireAuthority = true } = {}) {
+  const registry = parseRegistryDocument(file);
+  if (registry === null) {
+    if (requireAuthority) {
+      fail('WORKSPACE_UNREGISTERED', 'machine registry does not exist');
+    }
+    return null;
+  }
+  validateReadableHeader(registry);
+  const nonAuthoritative = requireRegistryAuthority(
+    registry,
+    requireAuthority,
+  );
+  if (nonAuthoritative) return nonAuthoritative;
+  return validateRegistry(registry);
+}
+
+// Read-only discovery for pull-based collectors. The registry is the only
+// machine-wide enumeration of worktree roots; observation writers never push
+// into a shared directory. A missing registry means "nothing registered yet"
+// and resolves to an empty list. A corrupt registry still throws so the
+// collector can isolate and report the discovery failure.
+export function registeredCanonicalRoots(options = {}) {
+  const file = options.registryPath ?? machineRegistryPath(options.home);
+  const registry = readRegistry(file, { requireAuthority: false });
+  if (registry === null) return [];
+  return registry.registrations.map((entry) => entry.canonicalRoot);
+}
+
+function readOperationalRegistry(
+  options,
+  { requireAuthority = true, registryLockHeld = false } = {},
+) {
+  const file = options.registryPath ?? machineRegistryPath(options.home);
+  const readCurrent = () => {
+    const registry = loadValidatedRegistry(file);
+    if (registry === null) {
+      if (requireAuthority) {
+        fail('WORKSPACE_UNREGISTERED', 'machine registry does not exist');
+      }
+      return null;
+    }
+    const nonAuthoritative = requireRegistryAuthority(
+      registry,
+      requireAuthority,
+    );
+    return nonAuthoritative ?? registry;
+  };
+  if (registryLockHeld) return readCurrent();
+  const release = acquireRegistryLock(
+    options.lockPath ?? machineRegistryLockPath(options.home),
+    options.lockTimeoutMs,
+  );
+  try {
+    return readCurrent();
+  } finally {
+    release();
+  }
+}
+
+function promoteRegistry(registry, now) {
+  const base = registry ?? {};
+  const observedRegistrations =
+    base.authority !== MACHINE_REGISTRY_AUTHORITY &&
+    Array.isArray(base.registrations)
+      ? base.registrations
+      : [];
+  const registrations =
+    base.authority === MACHINE_REGISTRY_AUTHORITY &&
+    Array.isArray(base.registrations)
+    ? base.registrations.map(normalizeRegistration)
+    : [];
+  const discovery =
+    observedRegistrations.length > 0
+      ? {
+          ...(isObject(base.discovery) ? base.discovery : {}),
+          observedRegistrations,
+        }
+      : base.discovery;
+  return validateRegistry({
+    ...base,
+    ...(discovery === undefined ? {} : { discovery }),
+    schemaVersion: MACHINE_REGISTRY_SCHEMA_VERSION,
+    kind: MACHINE_REGISTRY_KIND,
+    authority: MACHINE_REGISTRY_AUTHORITY,
+    updatedAt: now.toISOString(),
+    registrations,
+  });
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function sleep(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function acquireRegistryLock(lockFile, timeoutMs = REGISTRY_LOCK_TIMEOUT_MS) {
+  mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const temp = path.join(
+      path.dirname(lockFile),
+      `.${path.basename(lockFile)}.${process.pid}.${randomBytes(8).toString('hex')}`,
+    );
+    const processStart = processStartIdentity();
+    if (!processStart) {
+      fail(
+        'MACHINE_REGISTRY_INVALID',
+        'cannot establish registry-lock process identity',
+      );
+    }
+    writeFileSync(
+      temp,
+      `${JSON.stringify({
+        pid: process.pid,
+        processStart,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600, flag: 'wx' },
+    );
+    try {
+      linkSync(temp, lockFile);
+      unlinkSync(temp);
+      return () => {
+        try {
+          unlinkSync(lockFile);
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+      };
+    } catch (error) {
+      unlinkSync(temp);
+      if (error?.code !== 'EEXIST') throw error;
+      let metadata;
+      try {
+        metadata = JSON.parse(readFileSync(lockFile, 'utf8'));
+      } catch (readError) {
+        fail('MACHINE_REGISTRY_INVALID', 'registry lock metadata is invalid', {
+          cause: String(readError),
+        });
+      }
+      const live = processIsAlive(metadata?.pid);
+      const actualStart = live ? processStartIdentity(metadata.pid) : null;
+      if (!live || actualStart !== metadata?.processStart) {
+        try {
+          unlinkSync(lockFile);
+        } catch (unlinkError) {
+          if (unlinkError?.code !== 'ENOENT') throw unlinkError;
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        fail('MACHINE_REGISTRY_LOCKED', 'timed out acquiring registry lock');
+      }
+      sleep(50);
+    }
+  }
+}
+
+function syncDirectory(directory) {
+  if (process.platform === 'win32') return;
+  let fd;
+  try {
+    fd = openSync(directory, 'r');
+    fsyncSync(fd);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+export function writeMachineDocumentAtomic(file, registry) {
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.${process.pid}.${randomBytes(8).toString('hex')}`,
+  );
+  let fd;
+  try {
+    fd = openSync(temp, 'wx', 0o600);
+    writeFileSync(fd, `${JSON.stringify(canonicalize(registry), null, 2)}\n`);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, file);
+    syncDirectory(path.dirname(file));
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    if (existsSync(temp)) unlinkSync(temp);
+  }
+}
+
+function mutateRegistryUnderFence(options, mutation) {
+  const home = options.home;
+  const file = options.registryPath ?? machineRegistryPath(home);
+  const lock = options.lockPath ?? machineRegistryLockPath(home);
+  const now = options.now ?? new Date();
+  const release = acquireRegistryLock(lock, options.lockTimeoutMs);
+  try {
+    const current = loadValidatedRegistry(file);
+    const registry = promoteRegistry(current, now);
+    const output = mutation(registry, now);
+    registry.updatedAt = now.toISOString();
+    validateRegistry(registry);
+    writeMachineDocumentAtomic(file, registry);
+    const readback = readRegistry(file);
+    return { output, registry: readback };
+  } finally {
+    release();
+  }
+}
+
+// Resource persistence shares the existing lifecycle/registry lock ordering.
+export function mutateMachineResources(options, mutation) {
+  const workspace = captureWorkspace(options.workspaceRoot ?? repoRoot);
+  return withWorkspaceLifecycleLockSync({
+    home: options.home,
+    workspaceRoot: workspace.canonicalRoot,
+    workspaceId: workspace.workspaceId,
+    lifecycleLease: options.lifecycleLease,
+  }, () => {
+    const release = acquireRegistryLock(machineRegistryLockPath(options.home), options.lockTimeoutMs);
+    try {
+      const resolved = checkWorkspace({ ...options, [REGISTRY_LOCK_HELD]: true });
+      return mutation(resolved);
+    } finally {
+      release();
+    }
+  });
+}
+
+function mutateRegistry(options, mutation) {
+  const workspace = captureWorkspace(options.workspaceRoot ?? repoRoot);
+  try {
+    return withWorkspaceLifecycleLockSync(
+      {
+        home: options.home,
+        workspaceRoot: workspace.canonicalRoot,
+        workspaceId: workspace.workspaceId,
+        lifecycleLease: options.lifecycleLease,
+        lockTimeoutMs:
+          options.lifecycleLockTimeoutMs ?? options.lockTimeoutMs,
+        lifecycleFailpoint: options.lifecycleFailpoint,
+      },
+      (lifecycleLease) => {
+        const currentWorkspace = captureWorkspace(workspace.canonicalRoot);
+        return mutateRegistryUnderFence(
+          {
+            ...options,
+            workspaceRoot: currentWorkspace.canonicalRoot,
+            lifecycleLease,
+          },
+          (registry, now) => mutation(registry, now, currentWorkspace),
+        );
+      },
+    );
+  } catch (error) {
+    if (error instanceof WorkspaceLifecycleLockError) {
+      fail(error.code, error.message, error.detail);
+    }
+    throw error;
+  }
+}
+
+function mutateRegistryByWorkspaceId(options, mutation) {
+  const workspaceId = requiredText(options.workspaceId, 'workspaceId', 16);
+  if (!/^[0-9a-f]{16}$/.test(workspaceId)) {
+    fail('INVALID_ARGUMENT', 'workspaceId is invalid');
+  }
+  try {
+    return withWorkspaceLifecycleLockSync(
+      {
+        home: options.home,
+        workspaceId,
+        lifecycleLease: options.lifecycleLease,
+        lockTimeoutMs:
+          options.lifecycleLockTimeoutMs ?? options.lockTimeoutMs,
+        lifecycleFailpoint: options.lifecycleFailpoint,
+      },
+      (lifecycleLease) =>
+        mutateRegistryUnderFence(
+          { ...options, workspaceId, lifecycleLease },
+          (registry, now) => {
+            const current = registrationForWorkspace(registry, workspaceId);
+            return mutation(
+              registry,
+              now,
+              {
+                canonicalRoot: current.canonicalRoot,
+                workspaceId,
+              },
+              current,
+            );
+          },
+        ),
+    );
+  } catch (error) {
+    if (error instanceof WorkspaceLifecycleLockError) {
+      fail(error.code, error.message, error.detail);
+    }
+    throw error;
+  }
+}
+
+function assertSlotAvailable(registry, workspaceId, slot) {
+  const conflict = registry.registrations.find(
+    (entry) => entry.workspaceId !== workspaceId && entry.slot === slot,
+  );
+  if (conflict) {
+    fail('LOCAL_SLOT_CONFLICT', 'local slot is allocated to another workspace', {
+      slot,
+      workspaceId: conflict.workspaceId,
+    });
+  }
+}
+
+function firstAvailableSlot(registry) {
+  const allocated = new Set(registry.registrations.map((entry) => entry.slot));
+  for (let slot = 0; slot <= 99; slot += 1) {
+    if (!allocated.has(slot)) return slot;
+  }
+  fail('LOCAL_SLOT_UNAVAILABLE', 'no local development slot is available');
+}
+
+function defaultProfileCapabilities(definition) {
+  return definition.stationMode === 'remote'
+    && definition.stationDeployEnvironment
+    && definition.resetPolicy !== 'stable-protected'
+    ? ['station.connect', 'station.deploy']
+    : ['station.connect'];
+}
+
+function registrationForWorkspace(registry, workspaceId) {
+  const registration = registry.registrations.find(
+    (entry) => entry.workspaceId === workspaceId,
+  );
+  if (!registration) {
+    fail('WORKSPACE_UNREGISTERED', 'workspace is not registered', {
+      workspaceId,
+    });
+  }
+  return registration;
+}
+
+function leaseHelperPath() {
+  return fileURLToPath(new URL('./machine-dev-lease.py', import.meta.url));
+}
+
+function machineDevScriptPath() {
+  return fileURLToPath(new URL('./machine-dev.mjs', import.meta.url));
+}
+
+export function observeLeases(options = {}) {
+  const home = options.home;
+  const leaseRoot = options.leaseRoot ?? machineLeaseRoot(home);
+  if (!existsSync(leaseRoot)) {
+    return { activeLeases: [], staleMetadata: [] };
+  }
+  try {
+    const output = execFileSync(
+      options.python ?? 'python3',
+      [
+        leaseHelperPath(),
+        'status',
+        '--lease-root',
+        leaseRoot,
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    return JSON.parse(output);
+  } catch (error) {
+    fail('RUNTIME_IDENTITY_MISMATCH', 'cannot inspect OS-held leases', {
+      cause: error?.stderr?.toString().trim() || String(error),
+    });
+  }
+}
+
+function assertWorkspaceHasNoLease(options, workspaceId) {
+  const observation = (options.observeLeases ?? observeLeases)(options);
+  const active = observation.activeLeases.filter(
+    (lease) => lease.workspaceId === workspaceId,
+  );
+  if (active.length > 0) {
+    fail(
+      'STATION_CAPABILITY_CONFLICT',
+      'workspace binding cannot change while it holds runtime leases',
+      { activeLeases: active },
+    );
+  }
+}
+
+function assertWorkspaceHasNoRuntimeLease(options, workspace) {
+  assertWorkspaceHasNoLease(options, workspace.workspaceId);
+}
+
+export function registerWorkspace(options) {
+  const profile = requiredIdentifier(options.profile, 'profile');
+  const slot = requiredSlot(options.slot);
+  const allowedCapabilities = parseCapabilities(options.capabilities);
+  const purpose = requiredText(options.purpose, 'purpose', 1024);
+  const owner = requiredText(options.owner, 'owner', 256);
+
+  return mutateRegistry(options, (registry, now, workspace) => {
+    const definition = resolveProfileDefinition({
+      workspaceRoot: workspace.canonicalRoot,
+      envRepo: options.envRepo,
+      profile,
+    });
+    validateProfileCapabilities(definition, allowedCapabilities);
+    if (
+      registry.registrations.some(
+        (entry) => entry.workspaceId === workspace.workspaceId,
+      )
+    ) {
+      fail('WORKSPACE_ALREADY_REGISTERED', 'workspace is already registered', {
+        workspaceId: workspace.workspaceId,
+      });
+    }
+    assertSlotAvailable(registry, workspace.workspaceId, slot);
+    const timestamp = now.toISOString();
+    const registration = {
+      ...registrationIdentity(workspace),
+      profile,
+      slot,
+      allowedCapabilities,
+      purpose,
+      owner,
+      registeredAt: timestamp,
+      updatedAt: timestamp,
+      updatedBy: owner,
+    };
+    registry.registrations.push(registration);
+    registry.registrations.sort((left, right) =>
+      left.workspaceId.localeCompare(right.workspaceId),
+    );
+    return registration;
+  }).output;
+}
+
+export function selectWorkspaceProfile(options) {
+  const profile = requiredIdentifier(options.profile, 'profile');
+  const selectedBy = requiredText(options.owner, 'owner', 256);
+
+  return mutateRegistry(options, (registry, now, workspace) => {
+    const definition = resolveProfileDefinition({
+      workspaceRoot: workspace.canonicalRoot,
+      envRepo: options.envRepo,
+      profile,
+    });
+    const currentIndex = registry.registrations.findIndex(
+      (entry) => entry.workspaceId === workspace.workspaceId,
+    );
+    const current =
+      currentIndex === -1 ? null : registry.registrations[currentIndex];
+    const slot =
+      options.slot === undefined
+        ? current?.slot ?? firstAvailableSlot(registry)
+        : requiredSlot(options.slot);
+    const defaultCapabilities = defaultProfileCapabilities(definition);
+    const selectableCapabilities = new Set(defaultCapabilities);
+    if (
+      definition.stationMode === 'remote'
+      && definition.stationDeployEnvironment
+      && definition.resetPolicy !== 'stable-protected'
+    ) {
+      selectableCapabilities.add('station.reset');
+    }
+    const allowedCapabilities =
+      options.capabilities === undefined
+        ? current
+          ? parseCapabilities(
+              [...current.allowedCapabilities, ...defaultCapabilities].filter(
+                (capability) => selectableCapabilities.has(capability),
+              ),
+            )
+          : defaultCapabilities
+        : parseCapabilities(options.capabilities);
+    const purpose =
+      options.purpose === undefined
+        ? current?.purpose ?? `Interactive profile selection: ${profile}`
+        : requiredText(options.purpose, 'purpose', 1024);
+
+    validateProfileCapabilities(definition, allowedCapabilities);
+    assertSlotAvailable(registry, workspace.workspaceId, slot);
+
+    if (current) {
+      assertWorkspaceHasNoLease(options, workspace.workspaceId);
+    }
+    const timestamp = now.toISOString();
+    const registration = {
+      ...registrationIdentity(workspace),
+      profile,
+      slot,
+      allowedCapabilities,
+      purpose,
+      owner: current?.owner ?? selectedBy,
+      registeredAt: current?.registeredAt ?? timestamp,
+      updatedAt: timestamp,
+      updatedBy: selectedBy,
+    };
+    if (currentIndex === -1) {
+      registry.registrations.push(registration);
+      registry.registrations.sort((left, right) =>
+        left.workspaceId.localeCompare(right.workspaceId),
+      );
+    } else {
+      registry.registrations[currentIndex] = registration;
+    }
+    return registration;
+  }).output;
+}
+
+export function updateWorkspace(options) {
+  return mutateRegistry(options, (registry, now, workspace) => {
+    assertWorkspaceHasNoLease(options, workspace.workspaceId);
+    const current = registrationForWorkspace(registry, workspace.workspaceId);
+    if (current.canonicalRoot !== workspace.canonicalRoot) {
+      fail(
+        'WORKTREE_IDENTITY_MISMATCH',
+        'registered root does not match current canonical root',
+      );
+    }
+    const profile = options.profile
+      ? requiredIdentifier(options.profile, 'profile')
+      : current.profile;
+    const slot =
+      options.slot === undefined ? current.slot : requiredSlot(options.slot);
+    const allowedCapabilities =
+      options.capabilities === undefined
+        ? current.allowedCapabilities
+        : parseCapabilities(options.capabilities);
+    const purpose =
+      options.purpose === undefined
+        ? current.purpose
+        : requiredText(options.purpose, 'purpose', 1024);
+    const owner =
+      options.owner === undefined
+        ? current.owner
+        : requiredText(options.owner, 'owner', 256);
+    const definition = resolveProfileDefinition({
+      workspaceRoot: workspace.canonicalRoot,
+      envRepo: options.envRepo,
+      profile,
+    });
+    validateProfileCapabilities(definition, allowedCapabilities);
+    assertSlotAvailable(registry, workspace.workspaceId, slot);
+
+    const updated = {
+      ...current,
+      ...registrationIdentity(workspace),
+      profile,
+      slot,
+      allowedCapabilities,
+      purpose,
+      owner,
+      updatedAt: now.toISOString(),
+      updatedBy: owner,
+    };
+    registry.registrations[
+      registry.registrations.findIndex(
+        (entry) => entry.workspaceId === workspace.workspaceId,
+      )
+    ] = updated;
+    return updated;
+  }).output;
+}
+
+export function unregisterWorkspace(options) {
+  const owner = requiredText(options.owner, 'owner', 256);
+  return mutateRegistry(options, (registry, now, workspace) => {
+    const current = registrationForWorkspace(registry, workspace.workspaceId);
+    if (current.canonicalRoot !== workspace.canonicalRoot) {
+      fail(
+        'WORKTREE_IDENTITY_MISMATCH',
+        'registered root does not match current canonical root',
+      );
+    }
+    if (current.owner !== owner) {
+      fail('WORKSPACE_OWNER_MISMATCH', 'owner does not own workspace registration', {
+        expected: current.owner,
+        actual: owner,
+      });
+    }
+    assertWorkspaceHasNoRuntimeLease(options, workspace);
+    registry.registrations = registry.registrations.filter(
+      (entry) => entry.workspaceId !== workspace.workspaceId,
+    );
+    return {
+      workspaceId: workspace.workspaceId,
+      name: current.name,
+      unregisteredAt: now.toISOString(),
+      unregisteredBy: owner,
+    };
+  }).output;
+}
+
+export function unregisterWorkspaceByIdentity(options) {
+  const owner = requiredText(options.owner, 'owner', 256);
+  return mutateRegistryByWorkspaceId(
+    options,
+    (registry, now, workspace, current) => {
+      if (current.owner !== owner) {
+        fail(
+          'WORKSPACE_OWNER_MISMATCH',
+          'owner does not own workspace registration',
+          {
+            expected: current.owner,
+            actual: owner,
+          },
+        );
+      }
+      assertWorkspaceHasNoRuntimeLease(options, workspace);
+      registry.registrations = registry.registrations.filter(
+        (entry) => entry.workspaceId !== workspace.workspaceId,
+      );
+      return {
+        workspaceId: workspace.workspaceId,
+        name: current.name,
+        unregisteredAt: now.toISOString(),
+        unregisteredBy: owner,
+      };
+    },
+  ).output;
+}
+
+export function slotPorts(slotValue) {
+  const slot = requiredSlot(slotValue);
+  return {
+    station: 18_080 + slot * 100,
+    desktopAppGateway: 3_030 + slot * 100,
+    desktopAppWeb: 3_210 + slot * 100,
+    mobileWeb: 5_173 + slot * 100,
+  };
+}
+
+export function checkWorkspace(options = {}) {
+  const workspace = captureWorkspace(options.workspaceRoot ?? repoRoot);
+  const home = options.home;
+  const registry = readOperationalRegistry(options, {
+    registryLockHeld: options[REGISTRY_LOCK_HELD] === true,
+  });
+  const registration = registrationForWorkspace(
+    registry,
+    workspace.workspaceId,
+  );
+  if (
+    registration.canonicalRoot !== workspace.canonicalRoot ||
+    registration.branch !== workspace.branch
+  ) {
+    fail(
+      'WORKTREE_IDENTITY_MISMATCH',
+      'registered workspace identity does not match current worktree state',
+      { registered: registration, actual: workspace },
+    );
+  }
+  if (
+    options.workspaceId &&
+    options.workspaceId !== registration.workspaceId
+  ) {
+    fail('WORKTREE_IDENTITY_MISMATCH', 'workspaceId assertion failed', {
+      expected: options.workspaceId,
+      actual: registration.workspaceId,
+    });
+  }
+  if (options.profile && options.profile !== registration.profile) {
+    fail('WORKSPACE_BINDING_MISSING', 'profile assertion failed', {
+      expected: options.profile,
+      actual: registration.profile,
+    });
+  }
+  if (
+    options.slot !== undefined &&
+    requiredSlot(options.slot) !== registration.slot
+  ) {
+    fail('WORKSPACE_BINDING_MISSING', 'slot assertion failed', {
+      expected: Number(options.slot),
+      actual: registration.slot,
+    });
+  }
+  const capabilities = parseCapabilities(options.capabilities);
+  const missingCapabilities = capabilities.filter(
+    (item) => !registration.allowedCapabilities.includes(item),
+  );
+  if (missingCapabilities.length > 0) {
+    fail(
+      'WORKSPACE_CAPABILITY_MISSING',
+      'workspace binding does not allow requested Station capabilities',
+      { missingCapabilities },
+    );
+  }
+  if (options.budgetSeconds !== undefined) {
+    requiredBudget(options.budgetSeconds);
+  }
+  const definition = resolveProfileDefinition({
+    workspaceRoot: workspace.canonicalRoot,
+    envRepo: options.envRepo,
+    profile: options.targetProfile ?? registration.profile,
+  });
+  if (
+    options.targetProfile !== undefined &&
+    !registration.allowedCapabilities.includes('station.connect')
+  ) {
+    fail('WORKSPACE_CAPABILITY_MISSING', 'target Profile requires station.connect');
+  }
+  if (
+    definition.resetPolicy === 'stable-protected' &&
+    capabilities.includes('station.deploy') &&
+    definition.profile !== registration.profile
+  ) {
+    fail(
+      'WORKSPACE_CAPABILITY_MISSING',
+      'stable deployment requires an explicit binding to that Profile',
+      { profile: definition.profile, boundProfile: registration.profile },
+    );
+  }
+  validateProfileCapabilities(definition, capabilities);
+  return {
+    authority: registry.authority,
+    binding: registration,
+    source: {
+      branch: workspace.branch,
+      head: workspace.head,
+    },
+    profile: definition,
+    ports: slotPorts(registration.slot),
+    workspaceStateRoot: workspaceStatePath({
+      home,
+      repoRoot: workspace.canonicalRoot,
+    }),
+  };
+}
+
+export function prepareLease(options) {
+  const resourceKind = requiredText(
+    options.resourceKind,
+    'resourceKind',
+    64,
+  );
+  if (!LEASE_RESOURCE_KINDS.has(resourceKind)) {
+    fail('INVALID_ARGUMENT', `unsupported lease resource kind: ${resourceKind}`);
+  }
+  const resourceId = requiredIdentifier(options.resourceId, 'resourceId');
+  const budgetSeconds = requiredBudget(options.budgetSeconds);
+  const requiredCapabilities =
+    ['local.slot', 'simulator.ios'].includes(resourceKind)
+      ? []
+      : resourceKind === 'station.deploy'
+        ? ['station.connect', 'station.deploy']
+        : [resourceKind];
+  const resolved = checkWorkspace({
+    ...options,
+    capabilities: requiredCapabilities,
+    budgetSeconds,
+  });
+  if (resourceKind === 'simulator.ios') {
+    const snapshot = inspectGitWorkspace(resolved.binding.canonicalRoot, {
+      excludePaths: ['apps/mobile/src-tauri/gen/apple/assets'],
+    });
+    if (!snapshot.stable) fail('RUNTIME_IDENTITY_MISMATCH', 'workspace source changed during preparation');
+    resolved.source.workspaceDigest = snapshot.workspaceDigest;
+    if (options.expectedWorkspaceDigest && options.expectedWorkspaceDigest !== snapshot.workspaceDigest) {
+      fail('RUNTIME_IDENTITY_MISMATCH', 'workspace bytes changed after operation preparation');
+    }
+    const providerId = canonicalProviderId(resourceId);
+    if (providerId !== resourceId) {
+      fail('RESOURCE_ID_INVALID', 'physical lease UUID must be canonical');
+    }
+    const state = readResourceState(options);
+    iosRequirement(resolved.profile);
+    const instance = state.instances.find((item) => item.providerId === providerId);
+    const assignment = state.assignments.find((item) => item.profile === resolved.profile.profile);
+    if (!instance || assignment?.profileSource !== resolved.profile.profileFile ||
+        !assignment?.resources.some((item) => item.id === instance.id) ||
+        !['present', 'cleanup-failed', 'removing'].includes(instance.progress)) {
+      fail('WORKSPACE_BINDING_MISSING', 'physical device is not assigned to the operation Profile');
+    }
+  }
+  if (
+    options.expectedBranch !== undefined &&
+    requiredText(options.expectedBranch, 'expectedBranch') !==
+      resolved.source.branch
+  ) {
+    fail('RUNTIME_IDENTITY_MISMATCH', 'workspace branch changed before runtime admission', {
+      expected: options.expectedBranch,
+      actual: resolved.source.branch,
+    });
+  }
+  if (options.expectedHead !== undefined) {
+    const expectedHead = requiredText(options.expectedHead, 'expectedHead', 64);
+    if (!HEAD_PATTERN.test(expectedHead)) {
+      fail('INVALID_ARGUMENT', 'expectedHead is invalid');
+    }
+    if (expectedHead !== resolved.source.head) {
+      fail('RUNTIME_IDENTITY_MISMATCH', 'workspace HEAD changed before runtime admission', {
+        expected: expectedHead,
+        actual: resolved.source.head,
+      });
+    }
+  }
+  if (
+    resourceKind === 'local.slot' &&
+    String(resolved.binding.slot) !== resourceId
+  ) {
+    fail('WORKSPACE_BINDING_MISSING', 'local slot lease does not match binding', {
+      requested: resourceId,
+      bound: resolved.binding.slot,
+    });
+  }
+  if (
+    resourceKind === 'station.deploy' &&
+    resolved.profile.stationDeployEnvironment !== resourceId
+  ) {
+    fail('DEPLOY_TARGET_MISMATCH', 'deploy lease does not match bound profile', {
+      requested: resourceId,
+      bound: resolved.profile.stationDeployEnvironment,
+    });
+  }
+  if (
+    resourceKind === 'station.reset' &&
+    options.resetScope !== resourceId
+  ) {
+    fail(
+      'RESET_SCOPE_MISMATCH',
+      'station.reset requires an exact run-scoped resource identity',
+      { resourceId },
+    );
+  }
+  return {
+    resourceKind,
+    resourceId,
+    budgetSeconds,
+    ...(options.targetProfile === undefined
+      ? {}
+      : { targetProfile: resolved.profile.profile }),
+    workspaceId: resolved.binding.workspaceId,
+    source: resolved.source,
+    leaseFile:
+      options.leaseFile ??
+      machineLeasePath(
+        resourceKind,
+        resourceId,
+        options.home,
+      ),
+  };
+}
+
+function registrationState(registration) {
+  try {
+    const workspace = captureWorkspace(registration.canonicalRoot);
+    if (
+      workspace.workspaceId !== registration.workspaceId ||
+      workspace.branch !== registration.branch
+    ) {
+      return {
+        activity: 'stale',
+        reason: 'registered workspace identity does not match current worktree state',
+      };
+    }
+    return { activity: 'idle', reason: null };
+  } catch (error) {
+    return {
+      activity: 'stale',
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+export function validateLeaseRequest(options) {
+  const workspace = captureWorkspace(options.workspaceRoot ?? repoRoot);
+  try {
+    return withWorkspaceLifecycleLockSync(
+      {
+        home: options.home,
+        workspaceRoot: workspace.canonicalRoot,
+        workspaceId: workspace.workspaceId,
+        lifecycleLease: options.lifecycleLease,
+        lockTimeoutMs:
+          options.lifecycleLockTimeoutMs ?? options.lockTimeoutMs,
+        lifecycleFailpoint: options.lifecycleFailpoint,
+      },
+      (lifecycleLease) => {
+        const release = acquireRegistryLock(
+          options.lockPath ?? machineRegistryLockPath(options.home),
+          options.lockTimeoutMs,
+        );
+        try {
+          return prepareLease({
+            ...options,
+            workspaceRoot: workspace.canonicalRoot,
+            lifecycleLease,
+            [REGISTRY_LOCK_HELD]: true,
+          });
+        } finally {
+          release();
+        }
+      },
+    );
+  } catch (error) {
+    if (error instanceof WorkspaceLifecycleLockError) {
+      fail(error.code, error.message, error.detail);
+    }
+    throw error;
+  }
+}
+
+export function verifyHeldLease(options) {
+  const workspace = captureWorkspace(options.workspaceRoot ?? repoRoot);
+  const resourceKind = requiredText(options.resourceKind, 'resourceKind', 64);
+  const resourceId = requiredIdentifier(options.resourceId, 'resourceId');
+  const frame = JSON.parse(process.env.PT_MACHINE_LEASE_STACK_JSON ?? '[]')
+    .find((item) => item.kind === resourceKind && item.resourceId === resourceId);
+  const heldProfile = process.env.PT_MACHINE_LEASE_TARGET_PROFILE;
+  if (heldProfile && options.targetProfile && heldProfile !== options.targetProfile) {
+    fail('RUNTIME_IDENTITY_MISMATCH', 'inherited lease targets a different Profile');
+  }
+  const leaseFd = Number(
+    requiredText(
+      options.leaseFd ?? (frame ? String(frame.fd) : process.env.PT_MACHINE_LEASE_FD),
+      'PT_MACHINE_LEASE_FD',
+      16,
+    ),
+  );
+  if (!Number.isInteger(leaseFd) || leaseFd < 3) {
+    fail(
+      'RUNTIME_IDENTITY_MISMATCH',
+      'inherited lease file descriptor is invalid',
+    );
+  }
+  const leaseId = requiredText(
+    options.leaseId ?? frame?.leaseId ?? process.env.PT_MACHINE_LEASE_ID,
+    'PT_MACHINE_LEASE_ID',
+    128,
+  );
+  const leaseFile =
+    options.leaseFile ??
+    machineLeasePath(
+      resourceKind,
+      resourceId,
+      options.home,
+    );
+  try {
+    const output = execFileSync(
+      options.python ?? 'python3',
+      [
+        leaseHelperPath(),
+        'verify-held',
+        '--lease-file',
+        leaseFile,
+        '--lease-fd',
+        '3',
+        '--lease-id',
+        leaseId,
+        '--resource-kind',
+        resourceKind,
+        '--resource-id',
+        resourceId,
+        '--workspace-id',
+        workspace.workspaceId,
+      ],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe', leaseFd],
+      },
+    );
+    const held = JSON.parse(output);
+    validateLeaseRequest({
+      ...options,
+      targetProfile: heldProfile ?? options.targetProfile,
+      budgetSeconds: options.budgetSeconds ?? 1,
+      expectedBranch:
+        options.expectedBranch ??
+        process.env.PT_MACHINE_LEASE_SOURCE_BRANCH,
+      expectedHead:
+        options.expectedHead ??
+        process.env.PT_MACHINE_LEASE_SOURCE_HEAD,
+      expectedWorkspaceDigest:
+        options.expectedWorkspaceDigest ??
+        process.env.PT_MACHINE_LEASE_SOURCE_WORKSPACE_DIGEST,
+      resetScope:
+        options.resetScope ??
+        process.env.PT_MACHINE_LEASE_RESET_SCOPE,
+    });
+    return {
+      ...held,
+      validation: 'current',
+    };
+  } catch (error) {
+    if (error instanceof MachineDevError) throw error;
+    fail('RUNTIME_IDENTITY_MISMATCH', 'inherited lease is not valid', {
+      cause: String(error),
+    });
+  }
+}
+
+export function statusAll(options = {}) {
+  const home = options.home;
+  const registry = readOperationalRegistry(options, {
+    requireAuthority: false,
+  });
+  const leases = observeLeases(options);
+  const authoritative =
+    registry?.authority === MACHINE_REGISTRY_AUTHORITY;
+  const registrations = (
+    authoritative ? registry.registrations : []
+  ).map((raw) => {
+    let normalized;
+    try {
+      normalized = normalizeRegistration(raw);
+    } catch (error) {
+      return {
+        workspaceId: raw?.workspaceId ?? null,
+        activity: 'stale',
+        reason: error.message,
+      };
+    }
+    const state = registrationState(normalized);
+    if (
+      leases.activeLeases.some(
+        (lease) => lease.workspaceId === normalized.workspaceId,
+      )
+    ) {
+      state.activity = 'active';
+      state.reason = null;
+    }
+    let profileState = 'available';
+    let profileError = null;
+    let resetPolicy = null;
+    try {
+      const definition = resolveProfileDefinition({
+        workspaceRoot: normalized.canonicalRoot,
+        envRepo: options.envRepo,
+        profile: normalized.profile,
+      });
+      resetPolicy = definition.resetPolicy;
+    } catch (error) {
+      profileState = 'blocked';
+      profileError = {
+        code: error.code ?? 'PROFILE_UNAVAILABLE',
+        message: error.message,
+      };
+    }
+    return {
+      ...normalized,
+      ...state,
+      resetPolicy,
+      profileState,
+      profileError,
+    };
+  });
+  const unregisteredObservations = {
+    ...(isObject(registry?.discovery) ? registry.discovery : {}),
+  };
+  if (!authoritative && (registry?.registrations?.length ?? 0) > 0) {
+    unregisteredObservations.observedRegistrations = registry.registrations;
+  }
+  return {
+    observedAt: new Date().toISOString(),
+    authority: registry?.authority ?? 'missing',
+    registrations,
+    activeLeases: leases.activeLeases,
+    staleLeaseMetadata: leases.staleMetadata,
+    unregisteredObservations:
+      Object.keys(unregisteredObservations).length > 0
+        ? unregisteredObservations
+        : null,
+  };
+}
+
+export function buildLeaseCommand(options) {
+  const request = prepareLease(options);
+  const validationCommand = [
+    process.execPath,
+    machineDevScriptPath(),
+    'validate-lease',
+    '--workspace-root',
+    options.workspaceRoot ?? repoRoot,
+    '--resource-kind',
+    request.resourceKind,
+    '--resource-id',
+    request.resourceId,
+    '--budget-seconds',
+    String(request.budgetSeconds),
+  ];
+  if (options.envRepo) {
+    validationCommand.push('--env-repo', options.envRepo);
+  }
+  if (options.home) {
+    validationCommand.push('--home', options.home);
+  }
+  if (request.targetProfile) {
+    validationCommand.push('--target-profile', request.targetProfile);
+  }
+  if (options.resetScope) {
+    validationCommand.push(
+      '--reset-scope',
+      options.resetScope,
+    );
+  }
+  validationCommand.push(
+    '--expected-branch',
+    request.source.branch,
+    '--expected-head',
+    request.source.head,
+  );
+  if (request.source.workspaceDigest) {
+    validationCommand.push('--expected-workspace-digest', request.source.workspaceDigest);
+  }
+  const arguments_ = [
+    leaseHelperPath(),
+    'run',
+    '--lease-file',
+    request.leaseFile,
+    '--resource-kind',
+    request.resourceKind,
+    '--resource-id',
+    request.resourceId,
+    '--workspace-id',
+    request.workspaceId,
+    '--budget-seconds',
+    String(request.budgetSeconds),
+    '--expected-branch',
+    request.source.branch,
+    '--expected-head',
+    request.source.head,
+    '--validation-command-json',
+    JSON.stringify(validationCommand),
+  ];
+  if (request.targetProfile) {
+    arguments_.push('--target-profile', request.targetProfile);
+  }
+  if (request.source.workspaceDigest) {
+    arguments_.push('--expected-workspace-digest', request.source.workspaceDigest);
+  }
+  if (options.resetScope) {
+    arguments_.push(
+      '--reset-scope',
+      options.resetScope,
+    );
+  }
+  arguments_.push('--', ...options.command);
+  return {
+    executable: options.python ?? 'python3',
+    arguments: arguments_,
+    request,
+  };
+}

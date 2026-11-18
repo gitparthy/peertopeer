@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import hashlib
+import json
+import unittest
+
+from tooling.acceptance.gates.agent.foundation_candidate_producer import (
+    FoundationAdapters,
+    FoundationCandidateProducer,
+    FoundationRolePolicy,
+    FoundationTuple,
+    load_foundation_tuples,
+)
+from tooling.acceptance.gates.agent.foundation_direct_adapter import (
+    DirectRuntimeEvidenceError,
+    DirectRuntimeFoundationAdapter,
+    DirectRuntimeProbeInput,
+    REQUIRED_ASSERTIONS,
+)
+
+HASH = "a" * 64
+OBSERVED_AT = "2026-08-25T00:00:00Z"
+
+
+def runtime_tuple(
+    cell: str,
+    *,
+    row: str = "foundation-desktop-direct",
+    platform: str = "desktop_app",
+) -> FoundationTuple:
+    return FoundationTuple(
+        gate="agent-v2-kernel-foundation-e2e",
+        row=row,
+        platform=platform,
+        runtime="direct_model",
+        cell=cell,
+        locale="en",
+        ordering="single",
+        sample_id="sample-001",
+        role_policy=FoundationRolePolicy(
+            always=("cell-results", "runtime-attestation-set", "cleanup"),
+            required=(
+                "receiver-dom",
+                "station-readback",
+                "runtime-events",
+                "measurement-report",
+                "side-effect-count",
+                "replay",
+            ),
+            not_applicable=("contract-evidence", "guard-report"),
+        ),
+        runtime_attestation_profile=(
+            "station_turn"
+            if "external-runtime" in row
+            else (
+                "direct_runtime_secondary_native"
+                if platform == "secondary"
+                else "direct_runtime"
+            )
+        ),
+    )
+
+
+def capture(probe: DirectRuntimeProbeInput) -> dict[str, object]:
+    runtime_snapshot = {
+        "runtimeKind": "direct_model",
+        "providerId": "provider",
+        "modelId": "model",
+        "runtimeProfileId": "modern-chat-agent-v1",
+        "capabilities": {
+            "input": {"text": True},
+            "output": {"text": True},
+            "runtime": {"streaming": True},
+            "agentic": {"tools": True},
+            "limits": {"contextTokens": 1024},
+            "resolution": {"text": "native"},
+            "provenance": {"source": "station"},
+        },
+        "providerConfigVersion": "1",
+        "agentConfigVersion": "1",
+        "externalSessionId": "none",
+        "externalSessionEpoch": 1,
+        "thinkingMode": "auto",
+    }
+    capability_hash = hashlib.sha256(
+        json.dumps(
+            runtime_snapshot["capabilities"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    config_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "agentConfigVersion": "1",
+                "providerConfigVersion": "1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    runtime_snapshot_hash = hashlib.sha256(
+        json.dumps(
+            runtime_snapshot,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    result = {
+        "assertions": {
+            assertion: True
+            for assertion in REQUIRED_ASSERTIONS[probe.cell]
+        },
+        "runtimeAttestation": {
+            "actorIdentityHash": HASH,
+            "conversationRuntimeBinding": {
+                "runtimeKind": "direct_model",
+                "providerId": "provider",
+                "modelId": "model",
+                "runtimeProfileId": "modern-chat-agent-v1",
+                "externalSessionId": "none",
+                "externalSessionEpoch": 1,
+                "runtimeHomeRefHash": HASH,
+                "capabilitySnapshotHash": capability_hash,
+                "configSnapshotHash": config_hash,
+                "boundAt": OBSERVED_AT,
+            },
+            "runtimeSnapshot": runtime_snapshot,
+            "turnAttempt": {
+                "attemptId": "attempt",
+                "turnId": "turn",
+                "index": 1,
+                "contextLedgerId": "ledger",
+                "capabilityReadinessSnapshotId": "readiness",
+                "status": "completed",
+                "runtimeSnapshotHash": runtime_snapshot_hash,
+            },
+            "toolCallBinding": {
+                "toolCallId": "none",
+                "turnId": "turn",
+                "attemptId": "attempt",
+                "capabilityId": "foundation",
+                "capabilityVersion": "1",
+                "bindingId": "binding",
+                "bindingRevision": 1,
+                "readinessSnapshotId": "readiness",
+                "selectedDeviceId": "device",
+                "selectedLeaseId": "lease",
+                "sideEffectReceiptId": "receipt",
+            },
+            "clientSession": {
+                "capabilitySessionId": "session",
+                "actorIdHash": HASH,
+                "deviceId": "device",
+                "platform": probe.platform,
+                "capabilities": [
+                    {
+                        "capabilityId": "foundation",
+                        "schemaVersion": "1",
+                        "permission": "allowed",
+                        "constraints": {
+                            "maxRequestBytes": 1,
+                            "maxResultBytes": 1,
+                            "allowedResourceKinds": ["text"],
+                        },
+                    }
+                ],
+                "expiresAt": OBSERVED_AT,
+                "connectionId": "connection",
+                "leaseId": "lease",
+            },
+            "stationProfile": "one",
+            "desktopMode": probe.platform,
+            "networkPath": "station",
+            "machine": "test",
+            "coldWarmState": "neutral",
+            "observedAt": OBSERVED_AT,
+        },
+        "receiver-dom": {
+            "scenarioId": probe.cell,
+            "cellId": probe.cell,
+            "selector": "[data-pt-agent-composer]",
+            "locale": probe.locale,
+            "textHash": HASH,
+            "visible": True,
+        },
+        "station-readback": {
+            "entityKind": "turn",
+            "entityIdHash": HASH,
+            "revision": 1,
+            "stateHash": HASH,
+        },
+        "runtime-events": {
+            "eventId": "event",
+            "sequence": 1,
+            "eventType": "terminal",
+            "occurredAt": OBSERVED_AT,
+        },
+        "measurement-report": {
+            "metric": probe.cell,
+            "sampleIds": [probe.sample_id],
+            "threshold": "reviewed",
+            "passed": True,
+        },
+        "side-effect-count": {
+            "counterId": hashlib.sha256(probe.cell.encode()).hexdigest(),
+            "count": 0,
+            "maximum": 0,
+        },
+        "replay": {
+            "sourceHash": HASH,
+            "replayHash": HASH,
+            "equal": True,
+        },
+        "cleanup": {
+            "resourceKind": "scenario",
+            "resourceIdHash": HASH,
+            "status": "clean",
+        },
+    }
+    if probe.platform == "secondary":
+        attestation = result["runtimeAttestation"]
+        del attestation["toolCallBinding"]
+        attestation["clientSession"]["capabilities"] = []
+    if probe.cell == "BASE-RESUME-UNAVAILABLE":
+        attestation = result["runtimeAttestation"]
+        attestation.pop("clientSession", None)
+        attestation.pop("toolCallBinding", None)
+        attestation["conversationRuntimeBinding"].update(
+            {
+                "runtimeKind": "external_agent",
+                "providerId": "external-agent",
+                "modelId": "default",
+                "externalSessionId": "session-1",
+                "externalSessionEpoch": 1,
+            }
+        )
+        attestation["runtimeSnapshot"].update(
+            {
+                "runtimeKind": "external_agent",
+                "providerId": "external-agent",
+                "modelId": "default",
+                "externalSessionId": "session-1",
+                "externalSessionEpoch": 1,
+            }
+        )
+        attestation["turnAttempt"]["runtimeSnapshotHash"] = hashlib.sha256(
+            json.dumps(
+                attestation["runtimeSnapshot"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    return result
+
+
+class DirectRuntimeFoundationAdapterTest(unittest.TestCase):
+    def adapter(self, probe=capture) -> DirectRuntimeFoundationAdapter:
+        return DirectRuntimeFoundationAdapter(probe)
+
+    def test_queue_full_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-QUEUE_FULL"],
+            {
+                "queueAtCapacity",
+                "typedQueueFull",
+                "localizedRecoveryVisible",
+                "editQueueFocused",
+                "queueStateUnchanged",
+                "zeroAutomaticResend",
+                "cleanupComplete",
+            },
+        )
+
+    def test_forbidden_actor_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-FORBIDDEN_ACTOR"],
+            {
+                "typedForbiddenActorRejected",
+                "localizedRecoveryVisible",
+                "switchAccountExecuted",
+                "foreignReadRejected",
+                "ownerStatePreserved",
+                "zeroCrossMutation",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_incompatible_capability_requires_exact_assertion_contract(
+        self,
+    ) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-INCOMPATIBLE_CAPABILITY"],
+            {
+                "typedIncompatibleCapabilityRejected",
+                "localizedChooseCompatibleModelRecovery",
+                "stationReadinessReadback",
+                "zeroRejectedPathSideEffects",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_interrupted_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-INTERRUPTED"],
+            {
+                "typedInterruptionProjected",
+                "localizedRecoveryVisible",
+                "recoverExecuted",
+                "interruptedPersisted",
+                "exactlyOneAuthoritativeTerminal",
+                "zeroCompletedInference",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_invalid_reference_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-INVALID_REFERENCE"],
+            {
+                "typedInvalidReferenceRejected",
+                "localizedRemovalVisible",
+                "rejectedDraftPreserved",
+                "onlyRejectedReferenceRemoved",
+                "correctedResendCompleted",
+                "exactlyOneAuthoritativeAssistant",
+                "zeroRejectedPathSideEffects",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_invalid_resource_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-INVALID_RESOURCE_REF"],
+            {
+                "approvedThroughReceiver",
+                "typedInvalidResourceReference",
+                "boundedDetails",
+                "localizedRecoveryVisible",
+                "pickerActivated",
+                "zeroResourceRead",
+                "zeroLocalSideEffect",
+                "zeroProviderContinuation",
+                "oneTerminalResult",
+                "replayEqual",
+                "noAutomaticResend",
+                "cleanupComplete",
+            },
+        )
+
+    def test_lease_expired_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-LEASE_EXPIRED"],
+            {
+                "typedLeaseExpired",
+                "boundedDetails",
+                "localizedReconcileVisible",
+                "nonTerminalTurnPreserved",
+                "oldCommandAuditOnly",
+                "currentLeaseUnchanged",
+                "zeroExecutionAndSideEffect",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_permission_denied_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-PERMISSION_DENIED"],
+            {
+                "typedPermissionDenied",
+                "boundedDetails",
+                "deniedLeaseObserved",
+                "localizedRecoveryVisible",
+                "permissionDetailOpened",
+                "secondaryCapabilityIsolation",
+                "zeroToolCallPersistence",
+                "zeroLocalExecution",
+                "zeroProviderContinuation",
+                "replayEqual",
+                "noAutomaticResend",
+                "permissionRestored",
+                "cleanupComplete",
+            },
+        )
+
+    def test_loop_budget_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-LOOP_BUDGET_EXHAUSTED"],
+            {
+                "stationTypedPayload",
+                "typedLoopBudget",
+                "localizedInspectBudgetVisible",
+                "budgetIdentityProjected",
+                "inspectBudgetOpenedTurnDetails",
+                "terminalAtExactLimit",
+                "inspectBudgetHasNoAutomaticRetry",
+            },
+        )
+
+    def test_model_unavailable_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-MODEL_UNAVAILABLE"],
+            {
+                "typedModelUnavailable",
+                "localizedRecoveryVisible",
+                "chooseModelOpened",
+                "oneTerminalProviderAttempt",
+                "zeroSuccessfulCompletion",
+                "queueUnchanged",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_provider_timeout_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-PROVIDER_TIMEOUT"],
+            {
+                "typedProviderTimeout",
+                "localizedRetryVisible",
+                "deadlineProjected",
+                "oneTerminalProviderAttempt",
+                "upstreamTimeoutCancelled",
+                "providerDeadlinePrecedesTurnBudget",
+                "zeroSuccessfulCompletion",
+                "queueUnchanged",
+            },
+        )
+
+    def test_provider_rate_limit_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-RATE_LIMIT"],
+            {
+                "typedProviderRateLimit",
+                "localizedRetryLaterVisible",
+                "retryAfterProjected",
+                "realProvider429Observed",
+                "oneTerminalProviderAttempt",
+                "noHiddenRetry",
+                "zeroSuccessfulCompletion",
+                "queueUnchanged",
+                "replayEqual",
+                "cleanupComplete",
+            },
+        )
+
+    def test_resume_unavailable_requires_exact_assertion_contract(self) -> None:
+        self.assertEqual(
+            REQUIRED_ASSERTIONS["BASE-RESUME-UNAVAILABLE"],
+            {
+                "typedResumeUnavailable",
+                "localizedConfirmResetVisible",
+                "oldEpochPreservedBeforeConfirmation",
+                "resetAdvancedExactlyOneEpoch",
+                "resetReplayIdempotent",
+                "freshSessionCreated",
+                "stationBindingAuthoritative",
+                "zeroClientOwnedExecution",
+                "cleanupComplete",
+            },
+        )
+
+    def test_group_one_cells_are_explicitly_supported_on_both_receivers(self) -> None:
+        adapter = self.adapter()
+        producer = FoundationCandidateProducer(
+            FoundationAdapters(
+                desktop_native=adapter,
+                secondary=adapter,
+                mobile_contract=adapter,
+                d11=adapter,
+                non_advertisement=adapter,
+            )
+        )
+        for cell in REQUIRED_ASSERTIONS:
+            for row, platform, method in (
+                (
+                    "foundation-z-desktop-external-runtime"
+                    if cell == "BASE-RESUME-UNAVAILABLE"
+                    else "foundation-desktop-direct",
+                    "desktop_app",
+                    "observe_desktop_native",
+                ),
+                (
+                    "foundation-z-secondary-external-runtime"
+                    if cell == "BASE-RESUME-UNAVAILABLE"
+                    else "foundation-secondary-direct",
+                    "secondary",
+                    "observe_secondary",
+                ),
+            ):
+                item = runtime_tuple(cell, row=row, platform=platform)
+                observation = getattr(adapter, method)(item)
+                self.assertTrue(observation.observed)
+                self.assertTrue(observation.passed)
+                producer._validate_observation(item, observation)
+                self.assertEqual(
+                    set(observation.role_observations),
+                    {
+                        "cell-results",
+                        "receiver-dom",
+                        "station-readback",
+                        "runtime-events",
+                        "measurement-report",
+                        "side-effect-count",
+                        "replay",
+                        "cleanup",
+                    },
+                )
+
+    def test_required_assertion_cells_use_canonical_matrix_ids(self) -> None:
+        matrix_cells = {
+            item.cell
+            for item in load_foundation_tuples()
+            if item.row
+            in {
+                "foundation-desktop-direct",
+                "foundation-secondary-direct",
+                "foundation-z-desktop-external-runtime",
+                "foundation-z-secondary-external-runtime",
+            }
+        }
+
+        self.assertEqual(set(REQUIRED_ASSERTIONS) - matrix_cells, set())
+
+    def test_unknown_cell_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            DirectRuntimeEvidenceError,
+            "direct-runtime group is not implemented",
+        ):
+            self.adapter().observe_desktop_native(
+                runtime_tuple("AS-F99")
+            )
+
+    def test_missing_required_assertion_fails_closed(self) -> None:
+        def incomplete(probe: DirectRuntimeProbeInput) -> dict[str, object]:
+            evidence = capture(probe)
+            assertions = dict(evidence["assertions"])
+            assertions.pop(next(iter(REQUIRED_ASSERTIONS[probe.cell])))
+            evidence["assertions"] = assertions
+            return evidence
+
+        with self.assertRaisesRegex(
+            DirectRuntimeEvidenceError,
+            "incomplete oracle",
+        ):
+            self.adapter(incomplete).observe_desktop_native(
+                runtime_tuple("AS-F01")
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

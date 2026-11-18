@@ -1,0 +1,52 @@
+{
+  "id": "acceptance-framework",
+  "status": "active",
+  "product_area": "delivery-quality",
+  "owners": [
+    "tooling/acceptance/**",
+    "tooling/scripts/acceptance-*.py",
+    "tooling/scripts/execution-plan.py",
+    "tooling/scripts/quality-evidence.py",
+    "tooling/make/acceptance.mk",
+    "tooling/scripts/review/route-change.sh",
+    "docs/architecture/engineering/quality/**",
+    "docs/architecture/engineering/acceptance/**",
+    "Makefile"
+  ],
+  "truth_sources": [
+    "tooling/acceptance/capabilities/*.yaml",
+    "tooling/acceptance/domains/*.yaml",
+    "tooling/acceptance/registry.yaml",
+    "tooling/acceptance/gates.yaml",
+    "tooling/acceptance/features/*.yaml",
+    "evidence-store:acceptance-run:latest:run"
+  ],
+  "required_gates": [
+    "acceptance-plan-self",
+    "acceptance-infra-validation",
+    "acceptance-workflow-contract",
+    "acceptance-runtime-provisioning-self"
+  ],
+  "acceptance": {
+    "framework": [
+      "capability graph links product capabilities to features gates evidence and unproven scope",
+      "domain profiles select product domains used to validate acceptance effectiveness",
+      "changed paths select required gates through registry rules",
+      "the immutable workspace Plan binding schedules the current closure gates while synchronized foreign Plans are ignored",
+      "diff impact detects undeclared gates without expanding execution",
+      "full acceptance requires an explicit release or full-test request",
+      "explicit product gates can run independently from the current diff",
+      "context-enabled Gates receive non-persisted parent-owned capabilities through a bounded anonymous process channel",
+      "launch-context timeout cancellation quarantine and cleanup failures remain fail-closed and observable",
+      "reports preserve proven and unproven product scope for human review"
+    ],
+    "product_loop": [
+      "Federation gates validate real Station Dashboard and Desktop surfaces",
+      "Federation run results validate that acceptance gates are executable and useful without becoming acceptance core"
+    ]
+  },
+  "negative": [
+    "acceptance must not replace language-native unit tests",
+    "agent probes must be converted to stable gates before a feature is marked done"
+  ]
+}

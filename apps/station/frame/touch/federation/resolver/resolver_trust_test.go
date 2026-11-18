@@ -1,0 +1,425 @@
+package resolver
+
+import (
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+	"time"
+
+	authfed "github.com/peers-labs/peers-touch/station/frame/core/auth/federation"
+	nativefed "github.com/peers-labs/peers-touch/station/frame/core/plugin/native/federation"
+	locatorpb "github.com/peers-labs/peers-touch/station/frame/core/plugin/native/federation/locator/pb"
+	fedcache "github.com/peers-labs/peers-touch/station/frame/touch/federation/cache"
+	fedprofile "github.com/peers-labs/peers-touch/station/frame/touch/federation/profile"
+	profilepb "github.com/peers-labs/peers-touch/station/frame/touch/federation/profile/pb"
+	modelpb "github.com/peers-labs/peers-touch/station/frame/touch/model"
+	modeldb "github.com/peers-labs/peers-touch/station/frame/touch/model/db"
+	"google.golang.org/protobuf/proto"
+)
+
+type resolverRelayClient struct {
+	baseURL string
+	client  *http.Client
+}
+
+type membershipReaderStub struct {
+	active bool
+	err    error
+	calls  [][2]string
+}
+
+type stationURLResolverStub struct {
+	origin string
+	err    error
+	calls  []string
+}
+
+func (s *stationURLResolverStub) ResolveActiveStationURL(
+	_ context.Context,
+	stationPeerID string,
+) (string, error) {
+	s.calls = append(s.calls, stationPeerID)
+	return s.origin, s.err
+}
+
+func (s *membershipReaderStub) IsActiveMember(
+	_ context.Context,
+	federationID string,
+	stationPeerID string,
+) (bool, error) {
+	s.calls = append(s.calls, [2]string{federationID, stationPeerID})
+	return s.active, s.err
+}
+
+func (c resolverRelayClient) RelayOrigin() string {
+	return c.baseURL
+}
+
+func (c resolverRelayClient) Available() bool { return c.baseURL != "" }
+
+func (resolverRelayClient) Publish(context.Context, string, []byte) error {
+	return nil
+}
+
+func (c resolverRelayClient) RoundTrip(
+	ctx context.Context,
+	targetStationPeerID string,
+	request *http.Request,
+) (*http.Response, error) {
+	if targetStationPeerID != "station-remote" {
+		return nil, errors.New("unexpected Relay tunnel target")
+	}
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	outbound := request.Clone(ctx)
+	target := *request.URL
+	target.Scheme = base.Scheme
+	target.Host = base.Host
+	outbound.URL = &target
+	outbound.RequestURI = ""
+	return c.client.Do(outbound)
+}
+
+func TestRequireActiveMembershipFailsClosed(t *testing.T) {
+	reader := &membershipReaderStub{active: false}
+
+	err := requireActiveMembership(
+		context.Background(),
+		reader,
+		"federation-1",
+		"station-remote",
+	)
+	if !errors.Is(err, ErrStationOutsideFederation) {
+		t.Fatalf("error = %v, want ErrStationOutsideFederation", err)
+	}
+	if len(reader.calls) != 1 ||
+		reader.calls[0] != [2]string{"federation-1", "station-remote"} {
+		t.Fatalf("membership calls = %#v", reader.calls)
+	}
+}
+
+func TestRequireActiveMembershipPropagatesRepositoryFailure(t *testing.T) {
+	repositoryErr := errors.New("membership store unavailable")
+	reader := &membershipReaderStub{err: repositoryErr}
+
+	err := requireActiveMembership(
+		context.Background(),
+		reader,
+		"federation-1",
+		"station-remote",
+	)
+	if !errors.Is(err, repositoryErr) {
+		t.Fatalf("error = %v, want repository failure", err)
+	}
+}
+
+func TestResolveByHandleInFederationRequiresContextAndReader(t *testing.T) {
+	resolver := New(Config{})
+	if _, err := resolver.ResolveByHandleInFederation(
+		context.Background(),
+		"",
+		"@bob@remote.invalid",
+		&membershipReaderStub{active: true},
+		nil,
+		nil,
+	); !errors.Is(err, ErrFederationContextRequired) {
+		t.Fatalf("empty context error = %v", err)
+	}
+	if _, err := resolver.ResolveByHandleInFederation(
+		context.Background(),
+		"federation-1",
+		"@bob@remote.invalid",
+		nil,
+		nil,
+		nil,
+	); !errors.Is(err, ErrMembershipReaderMissing) {
+		t.Fatalf("missing reader error = %v", err)
+	}
+}
+
+func TestCachedProfileRetainsHomeProofAndRejectsProjectionOrKeySubstitution(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	key, err := authfed.MintLocalKey(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, _, err := fedprofile.Sign(fedprofile.SignInput{
+		Handle: "bob@remote.invalid", HomeStationPeerID: "station-remote",
+		HomeStationDomain: "remote.invalid", Now: now, LocalKey: key,
+		Profile: &modelpb.ActorProfile{PeersTouch: &modelpb.PeersTouchInfo{NetworkId: "ptid:bob"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached := &fedcache.Cached{Envelope: envelope, Actor: &modeldb.Actor{
+		PTID: "ptid:bob", CachedUntilUnixMs: envelope.ExpiresAtUnixMs,
+	}}
+	record := &locatorpb.ActorLocatorRecord{
+		HomeStationPeerId: "station-remote", HomeStationDomain: "remote.invalid",
+		SigningKeyPem: key.PubPEM,
+	}
+	original, _ := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	if err := verifyCachedProfile(cached, "bob@remote.invalid", record, now); err != nil {
+		t.Fatal(err)
+	}
+	retained, _ := proto.MarshalOptions{Deterministic: true}.Marshal(cached.Envelope)
+	if string(original) != string(retained) {
+		t.Fatal("cache verification changed Home-signed bytes")
+	}
+	for name, change := range map[string]func(*fedcache.Cached, *locatorpb.ActorLocatorRecord){
+		"unsigned-projection": func(c *fedcache.Cached, _ *locatorpb.ActorLocatorRecord) { c.Envelope.Signature = nil },
+		"changed-body": func(c *fedcache.Cached, _ *locatorpb.ActorLocatorRecord) {
+			c.Envelope.Profile.DisplayName = "substituted"
+		},
+		"changed-actor":  func(c *fedcache.Cached, _ *locatorpb.ActorLocatorRecord) { c.Actor.PTID = "ptid:other" },
+		"changed-home":   func(_ *fedcache.Cached, r *locatorpb.ActorLocatorRecord) { r.HomeStationPeerId = "station-other" },
+		"changed-expiry": func(c *fedcache.Cached, _ *locatorpb.ActorLocatorRecord) { c.Actor.CachedUntilUnixMs++ },
+		"changed-key":    func(_ *fedcache.Cached, r *locatorpb.ActorLocatorRecord) { r.SigningKeyPem = "untrusted" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			row := *cached.Actor
+			candidate := &fedcache.Cached{Actor: &row, Envelope: proto.Clone(envelope).(*profilepb.ActorProfileEnvelope)}
+			locator := proto.Clone(record).(*locatorpb.ActorLocatorRecord)
+			change(candidate, locator)
+			if verifyCachedProfile(candidate, "bob@remote.invalid", locator, now) == nil {
+				t.Fatal("invalid cached proof was accepted")
+			}
+		})
+	}
+}
+
+func TestLocatorCacheReuseRequiresSameSignedRevisionAndAuthority(t *testing.T) {
+	cached := &locatorpb.ActorLocatorRecord{
+		FederatedHandle:   "alice@example.test",
+		HomeStationPeerId: "station-a",
+		HomeStationDomain: "example.test",
+		Seq:               7,
+	}
+	if !locatorMatchesCachedProfile(proto.Clone(cached).(*locatorpb.ActorLocatorRecord), cached) {
+		t.Fatal("identical signed locator revision did not reuse cached profile")
+	}
+	for name, mutate := range map[string]func(*locatorpb.ActorLocatorRecord){
+		"revision": func(record *locatorpb.ActorLocatorRecord) {
+			record.Seq++
+		},
+		"station": func(record *locatorpb.ActorLocatorRecord) {
+			record.HomeStationPeerId = "station-b"
+		},
+		"domain": func(record *locatorpb.ActorLocatorRecord) {
+			record.HomeStationDomain = "other.test"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			current := proto.Clone(cached).(*locatorpb.ActorLocatorRecord)
+			mutate(current)
+			if locatorMatchesCachedProfile(current, cached) {
+				t.Fatalf("%s change reused cached profile", name)
+			}
+		})
+	}
+}
+
+func TestRememberRemoteStationKeyPersistsVerifiedLocatorKey(t *testing.T) {
+	key, err := authfed.MintLocalKey(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerKeys := authfed.NewInMemoryPeerKeyStore()
+	resolver := New(Config{PeerKeys: peerKeys})
+
+	if err := resolver.rememberRemoteStationKey(
+		context.Background(),
+		&locatorpb.ActorLocatorRecord{
+			HomeStationPeerId: "station:remote",
+			SigningKeyKid:     key.Kid,
+			SigningKeyPem:     key.PubPEM,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := peerKeys.Get(context.Background(), "station:remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.Kid != key.Kid || stored.PubPEM != key.PubPEM {
+		t.Fatalf("stored peer key = %+v", stored)
+	}
+}
+
+func TestRememberRemoteStationKeyPreservesTOFUMismatch(t *testing.T) {
+	first, err := authfed.MintLocalKey(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := authfed.MintLocalKey(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerKeys := authfed.NewInMemoryPeerKeyStore()
+	if err := peerKeys.UpsertTOFU(context.Background(), authfed.PeerKey{
+		StationID: "station:remote",
+		Kid:       first.Kid,
+		PubPEM:    first.PubPEM,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := New(Config{PeerKeys: peerKeys})
+
+	err = resolver.rememberRemoteStationKey(
+		context.Background(),
+		&locatorpb.ActorLocatorRecord{
+			HomeStationPeerId: "station:remote",
+			SigningKeyKid:     second.Kid,
+			SigningKeyPem:     second.PubPEM,
+		},
+	)
+	if !errors.Is(err, authfed.ErrPeerKeyMismatch) {
+		t.Fatalf("error = %v, want ErrPeerKeyMismatch", err)
+	}
+}
+
+func TestResolveRemoteUsesProtobufAndBindsProfileToLocator(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	key, err := authfed.MintLocalKey(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, body, err := fedprofile.Sign(fedprofile.SignInput{
+		Handle:            "@bob@remote.invalid",
+		HomeStationPeerID: "station-remote",
+		HomeStationDomain: "remote.invalid",
+		Profile: &modelpb.ActorProfile{
+			PeersTouch: &modelpb.PeersTouchInfo{NetworkId: "ptid:bob"},
+		},
+		DeviceSigningKeys: []*modelpb.VerifiedActorDeviceSigningKey{{
+			ActorPtid:          "ptid:bob",
+			ActorDeviceId:      "bob-device",
+			HomeStationPeerId:  "station-remote",
+			SigningKeyId:       "bob-key",
+			Ed25519PublicKey:   make([]byte, ed25519.PublicKeySize),
+			ProfileVersion:     1,
+			VerificationSource: modelpb.ActorSigningKeyVerificationSource_ACTOR_SIGNING_KEY_VERIFICATION_SOURCE_VERIFIED_PROFILE,
+		}},
+		Now:      now,
+		LocalKey: key,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Header.Get("Accept") != "application/protobuf" {
+			t.Fatalf("Accept = %q", request.Header.Get("Accept"))
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Fatalf("unexpected outer authorization in inner request")
+		}
+		writer.Header().Set("Content-Type", "application/protobuf")
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	nativefed.ClearRelayAccess()
+	nativefed.RegisterRelayAccess(resolverRelayClient{
+		baseURL: server.URL,
+		client:  server.Client(),
+	})
+	t.Cleanup(nativefed.ClearRelayAccess)
+
+	resolver := New(Config{Now: func() time.Time { return now }})
+	resolved, err := resolver.resolveRemote(
+		context.Background(),
+		"@bob@remote.invalid",
+		&locatorpb.ActorLocatorRecord{
+			FederatedHandle:   "@bob@remote.invalid",
+			HomeStationPeerId: "station-remote",
+			HomeStationDomain: "remote.invalid",
+			SigningKeyKid:     key.Kid,
+			SigningKeyPem:     key.PubPEM,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Envelope.GetProfile().GetPeersTouch().GetNetworkId() !=
+		envelope.GetProfile().GetPeersTouch().GetNetworkId() {
+		t.Fatalf("resolved envelope = %+v", resolved.Envelope)
+	}
+}
+
+func TestResolveRemoteUsesDirectStationRouteWhenRelayIsUnavailable(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	key, err := authfed.MintLocalKey(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.URL.Path != "/actor/federation/profile" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		writer.Header().Set("Content-Type", "application/protobuf")
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := "@bob@" + parsed.Host
+	envelope, encoded, err := fedprofile.Sign(fedprofile.SignInput{
+		Handle:            handle,
+		HomeStationPeerID: "station-remote",
+		HomeStationDomain: parsed.Host,
+		Profile: &modelpb.ActorProfile{
+			PeersTouch: &modelpb.PeersTouchInfo{NetworkId: "ptid:bob"},
+		},
+		Now:      now,
+		LocalKey: key,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = encoded
+	nativefed.ClearRelayAccess()
+	t.Cleanup(nativefed.ClearRelayAccess)
+	routes := &stationURLResolverStub{origin: server.URL}
+	resolver := New(Config{
+		Now:                func() time.Time { return now },
+		HTTPClient:         server.Client(),
+		StationURLResolver: routes,
+	})
+
+	resolved, err := resolver.resolveRemote(
+		context.Background(),
+		handle,
+		&locatorpb.ActorLocatorRecord{
+			FederatedHandle:   handle,
+			HomeStationPeerId: "station-remote",
+			HomeStationDomain: parsed.Host,
+			SigningKeyKid:     key.Kid,
+			SigningKeyPem:     key.PubPEM,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Envelope.GetProfile().GetPeersTouch().GetNetworkId() !=
+		envelope.GetProfile().GetPeersTouch().GetNetworkId() {
+		t.Fatalf("resolved envelope = %+v", resolved.Envelope)
+	}
+	if len(routes.calls) != 1 || routes.calls[0] != "station-remote" {
+		t.Fatalf("route calls = %v", routes.calls)
+	}
+}

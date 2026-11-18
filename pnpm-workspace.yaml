@@ -1,0 +1,22 @@
+packages:
+  - apps/official-site
+  - apps/x-config/console
+  - apps/mobile
+  - apps/desktop
+  - apps/desktop/applets-dev/*
+  - apps/applets/*/frontend
+  - apps/station/app/subserver/dashboard/web
+  - packages/model
+  - packages/schema
+  - packages/client-chat-core
+  - packages/client-media-security
+  - packages/client-storage
+  - packages/sdk/ts
+  - packages/ui/*
+  - packages/applet-sdk
+  - packages/applet-contract
+  - packages/applet-kernel
+  - packages/applets/*
+  - packages/prototypes/*
+  - packages/prototypes/*/*
+  - packages/prototypes/*/*/*

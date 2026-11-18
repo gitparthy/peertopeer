@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package peers_touch.model.bot.v1;
+
+import "domain/chat/publishing.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/app/subserver/bot/model;model";
+
+// Bot is an optional product form over the generic message-publishing grant.
+enum BotState {
+  BOT_STATE_UNSPECIFIED = 0;
+  BOT_STATE_DRAFT = 1;
+  BOT_STATE_ACTIVE = 2;
+  BOT_STATE_DISABLED = 3;
+  BOT_STATE_REVOKED = 4;
+}
+
+message Bot {
+  string bot_ptid = 1;
+  string owner_ptid = 2;
+  string name = 3;
+  BotState state = 4;
+  peers_touch.model.chat.v1.MessagePublishingGrant publishing_grant = 5;
+  // agent_binding is set only when the bot is bound to a Station Agent for
+  // automatic replies; an unbound bot only receives inbound messages.
+  BotAgentBinding agent_binding = 6;
+}
+
+// BotAgentBinding binds a bot's inbound publishing messages to a Station
+// Agent. The binding is the single switch for automatic replies; it defaults
+// to absent (no reply). Historical turns are never rewritten when it changes.
+message BotAgentBinding {
+  string bot_ptid = 1;
+  string owner_ptid = 2;
+  string agent_id = 3;
+  bool enabled = 4;
+  int64 version = 5;
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message SetBotAgentBindingRequest {
+  string bot_ptid = 1;
+  string agent_id = 2;
+  bool enabled = 3;
+  int64 expected_version = 4;
+}
+
+message SetBotAgentBindingResponse {
+  BotAgentBinding binding = 1;
+}
+
+message GetBotAgentBindingRequest {
+  string bot_ptid = 1;
+}
+
+message GetBotAgentBindingResponse {
+  // binding is empty (zero value) when the bot is not bound.
+  BotAgentBinding binding = 1;
+  bool bound = 2;
+}
+
+message ListBotAgentBindingsRequest {}
+
+message ListBotAgentBindingsResponse {
+  repeated BotAgentBinding bindings = 1;
+}
+
+message DeleteBotAgentBindingRequest {
+  string bot_ptid = 1;
+  int64 expected_version = 2;
+}
+
+message DeleteBotAgentBindingResponse {
+  bool deleted = 1;
+}
+
+message CreateBotRequest {
+  string name = 1;
+  optional string avatar = 2;
+}
+
+message CreateBotResponse {
+  Bot bot = 1;
+  string ingress_url = 2;
+  string secret = 3;
+}
+
+message RotateBotSecretRequest {
+  string bot_ptid = 1;
+}
+
+message RotateBotSecretResponse {
+  string secret = 1;
+}
+
+message SetBotStateRequest {
+  string bot_ptid = 1;
+  BotState target_state = 2;
+}
+
+message SetBotStateResponse {
+  Bot bot = 1;
+}
+
+message ListMyBotsRequest {}
+
+message ListMyBotsResponse {
+  repeated Bot bots = 1;
+}
+
+message SetBotProfileRequest {
+  string bot_ptid = 1;
+  optional string avatar = 2;
+}
+
+message SetBotProfileResponse {
+  Bot bot = 1;
+}

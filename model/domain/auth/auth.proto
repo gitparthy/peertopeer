@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package peers_touch.model.auth.v1;
+
+import "google/protobuf/timestamp.proto";
+import "domain/actor/actor.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model;model";
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+  string device_type = 3;
+}
+
+message AuthTokens {
+  string token = 1;
+  string access_token = 2;
+  string refresh_token = 3;
+  string token_type = 4;
+  string expires_at = 5;
+}
+
+message LoginResponse {
+  AuthTokens tokens = 1;
+  string session_id = 2;
+  reserved 3;
+  reserved "actor";
+  peers_touch.model.actor.v1.ActorRef actor_ref = 4 [json_name = "actor_ref"];
+}
+
+// AuthSessionCandidate is an inactive pre-session result. It carries no token
+// material and cannot authorize business APIs. Station activates it only after
+// the bound Access Gate attempt reaches GRANTED.
+message AuthSessionCandidate {
+  string candidate_id = 1;
+  peers_touch.model.actor.v1.ActorRef actor_ref = 2 [json_name = "actor_ref"];
+  string oauth_attempt_id = 3;
+  string access_attempt_id = 4;
+  string station_peer_id = 5;
+  google.protobuf.Timestamp issued_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  string device_id = 8;
+  uint64 lifecycle_generation = 9;
+  uint64 decision_revision = 10;
+}

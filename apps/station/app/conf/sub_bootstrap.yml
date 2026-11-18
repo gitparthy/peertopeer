@@ -1,0 +1,8 @@
+peers:
+  node:
+    server:
+      subserver:
+        bootstrap:
+          enabled: true
+          # The logical Station root never becomes a libp2p Host identity.
+          station-root-key-file: bootstrap.key

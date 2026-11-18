@@ -1,0 +1,373 @@
+# Desktop Runtime Projections
+
+## 1. Purpose
+
+Desktop UI state is a set of runtime projections over Station truth, local Rust state, and local UI interaction state. A projection is not allowed to stay correct only because a page mounted, a tab was clicked, or a component called a one-off refresh.
+
+This document is the Desktop platform source for how runtime components consume events, refresh derived business state, and reconcile missed updates. It also defines the **kernel contracts** (`Runtime`, `Page`, `Boot`) that all new pages and projection owners must follow.
+
+Cross-end architecture source:
+
+- `docs/architecture/platform/client/frontend-runtime/README.md` defines the cross-client frontend runtime model: scheduling lanes, page/section/applet lifecycle, hidden-tree budget, and performance evidence.
+- `docs/architecture/domains/social/runtime/README.md` defines the Desktop/Mobile shared social runtime abstraction. This Desktop document refines that abstraction inside `desktop-web` kernel/runtime contracts.
+
+Read this before changing:
+
+- `apps/desktop/src/kernel/runtime.ts`, `kernel/page.ts`, `kernel/boot.ts`, `kernel/PageHost.tsx`, `kernel/usePrefetch.ts`
+- `apps/desktop/src/runtimes/socialRuntime.ts`, `momentsRuntime.ts`, `searchRuntime.ts`, `settingsRuntime.ts`
+- `apps/desktop/src/runtimes/messagingRuntime.ts`
+- `apps/desktop/src/services/socialRealtime.ts`
+- `apps/desktop/src/services/messagingRealtime.ts`
+- `apps/desktop/src/services/appRuntime.ts`
+- `apps/desktop/src/store/socialChat.ts`
+- `apps/desktop/src/store/notification.ts`
+- `apps/desktop/src/store/navigationBadges.ts`
+- chat/contact pages and components that display social state
+
+## 2. Runtime Ownership
+
+Station owns cross-device business truth. `desktop-rust` is the local command and gateway runtime. `desktop-web` owns view rendering and local projections.
+
+Inside `desktop-web`, long-lived runtimes own projection freshness:
+
+| Runtime | Owns |
+|---|---|
+| `messaging` | Chat command lifecycle, native projection events, scoped reset, cold sync, and periodic reconciliation |
+| `messaging-recovery` | Authenticated backup status before Messaging activation, Session/Station-scoped reset, committed profile activation publication, post-restore identity refresh, and periodic reconciliation |
+| `socialRealtime` | Friendship, contact, profile, presence, and Social notification projections |
+| `momentsRuntime` | Moments HOME / Public / Circles projection bootstrap, periodic reconciliation, and actor-scoped reset; Page merges acquired HOME/Public windows into one timeline |
+| `agent-capability` | Provider, model, Agent, applet, MCP, Skill, Tool, and versioned Commands & Skills snapshot bootstrap |
+| `agent-topic` | Selected Agent topic/message bootstrap, historical Turn attribution readback, Agent-switch refresh, and periodic reconciliation |
+| `agent-tool` | Station-authored ToolCall proposal, approval-decision, and result projections; user decision-intent submission through Desktop Rust |
+| `home` | Station-authored Home projection bootstrap, actor-scoped reset, exact recent-conversation handoff, and periodic reconciliation |
+| `evaluation` | Station-authored benchmark, dataset, case, run, result, metrics, and recovery projection; actor-scoped reset, event consumption, and periodic reconciliation |
+| `x-config` | App-scoped signed snapshot cache, secure rollback watermark, bounded foreground refresh, non-authoritative Station suggestions, and non-executable release metadata |
+| `notification` store | Notification list, unread counts, notification presentation state |
+| `navigationBadges` | Cross-surface unread and badge projection |
+| Page components | Rendering, selection, local interaction state only |
+
+Capability-session warmup refreshes the lease and affected capability
+projections only. It must not reload Provider, model, Agent or applet catalogs
+each second. Model Settings uses the account default's own loading lifecycle;
+unrelated Agent loading cannot replace an established empty model view.
+
+Steady reconciliation preserves accepted UI projections, including empty
+ones. Identical Agent, model, Topic and message reads retain their array/row
+identity through TanStack Query's structural sharing. A selected Agent is
+identified by canonical ID, not by the roster array's allocation. Background
+Topic loading keeps its action strip mounted; only first loading without an
+accepted Topic projection may show preparation feedback. Topic reconciliation
+is single-flight per Agent and performs one authoritative message refresh;
+cache bootstrap belongs to cold entry. Draft reconciliation never clears local
+rejection or composer state. Selection changes refresh affected capability
+authority without reloading global directories. Periodic and event recovery
+remain active and must publish actual changes.
+
+Composer readiness feedback follows its admission projection. An Agent with
+no enabled capability bindings remains ready during capability-session warmup;
+an unrelated background request cannot replace that state with checking.
+Saving and unresolved required capabilities retain their checking feedback.
+
+Atelier is temporarily withheld pending product design. Shell navigation and
+both applet launcher sections omit it; restored/direct Atelier or orchestration
+routes return to Agent Chat. Its package, installation and user data remain
+owned by the applet runtime.
+
+Pages may trigger a first-screen fallback load, but they must not be the primary mechanism that keeps business projections fresh.
+
+## 3. Projection Rules
+
+Every business state change visible in Desktop must have two update paths:
+
+1. **Event consumption path**: the runtime consumes a typed event or notification and updates the owning store immediately.
+2. **Periodic reconciliation path**: the runtime periodically reloads or syncs the authoritative projection to cover dropped SSE events, reconnects, hidden windows, and process pauses.
+
+If a feature only refreshes on component mount, tab switch, or button click, the implementation is incomplete.
+
+## 4. Social Runtime Contract
+
+`messaging` is the only Desktop Web owner of Chat projection freshness after
+login:
+
+- own the authenticated Device Messaging Engine scope and command facade;
+- consume `messaging.profile_activated` after native recovery commits, verify
+  its Actor, Session epoch, Profile, Home Station and Endpoint against current
+  native readback, and rebuild scope through the Messaging owner;
+- keep the periodic timer installed when bootstrap lacks an Engine so a missed
+  activation wake retries native scope resolution;
+- consume native Messaging projection invalidations;
+- reconcile conversations, messages, receipts, typing, membership, settings,
+  and attachments after dropped events, reconnects, and foreground resume;
+- invalidate queued work and reset Chat projection state immediately on Session,
+  Station or Endpoint replacement; every read and command completion is fenced
+  by the current Session epoch and activation generation, including teardown;
+- keep pages and `socialRealtime` from installing Chat consumers.
+
+`socialRealtime` is responsible for keeping Social projections current after login:
+
+- own the `/events/stream` supervisor lifecycle after authentication, independent of page or presence-hook mounts;
+- bootstrap current user profile, friend requests, relationship state,
+  notification counts, and notification list;
+- consume presence, relationship, profile, and Social notification events;
+- acquire the complete original blocked-Actor list at bootstrap and periodically;
+  relationship status and blocked-list reads share Actor, Session epoch and Station reset fences.
+  Confirmed block commands update the original projection and emit `relationship.changed`;
+  periodic status readback emits the same invalidation after a dropped block event.
+  Status, command and complete blocked-list publication share the relationship Store's
+  per-target revision arbitration. Complete-list absence retains the known edge floor
+  and fences status requests begun before that list publication, including unseen
+  higher revisions. The list response revision is a page maximum, not a global
+  mutation clock. Unchanged status reconciliation must not supersede a concurrent
+  complete-list read; real membership changes and newer decisions retain that fence.
+- consume notification-derived social signals such as friend request and friend accepted notifications;
+- periodically reconcile friendship, profiles, presence, and notifications;
+- keep UI components as pure readers of the owning stores whenever possible.
+
+Chat/Messaging event consumption (messages, receipts, typing, mutations, group membership, group federation, conversation settings, cold resync) has been extracted to the `messaging` runtime (see §4.x Messaging Runtime Contract below).
+
+Thread reply identity is projected from `socialChat.threadMessages`, independently
+of the top-level timeline in `socialChat.messages`. The message summary and Thread
+panel both consume `client-chat-core.buildChatThreadSurface`; the summary retains
+the authoritative reply-count floor while exposing the loaded reply IDs in the
+same order as the panel. Opening the Thread owns its on-visit load. Rendering a
+summary must not fetch all replies or flatten them into the timeline. After
+refreshing a conversation's message projection, the store also reloads the
+currently open Thread only when its active conversation and kind still match.
+Typed invalidation and periodic reconciliation use this same refresh path;
+summary counts alone cannot keep an already open Thread payload current.
+Actor or Messaging scope reset invalidates pending message, Thread payload,
+and Thread count reads before they can repopulate the new scope. Native
+proof checks summary/panel count and ID equality after that load, including
+offline and restart recovery.
+
+Thread read cursors use the current conversation's loaded root message and
+that Thread's loaded replies. An explicit last-read message uses its committed
+authority sequence; otherwise the highest positive sequence in those projections
+is used. An empty reply list can therefore read the loaded root. Pending or
+unloaded messages cannot supply a cursor, and the store submits nothing until a
+positive sequence exists. Unrelated timeline messages do not advance the Thread
+cursor; Engine validation of positive sequences and the authority head remains
+the final command boundary.
+
+Friend request handling specifically belongs here. A notification saying "User B sent a friend request" must cause the social projection to refresh friend requests and related counters without waiting for Contacts to remount.
+
+Peer public profile is also part of this projection. The chat layer needs the rich public profile (display name, bio, avatar/header, region, tags, links, counts) of any peer it can converse with. The cache lives in `socialChat.peerProfiles` and is filled by `loadPeerProfile(did)`; UI panels (Contacts detail, Chat detail) call it lazily on view, while authoritative invalidation must come from the runtime — when an `actor.profile.updated` realtime signal lands (or, until then, on supervisor resync) `socialRealtime` must call `loadPeerProfile(did, true)` for every peer currently visible in `sessions`/`groupMembers` so the next render sees the new profile.
+
+Profile read completions are fenced by the authenticated Actor, Session epoch,
+and Social profile reset generation, including the subsequent authoritative
+Federation resolve. A failed refresh supplies no newer profile truth and retains
+the same scope's last successful profile; it clears the loading state and records
+the failure. An initial failure may retain an empty projection until the owning
+runtime retries. A successful authoritative response replaces the previous
+profile, including an explicitly removed avatar. Account/session changes and
+Social reset discard old read completions; Messaging-only reset does not own
+Social profile invalidation.
+
+## 4.1 Moments Runtime Contract
+
+`momentsRuntime` is responsible for the first runtime-owned Moments projection slice:
+
+- observe authenticated actor edges and reset actor-scoped Moments / Discovery state on identity switch;
+- bootstrap the viewer identity, original HOME/PUBLIC feed windows, circles and circle member previews;
+  the Page composes one deduplicated temporal feed plus a Circles scope;
+- traverse the original Circle and member pages completely before publishing member projections;
+  retain the last complete projection after failures, gate editing on acquisition errors,
+  and fence late reads across local Circle mutations and identity changes.
+  Member ordering is `(added_at, actor_ptid)`; the cursor binds the Circle.
+  Runtime reconciliation reloads existing memberships and resolves member profiles in bounded batches;
+- refresh detail projection when the user opens a Moment (`post + comments`);
+- acquire painted inline comment threads through `acquireMomentComments`;
+  the section binds viewport and PageHost visibility, never calls a first-read API on mount;
+  the Runtime loads the original thread once and reconciles visible public threads after missed events.
+  Closing, scrolling out, hiding the page and identity reset release interest;
+- refresh author projection when the user opens an actor page (`author feed + followers/following`);
+- refresh current-actor aggregates through the original `social_get_my_stats` owner; failed or
+  unacquired values remain unknown, and Actor reset fences late aggregate responses;
+- periodically reconcile the same projection until Station projection events and cursor sync land;
+- consume Desktop eventBus Moment events (`moment.created`, `moment.deleted`, `moment.commented`, `moment.reacted`, `moment.resync_requested`) and refresh affected projections while keeping periodic reconcile as the missed-event safety net;
+- preserve the typed reaction target through Native, EventStream and Runtime: a
+  `moment.reacted` with `commentId` refreshes its original thread; a post reaction
+  refreshes only the post summary. Private command status is keyed by
+  `(postId, commentId, kind)` in the existing private Moments Store. Private
+  Comment Store consumes the Native committed target projection; it never
+  toggles a count optimistically. Unknown outcomes expose an explicit retry
+  of the same durable command. Actor, renderer and Native-session replacement
+  fence completion and clear these projections.
+  The existing private Moments Store projects per-kind recovery eligibility,
+  exact command ID, absolute backoff deadline and live flight. Its single
+  deadline wake-up refreshes painted availability without a UI policy timer.
+  Pending unknown outcomes and retained retry failures recover the same command;
+  terminal rejection has no retry action. Exact retry callers share their flight,
+  while a direct retry cannot overlap the original submission. Ballots remain
+  separate from post-reaction presentation and admission.
+  An equivalent Native-session snapshot retains the current private Moments
+  activation identity. A newer Native generation or explicit reactivation
+  replaces it, including reactivation with the same Actor and renderer values.
+- merge private Comment content generation and reaction revision independently,
+  including replacement pages and Native snapshots; a delayed reaction updates
+  only the currently retained target and cannot recreate a deleted row or restore
+  old plaintext. Equivalent Native-session bootstrap retains activation identity;
+  reactivation with equal field values still fences old command completions.
+- keep merged Feed / Circles / Detail / User views as pure readers for first-screen data;
+- allow explicit user actions (`Load more`, sort switch, comment submit) to call store actions, because those are interaction-driven pagination/write flows rather than mount-time projection freshness.
+
+## 5. Implementation Pattern
+
+When adding or fixing a runtime-backed feature:
+
+1. Identify the domain owner and source of truth.
+2. Identify the `desktop-web` runtime/store that owns the projection.
+3. Add immediate event/notification consumption in that runtime.
+4. Add low-frequency reconciliation for missed events.
+5. Keep page/component changes limited to rendering and user actions.
+6. Verify by testing both live event delivery and reload/reconnect recovery.
+
+Do not fix stale runtime state by only adding `useEffect(...load...)` to a component. That is acceptable only as a defensive fallback after the owning runtime has a proper consumer and reconciliation path.
+
+## 6. Kernel Contracts
+
+The kernel formalizes **how** projections, pages, and the boot sequence relate. These contracts are not optional; new pages and new projection owners must conform.
+
+### 6.1 Runtime Contract
+
+`apps/desktop/src/kernel/runtime.ts`
+
+```ts
+interface RuntimeDescriptor {
+  id: string;                       // 'social' | 'search' | 'settings' | ...
+  scope: 'app' | 'session';         // app: lives for process; session: per-actor
+  install(): void;                  // register subscribers / timers (idempotent)
+  teardown(): void;                 // reverse install (idempotent)
+  bootstrap(actorId: string | null): Promise<void>;
+  reconcile?(reason: string): Promise<void>;
+  acquirePage?(pageId: string, reason: 'activate' | 'prewarm'): void | Promise<void>;
+  releasePage?(pageId: string, reason: 'explicit-close' | 'evict' | 'unmount'): void | Promise<void>;
+}
+```
+
+- A runtime is the SINGLE owner of one domain's projection store(s). No two runtimes own overlapping fields.
+- `searchInvalidations` is a declared read-only observer of the original Social
+  owners. Public/private Store subscriptions and identity-qualified Moment events only
+  invalidate Search source IDs. They must not acquire or mutate Moments Stores,
+  bootstrap Moments or reconcile its projection. The Social EventBus contract
+  checks both `subscribe` and `subscribeMany`; this observer does not create a
+  second Moments projection owner. Equivalent retained content and scope copies
+  do not invalidate Search. Comment loading, acquisition and cursor bookkeeping
+  alone do not change read authority; actual comment content, refusal state,
+  removal and identity changes still invalidate immediately.
+  Passive signed-feed acquisition also invalidates on retained Post/author/
+  Comment content, HOME/Public feed membership and integrity refusal changes.
+  A tombstone can remove a feed ID while retaining its normalized Post, so
+  membership must be observed independently. Feed loading, cursors and read
+  timestamps never supply content invalidation or a second refresh owner.
+  An invalidated Search frame remains `idle` until the Search owner reacquires
+  it, even when a pinned remote no-store source exposes no monotonic revision.
+  Only a `ready` response can present a completed empty query.
+- `install` runs once at boot. `bootstrap` runs once per `(actorId, runtime)` pair; the registry guards against duplicate concurrent bootstraps via per-runtime sequence numbers.
+- `app`-scope runtimes (social, moments) do not depend on the active actor at install time; their data either is identity-independent, is itself the source of truth for the active actor, or observes authenticated actor edges through its own bridge logic.
+- `settings` is `session`-scoped. Its L1 projections (active account, Agents) are Station-owned; its L2 personalization (language, chat shortcut, provider list filter) is read from the identity-scoped `config.preference` storage per authenticated actor and reset to identity-independent defaults on teardown. See [Client Settings Ownership](../../architecture/platform/client/settings-ownership.md).
+
+  The session owner carries the canonical Station PeerID from completed native
+  binding. Bootstrap follows the session epoch, including same-actor replacement;
+  Settings is excluded from app-scope deferred bootstrap. Every asynchronous
+  projection, error and native preference effect validates its initiating scope
+  and reset generation at commit. Local and cross-window identity transitions
+  pass the outgoing scope explicitly to the same cleanup pipeline.
+- `search` is session-scoped and boots after Messaging. Its `searchQueries` owner uses one headless TanStack Query Client/Observer for bounded result storage, subscriptions and cancellation, with native original-owner read-state checks and expiry timers. Input and displayed query/mode are separate semantic projections; only readable prior data survives a pending query. The Shell owns one on-demand overlay; no Search page is registered. Identity/session/Station scope transitions clear its projection and query partition; closing and page navigation preserve same-session query, order, selection and scroll. Interaction rules: [Desktop Search continuity](./search-experience-contract.md).
+- `session`-scope runtimes are created by registering a descriptor with `scope: 'session'`; the BootPipeline calls their `bootstrap`/`teardown` on the authenticated-actor edge.
+- `agent-chat` is an authenticated-critical session runtime. Its stream consumer and actor-bound recovery projection MUST finish install/bootstrap before Agent turn commands are exposed; otherwise early sequenced events can be observed by the transport but dropped by the recovery owner.
+- `messaging-recovery` is authenticated-critical and bootstraps before
+  `messaging`. Backup reads require the authenticated Session, not an active
+  Engine. Typed profile readiness validates Actor binding and may project a
+  null local identity. Store completions are fenced by Actor, Session epoch and
+  reset generation. The runtime resets on accepted Session or Station edges;
+  the recovery form is Actor-keyed so phrase drafts cannot survive an identity
+  switch. A successful native restore publishes its committed Actor/Profile/
+  Home Station/Endpoint binding before fetching backup status. Messaging alone
+  resolves and activates the new runtime scope. Status failure cannot suppress
+  this activation wake. It changes no authentication phase or inbox lane
+  sequence; the existing periodic owner covers a missed wake.
+- `acquirePage` / `releasePage` are optional page-resource lease hooks for dynamic runtime instances. They do not replace `install/bootstrap/reconcile`; they only let the owning runtime acquire or release page-scoped resources when PageHost proves a page needs them.
+- Ordinary page switches do not trigger `releasePage`. `keepAlive:{lru}` means the page is hidden but cached; resources are released only for explicit close, LRU eviction, or true unmount.
+- Runtime entries live in `apps/desktop/src/runtimes/*Runtime.ts` and are registered through `services/appRuntime.ts → registerKernelRuntimes`.
+
+### 6.2 Page Contract
+
+`apps/desktop/src/kernel/page.ts`
+
+```ts
+interface PageDescriptor {
+  id: string;
+  factory: () => ReactElement;       // pure renderer
+  preload: 'eager' | 'idle' | 'on-visit';
+  keepAlive: 'forever' | { lru: number } | 'none';
+  runtimes: ReadonlyArray<string>;   // ids of RuntimeDescriptors this page reads
+}
+```
+
+- A page is a **pure renderer** over its runtimes' stores. Pages MUST NOT trigger first-load API calls in mount-time effects. Mount-time `useEffect` is reserved for view-bound side-effects (focus restore, transient subscriptions, P2P transport status).
+- `preload: 'eager'` mounts on first render (use for the landing page only).
+- `preload: 'idle'` mounts during `requestIdleCallback` after first paint; this is the right default for any heavy keep-alive page.
+- `keepAlive: 'forever'` keeps the DOM alive across tab switches (visibility flipped via `display: contents | none`); destroying complex trees on every navigation is the primary cause of perceived lag and is forbidden for high-frequency surfaces.
+- Pages declare `runtimes: ['social', ...]` so the kernel can guarantee install + bootstrap before the page becomes visible (current implementation defers to `appRuntime` install order; declarative gating is the future contract).
+- Page descriptors live next to their page modules: `apps/desktop/src/pages/<Name>.descriptor.tsx`. They are registered via `pages/registry.ts → registerKernelPages` (idempotent, called once from `<ReadyView />`).
+
+### 6.3 Boot Pipeline
+
+`apps/desktop/src/kernel/boot.ts`
+
+| Phase | Trigger | Owner |
+|---|---|---|
+| `shell` | `main.tsx → bootstrap()` start | `main.tsx` |
+| `identity` | account picker / OAuth / restore | `useAppLifecycle` |
+| `runtime:critical` | authenticated actor accepted | `useAppRuntime` (`installAuthenticatedCriticalRuntimes`) |
+| `firstPaint` | critical runtime bootstrap completes | `App.tsx` / `ReadyView` |
+| `runtime:idle` | install non-critical session-scope runtimes | `App.tsx` (`scheduleIdle → installIdleRuntimes`) |
+| `pages:prewarm` | mount `preload: 'idle'` pages off-frame | `PageHost` |
+| `steady` | runtimes own their own reconcile timers | each runtime |
+
+Each phase is observable via `kernel/boot.ts → markPhaseStart/End` (logged through the unified `log.info('boot', ...)` channel) so cold-start cost is measurable in dev console.
+
+The five-second bootstrap boundary marks a runtime as degraded and releases
+first-paint ownership; it does not authorize the idle pipeline to enqueue the
+next native bootstrap while the same underlying operation is still in flight.
+Idle session bootstraps remain actor-scoped, single-flight, and serial until the
+bounded transport operation settles. Acceptance may observe this readiness
+barrier, but must not install or bootstrap runtimes itself.
+
+PageHost also owns page-resource lease dispatch:
+
+- `activate`: active registered page needs runtime resources.
+- `prewarm`: idle-prewarmed page needs runtime resources.
+- `explicit-close`: page requested resource release without waiting for LRU eviction.
+- `evict`: `keepAlive:{lru}` dropped a cached dynamic page.
+- `unmount`: `keepAlive:'none'` page left active state and unmounted.
+
+### 6.4 Page-local Prefetch
+
+`apps/desktop/src/kernel/usePrefetch.ts`
+
+`usePrefetch(key, loader)` is for one-shot, page-local data that is too heavy to bootstrap eagerly but still benefits from being warm by first click (Statistics, Tools, Search Providers, Help). Use cases:
+
+- The data is read by a single section, never by a runtime consumer.
+- The loader is idempotent and the cache value is small.
+- The data does not require runtime-driven invalidation (otherwise: own it in a Runtime).
+
+Prefetch is **not** a substitute for a runtime — runtimes own *long-lived* projections; prefetch caches *one-shot* fetches.
+
+## 7. Migration Status
+
+| Page | PageDescriptor | Runtimes | Status |
+|---|---|---|---|
+| Search overlay | `components/search/SearchHost.tsx` (Shell overlay slot) | `search` (session) | on-demand; no route |
+| `chat` | `pages/SocialChatPage.descriptor.tsx` | `messaging`, `social` | migrated |
+| `settings` | `pages/SettingsPage.descriptor.tsx` | `settings` | migrated; AI owns Discover and Memory as lazy sections |
+| `applets` | `pages/AppletsPage.descriptor.tsx` | `applets` | migrated internal launcher; no primary-nav entry |
+| `applet:*` | `pages/AppletRuntimePage.descriptor.tsx` | `applets` | migrated dynamic route; `appletsRuntime` owns `acquirePage/releasePage` session lease |
+| `moments` | `pages/moments/MomentsApp.descriptor.tsx` | `moments`, `social`, `messaging` | migrated |
+| `agent` | `pages/AgentChatPage.descriptor.tsx` | `agent-capability`, `agent-topic`, `agent-tool`, `social` | migrated (`preload: idle`, `keepAlive: forever`); page is a pure `AgentWorkbench` renderer |
+| `home` | `pages/HomePage.descriptor.tsx` | `home` | migrated (`preload: eager`, `keepAlive: forever`); page renders the Station Home projection |
+| `evaluation` | `pages/EvaluationPage.descriptor.tsx` | `evaluation`, `agent-capability` | migrated internal/Acceptance surface (`preload: on-visit`, `keepAlive: lru(1)`); no user navigation entry |
+| `agent-profile`, `agent-orchestration` | — | — | legacy `PageRouter` fallback; orchestration is an internal Atelier-owned mode with no standalone navigation entry |
+
+New pages that fit the contract should ship as descriptors from day one. Adding a page to the legacy `PageRouter` requires an explicit reason in the PR description.

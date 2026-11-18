@@ -1,0 +1,181 @@
+name: Review Framework
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  integration-policy-state:
+    runs-on: ubuntu-latest
+    outputs:
+      installed: ${{ steps.policy.outputs.installed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve accepted base policy
+        id: policy
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          policy_path=tooling/scripts/review/integration_review.py
+          if git cat-file -e "$BASE_SHA:$policy_path" 2>/dev/null; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$(git log --format=%H "$BASE_SHA" -- "$policy_path")" ]]; then
+            echo "Accepted integration policy was removed; installation fallback is forbidden." >&2
+            exit 1
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+  integration-verification:
+    needs: integration-policy-state
+    name: ${{ needs.integration-policy-state.outputs.installed == 'true' && 'integration-admission' || 'integration-installation-review' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        if: needs.integration-policy-state.outputs.installed == 'true'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: integration-policy
+          fetch-depth: 1
+      - name: Verify final merge source and external original evidence
+        if: needs.integration-policy-state.outputs.installed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mv integration-policy "$RUNNER_TEMP/integration-policy"
+          mkdir "$RUNNER_TEMP/integration-evidence"
+          python3 "$RUNNER_TEMP/integration-policy/tooling/scripts/review/integration_evidence.py" \
+            download --repository "$GH_REPO" --head "$HEAD_SHA" --base "$BASE_SHA" \
+            --output "$RUNNER_TEMP/integration-evidence"
+          python3 "$RUNNER_TEMP/integration-policy/tooling/scripts/review/integration_review.py" verify \
+            --repo-root "$GITHUB_WORKSPACE" --ours "$HEAD_SHA" --theirs "$BASE_SHA" \
+            --candidate auto --plan "$RUNNER_TEMP/integration-evidence/plan.json" \
+            --results "$RUNNER_TEMP/integration-evidence/results.json" \
+            --review "$RUNNER_TEMP/integration-evidence/review.json"
+      - name: Verify first installation regressions
+        if: needs.integration-policy-state.outputs.installed == 'false'
+        run: |
+          python3 tooling/scripts/review/integration_review_test.py
+          {
+            echo "## Integration policy installation"
+            echo "The accepted base has never contained the integration verifier."
+            echo "This check proves installation regressions, not integration admission."
+            echo "Independent installation review remains required before the owner lands."
+          } >> "$GITHUB_STEP_SUMMARY"
+  review-framework:
+    runs-on: ubuntu-latest
+    env:
+      REVIEW_RANGE: ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.12.0'
+
+      - name: Configure Acceptance artifact root
+        run: |
+          echo "PT_ACCEPTANCE_ARTIFACT_ROOT=$RUNNER_TEMP/peers-touch-acceptance" >> "$GITHUB_ENV"
+
+      - name: Resolve explicit execution plans
+        run: |
+          python3 tooling/scripts/review/pr-plan-input.py \
+            --event "$GITHUB_EVENT_PATH" \
+            > "$RUNNER_TEMP/execution-plans.txt"
+
+      - name: Install review framework dependencies
+        run: python3 -m pip install -r tooling/acceptance/requirements.txt
+
+      - name: Install plan validation fixture
+        run: |
+          # planctl.mjs -> module-governance.mjs imports the yaml package.
+          # Keep this version in sync with the yaml devDependency in
+          # package.json and pnpm-lock.yaml. --no-save/--no-package-lock
+          # provisions node_modules only; the manifest and lockfile stay
+          # unchanged because yaml is already a repo devDependency.
+          npm install --no-save --no-package-lock yaml@2.9.1
+
+      - name: Validate explicit execution plans
+        run: |
+          while IFS= read -r plan; do
+            node tooling/scripts/plan/planctl.mjs validate \
+              --repo-root "$GITHUB_WORKSPACE" \
+              --plan "$plan"
+          done < "$RUNNER_TEMP/execution-plans.txt"
+
+      - name: Validate Acceptance workflow contracts
+        run: |
+          python3 tooling/scripts/review/integration_review_test.py
+          python3 tooling/scripts/review/pr-plan-input-test.py
+          python3 -m unittest tooling.acceptance.tests.test_execution_plan
+          python3 tooling/scripts/acceptance-plan-test.py
+          python3 tooling/scripts/acceptance-run-test.py
+
+      - name: Install shell-quote audit fixture
+        run: |
+          # Keep this version in sync with the shell-quote entry in pnpm-lock.yaml.
+          # --no-save/--no-package-lock provision node_modules only; the manifest
+          # and lockfile stay unchanged because shell-quote is a transitive dep.
+          npm install --no-save --no-package-lock shell-quote@1.10.0
+
+      - name: Install dead-code advisory fixture
+        run: |
+          # Keep this version in sync with the knip devDependency in package.json
+          # and pnpm-lock.yaml. --no-save/--no-package-lock provisions node_modules
+          # only; the advisory is non-blocking and SKIPs when knip cannot resolve.
+          npm install --no-save --no-package-lock knip@5.43.6
+
+      - name: Run review framework gates
+        run: |
+          tooling/scripts/review/run.sh --range "$REVIEW_RANGE" --strict-knowledge
+
+      - name: Generate quality evidence
+        if: always()
+        run: |
+          python3 tooling/scripts/quality-evidence.py --range "$REVIEW_RANGE"
+
+      - name: Write review summary
+        if: always()
+        run: |
+          {
+            echo "## Review Framework"
+            tooling/scripts/review/route-change.sh --range "$REVIEW_RANGE" --format github || true
+            echo
+            tooling/scripts/review/knowledge-match.sh --range "$REVIEW_RANGE" || true
+            echo
+            if python3 tooling/scripts/acceptance-artifact.py cat \
+              --gate quality-evidence --role quality-markdown; then
+              true
+            else
+              echo "Quality evidence report was not generated."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload quality evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-evidence
+          path: ${{ runner.temp }}/peers-touch-acceptance
+          if-no-files-found: warn
+          retention-days: 14

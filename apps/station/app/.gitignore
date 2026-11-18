@@ -1,0 +1,27 @@
+# Peers-touch Station App .gitignore
+
+# Database and key files
+peers.db
+libp2pIdentity.key
+private.pem
+public.pem
+*.local.yml
+
+# Configuration files
+backend/gen/tool/config.yml
+
+# Generated files
+gen/
+
+# Photos directory
+photos-directory
+
+# Key files
+*.key
+
+# Go build artifacts
+main
+*.exe
+*.dll
+*.so
+*.dylib

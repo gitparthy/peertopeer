@@ -1,0 +1,310 @@
+syntax = "proto3";
+
+package peers_touch.model.actor.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model;model";
+
+enum ActorKind {
+  ACTOR_KIND_UNSPECIFIED = 0;
+  ACTOR_KIND_PERSON = 1;
+  ACTOR_KIND_GROUP = 2;
+  ACTOR_KIND_ORGANIZATION = 3;
+  ACTOR_KIND_SERVICE = 4;
+  ACTOR_KIND_APPLICATION = 5;
+  ACTOR_KIND_NODE = 6;
+  // IM bot: a conversable non-human actor backed by a message-publishing grant.
+  // Distinct from APPLICATION/SERVICE: an AGENT owns an ordinary conversation
+  // graph edge with its owner but is never E2EE (service-plaintext delivery).
+  ACTOR_KIND_AGENT = 7;
+}
+
+// ActorOrigin tells the consumer whether this actor row was authored on the
+// local station (local) or fetched from a peer station and cached locally
+// (remote_cached). Touch UIs use it to gate edit affordances; the locator
+// publisher uses it to refuse publishing remote-cached rows back into the DHT.
+enum ActorOrigin {
+  ACTOR_ORIGIN_UNSPECIFIED = 0;
+  ACTOR_ORIGIN_LOCAL = 1;
+  ACTOR_ORIGIN_REMOTE_CACHED = 2;
+}
+
+// ActorVisibility is the federation-discoverability state of an actor.
+//
+// ACTOR_VISIBILITY_HIDDEN     — never published to DHT, never resolvable
+//                               by handle from other stations.
+// ACTOR_VISIBILITY_BY_HANDLE  — published to the DHT under its federated
+//                               handle. Other stations can resolve it iff
+//                               they know the exact handle (no enumeration).
+// ACTOR_VISIBILITY_INDEXED    — same as BY_HANDLE plus opt-in to a future
+//                               directory-style index. Treated identically
+//                               to BY_HANDLE by the DHT publisher today;
+//                               the directory layer is Phase C.
+//
+// The ordering matters: hidden < by_handle < indexed. Numeric increases
+// monotonically widen visibility; the publisher uses this to decide whether
+// to publish or tombstone.
+enum ActorVisibility {
+  ACTOR_VISIBILITY_UNSPECIFIED = 0;
+  ACTOR_VISIBILITY_HIDDEN = 1;
+  ACTOR_VISIBILITY_BY_HANDLE = 2;
+  ACTOR_VISIBILITY_INDEXED = 3;
+}
+
+message ActorRef {
+  reserved 1;
+  reserved "actor_id";
+  string ptid = 2;
+  string acct = 3;
+  ActorKind kind = 4;
+}
+
+enum ActorDeviceStatus {
+  ACTOR_DEVICE_STATUS_UNSPECIFIED = 0;
+  ACTOR_DEVICE_STATUS_ENROLLING = 1;
+  ACTOR_DEVICE_STATUS_ACTIVE = 2;
+  ACTOR_DEVICE_STATUS_REVOKE_PENDING = 3;
+  ACTOR_DEVICE_STATUS_REVOKED = 4;
+}
+
+message ActorDeviceRef {
+  ActorRef actor = 1;
+  string device_id = 2;
+}
+
+// Deterministic actor-signed authorization for one fresh device.
+message ActorDeviceCertificate {
+  uint32 format_version = 1;
+  ActorDeviceRef device = 2;
+  bytes actor_identity_public_key = 3;
+  bytes actor_identity_key_fingerprint = 4;
+  bytes device_signing_public_key = 5;
+  string signing_key_id = 6;
+  uint64 observed_profile_version = 7;
+}
+
+message ActorDevice {
+  ActorDeviceRef ref = 1;
+  ActorDeviceStatus status = 2;
+  string label = 3;
+  bytes actor_identity_key_fingerprint = 4;
+  string signing_key_id = 5;
+  bytes device_signing_public_key = 6;
+  uint64 profile_version = 7;
+  int64 activation_sequence = 8;
+  google.protobuf.Timestamp enrolled_at = 9;
+  google.protobuf.Timestamp revoked_at = 10;
+}
+
+message EnrollActorDeviceRequest {
+  ActorDeviceCertificate certificate = 1;
+  string label = 2;
+  bytes actor_cross_signature = 3;
+}
+
+message EnrollActorDeviceResponse {
+  ActorDevice device = 1;
+}
+
+message ListActorDevicesRequest {}
+
+message ListActorDevicesResponse {
+  repeated ActorDevice devices = 1;
+}
+
+message RevokeActorDeviceRequest {
+  string device_id = 1;
+  uint64 observed_profile_version = 2;
+}
+
+message RevokeActorDeviceResponse {
+  ActorDevice device = 1;
+}
+
+message ActorEndpointManifestEntry {
+  ActorDeviceRef endpoint = 1;
+  string signing_key_id = 2;
+  repeated bytes public_material_sha256 = 3;
+}
+
+message ActorEndpointManifestSigningInput {
+  uint32 format_version = 1;
+  string manifest_id = 2;
+  ActorRef actor = 3;
+  string home_station_peer_id = 4;
+  uint64 directory_version = 5;
+  repeated ActorEndpointManifestEntry active_endpoints = 6;
+  google.protobuf.Timestamp issued_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  string signing_key_id = 9;
+  bytes actor_identity_public_key = 10;
+  uint64 actor_profile_version = 11;
+}
+
+message ActorEndpointManifest {
+  uint32 format_version = 1;
+  string manifest_id = 2;
+  ActorRef actor = 3;
+  string home_station_peer_id = 4;
+  uint64 directory_version = 5;
+  repeated ActorEndpointManifestEntry active_endpoints = 6;
+  google.protobuf.Timestamp issued_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  string signing_key_id = 9;
+  bytes station_signature = 10;
+  bytes actor_identity_public_key = 11;
+  uint64 actor_profile_version = 12;
+}
+
+message GetActorEndpointManifestRequest {
+  ActorRef actor = 1;
+}
+
+message GetActorEndpointManifestResponse {
+  ActorEndpointManifest manifest = 1;
+}
+
+message Actor {
+  reserved 1;
+  reserved "id";
+  string username = 2;
+  string display_name = 3;
+  string email = 4;
+  string inbox = 5;
+  string outbox = 6;
+  map<string, string> endpoints = 7;
+  bool is_following = 8 [json_name = "is_following"];
+  reserved 9;
+  reserved "actor_id";
+  string avatar = 10;
+  ActorKind kind = 11;
+
+  // Federation extension fields. Populated for every actor row regardless of
+  // origin. For ACTOR_ORIGIN_LOCAL the home_station_* fields describe the
+  // current station; for ACTOR_ORIGIN_REMOTE_CACHED they describe the
+  // authoritative station that issued the locator record.
+  string federated_handle = 12 [json_name = "federated_handle"];          // e.g. "@alice@station-1.example"
+  string home_station_peer_id = 13 [json_name = "home_station_peer_id"]; // libp2p PeerID of the home station
+  string home_station_domain = 14 [json_name = "home_station_domain"];   // DNS-style domain of the home station
+  ActorVisibility visibility = 15;
+  ActorOrigin origin = 16;
+
+  // Ed25519 public key for actor-initiated governance signing.
+  // Generated at account creation; used to verify actor_signature on ledger events.
+  bytes signing_public_key = 17 [json_name = "signing_public_key"];
+  ActorRef ref = 18;
+}
+
+// Identity-owned device signing-key projection used to verify actor-signed
+// federated commands. Consumers must not accept a key supplied by the command
+// being verified.
+message VerifiedActorDeviceSigningKey {
+  string actor_ptid = 1;
+  string actor_device_id = 2;
+  string home_station_peer_id = 3;
+  string signing_key_id = 4;
+  bytes ed25519_public_key = 5;
+  int64 profile_version = 6;
+  ActorSigningKeyVerificationSource verification_source = 7;
+  int64 valid_from_unix_ms = 8;
+  int64 revoked_at_unix_ms = 9;
+}
+
+enum ActorSigningKeyVerificationSource {
+  ACTOR_SIGNING_KEY_VERIFICATION_SOURCE_UNSPECIFIED = 0;
+  ACTOR_SIGNING_KEY_VERIFICATION_SOURCE_LOCAL_DEVICE_REGISTRATION = 1;
+  ACTOR_SIGNING_KEY_VERIFICATION_SOURCE_VERIFIED_PROFILE = 2;
+  ACTOR_SIGNING_KEY_VERIFICATION_SOURCE_VERIFIED_LOCATOR = 3;
+}
+
+message UserLink {
+  string label = 1;
+  string url = 2;
+}
+
+message PeersTouchInfo {
+  string network_id = 1 [json_name = "network_id"];
+}
+
+message ActorProfile {
+  string id = 1;
+  string display_name = 2 [json_name = "display_name"];
+  string username = 3;
+  string note = 4;
+  string avatar = 5;
+  string header = 6;
+  string region = 7;
+  string timezone = 8;
+  repeated string tags = 9;
+  repeated UserLink links = 10;
+  string url = 11;
+  string server_domain = 12 [json_name = "server_domain"];
+  string key_fingerprint = 13 [json_name = "key_fingerprint"];
+  repeated string verifications = 14;
+  PeersTouchInfo peers_touch = 15 [json_name = "peers_touch"];
+  string acct = 16;
+  bool locked = 17;
+  string created_at = 18 [json_name = "created_at"];
+  int64 followers_count = 19 [json_name = "followers_count"];
+  int64 following_count = 20 [json_name = "following_count"];
+  int64 statuses_count = 21 [json_name = "statuses_count"];
+  bool show_counts = 22 [json_name = "show_counts"];
+  repeated string moments = 23;
+  string default_visibility = 24 [json_name = "default_visibility"];
+  bool manually_approves_followers = 25 [json_name = "manually_approves_followers"];
+  string message_permission = 26 [json_name = "message_permission"];
+  int32 auto_expire_days = 27 [json_name = "auto_expire_days"];
+  ActorRef ref = 28 [json_name = "ref"];
+  uint64 profile_revision = 29 [json_name = "profile_revision"];
+  string federated_handle = 30 [json_name = "federated_handle"];
+  string home_station_peer_id = 31 [json_name = "home_station_peer_id"];
+  string home_station_domain = 32 [json_name = "home_station_domain"];
+  ActorVisibility discoverability = 33;
+  // Intrinsic actor type (person, agent/bot, ...). Clients use it to adapt UX
+  // for non-human peers, e.g. rendering a bot direct conversation as one-way,
+  // non-E2EE. Mirrors ActorRef.kind as a first-class profile attribute.
+  ActorKind kind = 34;
+}
+
+message UpdateProfileRequest {
+  optional string display_name = 1 [json_name = "display_name"];
+  optional string note = 2;
+  optional string avatar = 3;
+  optional string header = 4;
+  optional string region = 5;
+  optional string timezone = 6;
+  repeated string tags = 7;
+  repeated UserLink links = 8;
+  optional string default_visibility = 9 [json_name = "default_visibility"];
+  optional bool manually_approves_followers = 10 [json_name = "manually_approves_followers"];
+  optional string message_permission = 11 [json_name = "message_permission"];
+  optional int32 auto_expire_days = 12 [json_name = "auto_expire_days"];
+  uint64 observed_revision = 13 [json_name = "observed_revision"];
+  optional ActorVisibility discoverability = 14;
+}
+
+enum ProfileUpdateOutcome {
+  PROFILE_UPDATE_OUTCOME_UNSPECIFIED = 0;
+  PROFILE_UPDATE_OUTCOME_APPLIED = 1;
+  PROFILE_UPDATE_OUTCOME_UNCHANGED = 2;
+  PROFILE_UPDATE_OUTCOME_CONFLICT = 3;
+}
+
+message UpdateProfileResponse {
+  ProfileUpdateOutcome outcome = 1;
+  ActorProfile profile = 2;
+}
+
+message ActorList {
+  repeated Actor items = 1;
+  int64 total = 2;
+}
+
+// SearchUsersRequest carries query parameters for the user search endpoint.
+message SearchUsersRequest {
+  string q = 1;
+}
+
+// GetMeRequest is intentionally empty; the current user is identified via JWT auth context.
+message GetMeRequest {}

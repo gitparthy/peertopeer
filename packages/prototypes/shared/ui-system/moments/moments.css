@@ -1,0 +1,28 @@
+/* Prototype region layout only. Shared Moments controls own their material,
+   geometry and motion in packages/ui/web/src/moments.css. */
+.sk-moments {
+  flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  container-type: inline-size; container-name: moments;
+}
+.sk-moments-scroll {
+  flex: 1; min-width: 0; min-height: 0; overflow-x: hidden; overflow-y: auto;
+  padding: 6px 14px 24px; display: flex; flex-direction: column; gap: 14px;
+}
+.sk-feed-end { text-align: center; font-size: 11.5px; color: var(--sk-text-3); padding: 6px 0 2px; }
+.sk-loadmore { margin: 2px 0; }
+.sk-profile-view { display: flex; flex-direction: column; gap: 14px; }
+.sk-detail-back { align-self: flex-start; }
+.sk-profile-blocked-note {
+  margin: 0; padding: 10px 14px; border-radius: 12px; font-size: 12.5px;
+  color: var(--sk-danger);
+  background: color-mix(in srgb, var(--sk-danger) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--sk-danger) 25%, transparent);
+}
+.sk-profile-posts { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+.sk-circles {
+  flex: 1; min-height: 0; overflow: auto;
+  padding: 6px 14px 24px; display: flex; flex-direction: column; gap: 12px;
+}
+@media (max-width: 760px) {
+  .sk-moments-scroll, .sk-circles { padding: 4px 12px 20px; }
+}

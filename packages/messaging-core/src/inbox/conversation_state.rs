@@ -1,0 +1,302 @@
+use crate::codec::verification::verify_device_event_delivery;
+use crate::contracts::{
+    ConversationAuthorityMemberProjection, ConversationProjection, ConversationStateReceiveCommit,
+    CryptoEndpoint, ReceiveCommitResult,
+};
+use crate::proto::chat::{
+    conversation_event, ConversationKind, ConversationScopeKind, ConversationStateMarker,
+    DeviceConsumptionReceipt, DurableDeviceInboxItem, MemberRole,
+    PreparedEndpointPayloadKind,
+};
+use crate::store::MessagingRepository;
+
+use super::{ClaimedItemConsumer, ConsumeError, ItemRejectionCode};
+use prost::Message;
+use std::sync::Arc;
+
+/// Validate the Local/Federation scope carried by a ConversationCreated fact
+/// and return its authority post-state.
+///
+/// Local Direct scope intentionally carries an empty federation id because the
+/// scope is derived from the two participating Home Stations. Federation scope
+/// and every Group conversation still require a non-empty Federation id.
+fn validate_conversation_created_scope(
+    created: &crate::proto::chat::ConversationCreatedFact,
+) -> Result<&crate::proto::chat::ConversationAuthoritySnapshot, String> {
+    let post_state = created
+        .post_state
+        .as_ref()
+        .ok_or_else(|| "messaging conversation-state post-state is missing".to_string())?;
+    let scope = ConversationScopeKind::try_from(post_state.scope_kind).map_err(|_| {
+        "messaging conversation-state scope kind is invalid".to_string()
+    })?;
+    let federation_id = post_state.federation_id.trim();
+    let is_group = created.kind == ConversationKind::Group as i32;
+    if scope == ConversationScopeKind::Federation && federation_id.is_empty() {
+        return Err(
+            "messaging conversation-state Federation scope requires a federation id".to_string(),
+        );
+    }
+    if is_group && federation_id.is_empty() {
+        return Err("messaging group conversation-state requires a federation id".to_string());
+    }
+    Ok(post_state)
+}
+
+pub struct ConversationStateProcessor<R> {
+    store: Arc<R>,
+    endpoint: CryptoEndpoint,
+    clock: fn() -> i64,
+}
+impl<R: MessagingRepository> ConversationStateProcessor<R> {
+    pub fn new(
+        store: Arc<R>,
+        endpoint: CryptoEndpoint,
+        clock: fn() -> i64,
+    ) -> Result<Self, String> {
+        if endpoint.ptid.trim().is_empty() || endpoint.device_id.trim().is_empty() {
+            return Err("messaging conversation-state processor requires endpoint".to_string());
+        }
+        Ok(Self {
+            store,
+            endpoint,
+            clock,
+        })
+    }
+
+    fn process(&self, item: &DurableDeviceInboxItem, consumer_epoch: u64) -> Result<(), ConsumeError> {
+        let now = (self.clock)();
+        self.store.persist_claimed_item(
+            &item.item_id,
+            &item.event_id,
+            &item.conversation_id,
+            item.lane_sequence,
+            consumer_epoch,
+            &item.payload_sha256,
+            &item.opaque_payload,
+            now,
+        )?;
+        if self
+            .store
+            .consumption_marker_matches(&item.item_id, &item.payload_sha256)?
+        {
+            return Ok(());
+        }
+        let delivery = verify_device_event_delivery(item, &self.endpoint.ptid, &self.endpoint.device_id)
+            .map_err(|error| {
+                // Pure cryptographic binding/hash verification: the same bytes
+                // can never become valid on retry.
+                ConsumeError::rejected(ItemRejectionCode::IntegrityFailed, error)
+            })?;
+        if PreparedEndpointPayloadKind::try_from(delivery.payload_kind)
+            .map_err(|_| {
+                ConsumeError::rejected(
+                    ItemRejectionCode::PayloadInvalid,
+                    "messaging conversation-state payload kind is invalid",
+                )
+            })?
+            != PreparedEndpointPayloadKind::ConversationState
+        {
+            return Err(ConsumeError::rejected(
+                ItemRejectionCode::PayloadInvalid,
+                "messaging conversation-state payload kind mismatch",
+            ));
+        }
+        let event = delivery.event.as_ref().ok_or_else(|| {
+            ConsumeError::rejected(
+                ItemRejectionCode::PayloadInvalid,
+                "messaging conversation-state event is missing",
+            )
+        })?;
+        let marker = ConversationStateMarker::decode(delivery.endpoint_payload.as_slice())
+            .map_err(|_| {
+                ConsumeError::rejected(
+                    ItemRejectionCode::PayloadInvalid,
+                    "messaging conversation-state marker is invalid",
+                )
+            })?;
+        if marker.conversation_id != event.conversation_id || marker.event_id != event.event_id {
+            return Err(ConsumeError::rejected(
+                ItemRejectionCode::RecipientMismatch,
+                "messaging conversation-state marker binding mismatch",
+            ));
+        }
+        let created = match event.payload.as_ref() {
+            Some(conversation_event::Payload::ConversationCreated(created)) => created,
+            _ => {
+                return Err(ConsumeError::rejected(
+                    ItemRejectionCode::PayloadInvalid,
+                    "messaging conversation-state event is unsupported",
+                ))
+            }
+        };
+        let post_state = validate_conversation_created_scope(created).map_err(|error| {
+            ConsumeError::rejected(ItemRejectionCode::PayloadInvalid, error)
+        })?;
+        if !created
+            .members
+            .iter()
+            .any(|member| member.ptid == self.endpoint.ptid)
+        {
+            return Err(ConsumeError::rejected(
+                ItemRejectionCode::RecipientMismatch,
+                "messaging recipient is not a conversation member",
+            ));
+        }
+        let members = post_state
+            .active_members
+            .iter()
+            .map(authority_member_projection)
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|error| {
+                ConsumeError::rejected(ItemRejectionCode::PayloadInvalid, error)
+            })?;
+        let projection = ConversationProjection {
+            conversation_id: event.conversation_id.clone(),
+            authority_station_id: event.authority_station_peer_id.clone(),
+            federation_id: post_state.federation_id.clone(),
+            kind: created.kind,
+            name: created.name.clone(),
+            description: post_state.description.clone(),
+            avatar_object_id: post_state.avatar_object_id.clone(),
+            owner_ptid: created.owner_ptid.clone(),
+            members,
+            membership_epoch: event.membership_epoch,
+            mls_epoch: event.mls_epoch,
+            active: true,
+            updated_at_unix_ms: now,
+        };
+        let receipt = DeviceConsumptionReceipt {
+            receipt_id: format!("device-consumed:{}", item.item_id),
+            conversation_id: event.conversation_id.clone(),
+            event_id: event.event_id.clone(),
+            consumer: Some(crate::proto::chat::CryptoEndpoint {
+                ptid: self.endpoint.ptid.clone(),
+                device_id: self.endpoint.device_id.clone(),
+            }),
+            event_sequence: event.sequence,
+            lane_sequence: item.lane_sequence,
+            payload_sha256: item.payload_sha256.clone(),
+            consumed_at: Some(prost_types::Timestamp {
+                seconds: now.div_euclid(1_000),
+                nanos: (now.rem_euclid(1_000) * 1_000_000) as i32,
+            }),
+        };
+        let receipt_bytes = receipt.encode_to_vec();
+        let result = self
+            .store
+            .commit_conversation_state(&ConversationStateReceiveCommit {
+                item_id: &item.item_id,
+                event_id: &event.event_id,
+                conversation_id: &event.conversation_id,
+                event_sequence: event.sequence,
+                lane_sequence: item.lane_sequence,
+                consumer_epoch,
+                payload_sha256: &item.payload_sha256,
+                event_hash: &event.event_hash,
+                previous_event_hash: &event.previous_hash,
+                projection: &projection,
+                receipt_id: &receipt.receipt_id,
+                receipt_bytes: &receipt_bytes,
+                consumed_at_unix_ms: now,
+            })?;
+        match result {
+            ReceiveCommitResult::Committed | ReceiveCommitResult::AlreadyCommitted => Ok(()),
+        }
+    }
+}
+
+fn authority_member_projection(
+    member: &crate::proto::chat::ConversationAuthorityMember,
+) -> Result<ConversationAuthorityMemberProjection, String> {
+    let role = match member.role.as_str() {
+        "member" | "MEMBER_ROLE_MEMBER" => MemberRole::Member,
+        "admin" | "MEMBER_ROLE_ADMIN" => MemberRole::Admin,
+        "owner" | "MEMBER_ROLE_OWNER" => MemberRole::Owner,
+        _ => return Err("messaging conversation-state member role is invalid".to_string()),
+    };
+    Ok(ConversationAuthorityMemberProjection {
+        ptid: member.ptid.clone(),
+        role: role as i32,
+        home_station_peer_id: member.home_station_peer_id.clone(),
+        muted: member.muted,
+        muted_until_unix_ms: member.muted_until.as_ref().map(|timestamp| {
+            timestamp
+                .seconds
+                .saturating_mul(1_000)
+                .saturating_add(i64::from(timestamp.nanos) / 1_000_000)
+        }),
+    })
+}
+
+impl<R: MessagingRepository> ClaimedItemConsumer for ConversationStateProcessor<R> {
+    fn consume(
+        &self,
+        item: &DurableDeviceInboxItem,
+        consumer_epoch: u64,
+    ) -> Result<(), ConsumeError> {
+        self.process(item, consumer_epoch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_conversation_created_scope;
+    use crate::proto::chat::{
+        ConversationAuthoritySnapshot, ConversationCreatedFact,
+        ConversationKind, ConversationScopeKind,
+    };
+
+    fn created(kind: ConversationKind, scope: ConversationScopeKind, federation_id: &str) -> ConversationCreatedFact {
+        ConversationCreatedFact {
+            kind: kind as i32,
+            post_state: Some(ConversationAuthoritySnapshot {
+                kind: kind as i32,
+                federation_id: federation_id.to_string(),
+                scope_kind: scope as i32,
+                ..ConversationAuthoritySnapshot::default()
+            }),
+            ..ConversationCreatedFact::default()
+        }
+    }
+
+    #[test]
+    fn local_direct_accepts_empty_federation() {
+        let fact = created(
+            ConversationKind::Direct,
+            ConversationScopeKind::Local,
+            "",
+        );
+        let state = validate_conversation_created_scope(&fact).expect("local direct is valid");
+        assert_eq!(state.scope_kind, ConversationScopeKind::Local as i32);
+        assert!(state.federation_id.is_empty());
+    }
+
+    #[test]
+    fn federation_scope_requires_federation_id() {
+        let fact = created(
+            ConversationKind::Direct,
+            ConversationScopeKind::Federation,
+            "",
+        );
+        assert!(validate_conversation_created_scope(&fact).is_err());
+        let fact = created(
+            ConversationKind::Direct,
+            ConversationScopeKind::Federation,
+            "fed_1",
+        );
+        assert!(validate_conversation_created_scope(&fact).is_ok());
+    }
+
+    #[test]
+    fn group_always_requires_federation_id() {
+        let fact = created(ConversationKind::Group, ConversationScopeKind::Local, "");
+        assert!(validate_conversation_created_scope(&fact).is_err());
+        let fact = created(
+            ConversationKind::Group,
+            ConversationScopeKind::Federation,
+            "fed_1",
+        );
+        assert!(validate_conversation_created_scope(&fact).is_ok());
+    }
+}

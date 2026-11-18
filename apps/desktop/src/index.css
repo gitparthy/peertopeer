@@ -1,0 +1,752 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/*
+ * Wake repaint nudge: applied for one frame by kernel/wakeRecovery after a
+ * system resume. Promoting the body to its own compositing layer forces
+ * WKWebView to rebuild the backing store, which recovers a blank surface left
+ * by a sleep-killed GPU/compositing process without reloading the page.
+ */
+body.pt-wake-repaint {
+  transform: translateZ(0);
+}
+
+input, textarea, [contenteditable="true"] {
+  -webkit-user-select: auto;
+  user-select: auto;
+}
+
+:where(button, [role="button"]):focus,
+:where(button, [role="button"]):focus-visible {
+  outline: none !important;
+}
+
+:where(button, [role="button"]):focus-visible {
+  /* Button focus is tonal, never a browser/component-library border ring. */
+  box-shadow: inset 0 0 0 9999px color-mix(in srgb, currentColor 8%, transparent) !important;
+}
+
+:where(.ant-btn-text, .ant-btn-link) {
+  border-color: transparent !important;
+}
+
+:where(a[href]):focus {
+  outline: none;
+}
+
+:where(a[href]):focus-visible {
+  outline: none;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* One quiet scrollbar language across the whole shell: a transparent track so
+   no grey gutter box is ever painted, and a thin low-alpha rounded thumb.
+   Layout reservation is owned by `scrollbar-gutter` on each scroll container
+   (see .sc-settings-* / .sc-provider-detail), not by this visual skin, so the
+   content right edge stays constant whether or not a thumb is shown. */
+@supports selector(::-webkit-scrollbar) {
+  /* Non-auto standard properties override the inset WebKit thumb. Neutralize
+     the component-library reset inside the shell; explicit hidden bars remain
+     owned by their controls. */
+  .ds-shell, .ds-shell * {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(23, 26, 28, 0.14);
+  border-radius: 999px;
+  /* Inset the thumb from both edges so it never sits flush on the 2px shell
+     frame or reads as a solid content border. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(23, 26, 28, 0.26);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.settings-tabs .ant-tabs-content {
+  height: 100%;
+}
+
+.ant-modal-close {
+  border: none !important;
+}
+
+.settings-tabs .ant-tabs-content-holder {
+  overflow: hidden;
+}
+.settings-tabs .ant-tabs-tabpane {
+  height: 100%;
+}
+
+@keyframes search-highlight {
+  0% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--pt-primary) 60%, transparent); }
+  25% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--pt-primary) 20%, transparent); }
+  50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--pt-primary) 60%, transparent); }
+  75% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--pt-primary) 20%, transparent); }
+  100% { box-shadow: none; }
+}
+
+.search-highlight-flash {
+  animation: search-highlight 2s ease-out;
+  border-color: var(--pt-primary) !important;
+}
+
+.applet-card {
+  container-type: inline-size;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+.spin svg {
+  animation: spin 1s linear infinite;
+}
+
+/*
+ * Auth surface — Quiet Protocol Minimalism.
+ * One compact peers-ui card (sign-in + Station) centered on the calm pt
+ * canvas. No gradient, glow, or decorative motion.
+ */
+/*
+ * Full-bleed auth surface: the card IS the window content. There is no outer
+ * app canvas band or floating box — outside the card only the OS window
+ * chrome remains. The shell carries the same pine tint so overscroll never
+ * reveals a second background, and scrolls (without a visible bar) on short
+ * windows instead of clipping.
+ */
+.pt-auth-shell {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  /* Reserve the overlay traffic-light strip at the top (macOS); the shell
+     itself is the window drag region. Zero on platforms with a native bar. */
+  padding: var(--pt-titlebar-inset) 0 0;
+  overflow: auto;
+  background: color-mix(in srgb, var(--pt-accent) 8%, var(--pt-surface));
+  /* Suppress the system scrollbar on this surface only; wheel/trackpad
+     scrolling keeps working. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.pt-auth-shell::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.pt-auth-region {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+}
+
+/* The card fills the shell edge to edge at every size (no radius/border/
+   shadow — it is the surface, not a floating tile). Geometry is scoped under
+   .pt-auth-shell so an embedded card keeps the default peers-ui card chrome. */
+.pt-auth-shell .pt-auth-card {
+  width: 100%;
+  max-width: none;
+  min-height: 100%;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  /* Light pine tint so the dark wordmark and white controls read as layered
+     surfaces instead of blending into an all-white card. */
+  background: color-mix(in srgb, var(--pt-accent) 8%, var(--pt-surface));
+}
+
+/* Content keeps a comfortable reading measure and stays centered on wide
+   windows even though the surface itself is full-bleed. */
+.pt-auth-shell .pt-auth-card .pt-card-body {
+  width: 100%;
+  max-width: var(--pt-auth-card-width, 336px);
+  margin-inline: auto;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--pt-space-sm);
+  padding: 16px 12px 12px;
+}
+
+.pt-auth-shell .pt-auth-card > footer {
+  width: 100%;
+  max-width: var(--pt-auth-card-width, 336px);
+  margin-inline: auto;
+  margin-top: auto;
+  padding: 0 12px 16px;
+}
+
+/* First-run Station gate: a compact centered card instead of the full-bleed
+   login surface — no brand hero, no full-height stretch, WeChat-scale padding.
+   The higher-specificity selector overrides the edge-to-edge card rules above. */
+.pt-auth-shell .pt-auth-card.pt-auth-card--station {
+  min-height: 0;
+  width: 100%;
+  max-width: var(--pt-auth-card-width, 336px);
+  align-self: center;
+  border-radius: var(--pt-radius-lg);
+  border: 1px solid color-mix(in srgb, var(--pt-border) 55%, transparent);
+  box-shadow: var(--pt-shadow-float);
+  background: var(--pt-surface);
+}
+
+.pt-auth-shell .pt-auth-card--station .pt-card-body {
+  padding: 16px 18px;
+  gap: 10px;
+}
+
+/* Base (embedded) card skin: pine tint + soft hairline for the non-shell
+   render path. */
+.pt-auth-card {
+  background: color-mix(in srgb, var(--pt-accent) 8%, var(--pt-surface));
+  border-color: color-mix(in srgb, var(--pt-border) 55%, transparent);
+}
+
+.pt-auth-card .pt-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pt-space-sm);
+  padding: 16px 12px 12px;
+}
+
+.pt-auth-card > footer {
+  padding: 0 12px 14px;
+}
+
+.pt-auth-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pt-space-sm);
+}
+
+/* The lead slot always occupies the left track; when no back control is
+   present it stays empty, keeping the right-side actions symmetric. */
+.pt-auth-head__lead {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* Right-side header cluster: the Station gear (dedicated setup card entry)
+   and the language switcher share one quiet, evenly-spaced track. */
+.pt-auth-head__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* Back control pinned to the top of the gear-opened Station setup card. */
+.pt-station-panel__back {
+  align-self: flex-start;
+  margin-bottom: 4px;
+}
+
+/* First-run "continue to sign in" shares the top-left slot; it is a quiet
+   text action whose disabled state communicates that a Station is required. */
+.pt-station-panel__proceed {
+  align-self: flex-start;
+  margin-bottom: 4px;
+}
+
+/* Centered brand hero: the square app icon already ships as a white rounded
+   tile with transparent corners, so it sits directly on the tinted card
+   without an extra border frame or drop shadow. */
+.pt-auth-brand-hero {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 10px;
+}
+
+.pt-auth-brand-logo {
+  width: 96px;
+  height: 96px;
+  object-fit: contain;
+  border-radius: var(--pt-radius-xl);
+}
+
+.pt-auth-title {
+  margin: 2px 0 0;
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--pt-text);
+  text-align: center;
+}
+
+/* Re-authentication identity tile: an interactive secondary button whose
+   chrome (surface, hairline, hover) comes from .pt-button. This rule only owns
+   layout — left-aligned avatar + meta, chevron pinned at the trailing edge.
+   Position context anchors the expired-session glass overlay to the tile. */
+.pt-auth-reauth.pt-button {
+  justify-content: flex-start;
+  width: 100%;
+  padding-block: 9px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* The button content wrapper only hugs content by default; span the full row
+   so the meta block can grow and pin the chevron to the far-right edge. */
+.pt-auth-reauth .pt-button-content {
+  width: 100%;
+}
+
+.pt-auth-reauth-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.pt-auth-reauth-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--pt-text);
+  line-height: 1.35;
+}
+
+.pt-auth-reauth-handle {
+  font-size: 12px;
+  color: var(--pt-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Expired-session state: push the identity content down and present the reason
+   as a frosted glass layer over the same tile, so the warning reuses the tile's
+   footprint instead of a separate strip that wastes vertical space. The
+   identity pieces dim individually (never the button itself) so the warning
+   label on the overlay stays full contrast. */
+.pt-auth-reauth--expired .pt-button-content > :not(.pt-auth-reauth__expired) {
+  opacity: 0.45;
+}
+
+.pt-auth-reauth__expired {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--pt-space-xs);
+  border-radius: inherit;
+  /* Blur and tint are separate knobs: low-alpha warning surface reads as
+     frosted glass, not a dark scrim. Never intercepts the tile's click. */
+  background: color-mix(in srgb, var(--pt-warningSubtle) 82%, transparent);
+  -webkit-backdrop-filter: blur(6px) saturate(1.15);
+  backdrop-filter: blur(6px) saturate(1.15);
+  color: var(--pt-warning);
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+/* Login CTA carries the pine brand accent on this surface (scoped override of
+   the ink primary button; do not repaint the global --pt-primary token). */
+.pt-auth-submit.pt-button[data-emphasis='primary'] {
+  background: var(--pt-accent);
+  border-color: var(--pt-accent);
+  color: var(--pt-onAccent);
+}
+
+.pt-auth-submit.pt-button[data-emphasis='primary']:hover:not([aria-disabled='true']) {
+  background: var(--pt-accentHover);
+  border-color: var(--pt-accentHover);
+}
+
+.pt-auth-subtitle {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--pt-secondary);
+  text-align: center;
+}
+
+.pt-auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pt-space-sm);
+  width: 100%;
+}
+
+.pt-auth-back {
+  align-self: flex-start;
+  margin: -4px 0 -2px;
+}
+
+.pt-auth-segmented {
+  width: 100%;
+}
+
+.pt-auth-segmented .pt-button {
+  flex: 1 1 0;
+}
+
+/* OAuth provider action keeps fixed geometry across opening/waiting/retry. */
+.pt-auth-oauth {
+  position: relative;
+}
+
+.pt-auth-oauth .pt-button[data-full-width='true'] {
+  min-height: 42px;
+}
+
+.pt-auth-oauth__cancel {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 1;
+}
+
+.pt-auth-gate-row {
+  display: flex;
+  gap: var(--pt-space-xs);
+  align-items: center;
+}
+
+.pt-auth-gate-row > .pt-field-frame {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pt-auth-inline-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--pt-danger);
+}
+
+/* Account rows */
+.pt-auth-account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.pt-auth-account-row.pt-button {
+  justify-content: flex-start;
+  min-height: 60px;
+  padding: 8px 12px;
+}
+
+.pt-auth-account-row .pt-button-content {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 12px;
+}
+
+.pt-auth-account-meta {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+}
+
+.pt-auth-account-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--pt-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pt-auth-account-handle {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--pt-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Trailing cluster uses fixed-width slots so the sign-in badge, PIN shield and
+   chevron land on the same vertical edges in every row, even when a row has no
+   shield. Alignment comes from the slot geometry, never from nudging margins. */
+.pt-auth-account-trailing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.pt-auth-account-trailing__badge {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Both icon slots reserve the icon box unconditionally. An empty slot keeps
+   the width so a missing shield cannot shift the badge or chevron. */
+.pt-auth-account-trailing__pin,
+.pt-auth-account-trailing__chevron {
+  width: 15px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 15px;
+}
+
+.pt-auth-identity {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.pt-auth-identity-name {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--pt-text);
+}
+
+.pt-auth-identity-handle {
+  font-size: 12px;
+  color: var(--pt-secondary);
+}
+
+.pt-auth-pin-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--pt-radius-md);
+  background: var(--pt-primarySubtle);
+  color: var(--pt-primary);
+}
+
+.pt-auth-pin-forgot {
+  align-self: center;
+}
+
+.pt-auth-actions-row {
+  display: flex;
+  gap: var(--pt-space-sm);
+}
+
+.pt-auth-actions-row > * {
+  flex: 1 1 0;
+}
+
+/* Station switcher inside the card footer */
+.pt-auth-station {
+  margin-top: 12px;
+}
+
+.pt-station-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pt-station-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font-size: 13px;
+}
+
+.pt-station-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  background: var(--pt-muted);
+}
+
+.pt-station-dot[data-status='online'] { background: var(--pt-accent); }
+.pt-station-dot[data-status='offline'] { background: var(--pt-danger); }
+.pt-station-dot[data-status='checking'] { background: var(--pt-primary); }
+
+.pt-station-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pt-station-panel-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--pt-text);
+}
+
+.pt-station-panel__hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--pt-secondary);
+}
+
+.pt-station-panel__empty {
+  padding: 6px 4px;
+  font-size: 12px;
+  color: var(--pt-secondary);
+  text-align: center;
+}
+
+.pt-station-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.pt-station-row.pt-button {
+  justify-content: flex-start;
+}
+
+.pt-station-row .pt-button-content {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.pt-station-row-endpoint {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--pt-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pt-station-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: var(--pt-space-sm);
+  border-top: 1px solid var(--pt-border, rgba(0, 0, 0, 0.08));
+}
+
+.pt-station-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pt-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pt-station-source-tag {
+  display: inline-block;
+  margin-top: 2px;
+  margin-right: 6px;
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  border-radius: 8px;
+  color: var(--pt-accent, #2f6a50);
+  background: var(--pt-accent-soft, rgba(47, 106, 80, 0.1));
+}
+
+.pt-station-add {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.pt-station-add > .pt-field-frame {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Full-bleed is now size-independent: the same edge-to-edge surface applies
+   from the 360px window floor up to wide desktop, so there are no auth width
+   breakpoints. Short windows scroll via .pt-auth-shell (overflow:auto), and
+   the Station footer stays pinned by margin-top:auto on the flex card. */
+
+@media (prefers-reduced-motion: reduce) {
+  [data-pt-agent-workbench],
+  [data-pt-agent-workbench] *,
+  [data-pt-agent-workbench] *::before,
+  [data-pt-agent-workbench] *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/*
+ * Desktop feedback toasts float from the bottom-right. The shared peers-ui
+ * `.pt-toast-host` defaults to top-right; desktop overrides it here (scoped +
+ * higher specificity so it does not depend on stylesheet order and never
+ * touches other consumers of the shared package). Bottom-right keeps the
+ * notice beside the composer instead of covering the conversation header.
+ */
+body .pt-toast-host {
+  top: auto;
+  bottom: var(--pt-space-md);
+  right: var(--pt-space-md);
+}

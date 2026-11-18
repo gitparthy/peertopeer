@@ -1,0 +1,395 @@
+# Peers-Touch Docker Compose
+#
+# Driven from the Makefile via:
+#   make pt-up   ENV=<name>
+#   make pt-down ENV=<name>
+#
+# Isolation principle (see .localenv §0):
+#   - Every test node = one compose project (COMPOSE_PROJECT_NAME=pt-<name>)
+#   - Each project ships its own postgres container; never reuse a host PG.
+#   - Default network = bridge, project-scoped. `network_mode: host` is forbidden.
+#   - Postgres ports are NOT exposed to the host unless POSTGRES_PORT is set
+#     (debug-only override).
+#   - container_name is intentionally NOT pinned; compose prefixes containers
+#     with the project name, so two projects on the same host never collide.
+#
+# Profiles:
+#   station — station service + (must include `infra`)
+#   relay   — relay  service + (must include `infra`)
+#   livekit — LiveKit SFU (shared; deploy on one host, all stations point at it)
+#   infra   — postgres only
+
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── PostgreSQL (per-project, internal-only by default) ─────────
+  postgres:
+    image: ${PEERS_POSTGRES_IMAGE:-pgvector/pgvector:pg16}
+    profiles: [infra]
+    logging: *json-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-peers}
+      POSTGRES_PASSWORD: ${PEERS_DB_PASSWORD:?PEERS_DB_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-peers_touch}
+    # No host port mapping by default. Postgres is reachable only from
+    # within the project's bridge network via the service name `postgres`.
+    # For host-side debugging, use:
+    #   docker compose -p pt-<name> exec postgres psql -U peers peers_touch
+    # If you really need a host port, drop a docker-compose.override.yml
+    # next to this file with a `ports:` entry; the override is gitignored.
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peers} -d ${POSTGRES_DB:-peers_touch}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Station ────────────────────────────────────────────────────
+  station:
+    build:
+      context: ../..
+      dockerfile: tooling/docker/station.Dockerfile
+      args:
+        BUILDER_IMAGE: ${PEERS_STATION_BUILDER_IMAGE:-golang:1.24.6}
+        BASE_IMAGE: ${PEERS_STATION_BASE_IMAGE:-ubuntu:22.04}
+        BUILD_COMMIT: ${PEERS_TOUCH_BUILD_COMMIT:-unknown}
+        BUILD_LABEL: ${PEERS_TOUCH_BUILD_LABEL:-dev}
+        BUILD_TIME: ${PEERS_TOUCH_BUILD_TIME:-unknown}
+        SOCIAL_ACCEPTANCE: ${PT_SOCIAL_ACCEPTANCE_BUILD:-0}
+    profiles: [station]
+    # Reap orphaned CLI descendants after timeout or process-group teardown.
+    init: true
+    logging: *json-logging
+    environment:
+      PEERS_NODE_ROLE: station
+      # Stable envelope key supplied by the deployment secret store.
+      # File paths must point inside an existing persistent or secret mount.
+      PT_SECRET_KEK: ${PT_SECRET_KEK:-}
+      PT_SECRET_KEK_FILE: ${PT_SECRET_KEK_FILE:-}
+      PEERS_AUTH_SECRET: ${PEERS_AUTH_SECRET:?PEERS_AUTH_SECRET is required}
+      PEERS_OAUTH_BRIDGE_SECRET: ${PEERS_OAUTH_BRIDGE_SECRET:-}
+      # Native (Mobile) Station-direct OAuth provider credentials. Empty by
+      # default; the access gate advertises provider sign-in only when the
+      # client id and secret for a provider are present.
+      PEERS_OAUTH_GITHUB_CLIENT_ID: ${PEERS_OAUTH_GITHUB_CLIENT_ID:-}
+      PEERS_OAUTH_GITHUB_CLIENT_SECRET: ${PEERS_OAUTH_GITHUB_CLIENT_SECRET:-}
+      PEERS_OAUTH_GITHUB_REDIRECT_URIS: ${PEERS_OAUTH_GITHUB_REDIRECT_URIS:-}
+      PEERS_OAUTH_GOOGLE_CLIENT_ID: ${PEERS_OAUTH_GOOGLE_CLIENT_ID:-}
+      PEERS_OAUTH_GOOGLE_CLIENT_SECRET: ${PEERS_OAUTH_GOOGLE_CLIENT_SECRET:-}
+      PEERS_OAUTH_GOOGLE_REDIRECT_URIS: ${PEERS_OAUTH_GOOGLE_REDIRECT_URIS:-}
+      # Canonical Station-owned durable files, including Messaging attachment
+      # blobs, must resolve inside the named peers_data volume.
+      PEERS_DATA_DIR: /app/data
+      # Shared managed CLI installations and private actor invocation state
+      # live under the persistent volume.
+      PEERS_AGENT_WORKSPACE_BASE: /app/data/agent-workspaces
+      # DSN points at the project's bridge-internal postgres service. Never
+      # at the host. POSTGRES_DB / PEERS_DB_PASSWORD come from .env.<project>.
+      PEERS_DB_DSN: host=postgres user=${POSTGRES_USER:-peers} password=${PEERS_DB_PASSWORD} dbname=${POSTGRES_DB:-peers_touch} port=5432 sslmode=disable TimeZone=Asia/Shanghai
+      PEERS_STATION_CLUSTER_MODE: ${PEERS_STATION_CLUSTER_MODE:-single}
+      PEERS_STATION_CLUSTER_LEASE_SECONDS: ${PEERS_STATION_CLUSTER_LEASE_SECONDS:-15}
+      PEERS_STATION_CLUSTER_HEARTBEAT_SECONDS: ${PEERS_STATION_CLUSTER_HEARTBEAT_SECONDS:-5}
+      # OSS local backend store path. Lives under /app/data so it is
+      # carried by the same named volume as the libp2p identities;
+      # entrypoint.sh ensures the directory exists at startup.
+      PEERS_NODE_SERVER_SUBSERVER_OSS_STORE_PATH: /app/data/oss
+      PEERS_OSS_BACKEND: ${PEERS_OSS_BACKEND:-local}
+      # Node-level libp2p federation policy. entrypoint.sh projects each of
+      # these vars (when non-empty) into a single federation.docker.yml
+      # overlay under peers.node.federation.*. Both libp2p hosts in the
+      # process (bootstrap subserver + transport) consume that one location.
+      #
+      #   PEERS_BOOTSTRAP_NODES        — DHT seeds + ConnectionGater allow-list
+      #   PEERS_LIBP2P_PUBLIC_ADDRS    — multiaddrs this node announces. MUST
+      #                                  be set under Docker so DHT records
+      #                                  carry the host IP, not the bridge IP.
+      #   PEERS_FEDERATION_DIRECT_OUT  — Gater outbound rule. false ⇒ dial
+      #                                  only seeds (relay-only mode).
+      #   PEERS_FEDERATION_DIRECT_IN   — Gater inbound rule. false ⇒ accept
+      #                                  only seeds.
+      PEERS_BOOTSTRAP_NODES: ${PEERS_BOOTSTRAP_NODES:-}
+      PEERS_LIBP2P_PUBLIC_ADDRS: ${PEERS_LIBP2P_PUBLIC_ADDRS:-}
+      PEERS_FEDERATION_DIRECT_OUTBOUND: ${PEERS_FEDERATION_DIRECT_OUTBOUND:-true}
+      PEERS_FEDERATION_DIRECT_INBOUND: ${PEERS_FEDERATION_DIRECT_INBOUND:-true}
+      # Phase D / E.2 — locator republisher cadence + readiness-gate
+      # threshold. entrypoint.sh emits these into the same federation.docker.yml
+      # overlay under peers.node.federation.* when non-empty; empty means
+      # "use federation.yml defaults" (12h republish, min-dht-peers=1).
+      PEERS_FEDERATION_REPUBLISH_INTERVAL_SEC: ${PEERS_FEDERATION_REPUBLISH_INTERVAL_SEC:-}
+      PEERS_FEDERATION_REPUBLISH_DISABLED: ${PEERS_FEDERATION_REPUBLISH_DISABLED:-}
+      PEERS_FEDERATION_MIN_DHT_PEERS: ${PEERS_FEDERATION_MIN_DHT_PEERS:-}
+      # Federation-visible HTTP origin. entrypoint.sh translates this into a
+      # server_host.docker.yml overlay; the locator publisher derives its
+      # StationDomain from the URL host. Without this set, federation
+      # publishing degrades silently — set it in every .env.<environment>.
+      PEERS_NODE_SERVER_BASEURL: ${PEERS_NODE_SERVER_BASEURL:-}
+      # Standard Circuit Relay target and signed control plane.
+      STATION_RELAY_ENABLED: ${STATION_RELAY_ENABLED:-false}
+      STATION_RELAY_PEER_ID: ${STATION_RELAY_PEER_ID:-}
+      STATION_RELAY_MULTIADDR: ${STATION_RELAY_MULTIADDR:-}
+      STATION_RELAY_CONTROL_ORIGIN: ${STATION_RELAY_CONTROL_ORIGIN:-}
+      STATION_RELAY_INVITE_TOKEN: ${STATION_RELAY_INVITE_TOKEN:-}
+      STATION_RELAY_LABEL: ${STATION_RELAY_LABEL:-${COMPOSE_PROJECT_NAME:-station}}
+      STATION_RELAY_TLS_CA_FILE: ${STATION_RELAY_TLS_CA_FILE:-}
+      # Envelope federation peer map: peer_id=base_url pairs for cross-station delivery.
+      PEERS_FEDERATION_PEER_MAP: ${PEERS_FEDERATION_PEER_MAP:-}
+      # Actor display_name pattern: replaces __NODE__ in actor.yml
+      PEERS_NODE_LABEL: ${PEERS_NODE_LABEL:-}
+      # Host-installed CLI providers (e.g. traecli). When PEERS_HOST_CLI_BIN is
+      # set to an absolute binary path on the host, the entrypoint symlinks it
+      # into /usr/local/bin so the agent can spawn CLI providers without baking
+      # them into the image. The host auth/config dir is bind-mounted below.
+      PEERS_HOST_CLI_BIN: ${PEERS_HOST_CLI_BIN:-}
+      PEERS_HOST_CLI_HOME: ${PEERS_HOST_CLI_HOME:-}
+      # LiveKit SFU — group call infrastructure. Station uses these
+      # to create rooms and generate participant tokens.
+      LIVEKIT_API_URL: ${LIVEKIT_API_URL:-}
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      # Run-scoped Acceptance controls remain empty for ordinary deployments.
+      PT_ACCEPTANCE_ENVIRONMENT: ${PT_ACCEPTANCE_ENVIRONMENT:-}
+      PT_AGENT_CAPABILITY_SCENARIO_CONTROL: ${PT_AGENT_CAPABILITY_SCENARIO_CONTROL:-}
+      PT_ACCEPTANCE_RUN_ID: ${PT_ACCEPTANCE_RUN_ID:-}
+      PT_SOCIAL_ACCEPTANCE_RUN_ID: ${PT_SOCIAL_ACCEPTANCE_RUN_ID:-}
+      PT_SOCIAL_ACCEPTANCE_PROFILE: ${PT_SOCIAL_ACCEPTANCE_PROFILE:-}
+      PT_AGENT_EXTERNAL_RUNTIME_ROOT: ${PT_AGENT_EXTERNAL_RUNTIME_ROOT:-}
+      PT_AGENT_EXTERNAL_START_ARGV_JSON: ${PT_AGENT_EXTERNAL_START_ARGV_JSON:-}
+      PT_AGENT_EXTERNAL_RESUME_ARGV_JSON: ${PT_AGENT_EXTERNAL_RESUME_ARGV_JSON:-}
+      PT_AGENT_EXTERNAL_RESET_ARGV_JSON: ${PT_AGENT_EXTERNAL_RESET_ARGV_JSON:-}
+      # WE-20261104 WORKSPACE_SANDBOX execution. Empty default keeps sandbox
+      # execution inert; the sandbox compose profile sets the provisioner URL
+      # and pins the image by immutable content id (fail-closed if unset).
+      PEERS_SANDBOX_PROVISIONER_URL: ${PEERS_SANDBOX_PROVISIONER_URL:-http://workspace-sandbox-provisioner:8090}
+      PEERS_SANDBOX_DEFAULT_IMAGE: ${PEERS_SANDBOX_DEFAULT_IMAGE:-}
+      # Must match SANDBOX_PROVISIONER_TOKEN on the provisioner side.
+      PEERS_SANDBOX_PROVISIONER_TOKEN: ${PEERS_SANDBOX_PROVISIONER_TOKEN:-}
+    ports:
+      - "${STATION_PORT:-18080}:18080"
+      # libp2p port for the bootstrap subserver. Same-host coexistence
+      # (Station-2 + Station-4 on 192.0.2.60) requires distinct host
+      # ports — set LIBP2P_PORT in the per-env file accordingly.
+      - "${LIBP2P_PORT:-4001}:4001"
+    volumes:
+      # Persist the logical Station root and each process node identity.
+      # Key paths are projected into /app/data via the paths.docker.yml
+      # overlay emitted by entrypoint.sh; peers.yml stays untouched.
+      - peers_data:/app/data
+      # Host-installed CLI providers (e.g. traecli). Bind-mount the REAL
+      # binary (not a ~/.local/bin symlink — bind-mounting a symlink only
+      # mounts the link itself) and its auth/config home so CLI providers
+      # survive container recreate (make station) without rebuilding the
+      # image. Both sources are host-specific and enabled only when the
+      # per-env file sets PEERS_HOST_CLI_BIN_MOUNT / PEERS_HOST_CLI_HOME_MOUNT
+      # (empty defaults → bind /dev/null, effectively disabling the feature).
+      - ${PEERS_HOST_CLI_BIN_MOUNT:-/dev/null}:/usr/local/bin/host-cli-bin:ro
+      # CLI auth/config home is mounted read-write (not :ro): some CLIs
+      # (e.g. traecli) refresh installation metadata or write session state
+      # under ~/.trae on startup. Mounting the host's real home reuses its
+      # existing login and persists across container recreate.
+      - ${PEERS_HOST_CLI_HOME_MOUNT:-/dev/null}:/root/.host-cli-home
+      - ${STATION_RELAY_CA_FILE_MOUNT:-/dev/null}:/app/relay-ca/relay.crt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=3", "http://127.0.0.1:18080/sub-oss/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Relay Station ──────────────────────────────────────────────
+  # Same image, same Dockerfile. PEERS_NODE_ROLE selects the relay
+  # composition allowlist at runtime; build flags never fork the binary.
+  relay:
+    build:
+      context: ../..
+      dockerfile: tooling/docker/station.Dockerfile
+      args:
+        BUILD_COMMIT: ${PEERS_TOUCH_BUILD_COMMIT:-unknown}
+        BUILD_LABEL: ${PEERS_TOUCH_BUILD_LABEL:-dev}
+        BUILD_TIME: ${PEERS_TOUCH_BUILD_TIME:-unknown}
+    profiles: [relay]
+    logging: *json-logging
+    environment:
+      PEERS_NODE_ROLE: relay
+      PEERS_AUTH_SECRET: ${PEERS_AUTH_SECRET:?PEERS_AUTH_SECRET is required}
+      PEERS_DATA_DIR: /app/data
+      PEERS_DB_DSN: host=postgres user=${POSTGRES_USER:-peers} password=${PEERS_DB_PASSWORD} dbname=${POSTGRES_DB:-peers_relay} port=5432 sslmode=disable TimeZone=Asia/Shanghai
+      PEERS_NODE_SERVER_SUBSERVER_OSS_STORE_PATH: /app/data/oss
+      # The Relay itself is the federation seed; it does not chase any
+      # other bootstrap node. PEERS_LIBP2P_PUBLIC_ADDRS is mandatory in
+      # production: stations dial the Relay via these advertised addrs.
+      PEERS_BOOTSTRAP_NODES: ${PEERS_BOOTSTRAP_NODES:-}
+      PEERS_LIBP2P_PUBLIC_ADDRS: ${PEERS_LIBP2P_PUBLIC_ADDRS:-}
+      # Federation-visible HTTP origin. The Relay station also publishes its
+      # own actor records (and resolves remote ones), so the same overlay
+      # rule applies here.
+      PEERS_NODE_SERVER_BASEURL: ${PEERS_NODE_SERVER_BASEURL:-}
+      RELAY_OPERATOR_KEY_FILE: ${RELAY_OPERATOR_KEY_FILE:-}
+      RELAY_OPERATOR_ISSUER: ${RELAY_OPERATOR_ISSUER:-}
+      RELAY_OPERATOR_AUDIENCE: ${RELAY_OPERATOR_AUDIENCE:-}
+      RELAY_OPERATOR_SCOPE: ${RELAY_OPERATOR_SCOPE:-}
+      PEERS_NODE_LABEL: ${PEERS_NODE_LABEL:-}
+    ports:
+      - "127.0.0.1:${RELAY_CONTROL_PORT:-18082}:18080"
+      - "${RELAY_PUBLIC_PORT:-18081}:18443"
+      - "${LIBP2P_PORT:-4001}:4001"
+    volumes:
+      - peers_data:/app/data
+      - ${RELAY_SECRET_DIR_MOUNT:-/dev/null}:/app/relay-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=3", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  relay-proxy:
+    image: nginx:1.27-alpine
+    profiles: [relay]
+    network_mode: "service:relay"
+    volumes:
+      - ./relay-nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${RELAY_SECRET_DIR_MOUNT:-/dev/null}:/etc/nginx/tls:ro
+    depends_on:
+      relay:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── LiveKit SFU (group voice/video calls) ──────────────────────
+  # Single-node LiveKit Server. No Redis needed. Station connects
+  # via server-sdk-go; Desktop connects via @livekit/livekit-client.
+  # Built-in TURN is disabled — Station's Pion TURN on :3478 is reused.
+  #
+  # LiveKit is shared infrastructure — one instance can serve multiple
+  # Stations. It does NOT need to be co-located with every Station.
+  # Deploy it on one host and point all Stations at it via
+  # LIVEKIT_API_URL and LIVEKIT_PUBLIC_URL.
+  #
+  # LIVEKIT_API_KEY / LIVEKIT_API_SECRET are injected from the per-env
+  # file. If missing, the container starts but rejects all requests —
+  # group calls are unavailable while 1v1 and chat remain functional.
+  livekit:
+    image: ${PEERS_LIVEKIT_IMAGE:-peers-touch/livekit:1.13.0-admission1}
+    build:
+      context: ../..
+      dockerfile: tooling/docker/livekit.Dockerfile
+    profiles: [livekit]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-}: ${LIVEKIT_API_SECRET:-}"
+      NODE_IP: "${LIVEKIT_NODE_IP:-}"
+      LIVEKIT_CONFIG: |
+        port: 7880
+        rtc:
+          tcp_port: 7881
+          udp_port: 7881
+          use_external_ip: false
+        turn:
+          enabled: false
+        webhook:
+          api_key: "${LIVEKIT_API_KEY:-}"
+          urls:
+            - "${LIVEKIT_WEBHOOK_URL:-http://station:18080/hooks/livekit}"
+        room:
+          empty_timeout: 300
+          max_participants: 50
+        logging:
+          level: info
+    command:
+      - --bind=0.0.0.0
+    ports:
+      - "${LIVEKIT_PORT:-7880}:7880"
+      - "${LIVEKIT_RTC_PORT:-7881}:7881/tcp"
+      - "${LIVEKIT_RTC_PORT:-7881}:7881/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=2", "http://127.0.0.1:7880"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Webhook Receiver (auto-deploy on git push) ─────────────────
+  # Always-on infrastructure service. Listens for GitHub webhooks
+  # and triggers deploy-branch.sh for the pushed branch.
+  webhook:
+    image: almir/webhook:latest
+    profiles: [webhook]
+    volumes:
+      - ./webhook.json:/etc/webhook/hooks.json:ro
+      - ./deploy-branch.sh:/opt/peers-touch/deploy-branch.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/peers-touch:/opt/peers-touch
+    ports:
+      - "${WEBHOOK_PORT:-9000}:9000"
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change_me_in_production}
+    command: ["-hooks", "/etc/webhook/hooks.json", "-verbose", "-hotreload"]
+    restart: unless-stopped
+
+  # ── Workspace Sandbox provisioner (WE-20261104) ─────────────────
+  # Independent sidecar: the ONLY service that mounts the Docker socket.
+  # It allocates sibling sandbox containers on the isolated `wbox-isolated`
+  # network; Station reaches it over the project bridge but Station itself
+  # never mounts the socket and never shares the sandbox network. Enabled with
+  # COMPOSE_PROFILES=...,sandbox.
+  workspace-sandbox-provisioner:
+    build:
+      context: ../..
+      dockerfile: tooling/docker/sandbox/provisioner.Dockerfile
+    profiles: [sandbox]
+    logging: *json-logging
+    environment:
+      PROVISIONER_LISTEN: ":8090"
+      # Sandbox containers attach only to this internal network: no route to
+      # the project bridge (Station/Postgres) and no external egress.
+      SANDBOX_ISOLATED_NETWORK: wbox-isolated
+      # Immutable content-id pin for the locally built sandbox base image (or
+      # repo@digest entries). The provisioner rejects anything not listed.
+      SANDBOX_ALLOWED_IMAGE_IDS: ${PEERS_SANDBOX_DEFAULT_IMAGE:-}
+      SANDBOX_RUN_UID: "10001"
+      SANDBOX_RUN_GID: "10001"
+      # Shared Station↔provisioner bearer secret. When set, the sidecar
+      # requires it on every /v1 call; Station sends the same value (below).
+      # Empty leaves the surface unauthenticated (dev only; network-isolated).
+      SANDBOX_PROVISIONER_TOKEN: ${PEERS_SANDBOX_PROVISIONER_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The provisioner is NOT attached to wbox-isolated: it places sandbox
+    # containers there through the daemon but joining the network itself would
+    # expose its control API to a compromised workload. The top-level network is
+    # created by compose even with no member service.
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=3", "http://127.0.0.1:8090/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  peers_data:
+
+networks:
+  # Dedicated, fully internal network for sandbox containers. It is attached
+  # to the provisioner only so compose guarantees its creation; workload
+  # containers themselves are placed here exclusively and cannot reach the
+  # default bridge or the outside world.
+  wbox-isolated:
+    name: wbox-isolated
+    internal: true

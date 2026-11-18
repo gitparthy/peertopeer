@@ -1,0 +1,357 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { AccessGateHost, authStationLabel } from './AccessGateHost';
+import type { AccessDecision, AccessGateAction } from './authSession';
+
+const recoveryMock = vi.hoisted(() => ({
+  states: [] as Array<Record<string, unknown>>,
+}));
+
+vi.mock('../../app/mobileI18n', () => ({
+  useMobileI18n: () => ({ t: (key: string) => key }),
+}));
+vi.mock('../../components/LanguageSwitcher', () => ({
+  LanguageSwitcher: () => null,
+}));
+vi.mock('../../runtimes/authRuntime', () => ({
+  cancelOAuth: vi.fn(),
+  oauthPhaseMessageKey: (phase: string) => phase,
+  refreshOAuthStatus: vi.fn(),
+  retryOAuthBrowser: vi.fn(),
+  startOAuth: vi.fn(),
+  useAuthRuntime: () => ({
+    phase: 'idle',
+    errorKey: null,
+    provider: undefined,
+    recovery: 'none',
+  }),
+}));
+vi.mock('../../runtimes/recoveryProjection', () => ({
+  getRecoveryProjection: () => ({
+    getSnapshot: () => ({
+      states: recoveryMock.states,
+      hasActiveRecovery: recoveryMock.states.length > 0,
+    }),
+    subscribe: () => () => undefined,
+  }),
+}));
+
+const source = readFileSync(
+  new URL('./AccessGateHost.tsx', import.meta.url),
+  'utf8',
+);
+const styles = readFileSync(
+  new URL('../../styles.css', import.meta.url),
+  'utf8',
+);
+
+afterEach(() => {
+  recoveryMock.states = [];
+});
+
+describe('AccessGateHost schema gate surface', () => {
+  it('renders Station-authored scalar fields and delegates one bound submission', () => {
+    expect(source).toContain('isSchemaDrivenGate(currentGate)');
+    expect(source).toContain('data-acceptance-id="schema-access-gate"');
+    expect(source).toContain('onSchemaSubmit(schemaValues)');
+    expect(source).toContain('<Checkbox');
+    expect(source).toContain('<Select');
+    expect(source).toContain('<NumberField');
+  });
+
+  it('keeps the Station-authored Continue action primary', () => {
+    const markup = renderGate([], {
+      decision: schemaDecision(),
+    });
+
+    expect(markup).toContain('mobile.launch.continue');
+    expect(markup).toContain('data-emphasis="primary"');
+    expect(markup).toContain('access-gate-schema-submit');
+    expect(markup).not.toContain('auth-actions single');
+  });
+});
+
+describe('AccessGateHost advertised credential gating', () => {
+  it('renders email-only and OAuth-only Station advertisements independently', () => {
+    const emailMarkup = renderGate([
+      action('auth.password', 'ACCESS_GATE_TYPE_AUTH_LOGIN', 'submit_login'),
+    ]);
+    expect(emailMarkup).toContain('mobile.auth.emailAddress');
+    expect(emailMarkup).not.toContain('mobile.auth.oauthGithub');
+
+    const oauthMarkup = renderGate([
+      action('auth.oauth', 'ACCESS_GATE_TYPE_AUTH_OAUTH', 'start_oauth'),
+    ]);
+    expect(oauthMarkup).toContain('mobile.auth.oauthGithub');
+    expect(oauthMarkup).toContain('mobile.auth.oauthGoogle');
+    expect(oauthMarkup).not.toContain('mobile.auth.emailAddress');
+  });
+
+  it('hides the Quick tab and lands on email when the Station advertises no OAuth providers', () => {
+    // The gate advertises OAuth, but the provider directory loads empty.
+    const markup = renderGate([
+      action('auth.password', 'ACCESS_GATE_TYPE_AUTH_LOGIN', 'submit_login'),
+      action('auth.oauth', 'ACCESS_GATE_TYPE_AUTH_OAUTH', 'start_oauth'),
+    ], {
+      oauthOverride: { availableProviders: [] },
+    });
+
+    // Email fields render immediately ...
+    expect(markup).toContain('mobile.auth.emailAddress');
+    // ... the empty Quick tab row and provider buttons do not.
+    expect(markup).not.toContain('auth-tab-row');
+    expect(markup).not.toContain('mobile.auth.oauthGithub');
+  });
+
+  it('renders no credential control when no supported action is advertised', () => {
+    const markup = renderGate([
+      action('future.credential', 'ACCESS_GATE_TYPE_CUSTOM', 'future_action'),
+    ]);
+
+    expect(markup).toContain('mobile.launch.unavailable');
+    expect(markup).not.toContain('mobile.auth.emailAddress');
+    expect(markup).not.toContain('mobile.auth.oauthGithub');
+  });
+
+  it('renders email and OAuth only when their Station actions are advertised', () => {
+    expect(source).toContain('advertisedCredentialChoices(currentGate)');
+    expect(source).toContain('currentAccessGate(decision)');
+    expect(source).toContain(
+      'const showEmailLogin = credentialGateActive && credentialChoices.emailPassword;',
+    );
+    expect(source).toContain(
+      'const showOAuthLogin = credentialGateActive && credentialChoices.oauth;',
+    );
+    expect(source).toContain('{showEmailLogin && showOAuthLogin && oauthAvailable ? (');
+    expect(source).toContain('{showOAuthLogin && oauthAvailable ? (');
+    expect(source).toContain('{showEmailLogin ? (');
+    expect(source).toContain("gateId: currentGate?.gateId || 'auth.login'");
+    expect(source).not.toContain('auth-oauth-wechat');
+    expect(source).not.toContain('isLoginGate(currentGate) || !currentGate');
+  });
+
+  it('keeps the embedded gate brand on a single full-width column', () => {
+    // The embedded brand renders no logo cell. Without overriding the shared
+    // 44px grid, the copy collapses one character per line.
+    expect(styles).toMatch(
+      /\.auth-gate-embedded \.auth-gate-brand-embedded\s*\{[^}]*display:\s*flex/,
+    );
+    expect(styles).toMatch(
+      /\.auth-gate-embedded \.auth-gate-brand-embedded\s*\{[^}]*width:\s*100%/,
+    );
+  });
+
+  it('fails closed to the unavailable gate surface without a supported action', () => {
+    expect(source).toMatch(
+      /const showLogin = showEmailLogin \|\| showOAuthLogin;[\s\S]*const showUnavailableGate = ready[\s\S]*&& !showLogin/,
+    );
+    expect(source).toContain('{showUnavailableGate ? (');
+  });
+});
+
+describe('AccessGateHost attempt recovery', () => {
+  it.each([
+    'ACCESS_DECISION_STATE_PENDING',
+    'ACCESS_DECISION_STATE_BLOCKED',
+    'ACCESS_DECISION_STATE_FAILED',
+  ])('keeps refresh and cancellation visible for %s', (state) => {
+    const markup = renderGate([], {
+      decision: {
+        state,
+        attemptId: 'attempt-1',
+        gates: [],
+      },
+    });
+
+    expect(markup).toContain('mobile.auth.retryDecision');
+    expect(markup).toContain('mobile.auth.changeStation');
+    expect(markup).not.toContain('mobile.auth.emailAddress');
+  });
+
+  it('delegates retry and Station change to async recovery owners', () => {
+    expect(source).toContain('onRefresh: () => Promise<void>');
+    expect(source).toContain('onBack: () => Promise<void>');
+    expect(source).toContain('onActivate={() => void onRefresh()}');
+    expect(source).toContain('onActivate={() => void onBack()}');
+  });
+
+  it('keeps the single Station-change action at the mobile touch minimum', () => {
+    expect(source).toMatch(/actionId="access-gate-change-station"\s*emphasis="secondary"\s*density="comfortable"/);
+    expect(styles).not.toMatch(/\.auth-actions\.single button\s*\{/);
+  });
+});
+
+describe('AccessGateHost entry surface inventory', () => {
+  it('projects distinct login, OAuth, pending, and expired-session surfaces', () => {
+    expect(renderGate([
+      action('auth.password', 'ACCESS_GATE_TYPE_AUTH_LOGIN', 'submit_login'),
+    ])).toContain('data-product-surface="entry.access-login"');
+    expect(renderGate([
+      action('auth.oauth', 'ACCESS_GATE_TYPE_AUTH_OAUTH', 'start_oauth'),
+    ])).toContain('data-product-surface="entry.access-oauth"');
+    expect(renderGate([], {
+      decision: {
+        state: 'ACCESS_DECISION_STATE_PENDING',
+        attemptId: 'attempt-1',
+        gates: [],
+      },
+    })).toContain('data-product-surface="entry.access-pending"');
+    expect(renderGate([
+      action('auth.password', 'ACCESS_GATE_TYPE_AUTH_LOGIN', 'submit_login'),
+    ], {
+      forceSessionExpired: true,
+    })).toContain('data-product-surface="entry.session-expired"');
+  });
+});
+
+describe('AccessGateHost shared Auth identity', () => {
+  it('uses the canonical Desktop logo asset in Mobile and its prototype', () => {
+    const hash = (path: string) => createHash('sha256')
+      .update(readFileSync(new URL(path, import.meta.url)))
+      .digest('hex');
+
+    const desktop = hash('../../../../desktop/src-tauri/icons/icon.png');
+    expect(hash('../../assets/logo.png')).toBe(desktop);
+    expect(
+      hash('../../../../../packages/prototypes/mobile/chat/src/assets/logo.png'),
+    ).toBe(desktop);
+  });
+
+  it('keeps the brand and expired-session context inside the auth card', () => {
+    recoveryMock.states = [{
+      kind: 'device-local-flag',
+      reason: 'session-expired',
+      since: 1,
+    }];
+
+    const markup = renderGate([
+      action('auth.oauth', 'ACCESS_GATE_TYPE_AUTH_OAUTH', 'start_oauth'),
+    ], {
+      rememberedAccounts: [{
+        email: 'alice@peers.social',
+        displayName: 'Alice',
+        lastUsedAt: 1,
+        ptid: 'alice',
+        stationPeerId: 'station-peer',
+        stationUrl: 'http://192.0.2.30:18132',
+      }],
+      stationLabel: '192.0.2.30:18132',
+      stationUrl: 'http://192.0.2.30:18132',
+    });
+
+    expect(markup).toContain('auth-gate-logo');
+    expect(markup).toContain('data-acceptance-id="auth-session-expired"');
+    expect(markup).toContain('mobile.auth.welcomeBackTitle');
+    expect(markup).toContain('common.stationPicker.fallbackLabel');
+    expect(markup).not.toContain('PEERS TOUCH MOBILE');
+    expect(markup).not.toContain('192.0.2.30');
+    // Brand lives in the composed gate body; the standalone card wraps it.
+    expect(source).toContain('const gateBody = (');
+    expect(source).toContain('<section className="auth-gate-brand"');
+    expect(source).toContain('<div className="auth-gate-card">');
+    expect(source).toContain('{gateBody}');
+    expect(source).toContain('className="auth-gate-brand-copy"');
+  });
+
+  it('uses localized client copy for the known login gate', () => {
+    expect(source).toMatch(
+      /: showLogin\s*\?\s*t\('mobile\.auth\.subtitle'\)/,
+    );
+  });
+
+  it('preserves a friendly Station label and hides address-shaped labels', () => {
+    expect(authStationLabel(
+      'Mobile Development',
+      'http://192.0.2.30:18132',
+      'Station',
+    )).toBe('Mobile Development');
+    expect(authStationLabel(
+      '192.0.2.30:18132',
+      'http://192.0.2.30:18132',
+      'Station',
+    )).toBe('Station');
+  });
+});
+
+function renderGate(
+  alternativeActions: AccessGateAction[],
+  overrides: Partial<Parameters<typeof AccessGateHost>[0]> = {},
+): string {
+  return renderToStaticMarkup(createElement(AccessGateHost, {
+    decision: loginDecision(alternativeActions),
+    stationLabel: 'Station',
+    stationUrl: 'https://station.example',
+    error: null,
+    loading: false,
+    rememberedAccounts: [],
+    onBack: vi.fn(),
+    onRefresh: vi.fn(),
+    onLogin: vi.fn().mockResolvedValue(undefined),
+    onInviteCode: vi.fn().mockResolvedValue(undefined),
+    onSchemaSubmit: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  }));
+}
+
+function loginDecision(alternativeActions: AccessGateAction[]): AccessDecision {
+  return {
+    state: 'ACCESS_DECISION_STATE_ACTION_REQUIRED',
+    attemptId: 'attempt-1',
+    currentGateId: 'auth.login',
+    gates: [{
+      gateId: 'auth.login',
+      type: 'ACCESS_GATE_TYPE_AUTH_LOGIN',
+      state: 'ACCESS_GATE_STATE_ACTION_REQUIRED',
+      alternativeActions,
+      actionId: 'auth.password',
+      schemaRevision: 1,
+      schemaDigest: 'a'.repeat(64),
+    }],
+  };
+}
+
+function schemaDecision(): AccessDecision {
+  return {
+    state: 'ACCESS_DECISION_STATE_ACTION_REQUIRED',
+    attemptId: 'attempt-1',
+    currentGateId: 'terms.acceptance',
+    gates: [{
+      gateId: 'terms.acceptance',
+      type: 'ACCESS_GATE_TYPE_CUSTOM',
+      state: 'ACCESS_GATE_STATE_ACTION_REQUIRED',
+      title: 'Terms',
+      description: 'Review the current Station terms.',
+      submitAction: 'submit_generic',
+      inputSchemaJson: JSON.stringify({
+        fields: [{
+          name: 'accepted',
+          type: 'checkbox',
+          label: 'Accept',
+          required: true,
+        }],
+      }),
+      alternativeActions: [],
+      actionId: 'terms.acceptance',
+      schemaRevision: 1,
+      schemaDigest: 'b'.repeat(64),
+    }],
+  };
+}
+
+function action(
+  actionId: string,
+  type: AccessGateAction['type'],
+  submitAction: string,
+): AccessGateAction {
+  return {
+    actionId,
+    type,
+    submitAction,
+    schemaRevision: 1,
+    schemaDigest: 'a'.repeat(64),
+  };
+}

@@ -1,0 +1,147 @@
+/* Search page layout; controls consume peers-ui search contracts. */
+.mobile-search-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100% - var(--mobile-search-keyboard-overlap, 0px));
+  min-height: 0;
+  overflow: hidden;
+  background: var(--pt-surface);
+  color: inherit;
+}
+
+.mobile-search-page .header-action,
+.mobile-search-filters button {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.mobile-search-controls {
+  flex: none;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--pt-border);
+}
+
+.mobile-search-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.mobile-search-input {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+}
+
+.mobile-search-input > * {
+  width: 100%;
+}
+
+.mobile-search-leading {
+  display: inline-flex;
+  align-items: center;
+  color: var(--pt-muted);
+}
+
+.mobile-search-input-row > button {
+  height: 44px;
+  flex: none;
+}
+
+.mobile-search-filters {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.mobile-search-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  min-height: 44px;
+}
+
+.mobile-search-scope .mobile-search-scope-copy {
+  color: inherit;
+  opacity: 0.75;
+}
+
+.mobile-search-scope button {
+  min-height: 44px;
+}
+
+.mobile-search-viewport {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: calc(var(--safe-area-bottom) + 12px);
+}
+
+.mobile-search-function {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  text-align: start;
+  border: 0;
+  border-bottom: 1px solid var(--pt-border);
+  background: transparent;
+  color: inherit;
+  min-height: 44px;
+}
+
+.mobile-search-coverage,
+.mobile-search-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.mobile-search-coverage {
+  font-size: 0.875em;
+  opacity: 0.75;
+}
+
+.mobile-search-state {
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 16px;
+  text-align: center;
+}
+
+.mobile-search-pagination {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+.mobile-search-pagination button {
+  min-height: 44px;
+}
+
+.mobile-search-functions h2,
+.mobile-search-functions p {
+  font-size: 0.875em;
+  padding: 12px 16px;
+}
+
+.mobile-search-function span {
+  flex: 1;
+}
+
+.mobile-search-page button:focus-visible {
+  outline: 2px solid var(--pt-focus);
+  outline-offset: -2px;
+}

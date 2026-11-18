@@ -1,0 +1,917 @@
+{
+  "id": "mobile-native",
+  "profile": {
+    "required": false,
+    "identity_match": false
+  },
+  "source_identity": {
+    "commit_required": true,
+    "workspace_digest_required": true
+  },
+  "scenarios": {
+    "access": {
+      "gate_id": "mobile-native-access-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [
+        "github-disposable-account",
+        "google-disposable-account"
+      ],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": ["github", "google"],
+      "browser_sessions": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "harness_actions": [
+        "station.add",
+        "station.replace",
+        "access.submit",
+        "oauth.start",
+        "oauth.status",
+        "oauth.cancel",
+        "lifecycle.restart",
+        "projection.read",
+        "messaging.createDirect",
+        "messaging.createGroup",
+        "messaging.attachment.stage",
+        "messaging.attachment.open",
+        "messaging.send",
+        "messaging.interact",
+        "messaging.read",
+        "messaging.typing",
+        "messaging.reconcile",
+        "messaging.command.read",
+        "messaging.search",
+        "messaging.projection.read",
+        "social.request.send",
+        "social.request.accept",
+        "social.reconcile",
+        "social.projection.read",
+        "cleanup"
+      ],
+      "parent_harness_actions": [
+        "build.identity",
+        "oauth.replayHandle",
+        "oauth.negativeCallback"
+      ],
+      "ephemeral_capabilities": [
+        "mobile.native.appium-session",
+        "mobile.native.provider-authorization",
+        "mobile.native.station-fixture"
+      ],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "harness_negative_callback",
+        "refresh_webview",
+        "find_element",
+        "click",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "provider-account-leases",
+        "provider-browser-session-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "lifecycle": {
+      "gate_id": "mobile-native-lifecycle-e2e",
+      "clients": ["alice-ios", "alice-android"],
+      "services": [],
+      "credentials": [],
+      "fixtures": [],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [
+        "lifecycle.snapshot",
+        "lifecycle.waitReady",
+        "lifecycle.restart",
+        "lifecycle.secureStorageDeleteFailure"
+      ],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": false,
+      "cleanup_resources": [
+        "appium-sessions",
+        "ports",
+        "storage",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases"
+      ]
+    },
+    "recovery": {
+      "gate_id": "mobile-native-recovery-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [
+        "station.add",
+        "access.submit",
+        "lifecycle.restart",
+        "reliability.fixture.configure",
+        "reliability.friendRequest.submit",
+        "reliability.snapshot",
+        "reliability.reconcile",
+        "reliability.command.action",
+        "reliability.draft.write",
+        "reliability.draft.read",
+        "reliability.draft.action",
+        "reliability.reset",
+        "recovery.snapshot",
+        "social.reconcile",
+        "social.projection.read",
+        "cleanup"
+      ],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "recovery-ui": {
+      "gate_id": "mobile-native-recovery-ui-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [
+        "station.add",
+        "access.submit",
+        "lifecycle.restart",
+        "reliability.fixture.configure",
+        "reliability.snapshot",
+        "reliability.reconcile",
+        "reliability.command.action",
+        "reliability.draft.write",
+        "reliability.draft.read",
+        "reliability.draft.action",
+        "reliability.reset",
+        "recovery.snapshot",
+        "social.reconcile",
+        "social.projection.read",
+        "cleanup"
+      ],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "social-convergence": {
+      "gate_id": "mobile-native-social-convergence-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "chat-contacts": {
+      "gate_id": "mobile-native-chat-contacts-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "moments": {
+      "gate_id": "mobile-native-moments-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "settings": {
+      "gate_id": "mobile-native-settings-e2e",
+      "clients": [
+        "alice-ios",
+        "bob-ios",
+        "alice-android",
+        "bob-android"
+      ],
+      "services": ["station-primary", "station-secondary", "relay"],
+      "credentials": [],
+      "fixtures": ["mobile-native-actors"],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "background_app",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": true,
+      "cleanup_resources": [
+        "processes",
+        "appium-sessions",
+        "ports",
+        "storage",
+        "sessions",
+        "fixture-data",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases",
+        "deployment-leases"
+      ]
+    },
+    "uca-android-host": {
+      "gate_id": "unified-client-android-host-e2e",
+      "clients": ["alice-android"],
+      "services": ["station-primary"],
+      "credentials": [],
+      "fixtures": [],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": ["lifecycle.snapshot", "navigation.snapshot", "projection.read"],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start", "stop", "wait_ready", "is_alive", "contexts",
+        "switch_context", "harness_inventory", "harness_action",
+        "background_app", "find_element", "click",
+        "capture_page_source", "capture_screenshot", "verify_build_identity"
+      ],
+      "require_exact_device_count": false,
+      "cleanup_resources": [
+        "appium-sessions", "ports", "storage", "physical-device-leases",
+        "correlation-channel", "profile-leases", "deployment-leases"
+      ]
+    },
+    "uca-ios-host": {
+      "gate_id": "unified-client-ios-host-e2e",
+      "clients": ["alice-ios"],
+      "services": ["station-primary"],
+      "credentials": [],
+      "fixtures": [],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": ["lifecycle.snapshot", "navigation.snapshot", "projection.read"],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start", "stop", "wait_ready", "is_alive", "contexts",
+        "switch_context", "harness_inventory", "harness_action",
+        "background_app", "find_element", "click",
+        "capture_page_source", "capture_screenshot", "verify_build_identity"
+      ],
+      "require_exact_device_count": false,
+      "cleanup_resources": [
+        "appium-sessions", "ports", "storage", "physical-device-leases",
+        "correlation-channel", "profile-leases", "deployment-leases"
+      ]
+    },
+    "platform": {
+      "gate_id": "mobile-native-platform-e2e",
+      "clients": ["alice-ios", "alice-android"],
+      "services": [],
+      "credentials": [],
+      "fixtures": [],
+      "provider_accounts": [],
+      "browser_sessions": [],
+      "harness_actions": [
+        "lifecycle.snapshot",
+        "platform.permission.check",
+        "platform.permission.request",
+        "platform.permission.checkAll",
+        "platform.network.read"
+      ],
+      "parent_harness_actions": ["build.identity"],
+      "ephemeral_capabilities": ["mobile.native.appium-session"],
+      "appium_operations": [
+        "start",
+        "stop",
+        "wait_ready",
+        "is_alive",
+        "contexts",
+        "switch_context",
+        "harness_inventory",
+        "harness_action",
+        "capture_page_source",
+        "capture_screenshot",
+        "verify_build_identity"
+      ],
+      "require_exact_device_count": false,
+      "cleanup_resources": [
+        "appium-sessions",
+        "ports",
+        "storage",
+        "physical-device-leases",
+        "correlation-channel",
+        "profile-leases"
+      ]
+    }
+  },
+  "build": {
+    "environment": {
+      "VITE_ACCEPTANCE_HARNESS": "1"
+    },
+    "projects": {
+      "ios": "apps/mobile/src-tauri/gen/apple/peers-touch-mobile.xcodeproj",
+      "android": "apps/mobile/src-tauri/gen/android"
+    },
+    "applications": {
+      "ios": {
+        "id": "com.peers.touch.mobile",
+        "callback_scheme": "peers-touch"
+      },
+      "android": {
+        "id": "com.peers.touch.mobile",
+        "callback_scheme": "peers-touch"
+      }
+    }
+  },
+  "appium": {
+    "server": {
+      "url_ref": "env:PT_MOBILE_APPIUM_SERVER_URL",
+      "executable": "appium",
+      "expected_version": "2.19.0",
+      "status_path": "/status"
+    },
+    "drivers": {
+      "ios": {
+        "identity": "appium-xcuitest-driver",
+        "installed_name": "xcuitest",
+        "automation_name": "XCUITest",
+        "expected_version": "9.10.5"
+      },
+      "android": {
+        "identity": "appium-uiautomator2-driver",
+        "installed_name": "uiautomator2",
+        "automation_name": "UiAutomator2",
+        "expected_version": "4.2.9"
+      }
+    },
+    "ios": {
+      "device_inventory_command": ["xcrun", "xctrace", "list", "devices"],
+      "native_context": "NATIVE_APP",
+      "webview_context_prefix": "WEBVIEW",
+      "wda_bundle_id_ref": "env:PT_MOBILE_IOS_WDA_BUNDLE_ID",
+      "webview_bundle_id_ref": "env:PT_MOBILE_IOS_WEBVIEW_BUNDLE_ID"
+    },
+    "android": {
+      "device_inventory_command": ["adb", "devices", "-l"],
+      "chromedriver": {
+        "browser_packages": [
+          "com.android.chrome",
+          "com.google.android.webview"
+        ],
+        "cache_root": "<runtime-cache>/chromedriver",
+        "cache_root_ref": "env:PT_MOBILE_ACCEPTANCE_RUNTIME_CACHE",
+        "executable_ref": "env:PT_MOBILE_ANDROID_CHROMEDRIVER_EXECUTABLE",
+        "acquisition": {
+          "enabled": false,
+          "mode": "preseeded"
+        },
+        "artifacts": [
+          {
+            "browser_major": 124,
+            "driver_version": "124.0.6367.207",
+            "source": "https://storage.googleapis.com/chrome-for-testing-public/124.0.6367.207/mac-arm64/chromedriver-mac-arm64.zip",
+            "platform": "darwin",
+            "arch": "arm64",
+            "android_abis": ["arm64-v8a"],
+            "sha256": "115e3923a95abfddee333819923ca9ab545aceab4fd56f30f3f7387556798632",
+            "cache_target": "124.0.6367.207/darwin-arm64/chromedriver-mac-arm64.zip",
+            "executable_target": "124.0.6367.207/darwin-arm64/chromedriver"
+          },
+          {
+            "browser_major": 103,
+            "driver_version": "103.0.5060.134",
+            "source": "https://chromedriver.storage.googleapis.com/103.0.5060.134/chromedriver_mac64_m1.zip",
+            "platform": "darwin",
+            "arch": "arm64",
+            "android_abis": ["arm64-v8a"],
+            "sha256": "8a1fc69e573a15bfa9c53f0be15af3252bafa04e779c8e2074bedc6db9c067a7",
+            "cache_target": "103.0.5060.134/darwin-arm64/chromedriver-mac64-m1.zip",
+            "executable_target": "103.0.5060.134/darwin-arm64/chromedriver"
+          }
+        ]
+      }
+    }
+  },
+  "services": {
+    "station-primary": {
+      "kind": "station",
+      "required": true,
+      "runtime_identity_required": true,
+      "endpoint_ref": "env:PT_MOBILE_STATION_PRIMARY_URL",
+      "deployment_environment_ref": "env:PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV",
+      "ready_action": "station-check",
+      "health_action": "station-check",
+      "status_action": "station-status",
+      "attestation_producer": "station-deployment"
+    },
+    "station-secondary": {
+      "kind": "station",
+      "required": true,
+      "runtime_identity_required": true,
+      "endpoint_ref": "env:PT_MOBILE_STATION_SECONDARY_URL",
+      "deployment_environment_ref": "env:PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV",
+      "ready_action": "station-check",
+      "health_action": "station-check",
+      "status_action": "station-status",
+      "attestation_producer": "station-deployment"
+    },
+    "relay": {
+      "kind": "relay",
+      "required": true,
+      "runtime_identity_required": true,
+      "endpoint_ref": "env:PT_RELAY_URL",
+      "deployment_environment_ref": "env:PT_RELAY_DEPLOY_ENV",
+      "health_endpoint_ref": "env:PT_RELAY_HEALTH_URL",
+      "ready_action": "relay-check",
+      "health_action": "relay-check",
+      "status_action": "relay-status",
+      "attestation_producer": "relay-deployment"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "mobile-native-actors",
+      "authorization_required": true,
+      "authorization_ref": "station.reset:mobile-native-actors",
+      "target_assertion": "station-primary and station-secondary are approved disposable targets",
+      "initial_assertion": "alice and bob have isolated PTID and device identities on both Stations",
+      "setup_action": "python3 -m tooling.acceptance.fixtures.mobile_native_reset --prepare",
+      "cleanup_action": "python3 -m tooling.acceptance.fixtures.mobile_native_reset --cleanup"
+    }
+  ],
+  "credentials": [
+    {
+      "id": "github-disposable-account",
+      "source_ref": "env:MOBILE_ACCEPTANCE_GITHUB_ACCOUNT",
+      "required": true
+    },
+    {
+      "id": "google-disposable-account",
+      "source_ref": "env:MOBILE_ACCEPTANCE_GOOGLE_ACCOUNT",
+      "required": true
+    }
+  ],
+  "clients": [
+    {
+      "id": "alice-ios",
+      "platform": "ios",
+      "actor": "alice",
+      "runtime": "tauri-ios",
+      "destination_class_ref": "ios-physical",
+      "physical_device_lease_ref": "physical-device-lease/alice-ios",
+      "device_role": "primary-physical",
+      "profile": "mobile-shell-alice-ios",
+      "port_roles": ["wda-local", "mjpeg", "webview"],
+      "storage_root": "<runtime-home>/acceptance/mobile-shell/<run-id>/alice-ios",
+      "session_lease": "mobile-native/alice-ios",
+      "browser_session": {
+        "owner": "alice-ios",
+        "provider": "github",
+        "credential_ref": "github-disposable-account",
+        "lease_ref": "provider-browser-session-lease/alice-ios",
+        "baseline": "preauthenticated-exclusive",
+        "cleanup_policy": "preserve-login-verify-identity"
+      }
+    },
+    {
+      "id": "bob-ios",
+      "platform": "ios",
+      "actor": "bob",
+      "runtime": "tauri-ios",
+      "destination_class_ref": "ios-physical",
+      "physical_device_lease_ref": "physical-device-lease/bob-ios",
+      "device_role": "secondary-physical",
+      "profile": "mobile-shell-bob-ios",
+      "port_roles": ["wda-local", "mjpeg", "webview"],
+      "storage_root": "<runtime-home>/acceptance/mobile-shell/<run-id>/bob-ios",
+      "session_lease": "mobile-native/bob-ios",
+      "browser_session": {
+        "owner": "bob-ios",
+        "provider": "google",
+        "credential_ref": "google-disposable-account",
+        "lease_ref": "provider-browser-session-lease/bob-ios",
+        "baseline": "preauthenticated-exclusive",
+        "cleanup_policy": "preserve-login-verify-identity"
+      }
+    },
+    {
+      "id": "alice-android",
+      "platform": "android",
+      "actor": "alice",
+      "runtime": "tauri-android",
+      "destination_class_ref": "android-physical",
+      "physical_device_lease_ref": "physical-device-lease/alice-android",
+      "device_role": "primary-physical",
+      "profile": "mobile-shell-alice-android",
+      "port_roles": ["system", "mjpeg", "webview"],
+      "storage_root": "<runtime-home>/acceptance/mobile-shell/<run-id>/alice-android",
+      "session_lease": "mobile-native/alice-android",
+      "browser_session": {
+        "owner": "alice-android",
+        "provider": "google",
+        "credential_ref": "google-disposable-account",
+        "lease_ref": "provider-browser-session-lease/alice-android",
+        "baseline": "preauthenticated-exclusive",
+        "cleanup_policy": "preserve-login-verify-identity"
+      }
+    },
+    {
+      "id": "bob-android",
+      "platform": "android",
+      "actor": "bob",
+      "runtime": "tauri-android",
+      "destination_class_ref": "android-physical",
+      "physical_device_lease_ref": "physical-device-lease/bob-android",
+      "device_role": "secondary-physical",
+      "profile": "mobile-shell-bob-android",
+      "port_roles": ["system", "mjpeg", "webview"],
+      "storage_root": "<runtime-home>/acceptance/mobile-shell/<run-id>/bob-android",
+      "session_lease": "mobile-native/bob-android",
+      "browser_session": {
+        "owner": "bob-android",
+        "provider": "github",
+        "credential_ref": "github-disposable-account",
+        "lease_ref": "provider-browser-session-lease/bob-android",
+        "baseline": "preauthenticated-exclusive",
+        "cleanup_policy": "preserve-login-verify-identity"
+      }
+    }
+  ],
+  "harness": {
+    "namespace": "__PEERS_MOBILE_ACCEPTANCE__",
+    "build_flag": "VITE_ACCEPTANCE_HARNESS=1",
+    "required_actions": [
+      "station.add",
+      "station.replace",
+      "access.submit",
+      "oauth.start",
+      "oauth.status",
+      "oauth.cancel",
+      "lifecycle.restart",
+      "projection.read",
+      "messaging.createDirect",
+      "messaging.createGroup",
+      "messaging.attachment.stage",
+      "messaging.attachment.open",
+      "messaging.send",
+      "messaging.interact",
+      "messaging.read",
+      "messaging.typing",
+      "messaging.reconcile",
+      "messaging.command.read",
+      "messaging.search",
+      "messaging.projection.read",
+      "social.request.send",
+      "social.request.accept",
+      "social.reconcile",
+      "social.projection.read",
+      "cleanup"
+    ],
+    "parent_only_actions": [
+      "build.identity",
+      "oauth.replayHandle",
+      "oauth.negativeCallback"
+    ],
+    "policy": "production actions only; direct Store mutation and successful-result injection are forbidden"
+  },
+  "leases": {
+    "ports": "one reserved set per client",
+    "storage": "one isolated root per client and run",
+    "storage_root_ref": "env:PT_MOBILE_ACCEPTANCE_RUNTIME_ROOT",
+    "authentication_key_ref": "env:PT_MOBILE_RESOURCE_LEASE_AUTH_KEY",
+    "sessions": "one Appium session lease per client",
+    "deployments": ["station-primary", "station-secondary", "relay"],
+    "resource_broker": {
+      "broker_ref": "mobile-resource-lease-broker",
+      "heartbeat_seconds": 300,
+      "expiry_seconds": 600,
+      "expiry_policy": "quarantine-until-baseline-recovery",
+      "operation_fence": ["resourceKey", "holderRunId", "fenceToken"],
+      "correlation": {
+        "mode": "run-scoped-secret-side-hmac",
+        "channel": "anonymous-pipe-or-process-memory",
+        "cleanup": ["close-channel", "zeroize-key"]
+      }
+    },
+    "physical_devices": [
+      {
+        "client_id": "alice-ios",
+        "platform": "ios",
+        "resource_key": "physical-device/alice-ios",
+        "physical_device_ref": "device-ref/alice-ios",
+        "destination_class_ref": "ios-physical"
+      },
+      {
+        "client_id": "bob-ios",
+        "platform": "ios",
+        "resource_key": "physical-device/bob-ios",
+        "physical_device_ref": "device-ref/bob-ios",
+        "destination_class_ref": "ios-physical"
+      },
+      {
+        "client_id": "alice-android",
+        "platform": "android",
+        "resource_key": "physical-device/alice-android",
+        "physical_device_ref": "device-ref/alice-android",
+        "destination_class_ref": "android-physical"
+      },
+      {
+        "client_id": "bob-android",
+        "platform": "android",
+        "resource_key": "physical-device/bob-android",
+        "physical_device_ref": "device-ref/bob-android",
+        "destination_class_ref": "android-physical"
+      }
+    ],
+    "provider_accounts": [
+      {
+        "provider": "github",
+        "account_ref": "github-disposable-account",
+        "resource_key": "provider-account/github/disposable",
+        "allowed_client_ids": ["alice-ios", "bob-android"],
+        "max_concurrent_authorizations": 1
+      },
+      {
+        "provider": "google",
+        "account_ref": "google-disposable-account",
+        "resource_key": "provider-account/google/disposable",
+        "allowed_client_ids": ["bob-ios", "alice-android"],
+        "max_concurrent_authorizations": 1
+      }
+    ],
+    "browser_profiles": [
+      {
+        "client_id": "alice-ios",
+        "resource_key": "physical-device/alice-ios/browser/default",
+        "browser_profile_ref": "browser-profile/alice-ios"
+      },
+      {
+        "client_id": "bob-ios",
+        "resource_key": "physical-device/bob-ios/browser/default",
+        "browser_profile_ref": "browser-profile/bob-ios"
+      },
+      {
+        "client_id": "alice-android",
+        "resource_key": "physical-device/alice-android/browser/default",
+        "browser_profile_ref": "browser-profile/alice-android"
+      },
+      {
+        "client_id": "bob-android",
+        "resource_key": "physical-device/bob-android/browser/default",
+        "browser_profile_ref": "browser-profile/bob-android"
+      }
+    ]
+  },
+  "cleanup": {
+    "resources": [
+      "processes",
+      "appium-sessions",
+      "ports",
+      "storage",
+      "sessions",
+      "fixture-data",
+      "physical-device-leases",
+      "provider-account-leases",
+      "provider-browser-session-leases",
+      "correlation-channel",
+      "profile-leases",
+      "deployment-leases"
+    ],
+    "order": [
+      "appium-sessions",
+      "client-processes",
+      "ports",
+      "storage",
+      "fixture-sessions",
+      "fixture-data",
+      "provider-browser-session-leases",
+      "provider-account-leases",
+      "physical-device-leases",
+      "correlation-channel",
+      "client-profile-leases",
+      "environment-profile-lease",
+      "deployment-leases"
+    ],
+    "deterministic": true
+  }
+}

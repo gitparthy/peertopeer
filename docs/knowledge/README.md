@@ -1,0 +1,257 @@
+# Operational Knowledge Layer
+
+> Status: Canonical. Owner: Architecture.
+> Audience: humans AND AI agents acting on this codebase.
+> Updated: 2026-10-30
+
+---
+
+## 1. What this directory is
+
+The **operational knowledge layer** captures the kind of project knowledge that doesn't fit anywhere else:
+
+- Things that are **true across multiple subsystems** but cannot live in any one of them.
+- Things we **already paid for** (bugs hit, near-misses caught at review) and don't want to pay for again.
+- Things that **describe how to do recurring work** without prescribing implementation.
+- Project-specific **terminology** that isn't in any standard glossary.
+
+This sits **below** architecture / design and **above** code comments in the documentation source hierarchy (see `AGENTS.md §3`):
+
+```
+Architecture        — what / why at the system level     (docs/architecture/)
+Platform / spec     — how each platform implements it    (docs/{client,station,global}/)
+Decisions           — point-in-time trade-offs           (docs/context/decisions/)
+► Operational KB ◄  — invariants / pitfalls / playbooks  (THIS DIR)
+Subsystem           — surface API + local README         (per-dir README.md)
+Code                — line-level intent                   (in-file comments)
+```
+
+Anything that would otherwise be lost in PR descriptions, commit messages, or session memory belongs here.
+
+---
+
+## 2. Three kinds of files
+
+### 2.1 `invariants/` — what must always hold
+
+Cross-cutting properties that any code touching the named paths MUST respect.
+
+Examples in this repo:
+
+- "the relay readLoop must never block on disk I/O or contended mutexes"
+- "every locator-publisher caller is either user-driven (broadcast) or maintenance (no broadcast); there is no third category"
+
+Invariants are written as **negative space** — what cannot happen — not as "how to do things". They tend to be small (a few hundred lines) and stable (rare edits).
+
+### 2.2 `pitfalls/` — what we already paid for
+
+A pitfall captures a specific bug or near-miss with enough context that the next person doesn't repeat it. Format:
+
+- **Symptom**: what was observed.
+- **Root cause**: the system property that allowed it.
+- **Mitigation**: what was done in code AND what guards it from regression.
+- **How to detect a recurrence**: a grep / metric / test that fires if the bug returns.
+
+Pitfalls are typically born from review findings, incidents, or "I almost shipped …" moments. They are append-only — never delete a pitfall, mark `status: superseded-by:<path>` if a follow-up made the original obsolete.
+
+### 2.3 `playbooks/` — how to do a recurring class of task
+
+A playbook is the standard operating procedure for a category of work that we've done at least twice and will do more.
+
+Examples:
+
+- "adding a federation broadcast topic" — covers proto + relay allow-list + handler + receiver gate + metrics
+- "introducing a new actor visibility state" — covers proto + DB column + UI + locator-hook + republisher
+
+Playbooks reference the relevant invariants and pitfalls so that following one automatically respects them.
+
+---
+
+## 3. Frontmatter contract
+
+Every file in `invariants/`, `pitfalls/`, `playbooks/` has YAML frontmatter at the top:
+
+```yaml
+---
+kind: invariant | pitfall | playbook
+title: <one line, human-readable>
+status: active | deprecated | superseded-by:<relative-path>
+owns:
+  - <repo path that this knowledge governs>
+  - <repo path>
+referenced-by:
+  - <other knowledge file path>
+related:
+  - <ADR / architecture doc / external link>
+detected: YYYY-MM-DD
+owner: <owning team>            # recommended
+review-cadence: annual          # recommended: quarterly | semiannual | annual | on-change
+next-review: YYYY-MM-DD         # required when review-cadence is set
+---
+```
+
+The optional `owner` / `review-cadence` / `next-review` fields use the same
+review-cadence mechanism defined for client contracts in
+`docs/client/common/ui-identity/README.md §9`. They are recommended for new
+entries; existing entries gain them incrementally.
+
+The `owns:` field is **machine-readable** and load-bearing:
+
+- `tooling/skills/pt-read-before-edit/` greps every `owns:` entry across this directory before any Edit tool fires. Files matching one or more `owns:` paths cause the corresponding knowledge file to be loaded into the agent's context as a reviewer's voice.
+- A knowledge file with no `owns:` is allowed (e.g. cross-cutting glossary) but will never auto-trigger; humans must reference it explicitly.
+
+Non-knowledge files (`README.md`, `_TEMPLATE.md`, `glossary.md`) are exempt.
+
+---
+
+## 4. Lifecycle
+
+| Event | Action |
+|-------|--------|
+| Bug shipped, root cause identified | Add a `pitfall/` entry in the same PR as the fix |
+| Invariant discovered (e.g. during review) | Add an `invariant/` entry, link it from any subsystem `CONSTRAINTS.md` |
+| Same task done ≥ 2× with the same shape | Promote the procedure to a `playbook/` |
+| Knowledge becomes obsolete | Mark `status: superseded-by:<path>` and link to the replacement; never delete |
+| New term coined for the domain | Add to `glossary.md` |
+
+Promotion path:
+
+```
+session insight ──► PR comment ──► commit message ──► .localenv note
+                                                           │
+                                                           ▼
+                                                  pitfall / invariant
+                                                  (in this directory)
+                                                           │
+                                                           ▼
+                                              playbook / architecture doc
+                                              (when generalized to a class)
+```
+
+---
+
+## 5. What this layer is NOT
+
+To prevent dilution:
+
+- **Not architectural design.** If the knowledge defines a system relationship or boundary, it goes to `docs/architecture/` instead.
+- **Not coding style.** If the knowledge is "name things this way" / "format files like that", it goes to `docs/global/coding-guide/`.
+- **Not a runbook.** Operational steps for running the system live next to the deployment artifacts (`tooling/scripts/`, `tooling/docker/`, `.localenv`).
+- **Not a wiki.** A knowledge file that doesn't end with a verifiable rule (an `invariant`'s "must hold", a `pitfall`'s "how to detect a recurrence", a `playbook`'s checklist) is incomplete and should not be merged.
+
+When in doubt: if the file doesn't tell you what to **do or not do** the next time you touch a specific path, it doesn't belong here.
+
+---
+
+## 6. Reading entry points
+
+Pick one based on intent:
+
+- **"I'm about to edit code in path X"** → grep `owns: $X` here, read every match.
+- **"I want to do task class Y"** → check `playbooks/` first.
+- **"I'm reviewing a PR that touches federation"** → start with `invariants/relay-readloop-discipline.md` and `invariants/locator-publisher-symmetry.md`.
+- **"What does term Z mean in this project?"** → `glossary.md`.
+
+---
+
+## 7. Index
+
+### Invariants (active)
+
+- [`invariants/profile-resources-use-machine-owner.md`](invariants/profile-resources-use-machine-owner.md) — Profile resource callers consume the existing machine owner; physical allocation, recovery and data-scope checks cannot drift into launchers.
+- [`invariants/provider-execution-owner-boundary.md`](invariants/provider-execution-owner-boundary.md) — Provider resources, grants, credentials and shared binaries preserve the requesting actor's execution boundary.
+- [`invariants/relay-readloop-discipline.md`](invariants/relay-readloop-discipline.md) — readLoop goroutines must dispatch blocking work asynchronously.
+- [`invariants/locator-publisher-symmetry.md`](invariants/locator-publisher-symmetry.md) — `PublishVisibility` callers split into "user-driven" (broadcast) and "maintenance" (no broadcast); no third category.
+- [`invariants/relay-runtime-role-is-minimal.md`](invariants/relay-runtime-role-is-minimal.md) — Relay composition is deny-by-default and fails closed on missing transport/operator security.
+- [`invariants/circuit-relay-control-plane-boundary.md`](invariants/circuit-relay-control-plane-boundary.md) — Circuit Relay stays an opaque standard data plane with fenced admission and independent reservations.
+- [`invariants/chat-message-boundaries.md`](invariants/chat-message-boundaries.md) — Chat message content must not be covered by actions, metadata, composers, safe areas, or floating layers.
+- [`invariants/self-direct-is-one-member-direct.md`](invariants/self-direct-is-one-member-direct.md) — Saved Messages is a one-member Direct on the existing pipeline, never a new conversation kind or local-only store.
+- [`invariants/mobile-chat-layout-boundaries.md`](invariants/mobile-chat-layout-boundaries.md) — Mobile Chat bottom layers must participate in one bottom clearance model.
+- [`invariants/desktop-chat-layout-boundaries.md`](invariants/desktop-chat-layout-boundaries.md) — Desktop Chat actions must respect conversation pane bounds and collision handling.
+- [`invariants/composite-form-control-boundaries.md`](invariants/composite-form-control-boundaries.md) — composite form controls that represent one semantic input must share one parent frame and state model.
+- [`invariants/desktop-identity-lifecycle-closure.md`](invariants/desktop-identity-lifecycle-closure.md) — Desktop identity/profile/account/avatar projections must close through the identity state machine.
+- [`invariants/desktop-actor-identity-scope-migration.md`](invariants/desktop-actor-identity-scope-migration.md) — Desktop Actor identity scope changes migrate the Station-anchored seed and preserve the local device identity.
+- [`invariants/mobile-user-identity-visual-consistency.md`](invariants/mobile-user-identity-visual-consistency.md) — Mobile user identities use one rounded-square avatar primitive and one canonical actor projection across Social surfaces.
+- [`invariants/access-gate-wire-contract.md`](invariants/access-gate-wire-contract.md) — `AccessDecision` consumers must tolerate snake_case-first keys and match enums by both number and string name across Go→Rust→TS.
+- [`invariants/device-link-commit-and-lifecycle-admission.md`](invariants/device-link-commit-and-lifecycle-admission.md) — Device Link commit defers to current Access and Session owners; stale asynchronous work cannot reacquire lifecycle or route ownership.
+- [`invariants/actor-ref-account-is-persisted-identity.md`](invariants/actor-ref-account-is-persisted-identity.md) — `ActorRef.acct` comes from the persisted federated handle, never request transport.
+- [`invariants/actor-presence-ownership.md`](invariants/actor-presence-ownership.md) — actor presence belongs to the global presence owner, not chat subservers or chat proto models.
+- [`invariants/direct-receipt-endpoint-truth.md`](invariants/direct-receipt-endpoint-truth.md) — Direct receipt aggregation uses immutable event commitments, not Group/MLS device rows.
+- [`invariants/continuous-plan-run.md`](invariants/continuous-plan-run.md) — one authorized Development Run continues across Goal slices, review, evidence refresh, and context boundaries until completion or a true hard stop.
+- [`invariants/host-neutral-agent-execution.md`](invariants/host-neutral-agent-execution.md) — project scheduling, runtime verification, evidence, and cleanup semantics remain independent of TRAE, Cursor, Codex, or future hosts.
+- [`invariants/acceptance-scope-is-runner-owned.md`](invariants/acceptance-scope-is-runner-owned.md) — Acceptance runner and Gap Detector resolve their own explicit scope without a second admission owner.
+- [`invariants/user-skill-overlays-are-interaction-only.md`](invariants/user-skill-overlays-are-interaction-only.md) — machine-local user overlays may shape interaction only and cannot alter project execution semantics.
+- [`invariants/workflow-snapshot-is-read-only.md`](invariants/workflow-snapshot-is-read-only.md) — current-source and optional task status is read-only, explicitly selected, and corruption-isolated.
+- [`invariants/worktree-observation-is-diagnostic.md`](invariants/worktree-observation-is-diagnostic.md) — each worktree owns its opportunity report while Dev UI discovery and freshness remain non-authoritative.
+- [`invariants/desktop-vite-entry-readiness.md`](invariants/desktop-vite-entry-readiness.md) — Desktop startup and reuse require the Vite renderer entry module to respond successfully.
+- [`invariants/acceptance-suite-runtime-reuse.md`](invariants/acceptance-suite-runtime-reuse.md) — multi-scenario Acceptance provisions expensive resources once at Suite scope and keeps Scenarios attach-only.
+- [`invariants/desktop-sqlite-path-budget.md`](invariants/desktop-sqlite-path-budget.md) — Desktop database paths compact oversized identity-derived scopes without changing encryption identity or existing short paths.
+- [`invariants/private-comment-read-completion.md`](invariants/private-comment-read-completion.md) — private Comment Store reads share completion and reject stale scope, page, anchor, and removed-post publication.
+- [`invariants/x-config-origins-never-extend-trust.md`](invariants/x-config-origins-never-extend-trust.md) — x-config origin lists choose fetch transport only; publisher trust stays app-baked, key rotation requires a release.
+- [`invariants/x-config-must-not-block-local-startup.md`](invariants/x-config-must-not-block-local-startup.md) — optional configuration I/O cannot block local startup or readers; denied watermarks stay unknown and concurrent refreshes coalesce.
+- [`invariants/client-settings-personalization-actor-scoped.md`](invariants/client-settings-personalization-actor-scoped.md) — client personalization is L2 `(app, station, actor)` `config.preference`, symmetric across Desktop/Mobile, hard-deleted on logout; no generic settings store.
+
+### Pitfalls
+
+- [`pitfalls/private-outage-must-follow-source-commit.md`](pitfalls/private-outage-must-follow-source-commit.md) — private delivery outage starts after an online commit and an observed original undelivered frame.
+- [`pitfalls/standalone-federation-probe-scope-initialization.md`](pitfalls/standalone-federation-probe-scope-initialization.md) — standalone replay probes install canonical peer scopes before real HTTP token minting.
+- [`pitfalls/private-audience-fixture-must-exclude-author.md`](pitfalls/private-audience-fixture-must-exclude-author.md) — explicit recipient fixtures exclude the author while retaining its original implicit-grant readback.
+- [`pitfalls/private-followers-remote-subscription.md`](pitfalls/private-followers-remote-subscription.md) — private follower preparation and current reads consume the authenticated remote subscription with Home and revision fences.
+- [`pitfalls/comment-revalidation-must-preserve-ui-intent.md`](pitfalls/comment-revalidation-must-preserve-ui-intent.md) — acquired empty threads, collapse choices and confirmed comment mutations survive background reads and return to an alive page.
+- [`pitfalls/desktop-header-drag-regions-fragmented.md`](pitfalls/desktop-header-drag-regions-fragmented.md) — Desktop pane headers consume one shell drag adapter; custom controls and forwarded composite roots require real hit testing.
+- [`pitfalls/private-comment-author-recovery-delivery.md`](pitfalls/private-comment-author-recovery-delivery.md) — complete resource delivery retains remote Comment authors' recovery envelopes and replacement-device root/reply readback.
+- [`pitfalls/private-endpoint-account-hint-equality.md`](pitfalls/private-endpoint-account-hint-equality.md) — verified private endpoints compare actor/device identity without treating account routing hints as authorization.
+- [`pitfalls/automatic-merge-can-propagate-accepted-ui-loss.md`](pitfalls/automatic-merge-can-propagate-accepted-ui-loss.md) — all bilateral and automatic merge paths require final-source preservation proof; keyword-only checks do not prove enforcement.
+- [`pitfalls/feed-derived-counts-must-preserve-authored-time.md`](pitfalls/feed-derived-counts-must-preserve-authored-time.md) — derived counts and authored edits must preserve signed post timestamps.
+- [`pitfalls/social-publication-and-retry-ownership.md`](pitfalls/social-publication-and-retry-ownership.md) — relationship readback and exact reaction retry share their original revision and command owners.
+- [`pitfalls/agent-user-message-identity-placeholder.md`](pitfalls/agent-user-message-identity-placeholder.md) — Agent user messages project the authenticated session actor through the shared avatar path.
+- [`pitfalls/c1-tombstone-only-broadcast.md`](pitfalls/c1-tombstone-only-broadcast.md) — first cut of Tier C1 fired invalidation only on tombstone, leaving BY_HANDLE/INDEXED transitions and profile updates on the slow path.
+- [`pitfalls/republisher-broadcast-spam.md`](pitfalls/republisher-broadcast-spam.md) — naive "broadcast on every PublishVisibility success" turns periodic republisher into a relay traffic generator.
+- [`pitfalls/social-ui-identity-surface-fragmentation.md`](pitfalls/social-ui-identity-surface-fragmentation.md) — Social UI surfaces must not fragment content rail, action row, trust meta, thread, or incomplete-capability states.
+- [`pitfalls/renderer-generation-churn-must-not-teardown-native-actor.md`](pitfalls/renderer-generation-churn-must-not-teardown-native-actor.md) — renderer generation churn must reset only the projection; native Secure Content teardown and rollback logout are scoped to genuine deauthentication/one actor.
+- [`pitfalls/mobile-chat-conversation-actions-right-drawer.md`](pitfalls/mobile-chat-conversation-actions-right-drawer.md) — Mobile Chat conversation actions must use bottom sheets or settings pages, not phone-width right drawers.
+- [`pitfalls/mobile-private-runtime-policy-readiness-divergence.md`](pitfalls/mobile-private-runtime-policy-readiness-divergence.md) — Private Mobile runtimes must reuse shared Station-origin policy and publish asynchronous activation failures through lifecycle readiness.
+- [`pitfalls/mobile-messaging-failure-periodic-repair.md`](pitfalls/mobile-messaging-failure-periodic-repair.md) — Existing Social periodic repair recovers failed Messaging through its original readiness owner before repairing dependents.
+- [`pitfalls/mobile-parity-design-system-selector-drift.md`](pitfalls/mobile-parity-design-system-selector-drift.md) — Mobile parity selectors must follow design-system DOM and aria-disabled semantics, not removed Ant classes or native disabled clicks; RadioGroup inputs must also bind each option value instead of collapsing to the browser default "on".
+- [`pitfalls/mobile-whole-product-surface-audit-layers.md`](pitfalls/mobile-whole-product-surface-audit-layers.md) — The whole-product Gate surfaces unlabeled/undersized controls, empty interaction artifacts, harness-overlay occlusion, landscape clipping and missing proof assertions one fail-fast layer at a time; touch geometry belongs in the design system and PASS reports need named assertions.
+- [`pitfalls/mobile-actor-display-name-ptid-fallback.md`](pitfalls/mobile-actor-display-name-ptid-fallback.md) — actorDisplayName derives a readable handle only when the caller supplies a PTID context; comment identities with no PTID wait for the canonical profile, blocked users keep the raw PTID, and client-only external stores need a null server snapshot.
+- [`pitfalls/mobile-resume-session-revocation-local-only.md`](pitfalls/mobile-resume-session-revocation-local-only.md) — resume revalidation detects a real same-device `kicked` session; the AS-04 Gate was realigned to SAL-D12 (per-device slots, multi-device coexistence, distinct device ids) and now seals PROVEN with evidence-derived assertions, after fixing a latent missing-assertions gap that the runner rejects as "source report is unproven".
+- [`pitfalls/mobile-route-preexpiry-renewal-single-owner.md`](pitfalls/mobile-route-preexpiry-renewal-single-owner.md) — Native renewal uses the Web preexpiry window, coalesces matching callers and preserves selection/removal fences.
+- [`pitfalls/acceptance-core-transport-import-cycle.md`](pitfalls/acceptance-core-transport-import-cycle.md) — Core attestation must receive remote source identity from a Provisioner adapter instead of importing concrete SSH transport.
+- [`pitfalls/acceptance-mutable-artifact-rewrite.md`](pitfalls/acceptance-mutable-artifact-rewrite.md) — mutable runtime logs must be written once, after the producing client stops, when the Evidence Store path is immutable.
+- [`pitfalls/acceptance-shared-validator-variant-assumptions.md`](pitfalls/acceptance-shared-validator-variant-assumptions.md) — shared Gate validators must derive journey and topology semantics from the active Gate variant.
+- [`pitfalls/ephemeral-gate-cleanup-reset-lease-projection.md`](pitfalls/ephemeral-gate-cleanup-reset-lease-projection.md) — ephemeral Gate child env strips reset lease descriptors; the parent must re-project its own live lease for provisioner cleanup.
+- [`pitfalls/acceptance-active-docs-must-not-promote-drafts.md`](pitfalls/acceptance-active-docs-must-not-promote-drafts.md) — active Acceptance docs must keep draft proposals non-normative, inventory implemented paths only, and treat Plans as optional.
+- [`pitfalls/native-chat-gates-require-federation-context.md`](pitfalls/native-chat-gates-require-federation-context.md) — Native Direct and Group creation must pass a Federation shared by every participating client.
+- [`pitfalls/native-semantic-startup-with-object-identity.md`](pitfalls/native-semantic-startup-with-object-identity.md) — startup and chooser proof keep one scoped AX object baseline, strict deadlines, original selector and complete cleanup.
+- [`pitfalls/native-social-controls-must-reveal-clipped-targets.md`](pitfalls/native-social-controls-must-reveal-clipped-targets.md) — reveal exact Social controls before viewport visibility waits and check canonical geometry tokens; hidden targets, stale sizes and missing tokens remain failures.
+- [`pitfalls/public-feed-integrity-recovery-phases.md`](pitfalls/public-feed-integrity-recovery-phases.md) — retain the original bounded Native rejection before observing the next passive Runtime recovery cycle.
+- [`pitfalls/modal-feedback-must-escape-inert-content.md`](pitfalls/modal-feedback-must-escape-inert-content.md) — render window-local modal failure feedback through the existing overlay host while retaining identity lifetime and background isolation.
+- [`pitfalls/public-api-owner-must-follow-resource-domain.md`](pitfalls/public-api-owner-must-follow-resource-domain.md) — public capabilities must be registered by their resource owner, never by an internal implementation namespace.
+- [`pitfalls/conversation-production-schema-migration-single-source.md`](pitfalls/conversation-production-schema-migration-single-source.md) — Conversation production migration must delegate to the persistence-owned canonical schema instead of copying its model list.
+- [`pitfalls/ios-simulator-uninstall-retains-keychain.md`](pitfalls/ios-simulator-uninstall-retains-keychain.md) — independent Mobile Acceptance runs must use fresh Simulators because application uninstall preserves Keychain state.
+- [`pitfalls/ios-acceptance-embedded-web-assets-split-brain.md`](pitfalls/ios-acceptance-embedded-web-assets-split-brain.md) — iOS acceptance builds must bind Cargo asset embedding and the bundle resource copy to one immutable harness dist snapshot.
+- [`pitfalls/mobile-enrollment-must-use-profile-revision.md`](pitfalls/mobile-enrollment-must-use-profile-revision.md) — Mobile device certificates must bind the authenticated Actor's current canonical profile revision.
+- [`pitfalls/call-id-must-use-canonical-ulid.md`](pitfalls/call-id-must-use-canonical-ulid.md) — Desktop and Mobile call arbitration must use one canonical shared ULID generator.
+- [`pitfalls/call-media-elements-must-rebind-after-mount.md`](pitfalls/call-media-elements-must-rebind-after-mount.md) — Single-call video remounts must retain real playback with one remote audio outlet.
+- [`pitfalls/runtime-owner-optional-workflow-state.md`](pitfalls/runtime-owner-optional-workflow-state.md) — runtime owners derive source-bound contract metadata without requiring optional task or declaration state.
+- [`pitfalls/fresh-recovery-cannot-require-active-engine.md`](pitfalls/fresh-recovery-cannot-require-active-engine.md) — fresh Actor recovery must establish the Messaging Engine instead of requiring one before archive restore.
+- [`pitfalls/json-fallback-decode-state.md`](pitfalls/json-fallback-decode-state.md) — fallback JSON parsers isolate destinations because failed decodes may leave partial state.
+- [`pitfalls/sqlcipher-raw-key-no-utf8-lossy.md`](pitfalls/sqlcipher-raw-key-no-utf8-lossy.md) — SQLCipher keys are 32 random bytes and must reach `sqlite3_key_v2` unmodified; UTF-8 lossy conversion folds their entropy.
+- [`pitfalls/desktop-gui-launch-profile-pointer.md`](pitfalls/desktop-gui-launch-profile-pointer.md) — double-click launches carry no `PT_PROFILE`; they must reuse the last identity-verified profile pointer instead of a hardcoded fallback, or identity-gated chat silently empties.
+- [`pitfalls/mobile-proto-regen-import-closure.md`](pitfalls/mobile-proto-regen-import-closure.md) — shipping one regenerated mobile proto file without its import closure breaks tsc; regen to a staging dir and sync the closure, not a single file.
+- [`pitfalls/global-personalization-leaks-across-actors.md`](pitfalls/global-personalization-leaks-across-actors.md) — app-global/OS-user settings stores survived logout and rendered actor A's language/theme/personalization to actor B on the same device.
+- [`pitfalls/peer-avatar-ephemeral-projection-flicker.md`](pitfalls/peer-avatar-ephemeral-projection-flicker.md) — the rotating station-resource projection token must never become the renderer avatar cache identity; the peer profile edge exposes canonical `avatar_identity` alongside the projected render URL.
+- [`pitfalls/device-inbox-poison-item-head-of-line-blocking.md`](pitfalls/device-inbox-poison-item-head-of-line-blocking.md) — a deterministically invalid inbox item (and an over-strict receiver invariant) must be quarantined and acked, never retried forever; submit must not inline the inbound drain.
+
+### Playbooks
+
+- [`playbooks/adding-federation-broadcast-topic.md`](playbooks/adding-federation-broadcast-topic.md) — full path for a new relay-mediated broadcast topic.
+- [`playbooks/ux-case-to-contract.md`](playbooks/ux-case-to-contract.md) — promote concrete UX examples into reusable contracts, platform refinements, invariants, and acceptance matrices.
+- [`playbooks/adding-an-access-gate.md`](playbooks/adding-an-access-gate.md) — proto → Station gatekeeper → Dashboard → Desktop/Mobile renderer for a new access gate.
+- [`playbooks/documenting-large-requirements.md`](playbooks/documenting-large-requirements.md) — required path for module-level demands, architecture work, and large cross-layer feature rebuilds.
+
+### Reference
+
+- [`glossary.md`](glossary.md) — project-specific terminology.
+- [`_TEMPLATE.md`](_TEMPLATE.md) — file template with frontmatter.

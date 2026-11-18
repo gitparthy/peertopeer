@@ -1,0 +1,463 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Button, Empty, Icon, Spin, Tag, Text } from '@peers-touch/ui';
+
+import { useMobileI18n } from '../../app/mobileI18n';
+import type { MobileChatDetailRoute } from '../../app/navigation';
+import { MobileNotice } from '../../components/MobileNotice';
+import { SocialActorAvatar } from '../../features/social/SocialActorAvatar';
+import {
+  dispatchBlockUser,
+  dispatchUnblockUser,
+} from '../../features/chat/chatCommands';
+import { dispatchOpenContactChat } from '../../features/social/contactCommands';
+import { actorDisplayName, projectAcceptedContacts } from '../../features/social/socialProjection';
+import {
+  dispatchFollowUser,
+  dispatchUnfollowUser,
+} from '../../features/social/socialProfileCommands';
+import {
+  formatSocialError,
+  useSocialStore,
+} from '../../features/social/socialStore';
+import {
+  requestSocialFriendshipStatus,
+  requestSocialPeerProfile,
+} from '../../features/social/socialRuntime';
+import { useSocialExperience } from '../../features/social/useSocialExperience';
+import { MomentFeedItem } from './MomentFeedItem';
+
+interface SocialProfilePageProps {
+  readonly actorPtid: string;
+  readonly federationId: string;
+  readonly onBack: () => void;
+  readonly onOpenChat: (route: MobileChatDetailRoute) => void;
+  readonly onOpenMoment: (postId: string) => void;
+}
+
+export function SocialProfilePage({
+  actorPtid,
+  federationId,
+  onBack,
+  onOpenChat,
+  onOpenMoment,
+}: SocialProfilePageProps) {
+  const { t } = useMobileI18n();
+  const { facade } = useSocialExperience();
+  const currentUserPtid = useSocialStore((state) => state.currentUserPtid);
+  const currentUserProfile = useSocialStore(
+    (state) => state.currentUserProfile,
+  );
+  const peerProfiles = useSocialStore((state) => state.peerProfiles);
+  const peerProfileLoading = useSocialStore(
+    (state) => state.peerProfileLoading,
+  );
+  const peerProfileErrors = useSocialStore((state) => state.peerProfileErrors);
+  const friendshipStatus = useSocialStore((state) => state.friendshipStatus);
+  const friendRequests = useSocialStore((state) => state.friendRequests);
+  const peerOnline = useSocialStore((state) => state.peerOnline);
+  const selectSession = useSocialStore((state) => state.selectSession);
+  const authoredFeed = useSocialStore(
+    (state) => state.authoredFeeds[actorPtid],
+  );
+  const loadAuthoredPosts = useSocialStore((state) => state.loadAuthoredPosts);
+  const requestedProfile = useRef('');
+
+  const [action, setAction] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [actionSheetOpen, setActionSheetOpen] = useState(false);
+  const [confirmBlockOpen, setConfirmBlockOpen] = useState(false);
+  const [reactionPickerPostId, setReactionPickerPostId] = useState<
+    string | null
+  >(null);
+  const profile =
+    actorPtid === currentUserPtid
+      ? currentUserProfile
+      : peerProfiles[actorPtid];
+  const profileLoading =
+    actorPtid === currentUserPtid
+      ? false
+      : Boolean(peerProfileLoading[actorPtid]);
+  const profileError = peerProfileErrors[actorPtid];
+  const relationship = friendshipStatus[actorPtid];
+  const isSelf = actorPtid === currentUserPtid;
+  const contacts = useMemo(
+    () => projectAcceptedContacts(friendRequests, currentUserPtid, peerOnline, peerProfiles),
+    [currentUserPtid, friendRequests, peerOnline, peerProfiles],
+  );
+  const contact = contacts.find((item) => item.peerPtid === actorPtid);
+  const directFederationId = contact?.federationIds.includes(federationId)
+    ? federationId
+    : contact?.federationIds.length === 1
+      ? contact.federationIds[0]
+      : '';
+
+  useEffect(() => {
+    if (requestedProfile.current === actorPtid) return;
+    requestedProfile.current = actorPtid;
+    setReactionPickerPostId(null);
+    void requestSocialPeerProfile(actorPtid);
+    if (!isSelf) {
+      void requestSocialFriendshipStatus(actorPtid).catch(() => undefined);
+    }
+    void loadAuthoredPosts(actorPtid);
+  }, [actorPtid, isSelf, loadAuthoredPosts]);
+
+  useEffect(() => {
+    setReactionPickerPostId((current) =>
+      current && authoredFeed?.posts.some((post) => post.id === current)
+        ? current
+        : null,
+    );
+  }, [authoredFeed?.posts]);
+
+  const invalidateProfileAndFeeds = useCallback(async () => {
+    await Promise.allSettled([
+      requestSocialPeerProfile(actorPtid, true),
+      loadAuthoredPosts(actorPtid),
+      facade?.feeds.home.refresh() ?? Promise.resolve(),
+      facade?.feeds.explore.refresh() ?? Promise.resolve(),
+    ]);
+  }, [actorPtid, facade, loadAuthoredPosts]);
+
+  const runRelationshipAction = async (
+    name: string,
+    command: () => Promise<void>,
+  ) => {
+    if (action) return;
+    setAction(name);
+    setActionError('');
+    try {
+      await command();
+      await invalidateProfileAndFeeds();
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : 'mobile.social.relationshipActionFailed',
+      );
+    } finally {
+      setAction('');
+    }
+  };
+
+  const openDirect = async () => {
+    if (!directFederationId || action) return;
+    setAction('message');
+    setActionError('');
+    try {
+      const sessionUlid = await dispatchOpenContactChat(
+        actorPtid,
+        directFederationId,
+      );
+      await selectSession(sessionUlid);
+      onOpenChat({ routeId: 'detail:chat-conversation', sessionUlid });
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : 'mobile.contacts.openChatFailed',
+      );
+    } finally {
+      setAction('');
+    }
+  };
+
+  return (
+    <div
+      className="page-container mobile-detail-page social-detail-page"
+      data-acceptance-id="social-profile-page"
+      data-profile-actor-ptid={actorPtid}
+    >
+      <header className="page-header">
+        <button
+          type="button"
+          className="header-action"
+          aria-label={t('common.action.back')}
+          onClick={onBack}
+        >
+          <Icon iconId="arrow-left" size={20} />
+        </button>
+        <h1 className="header-title compact">
+          {t('mobile.social.profile.title')}
+        </h1>
+        {!isSelf ? (
+          <button
+            type="button"
+            className="header-action"
+            aria-label={t('mobile.social.profile.actions')}
+            onClick={() => setActionSheetOpen(true)}
+          >
+            <Icon iconId="more-horizontal" size={20} />
+          </button>
+        ) : null}
+      </header>
+
+      <div className="mobile-detail-body">
+        <div className="contact-profile-card">
+          <Spin active={profileLoading}>
+            <SocialActorAvatar
+              actorPtid={actorPtid}
+              avatar={profile?.avatar}
+              displayName={profile?.displayName}
+              size={72}
+              username={profile?.username}
+            />
+          </Spin>
+          <div className="contact-profile-copy">
+            <Text strong className="contact-profile-name">
+              {actorDisplayName(profile?.displayName || profile?.username, actorPtid)
+                || t('mobile.contacts.unknownUser')}
+            </Text>
+            {profile?.federatedHandle || profile?.acct ? (
+              <Text tone="secondary">
+                {profile.federatedHandle || profile.acct}
+              </Text>
+            ) : null}
+            <Text tone="secondary" copyValue={actorPtid}>
+              {actorPtid}
+            </Text>
+            {profile?.note ? (
+              <Text className="contact-profile-note">{profile.note}</Text>
+            ) : null}
+          </div>
+
+          {profile ? (
+            <div className="contact-profile-stats">
+              <ProfileStat
+                label={t('mobile.contacts.profilePosts')}
+                value={profile.statusesCount}
+              />
+              <ProfileStat
+                label={t('mobile.contacts.profileFollowing')}
+                value={profile.followingCount}
+              />
+              <ProfileStat
+                label={t('mobile.contacts.profileFollowers')}
+                value={profile.followersCount}
+              />
+            </div>
+          ) : null}
+
+          {profileError ? (
+            <MobileNotice tone="error">
+              {formatSocialError(profileError)}
+            </MobileNotice>
+          ) : null}
+          {relationship?.blocked ? (
+            <Tag tone="danger">{t('mobile.contacts.blocked')}</Tag>
+          ) : null}
+          {actionError ? (
+            <MobileNotice tone="error">
+              {t(
+                actionError.startsWith('mobile.')
+                  ? actionError
+                  : 'mobile.social.relationshipActionFailed',
+              )}
+            </MobileNotice>
+          ) : null}
+
+          {!isSelf ? (
+            <>
+              <Button
+                actionId="social-profile-follow"
+                fullWidth
+                emphasis={relationship?.following ? 'secondary' : 'primary'}
+                leading={
+                  <Icon
+                    iconId={relationship?.following ? 'user-minus' : 'user-plus'}
+                    size={15}
+                  />
+                }
+                execution={action === 'follow' ? 'pending' : 'idle'}
+                availability={Boolean(action) || relationship?.blocked
+                  ? { kind: 'disabled', reason: t('mobile.social.profile.actions') }
+                  : undefined}
+                onActivate={() =>
+                  void runRelationshipAction(
+                    'follow',
+                    relationship?.following
+                      ? () => dispatchUnfollowUser(actorPtid)
+                      : () => dispatchFollowUser(actorPtid),
+                  )
+                }
+              >
+                {t(
+                  relationship?.following
+                    ? 'mobile.social.profile.unfollow'
+                    : 'mobile.social.profile.follow',
+                )}
+              </Button>
+              {directFederationId ? (
+                <Button
+                  actionId="social-profile-message"
+                  fullWidth
+                  emphasis="secondary"
+                  leading={<Icon iconId="message-circle" size={15} />}
+                  execution={action === 'message' ? 'pending' : 'idle'}
+                  availability={Boolean(action) || relationship?.blocked
+                    ? { kind: 'disabled', reason: t('mobile.contacts.openChat') }
+                    : undefined}
+                  onActivate={() => void openDirect()}
+                >
+                  {t('mobile.contacts.openChat')}
+                </Button>
+              ) : null}
+            </>
+          ) : null}
+        </div>
+
+        <section
+          data-acceptance-id="social-profile-authored-posts"
+          aria-label={t('mobile.social.profile.authoredPosts')}
+        >
+          <Text strong>{t('mobile.social.profile.authoredPosts')}</Text>
+          {(authoredFeed?.posts ?? []).map((post) => (
+            <div key={post.id} data-scroll-anchor-id={post.id}>
+              <MomentFeedItem
+                post={post}
+                onReact={(postId, kind) =>
+                  void facade?.intents.react(postId, kind)
+                }
+                onOpenComments={(postId) => {
+                  setReactionPickerPostId(null);
+                  onOpenMoment(postId);
+                }}
+                reactionPickerOpen={reactionPickerPostId === post.id}
+                onReactionPickerOpenChange={(open) =>
+                  setReactionPickerPostId((current) =>
+                    open ? post.id : current === post.id ? null : current,
+                  )
+                }
+              />
+            </div>
+          ))}
+          {authoredFeed?.loading ? <Spin /> : null}
+          {authoredFeed?.error ? (
+            <MobileNotice tone="error">
+              {formatSocialError(authoredFeed.error)}
+            </MobileNotice>
+          ) : null}
+          {!authoredFeed?.loading && (authoredFeed?.posts.length ?? 0) === 0 ? (
+            <Empty description={t('mobile.social.profile.noPosts')} />
+          ) : null}
+          {authoredFeed?.hasMore && !authoredFeed.loading ? (
+            <Button
+              actionId="social-profile-load-more"
+              fullWidth
+              emphasis="quiet"
+              onActivate={() =>
+                void loadAuthoredPosts(actorPtid, authoredFeed.nextCursor)
+              }
+            >
+              {t('mobile.moments.feed.loadMore')}
+            </Button>
+          ) : null}
+        </section>
+      </div>
+
+      {actionSheetOpen ? (
+        <div
+          className="moments-sheet-backdrop"
+          role="presentation"
+          onPointerDown={() => setActionSheetOpen(false)}
+        >
+          <section
+            className="moments-bottom-sheet social-profile-action-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('mobile.social.profile.actions')}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="moments-sheet-handle" />
+            <button
+              type="button"
+              className={
+                relationship?.blocked
+                  ? 'moments-choice-row'
+                  : 'moments-choice-row danger'
+              }
+              onClick={() => {
+                setActionSheetOpen(false);
+                if (relationship?.blocked) {
+                  void runRelationshipAction('unblock', () =>
+                    dispatchUnblockUser(actorPtid),
+                  );
+                } else {
+                  setConfirmBlockOpen(true);
+                }
+              }}
+            >
+              <span>
+                <strong>
+                  {t(
+                    relationship?.blocked
+                      ? 'mobile.contacts.unblock'
+                      : 'mobile.contacts.block',
+                  )}
+                </strong>
+              </span>
+              <Icon iconId="ban" size={18} />
+            </button>
+          </section>
+        </div>
+      ) : null}
+
+      {confirmBlockOpen ? (
+        <div
+          className="moments-sheet-backdrop"
+          role="presentation"
+          onPointerDown={() => setConfirmBlockOpen(false)}
+        >
+          <section
+            className="moments-bottom-sheet social-profile-confirm-sheet"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label={t('mobile.contacts.blockConfirmTitle')}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="moments-sheet-handle" />
+            <div className="social-profile-confirm-copy">
+              <Icon iconId="ban" size={22} />
+              <div>
+                <strong>{t('mobile.contacts.blockConfirmTitle')}</strong>
+                <p>{t('mobile.contacts.blockConfirmBody')}</p>
+              </div>
+            </div>
+            <div className="social-profile-confirm-actions">
+              <Button
+                actionId="social-profile-block-cancel"
+                emphasis="secondary"
+                onActivate={() => setConfirmBlockOpen(false)}
+              >
+                {t('common.action.cancel')}
+              </Button>
+              <Button
+                actionId="social-profile-block-confirm"
+                emphasis="primary"
+                tone="danger"
+                execution={action === 'block' ? 'pending' : 'idle'}
+                onActivate={() =>
+                  void runRelationshipAction('block', async () => {
+                    await dispatchBlockUser(actorPtid);
+                    setConfirmBlockOpen(false);
+                  })
+                }
+              >
+                {t('mobile.contacts.block')}
+              </Button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProfileStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="contact-profile-stat">
+      <Text strong>{value}</Text>
+      <Text tone="secondary">{label}</Text>
+    </div>
+  );
+}

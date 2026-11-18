@@ -1,0 +1,355 @@
+from __future__ import annotations
+
+import ast
+import os
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest.mock import Mock, patch
+
+from tooling.acceptance.core import GateError
+from tooling.acceptance.core.evidence import new_report
+from tooling.acceptance.gates.chat.native_group_mls_runner import (
+    ACTORS,
+    CLIENT_PORTS,
+    NativeGroupMlsGate,
+    REQUIRED_ASSERTIONS,
+    SELECTORS,
+)
+from tooling.acceptance.gates.chat.native_support import (
+    NativeClientLifecycleLedger,
+)
+
+
+RUNNER = Path(__file__).with_name("native_group_mls_runner.py")
+ROOT = Path(__file__).resolve().parents[4]
+
+
+class SyntheticRuntimeBinding:
+    cell_id = "desktop-linux-native"
+
+    def __init__(self) -> None:
+        self.cleaned_sessions: tuple[Any, ...] = ()
+        self.cleaned_specs: dict[str, dict[str, Any]] = {}
+
+    def runtime_identity(self) -> dict[str, Any]:
+        return {
+            "artifactKind": "acceptance-runtime-cell-manifest",
+            "cellId": self.cell_id,
+            "gateId": NativeGroupMlsGate.gate_id,
+            "runId": "cell-run-a",
+            "state": "LEASED",
+            "source": {
+                "commit": "commit-a",
+                "workspaceDigest": "clean",
+                "remoteSourceDigest": "b" * 64,
+                "remoteCheckoutClean": True,
+                "binarySha256": "a" * 64,
+            },
+            "platform": {"imageDigest": "d" * 64},
+            "transport": {
+                "hostIdentitySha256": "e" * 64,
+                "hostKeySha256": "f" * 64,
+            },
+        }
+
+    def binary_identity(self) -> dict[str, str]:
+        return {
+            "path": "runtime-cell:desktop-linux-native:cell-run-a:bin",
+            "sha256": "a" * 64,
+            "sourceCommit": "commit-a",
+        }
+
+    def finalize_cleanup(
+        self,
+        sessions: list[Any],
+        client_specs: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.cleaned_sessions = tuple(sessions)
+        self.cleaned_specs = client_specs
+        return {
+            "portsReleased": True,
+            "processesReleased": True,
+            "storageReleased": True,
+            "logsReleased": True,
+            "cleanupErrors": [],
+        }
+
+
+class NativeGroupMlsRuntimeBindingTests(unittest.TestCase):
+    def gate(self) -> tuple[NativeGroupMlsGate, SyntheticRuntimeBinding]:
+        binding = SyntheticRuntimeBinding()
+        gate = object.__new__(NativeGroupMlsGate)
+        gate.manifest = {
+            "source": {
+                "commit": "commit-a",
+                "workspaceDigest": "clean",
+            },
+            "services": {
+                "station": {
+                    "kind": "station",
+                    "endpoint": "http://station",
+                    "liveCommit": "commit-a",
+                    "workspaceDigest": "clean",
+                    "protocolDigest": "c" * 64,
+                },
+            },
+            "clients": [
+                {
+                    "id": actor,
+                    "actor": actor,
+                    "runtime": "native-tauri",
+                    "required_service_roles": ["station"],
+                    "service_bindings": {
+                        "station": {
+                            "service_id": "station",
+                            "required_kind": "station",
+                        },
+                    },
+                }
+                for actor in ("alice", "bob", "charlie")
+            ],
+        }
+        gate.tested_commit = "commit-a"
+        gate.runtime_binding = binding
+        gate.runtime_instances = []
+        gate.clients = {}
+        gate.client_specs = {
+            "alice": {},
+            "bob": {},
+            "charlie": {},
+        }
+        gate.client_lifecycles = NativeClientLifecycleLedger()
+        gate.report = new_report(gate.gate_id)
+        return gate, binding
+
+    def test_linux_identity_and_cleanup_are_binding_owned(self) -> None:
+        gate, binding = self.gate()
+
+        identity = gate.source_identity({"build_commit": "commit-a"})
+        cleanup = gate.cleanup_clients()
+
+        self.assertEqual(identity["runtimeCell"]["cellId"], binding.cell_id)
+        self.assertEqual(identity["binary"]["sha256"], "a" * 64)
+        self.assertEqual(
+            gate.report.runtime["runtimeCellRunId"],
+            "cell-run-a",
+        )
+        self.assertEqual(binding.cleaned_specs, gate.client_specs)
+        self.assertTrue(cleanup["storageReleased"])
+
+    def test_runner_requires_runtime_cell_without_local_launcher_fallback(
+        self,
+    ) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+
+        self.assertIn("NativeDesktopRuntimeBinding", imported_names)
+        self.assertIn("selected_native_runtime", imported_names)
+        self.assertIn("native_runtime_source_identity", imported_names)
+        self.assertIn(
+            "runtime_binding: NativeDesktopRuntimeBinding | None",
+            source,
+        )
+        self.assertIn(
+            "if selected_cell and runtime_binding is None:",
+            source,
+        )
+        self.assertIn(
+            "if self.runtime_binding is None:",
+            source,
+        )
+        self.assertIn("runtime_binding.create_bound_session(", source)
+        self.assertIn("runtime_binding.finalize_cleanup(", source)
+        self.assertNotIn("LocalTauriLauncher", imported_names)
+
+    def test_logout_failure_still_stops_runtime_client(self) -> None:
+        gate, _ = self.gate()
+        client = Mock(
+            profile="acceptance-charlie",
+            gateway_port=3030,
+        )
+        client.is_alive.return_value = True
+        gate.client_lifecycles.register(
+            client,
+            "ptid:v1:actor:charlie",
+        )
+        gate.client_lifecycles.mark_live(client)
+        gate.client_lifecycles.mark_authenticated(client)
+
+        with patch(
+            "tooling.acceptance.gates.chat.native_support."
+            "logout_native_client",
+            side_effect=RuntimeError("logout failed"),
+        ), self.assertRaisesRegex(RuntimeError, "logout failed"):
+            gate.stop_authenticated_client(client)
+
+        client.stop.assert_called_once_with()
+
+    def test_selected_runtime_rejects_uninjected_construction(self) -> None:
+        previous = os.environ.get("PT_ACCEPTANCE_RUNTIME_CELL")
+        os.environ["PT_ACCEPTANCE_RUNTIME_CELL"] = "desktop-linux-native"
+        try:
+            with self.assertRaisesRegex(
+                GateError,
+                "requires injected runtime resources",
+            ):
+                NativeGroupMlsGate()
+        finally:
+            if previous is None:
+                os.environ.pop("PT_ACCEPTANCE_RUNTIME_CELL", None)
+            else:
+                os.environ["PT_ACCEPTANCE_RUNTIME_CELL"] = previous
+
+    def test_product_contract_constants_remain_unchanged(self) -> None:
+        self.assertEqual(ACTORS, ("alice", "bob", "charlie"))
+        self.assertEqual(
+            CLIENT_PORTS,
+            {"alice": 4445, "bob": 4446, "charlie": 4450},
+        )
+        self.assertEqual(
+            REQUIRED_ASSERTIONS,
+            {
+                "native_runtime",
+                "actor_isolation",
+                "default_friend_projection",
+                "same_name_identity_disambiguated",
+                "identity_metadata_parity",
+                "avatar_parity",
+                "contact_message_routes_selected_peer",
+                "existing_friend_search_state",
+                "group_created",
+                "group_creation_visible",
+                "group_creation_failure_recoverable",
+                "member_added",
+                "group_message_delivered",
+                "group_restart_recovered",
+                "member_removed",
+            },
+        )
+        self.assertEqual(
+            SELECTORS["group_manage"],
+            "[data-chat-group-manage-members]",
+        )
+        self.assertEqual(
+            SELECTORS["create_group_contact"],
+            "[data-chat-create-group-contact]",
+        )
+        self.assertEqual(
+            SELECTORS["find_people_result"],
+            "[data-chat-find-people-result]",
+        )
+        self.assertEqual(
+            SELECTORS["contact_message"],
+            "[data-chat-contact-message]",
+        )
+        self.assertIn(
+            "chat-native-friendship-projection",
+            NativeGroupMlsGate.spec,
+        )
+
+    def test_default_friend_projection_is_checked_before_group_creation(
+        self,
+    ) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        projection = source.index(
+            '"friendship.default_projection"'
+        )
+        group_creation = source.index('"group.create"')
+
+        self.assertLess(projection, group_creation)
+        self.assertIn("complete Create Group identity projection", source)
+        self.assertIn("existing friend state in Find People", source)
+        self.assertIn('"actionDisabled"', source)
+
+    def test_native_surfaces_consume_the_runtime_owned_friend_projection(
+        self,
+    ) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        relationships = (
+            ROOT / "apps/desktop/src/store/relationships.ts"
+        ).read_text(encoding="utf-8")
+        realtime = (
+            ROOT / "apps/desktop/src/services/socialRealtime.ts"
+        ).read_text(encoding="utf-8")
+        find_people = (
+            ROOT / "apps/desktop/src/components/chat/FindPeopleModal.tsx"
+        ).read_text(encoding="utf-8")
+        create_group = (
+            ROOT / "apps/desktop/src/components/chat/CreateGroupModal.tsx"
+        ).read_text(encoding="utf-8")
+        contacts = (
+            ROOT / "apps/desktop/src/components/chat/ChatContactsPanel.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("projectMutualFriends(followers, following)", relationships)
+        self.assertIn(
+            "loadMutualFriends(actorPtid, refresh)",
+            realtime,
+        )
+        self.assertIn("refreshFriendshipProjection(true)", realtime)
+        self.assertIn("EVENT.RELATIONSHIP_CHANGED", realtime)
+        self.assertIn("data-chat-find-people-result", find_people)
+        self.assertIn("data-chat-friend-state", find_people)
+        self.assertIn("data-chat-create-group-contact", create_group)
+        self.assertIn("data-chat-friendship-state", contacts)
+        self.assertIn("data-chat-contact-federation-id", contacts)
+        self.assertIn("contact Message routes to the selected peer", source)
+
+    def test_start_client_delegates_to_the_bound_runtime_session(self) -> None:
+        gate, _ = self.gate()
+        gate.start_injected_client = Mock()
+
+        gate.start_client("alice")
+
+        gate.start_injected_client.assert_called_once_with("alice")
+
+    def test_group_creation_uses_visible_ui_and_not_create_group_harness(
+        self,
+    ) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        create_start = source.index("    def create_group(self)")
+        create_end = source.index(
+            "\n    def verify_default_friend_projection",
+            create_start,
+        )
+        create_source = source[create_start:create_end]
+
+        self.assertIn('SELECTORS["create_group_contact"]', create_source)
+        self.assertIn('SELECTORS["create_group_submit"]', create_source)
+        self.assertIn("data-chat-create-group-state", create_source)
+        self.assertIn("data-chat-create-group-error", create_source)
+        self.assertIn("data-chat-create-group-retry", create_source)
+        self.assertNotIn('"createGroup"', create_source)
+
+    def test_identity_and_visible_group_proof_fail_closed(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        for field in (
+            "federatedHandle",
+            "homeStationDomain",
+            "homeStationPeerId",
+            "federationId",
+            "federationName",
+            "avatarSource",
+            "avatarLoaded",
+            "federationLabel",
+            "stationLabel",
+            "metadataClipped",
+            "sameName",
+            "memberPtids",
+            "groupName",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, source)
+        self.assertIn("visible ready Group projection", source)
+        self.assertIn("restored Group projection", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

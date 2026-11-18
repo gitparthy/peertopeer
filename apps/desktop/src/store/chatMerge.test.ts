@@ -1,0 +1,673 @@
+import { describe, expect, it } from 'vitest';
+import type { CachedAgentMessage } from '@peers-touch/client-chat-core';
+import {
+  cachedMessageToChatMessage,
+  foldToolMessages,
+  isMessageRetryBlocked,
+  mergeServerMessages,
+  type ChatMessage,
+  type ChatOperation,
+} from './chat';
+
+function cachedRow(extra: Partial<CachedAgentMessage>): CachedAgentMessage {
+  return {
+    messageId: 'msg-1',
+    conversationId: 'conv-1',
+    turnId: 'turn-1',
+    role: 'assistant',
+    status: 'completed',
+    content: '',
+    seq: 1,
+    createdAt: '2026-11-03T00:00:00Z',
+    updatedAt: '2026-11-03T00:00:00Z',
+    ...extra,
+  };
+}
+
+function msg(id: string, role: ChatMessage['role'], content: string, extra: Partial<ChatMessage> = {}): ChatMessage {
+  return { id, role, content, timestamp: 1781680000000, ...extra };
+}
+
+describe('mergeServerMessages', () => {
+  it('retains the timeline and nested projections across identical snapshots', () => {
+    const current = [
+      msg('user-1', 'user', 'hello'),
+      msg('assistant-1', 'assistant', 'reply', {
+        toolCalls: [{ id: 'tool-1', name: 'search', args: '{}', result: 'done', pending: false }],
+        terminalStatus: 'completed',
+      }),
+    ];
+    const accepted = mergeServerMessages(current, structuredClone(current));
+    const normalized = mergeServerMessages(accepted, structuredClone(accepted));
+    const repeated = mergeServerMessages(normalized, structuredClone(normalized));
+    expect(repeated).toBe(normalized);
+    expect(repeated[1].toolCalls).toBe(normalized[1].toolCalls);
+    const changed = structuredClone(normalized);
+    changed[1].content = 'updated reply';
+    const refreshed = mergeServerMessages(normalized, changed);
+    expect(refreshed[0]).toBe(normalized[0]);
+    expect(refreshed[1].content).toBe('updated reply');
+    expect(refreshed[1]).not.toBe(normalized[1]);
+  });
+
+  it('preserves an optimistic user message and in-flight assistant when server returns an empty page', () => {
+    const current = [
+      msg('temp-user-1', 'user', 'hello'),
+      msg('temp-assistant-1', 'assistant', '', { loading: true }),
+    ];
+
+    const merged = mergeServerMessages(current, []);
+
+    expect(merged.map((m) => m.id)).toEqual(['temp-user-1', 'temp-assistant-1']);
+  });
+
+  it('drops optimistic messages once the server has echoed their authoritative counterparts', () => {
+    const current = [
+      msg('temp-user-1', 'user', 'hello'),
+      msg('temp-assistant-1', 'assistant', '', { loading: true }),
+    ];
+    const server = [
+      msg('server-user-1', 'user', 'hello'),
+      msg('server-assistant-1', 'assistant', 'hi there'),
+    ];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged.map((m) => m.id)).toEqual(['server-user-1', 'server-assistant-1']);
+    expect(merged.every((m) => !m.loading)).toBe(true);
+  });
+
+  it('deduplicates an identified optimistic turn across host clock skew', () => {
+    const current = [
+      msg('temp-user-1', 'user', 'hello', {
+        timestamp: 20_000,
+        turnId: 'turn-1',
+      }),
+      msg('temp-assistant-1', 'assistant', 'hi there', {
+        timestamp: 20_000,
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+      }),
+    ];
+    const server = [
+      msg('server-user-1', 'user', 'hello', {
+        timestamp: 1_000,
+        turnId: 'turn-1',
+      }),
+      msg('server-assistant-1', 'assistant', 'hi there', {
+        timestamp: 1_100,
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+      }),
+    ];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'server-user-1',
+      'server-assistant-1',
+    ]);
+  });
+
+  it('keeps the optimistic user message while the assistant is still in flight and server has only the user message', () => {
+    const current = [
+      msg('temp-user-1', 'user', 'hello'),
+      msg('temp-assistant-1', 'assistant', '', { loading: true }),
+    ];
+    const server = [msg('server-user-1', 'user', 'hello')];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged.map((m) => m.id)).toEqual(['server-user-1', 'temp-assistant-1']);
+  });
+
+  it('does not let a recent reply supersede the next optimistic assistant', () => {
+    const current = [
+      msg('server-user-1', 'user', 'original request', { timestamp: 1000 }),
+      msg('server-assistant-1', 'assistant', 'original response', { timestamp: 1500 }),
+      msg('temp-user-2', 'user', 'conflicting request', { timestamp: 1900 }),
+      msg('temp-assistant-2', 'assistant', '', { loading: true, timestamp: 1900 }),
+    ];
+    const server = current.slice(0, 2);
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'server-user-1',
+      'server-assistant-1',
+      'temp-user-2',
+      'temp-assistant-2',
+    ]);
+  });
+
+  it('uses server messages as the authoritative base and carries chain-of-thought fields for matched ids', () => {
+    const current = [
+      msg('a1', 'assistant', '', {
+        thinking: 'working',
+        thinkingDone: true,
+        toolCalls: [{ id: 't1', name: 'search', args: '{}', result: 'ok', pending: false }],
+      }),
+    ];
+    const server = [msg('a1', 'assistant', 'final answer')];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].content).toBe('final answer');
+    expect(merged[0].thinking).toBe('working');
+    expect(merged[0].toolCalls).toHaveLength(1);
+  });
+
+  it('keeps streamed follow-up suggestions when authoritative message sync catches up', () => {
+    const current = [
+      msg('a1', 'assistant', 'final answer', {
+        terminalStatus: 'completed',
+        followUpSuggestions: ['Explain further', 'Compare options', 'Next step'],
+      }),
+    ];
+    const server = [
+      msg('a1', 'assistant', 'final answer', {
+        terminalStatus: 'completed',
+      }),
+    ];
+
+    const [merged] = mergeServerMessages(current, server);
+
+    expect(merged.followUpSuggestions).toEqual([
+      'Explain further',
+      'Compare options',
+      'Next step',
+    ]);
+  });
+
+  it('carries a live ToolCall onto an unkeyed authoritative assistant reply', () => {
+    const current = [
+      msg('temp-assistant-1', 'assistant', '', {
+        loading: true,
+        turnId: 'turn-1',
+        toolCalls: [{
+          id: 'tool-call-1',
+          name: 'memory',
+          args: '{"action":"add"}',
+          pending: true,
+          status: 'approval_required',
+          approvalId: 'approval-1',
+        }],
+      }),
+    ];
+    const server = [
+      msg('server-assistant-1', 'assistant', 'Saved.', {
+        loading: false,
+        terminalStatus: 'completed',
+        timestamp: current[0].timestamp + 500,
+      }),
+    ];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      id: 'server-assistant-1',
+      turnId: 'turn-1',
+      content: 'Saved.',
+      terminalStatus: 'completed',
+      toolCalls: [{
+        id: 'tool-call-1',
+        status: 'approval_required',
+        approvalId: 'approval-1',
+      }],
+    });
+  });
+
+  it('removes an inactive branch when the authoritative projection selects an older sibling', () => {
+    const current = [
+      msg('user-1', 'user', 'question'),
+      msg('assistant-newer', 'assistant', 'regenerated answer'),
+    ];
+    const server = [
+      msg('user-1', 'user', 'question'),
+      msg('assistant-older', 'assistant', 'selected original answer'),
+    ];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'user-1',
+      'assistant-older',
+    ]);
+  });
+
+  it('retains a failed assistant message when the server has not persisted it', () => {
+    const current = [
+      msg('temp-user-1', 'user', 'hello'),
+      msg('temp-assistant-1', 'assistant', '', { error: 'runtime unavailable', loading: false }),
+    ];
+
+    const merged = mergeServerMessages(current, []);
+
+    expect(merged.map((m) => m.id)).toEqual(['temp-user-1', 'temp-assistant-1']);
+    expect(merged[1].error).toBe('runtime unavailable');
+  });
+
+  it('retains a local typed rejection when a late server page contains the preceding reply', () => {
+    const current = [
+      msg('server-user-1', 'user', 'original request', { timestamp: 1000 }),
+      msg('server-assistant-1', 'assistant', 'original response', { timestamp: 1500 }),
+      msg('temp-user-conflict', 'user', 'conflicting request', { timestamp: 1900 }),
+      msg('temp-assistant-conflict', 'assistant', '', {
+        timestamp: 1900,
+        loading: false,
+        error: 'agent.errors.duplicateConflict',
+        typedError: {
+          error: 'agent.errors.duplicateConflict',
+          error_type: 'ADMISSION_DUPLICATE_CONFLICT',
+          locale_key: 'agent.errors.duplicateConflict',
+          retryable: false,
+          terminal: true,
+          details: {
+            existing_command_id: 'turn-1',
+            idempotency_key_hash: 'hash-1',
+          },
+        },
+      }),
+    ];
+    const server = current.slice(0, 2);
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'server-user-1',
+      'server-assistant-1',
+      'temp-user-conflict',
+      'temp-assistant-conflict',
+    ]);
+    expect(merged[3].typedError?.error_type).toBe('ADMISSION_DUPLICATE_CONFLICT');
+  });
+
+  it('keeps a non-terminal lease incident over a stale server terminal', () => {
+    const current = [
+      msg('assistant-1', 'assistant', '', {
+        turnId: 'turn-1',
+        loading: true,
+        error: 'agent.errors.clientLeaseExpired',
+        typedError: {
+          error: 'agent.errors.clientLeaseExpired',
+          error_type: 'CLIENT_LEASE_EXPIRED',
+          locale_key: 'agent.errors.clientLeaseExpired',
+          retryable: true,
+          terminal: false,
+          details: {
+            session_id: 'capability-session-1',
+            lease_id: 'capability-lease-1',
+            expired_at: '2026-09-26T08:00:00Z',
+          },
+        },
+        resolution: {
+          type: 'reconcile',
+          sessionId: 'capability-session-1',
+          leaseId: 'capability-lease-1',
+          expiredAt: '2026-09-26T08:00:00Z',
+          label: 'agent.recovery.reconcile',
+        },
+      }),
+    ];
+    const server = [
+      msg('assistant-1', 'assistant', '', {
+        turnId: 'turn-1',
+        loading: false,
+        terminalStatus: 'completed',
+      }),
+    ];
+
+    const [merged] = mergeServerMessages(current, server);
+
+    expect(merged).toMatchObject({
+      loading: true,
+      cancelled: false,
+      error: 'agent.errors.clientLeaseExpired',
+      terminalStatus: undefined,
+      typedError: {
+        error_type: 'CLIENT_LEASE_EXPIRED',
+        terminal: false,
+      },
+      resolution: {
+        type: 'reconcile',
+      },
+    });
+  });
+
+  it.each([
+    ['cancelled', true, undefined],
+    ['failed', false, 'provider failed'],
+    ['interrupted', false, 'station restarted'],
+  ] as const)(
+    'preserves an immediate authoritative %s terminal fact when sync is stale',
+    (terminalStatus, cancelled, error) => {
+      const current = [
+        msg('a1', 'assistant', 'partial answer', {
+          loading: false,
+          cancelled,
+          terminalStatus,
+          error,
+          errorDetail: error,
+        }),
+      ];
+      const server = [
+        msg('a1', 'assistant', 'persisted partial answer', { loading: true }),
+      ];
+
+      const [merged] = mergeServerMessages(current, server);
+
+      expect(merged).toMatchObject({
+        loading: false,
+        cancelled,
+        terminalStatus,
+      });
+      if (error) {
+        expect(merged.error).toBe(error);
+        expect(merged.errorDetail).toBe(error);
+      }
+    },
+  );
+
+  it('keeps the authoritative server terminal over a stale local terminal', () => {
+    const current = [
+      msg('assistant-1', 'assistant', 'stale partial response', {
+        turnId: 'turn-1',
+        loading: false,
+        terminalStatus: 'failed',
+        error: 'provider failed',
+        errorDetail: 'provider failed',
+      }),
+    ];
+    const server = [
+      msg('assistant-1', 'assistant', '', {
+        turnId: 'turn-1',
+        loading: false,
+        terminalStatus: 'interrupted',
+      }),
+    ];
+
+    const [merged] = mergeServerMessages(current, server);
+
+    expect(merged).toMatchObject({
+      content: '',
+      loading: false,
+      terminalStatus: 'interrupted',
+    });
+    expect(merged.cancelled).not.toBe(true);
+    expect(merged.error).toBeUndefined();
+    expect(merged.errorDetail).toBeUndefined();
+  });
+
+  it('carries a recovered cancelled terminal fact to a persisted message with the same turn', () => {
+    const typedError = {
+      error: 'agent.errors.lifecycleCancelled',
+      error_type: 'LIFECYCLE_CANCELLED',
+      locale_key: 'agent.errors.lifecycleCancelled',
+      retryable: false,
+      terminal: true,
+      details: {
+        resource_kind: 'turn',
+        resource_id: 'turn-1',
+      },
+    };
+    const current = [
+      msg('recovered-turn-1', 'assistant', 'partial answer', {
+        turnId: 'turn-1',
+        loading: false,
+        cancelled: true,
+        terminalStatus: 'cancelled',
+        error: typedError.locale_key,
+        errorDetail: 'cancelled_by_user',
+        typedError,
+      }),
+    ];
+    const server = [
+      msg('assistant-1', 'assistant', 'persisted partial answer', {
+        turnId: 'turn-1',
+        loading: false,
+        cancelled: true,
+        terminalStatus: 'cancelled',
+        error: typedError.locale_key,
+        typedError,
+      }),
+    ];
+
+    const merged = mergeServerMessages(current, server);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      id: 'assistant-1',
+      turnId: 'turn-1',
+      loading: false,
+      cancelled: true,
+      terminalStatus: 'cancelled',
+      error: 'agent.errors.lifecycleCancelled',
+      errorDetail: 'cancelled_by_user',
+      typedError,
+    });
+  });
+
+  it('retains a recovered terminal message while Station message sync is empty', () => {
+    const current = [
+      msg('recovered-turn-1', 'assistant', 'partial answer', {
+        turnId: 'turn-1',
+        loading: false,
+        cancelled: true,
+        terminalStatus: 'cancelled',
+      }),
+    ];
+
+    const merged = mergeServerMessages(current, []);
+
+    expect(merged).toEqual(current);
+  });
+});
+
+describe('isMessageRetryBlocked', () => {
+  it.each(['failed', 'cancelled', 'interrupted'] as const)(
+    'allows retry when the matching %s Turn is terminal despite stale streaming state',
+    (status) => {
+      const operation: ChatOperation = {
+        id: 'operation-1',
+        sessionKey: 'test',
+        type: 'sendMessage',
+        status,
+        runState: status,
+        assistantMessageId: 'assistant-1',
+        abortController: new AbortController(),
+        startedAt: 1,
+        endedAt: 2,
+        turnId: 'turn-1',
+      };
+
+      expect(
+        isMessageRetryBlocked(true, operation, 'turn-1', status),
+      ).toBe(false);
+      expect(
+        isMessageRetryBlocked(true, operation, 'turn-2', status),
+      ).toBe(true);
+    },
+  );
+});
+
+describe('foldToolMessages', () => {
+  it('coalesces all assistant legs of one Turn into a single bubble', () => {
+    const messages: ChatMessage[] = [
+      msg('user-1', 'user', 'run the task', { turnId: 'turn-1' }),
+      msg('leg-1', 'assistant', '', {
+        turnId: 'turn-1',
+        toolCalls: [{ id: 'call-1', name: 'todo_write', pending: false }],
+      }),
+      msg('tool-1', 'tool', '**todo_write** created list'),
+      msg('leg-2', 'assistant', '', {
+        turnId: 'turn-1',
+        toolCalls: [{ id: 'call-2', name: 'local_file_write', pending: false }],
+      }),
+      msg('tool-2', 'tool', '**local_file_write** wrote file'),
+      msg('leg-3', 'assistant', 'Done.', {
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+      }),
+    ];
+
+    const folded = foldToolMessages(messages);
+
+    expect(folded.map((m) => m.id)).toEqual(['user-1', 'leg-1']);
+    const assistant = folded[1];
+    expect(assistant.content).toBe('Done.');
+    expect(assistant.terminalStatus).toBe('completed');
+    expect(assistant.loading).toBe(false);
+    expect(assistant.toolCalls?.map((call) => call.id)).toEqual([
+      'call-1',
+      'tool-1',
+      'call-2',
+      'tool-2',
+    ]);
+  });
+
+  it('keeps distinct turns separate and preserves an interrupted leg', () => {
+    const messages: ChatMessage[] = [
+      msg('leg-a', 'assistant', '', {
+        turnId: 'turn-a',
+        terminalStatus: 'completed',
+        content: 'first',
+      }),
+      msg('leg-b-1', 'assistant', '', { turnId: 'turn-b', loading: true }),
+      msg('leg-b-2', 'assistant', '', {
+        turnId: 'turn-b',
+        terminalStatus: 'interrupted',
+        typedError: {
+          error_type: 'LIFECYCLE_INTERRUPTED',
+          locale_key: 'agent.error.interrupted',
+          terminal: true,
+        } as ChatMessage['typedError'],
+      }),
+    ];
+
+    const folded = foldToolMessages(messages);
+
+    expect(folded.map((m) => m.id)).toEqual(['leg-a', 'leg-b-1']);
+    expect(folded[1].terminalStatus).toBe('interrupted');
+    expect(folded[1].typedError?.error_type).toBe('LIFECYCLE_INTERRUPTED');
+  });
+
+  it('tracks the content-bearing leg id for byte provenance', () => {
+    const messages: ChatMessage[] = [
+      msg('user-1', 'user', 'run the task', { turnId: 'turn-1' }),
+      msg('leg-1', 'assistant', '', {
+        turnId: 'turn-1',
+        toolCalls: [{ id: 'call-1', name: 'local_shell_exec', pending: false }],
+      }),
+      msg('tool-1', 'tool', '**local_shell_exec** ok'),
+      msg('leg-2', 'assistant', 'Final answer.', {
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+      }),
+      // A tool-only turn: the bubble exists but carries no claimable bytes.
+      msg('leg-3', 'assistant', '', {
+        turnId: 'turn-2',
+        toolCalls: [{ id: 'call-2', name: 'local_shell_exec', pending: false }],
+      }),
+    ];
+
+    const folded = foldToolMessages(messages);
+
+    const answered = folded.find((m) => m.role === 'assistant' && m.turnId === 'turn-1');
+    expect(answered?.id).toBe('leg-1');
+    expect(answered?.contentMessageId).toBe('leg-2');
+
+    const toolOnly = folded.find((m) => m.role === 'assistant' && m.turnId === 'turn-2');
+    expect(toolOnly?.id).toBe('leg-3');
+    expect(toolOnly?.contentMessageId).toBeUndefined();
+  });
+
+  it('never marks a completed tool-call leg as the Turn terminal', () => {
+    // Persisted row mapping: intermediate leg carries tool calls.
+    const toolLeg = cachedMessageToChatMessage(cachedRow({
+      toolCallsJson: JSON.stringify([{ id: 'call-1', name: 'local_shell_exec' }]),
+    }));
+    expect(toolLeg.terminalStatus).toBeUndefined();
+    expect(toolLeg.loading).toBe(false);
+
+    // A failed tool leg stays terminal: failures end the Turn.
+    const failedToolLeg = cachedMessageToChatMessage(cachedRow({
+      status: 'failed',
+      toolCallsJson: JSON.stringify([{ id: 'call-1', name: 'local_shell_exec' }]),
+    }));
+    expect(failedToolLeg.terminalStatus).toBe('failed');
+
+    // Content leg is the real Turn terminal.
+    const contentLeg = cachedMessageToChatMessage(cachedRow({
+      messageId: 'msg-2',
+      seq: 2,
+      content: 'Final answer.',
+    }));
+    expect(contentLeg.terminalStatus).toBe('completed');
+
+    // Fold gap: snapshot taken after the tool result but before the final
+    // leg row exists must not terminate the bubble.
+    const folded = foldToolMessages([toolLeg]);
+    expect(folded[0].terminalStatus).toBeUndefined();
+  });
+
+  it('keeps the bubble non-terminal while a later leg is still streaming', () => {
+    const streaming: ChatMessage[] = [
+      msg('user-1', 'user', 'run the task', { turnId: 'turn-1' }),
+      msg('leg-1', 'assistant', '', {
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+        toolCalls: [{ id: 'call-1', name: 'local_shell_exec', pending: false }],
+      }),
+      msg('tool-1', 'tool', '**local_shell_exec** ok'),
+      msg('leg-2', 'assistant', 'partial', { turnId: 'turn-1', loading: true }),
+    ];
+
+    const folded = foldToolMessages(streaming);
+    const assistant = folded.find((m) => m.role === 'assistant' && m.turnId === 'turn-1');
+    expect(assistant?.loading).toBe(true);
+    expect(assistant?.terminalStatus).toBeUndefined();
+
+    // Once the final leg settles, a fresh snapshot fold becomes terminal.
+    const settled: ChatMessage[] = [
+      streaming[0],
+      streaming[1],
+      streaming[2],
+      msg('leg-2', 'assistant', 'Final answer.', {
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+      }),
+    ];
+    const foldedSettled = foldToolMessages(settled);
+    const done = foldedSettled.find((m) => m.role === 'assistant' && m.turnId === 'turn-1');
+    expect(done?.loading).toBe(false);
+    expect(done?.terminalStatus).toBe('completed');
+    expect(done?.contentMessageId).toBe('leg-2');
+  });
+
+  it('stamps a single content-bearing leg as its own provenance', () => {
+    const messages: ChatMessage[] = [
+      msg('leg-a', 'assistant', 'plain answer', {
+        turnId: 'turn-a',
+        terminalStatus: 'completed',
+      }),
+    ];
+
+    const folded = foldToolMessages(messages);
+
+    expect(folded[0].id).toBe('leg-a');
+    expect(folded[0].contentMessageId).toBe('leg-a');
+  });
+
+  it('does not fold assistant rows without a turn id', () => {
+    const messages: ChatMessage[] = [
+      msg('opt-1', 'assistant', '', { queued: true, queueEntryId: 'queue-1' }),
+      msg('opt-2', 'assistant', '', { queued: true, queueEntryId: 'queue-2' }),
+    ];
+
+    const folded = foldToolMessages(messages);
+
+    expect(folded.map((m) => m.id)).toEqual(['opt-1', 'opt-2']);
+  });
+});

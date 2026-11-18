@@ -1,0 +1,2655 @@
+use crate::error::{AppResult, ErrorCode};
+use crate::model::common::PeersResponse;
+use prost::Message;
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt;
+use std::io::{Cursor, Read};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TURN_EXECUTION_WALL_TIME: Duration = Duration::from_secs(300);
+const TURN_EXECUTION_RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+const SAFE_ERROR_DETAIL_FIELDS: [&str; 20] = [
+    "resource_kind",
+    "resource_id",
+    "terminal_status",
+    "expected_revision",
+    "actual_revision",
+    "capability_id",
+    "capability_version",
+    "expected_version",
+    "actual_version",
+    "schema_field",
+    "binding_id",
+    "target_device_id",
+    "policy_kind",
+    "reason_code",
+    "session_id",
+    "lease_id",
+    "expired_at",
+    "operation",
+    "field",
+    "reason",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StationTransportPolicy {
+    Interactive,
+    TurnExecution,
+}
+
+impl StationTransportPolicy {
+    pub fn timeout(self) -> Duration {
+        match self {
+            Self::Interactive => INTERACTIVE_REQUEST_TIMEOUT,
+            Self::TurnExecution => TURN_EXECUTION_WALL_TIME + TURN_EXECUTION_RESPONSE_MARGIN,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::TurnExecution => "turn_execution",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TrafficClass {
+    Interactive,
+    Realtime,
+    Bulk,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StationRouteSecurity {
+    VerifiedRoute,
+    HttpOrHttps,
+}
+
+impl StationRouteSecurity {
+    pub(crate) fn permits(self, origin: &str) -> bool {
+        let _ = self;
+        let Ok(url) = reqwest::Url::parse(origin) else {
+            return false;
+        };
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StationRoutePolicy {
+    #[default]
+    Auto,
+    DirectOnly,
+    RelayOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplayPolicy {
+    SafeRead,
+    Idempotent(String),
+    Never,
+}
+
+/// Real byte-transfer progress callback `(bytes sent, total bytes)`.
+///
+/// Fired from the streaming upload reader as the transport drains the
+/// request body, so the UI reflects genuine network progress instead of a
+/// timer. The sink must be cheap and non-blocking (it runs on the sender
+/// thread); `ProgressReader` throttles how often it is invoked.
+pub type UploadProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+pub enum StationRequestBody {
+    Empty,
+    Bytes(Vec<u8>),
+    Reader {
+        reader: Box<dyn Read + Send>,
+        content_length: u64,
+    },
+}
+
+impl fmt::Debug for StationRequestBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("Empty"),
+            Self::Bytes(bytes) => formatter.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            Self::Reader { content_length, .. } => formatter
+                .debug_struct("Reader")
+                .field("content_length", content_length)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl StationRequestBody {
+    pub fn content_length(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::Bytes(bytes) => bytes.len() as u64,
+            Self::Reader { content_length, .. } => *content_length,
+        }
+    }
+
+    pub(crate) fn replay_copy(&self) -> Option<Self> {
+        match self {
+            Self::Empty => Some(Self::Empty),
+            Self::Bytes(bytes) => Some(Self::Bytes(bytes.clone())),
+            Self::Reader { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct StationRequest {
+    pub method: Method,
+    pub path_and_query: String,
+    pub headers: HeaderMap,
+    pub body: StationRequestBody,
+    pub timeout: Duration,
+    pub admission_timeout: Duration,
+    pub traffic_class: TrafficClass,
+    pub route_security: StationRouteSecurity,
+    pub route_policy: StationRoutePolicy,
+    pub replay_policy: ReplayPolicy,
+    pub cancellation: CancellationToken,
+    pub expected_scope: Option<StationRequestScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StationRequestScope {
+    pub station_peer_id: String,
+    pub lifecycle_generation: u64,
+}
+
+impl StationRequest {
+    pub(crate) fn remaining(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Duration, StationTransportError> {
+        if self.cancellation.is_cancelled() {
+            return Err(StationTransportError::new(
+                StationTransportErrorKind::Cancelled,
+                "Station request was cancelled",
+                false,
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(StationTransportError::new(
+                StationTransportErrorKind::Timeout,
+                "Station request deadline expired",
+                false,
+            ));
+        }
+        Ok(remaining)
+    }
+
+    pub(crate) fn bound_to_deadline(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), StationTransportError> {
+        let remaining = self.remaining(deadline)?;
+        self.timeout = self.timeout.min(remaining);
+        self.admission_timeout = self.admission_timeout.min(remaining);
+        Ok(())
+    }
+
+    pub fn replay_copy(&self) -> Option<Self> {
+        Some(Self {
+            method: self.method.clone(),
+            path_and_query: self.path_and_query.clone(),
+            headers: self.headers.clone(),
+            body: self.body.replay_copy()?,
+            timeout: self.timeout,
+            admission_timeout: self.admission_timeout,
+            traffic_class: self.traffic_class,
+            route_security: self.route_security,
+            route_policy: self.route_policy,
+            replay_policy: self.replay_policy.clone(),
+            cancellation: self.cancellation.clone(),
+            expected_scope: self.expected_scope.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StationTransportErrorKind {
+    Overloaded,
+    Cancelled,
+    Timeout,
+    Unavailable,
+    StaleRoute,
+    InvalidRoute,
+    NoRoute,
+    RoutePolicyConflict,
+    Protocol,
+    Shutdown,
+}
+
+#[derive(Debug)]
+pub struct StationTransportError {
+    pub kind: StationTransportErrorKind,
+    pub message: String,
+    pub submitted: bool,
+}
+
+impl StationTransportError {
+    pub fn new(
+        kind: StationTransportErrorKind,
+        message: impl Into<String>,
+        submitted: bool,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            submitted,
+        }
+    }
+}
+
+impl fmt::Display for StationTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StationTransportError {}
+
+pub struct StationResponse {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub body: Box<dyn Read + Send>,
+}
+
+pub trait StationRequestExecutor: Send + Sync {
+    fn execute(&self, request: StationRequest) -> Result<StationResponse, StationTransportError>;
+    fn execute_bounded(
+        &self,
+        mut request: StationRequest,
+        deadline: std::time::Instant,
+    ) -> Result<StationResponse, StationTransportError> {
+        request.bound_to_deadline(deadline)?;
+        self.execute(request)
+    }
+
+    fn execute_for_station(
+        &self,
+        _station_peer_id: &str,
+        _request: StationRequest,
+    ) -> Result<StationResponse, StationTransportError> {
+        Err(StationTransportError::new(
+            StationTransportErrorKind::Unavailable,
+            "Target Station transport is unavailable",
+            false,
+        ))
+    }
+    fn active_scope(&self) -> Option<StationRequestScope>;
+    fn active_station_peer_id(&self) -> Option<String>;
+    fn active_endpoint_origin(&self) -> Option<String>;
+    fn owns_resource_origin(&self, origin: &str) -> bool {
+        self.active_endpoint_origin()
+            .is_some_and(|active| active.trim_end_matches('/') == origin.trim_end_matches('/'))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StationClientErrorKind {
+    SessionRevoked,
+    HttpStatus(u16),
+    Network,
+    Unavailable,
+    Decode,
+    InvalidResponse,
+    Overloaded,
+    AmbiguousOutcome,
+    Cancelled,
+    StaleRoute,
+    NoRoute,
+    RoutePolicyConflict,
+}
+
+#[derive(Debug, Clone)]
+pub struct StationClientError {
+    pub kind: StationClientErrorKind,
+    pub message: String,
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonHttpResponse {
+    pub status: u16,
+    pub headers: Value,
+    pub body: Value,
+}
+
+impl StationClientError {
+    pub fn new(
+        kind: StationClientErrorKind,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            details,
+        }
+    }
+
+    pub fn session_revoked(body: &str) -> Self {
+        let details = session_revoked_details_from_text(body).unwrap_or_else(|| {
+            serde_json::json!({
+                "code": "session_revoked",
+                "reason": "unknown",
+                "raw": body,
+            })
+        });
+        Self::new(
+            StationClientErrorKind::SessionRevoked,
+            "session revoked",
+            Some(details),
+        )
+    }
+
+    pub fn into_app_result<T: Serialize>(self, context: impl Into<String>) -> AppResult<T> {
+        let code = match self.kind {
+            StationClientErrorKind::SessionRevoked => ErrorCode::Unauthorized,
+            StationClientErrorKind::HttpStatus(status) => {
+                if self
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("error_code"))
+                    .and_then(Value::as_str)
+                    == Some("AGENT_CANVAS_SINGLE_AGENT_NOT_READY")
+                {
+                    ErrorCode::AgentCanvasSingleAgentNotReady
+                } else {
+                    match status {
+                        400 => ErrorCode::InvalidArgument,
+                        401 => ErrorCode::Unauthorized,
+                        403 => ErrorCode::Forbidden,
+                        404 => ErrorCode::NotFound,
+                        409 => ErrorCode::Conflict,
+                        502 | 503 => ErrorCode::Unavailable,
+                        _ => ErrorCode::InternalError,
+                    }
+                }
+            }
+            StationClientErrorKind::Overloaded
+            | StationClientErrorKind::AmbiguousOutcome
+            | StationClientErrorKind::StaleRoute
+            | StationClientErrorKind::RoutePolicyConflict => ErrorCode::Conflict,
+            StationClientErrorKind::NoRoute => ErrorCode::NotFound,
+            StationClientErrorKind::Unavailable => ErrorCode::Unavailable,
+            _ => ErrorCode::InternalError,
+        };
+        AppResult::fail(code, context.into(), self.details)
+    }
+}
+
+impl fmt::Display for StationClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let error_code = self
+            .details
+            .as_ref()
+            .and_then(|details| details.get("error_code"))
+            .and_then(Value::as_str);
+        match error_code {
+            Some(code) => write!(formatter, "{} [code={}]", self.message, code),
+            None => formatter.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for StationClientError {}
+
+pub fn session_revoked_details_from_text(text: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    if value.get("code").and_then(Value::as_str) != Some("session_revoked") {
+        return None;
+    }
+    let mut details = serde_json::json!({
+        "code": "session_revoked",
+        "reason": value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "raw": text,
+    });
+    if let Some(device_type) = value.get("device_type").and_then(Value::as_str) {
+        details["device_type"] = Value::String(device_type.to_string());
+    }
+    Some(details)
+}
+
+#[derive(Clone)]
+pub struct StationClient {
+    executor: Arc<dyn StationRequestExecutor>,
+    device_id: Arc<RwLock<Option<String>>>,
+    resource_origins: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    expected_scope: Option<StationRequestScope>,
+}
+
+impl StationClient {
+    pub fn new(executor: Arc<dyn StationRequestExecutor>) -> Self {
+        Self {
+            executor,
+            device_id: Arc::new(RwLock::new(None)),
+            resource_origins: Arc::new(RwLock::new(HashMap::new())),
+            expected_scope: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_unavailable() -> Self {
+        Self::new(Arc::new(UnavailableTestExecutor { scope: None }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_scoped(
+        station_peer_id: impl Into<String>,
+        lifecycle_generation: u64,
+    ) -> Self {
+        Self::new(Arc::new(UnavailableTestExecutor {
+            scope: Some(StationRequestScope {
+                station_peer_id: station_peer_id.into(),
+                lifecycle_generation,
+            }),
+        }))
+    }
+
+    pub fn set_device_id(&self, id: String) {
+        *self.device_id.write().expect("device ID lock poisoned") = Some(id);
+    }
+
+    pub fn device_id(&self) -> Option<String> {
+        self.device_id.read().ok().and_then(|id| id.clone())
+    }
+
+    pub fn active_station_peer_id(&self) -> Option<String> {
+        self.executor.active_station_peer_id()
+    }
+
+    pub fn active_scope(&self) -> Option<StationRequestScope> {
+        self.executor.active_scope()
+    }
+
+    /// Bind every request in one identity-captured operation, including
+    /// nested manifest/profile reads, before runtime dispatch can select a route.
+    pub fn bound_to_scope(&self, scope: &StationRequestScope) -> Self {
+        let mut client = self.clone();
+        client.expected_scope = Some(scope.clone());
+        client
+    }
+
+    pub fn active_endpoint_origin(&self) -> Option<String> {
+        self.executor.active_endpoint_origin()
+    }
+
+    pub fn owns_resource_origin(&self, origin: &str) -> bool {
+        if self.executor.owns_resource_origin(origin) {
+            return true;
+        }
+        let Some(scope) = self.active_scope() else {
+            return false;
+        };
+        let key = format!("{}:{}", scope.station_peer_id, scope.lifecycle_generation);
+        self.resource_origins.read().ok().is_some_and(|origins| {
+            origins.get(&key).is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value == origin.trim_end_matches('/'))
+            })
+        })
+    }
+
+    pub(crate) fn bind_resource_origin(&self, scope: &StationRequestScope, origin: &str) {
+        if self.active_scope().as_ref() != Some(scope) {
+            return;
+        }
+        let Ok(url) = reqwest::Url::parse(origin) else {
+            return;
+        };
+        if !matches!(url.scheme(), "http" | "https") || url.path() != "/" {
+            return;
+        }
+        if let Ok(mut origins) = self.resource_origins.write() {
+            let key = format!("{}:{}", scope.station_peer_id, scope.lifecycle_generation);
+            origins.retain(|existing, _| existing == &key);
+            let values = origins.entry(key).or_default();
+            let origin = url.origin().ascii_serialization();
+            if values.len() < 16 && !values.contains(&origin) {
+                values.push(origin);
+            }
+        }
+    }
+
+    pub fn execute_raw(
+        &self,
+        mut request: StationRequest,
+    ) -> Result<StationResponse, StationClientError> {
+        if let Some(scope) = &self.expected_scope {
+            if request.expected_scope.as_ref().is_some_and(|expected| expected != scope) {
+                return Err(StationClientError::new(
+                    StationClientErrorKind::Cancelled,
+                    "Station request conflicts with its captured scope",
+                    None,
+                ));
+            }
+            request.expected_scope = Some(scope.clone());
+        }
+        let replay_policy = request.replay_policy.clone();
+        self.executor
+            .execute(request)
+            .map_err(|error| map_transport_error(error, replay_policy))
+    }
+
+    /// A generated read at an already authenticated Station scope, bounded by
+    /// the shared operation's cancellation and absolute deadline.
+    pub fn request_bounded_proto_read<Req: Message, Resp: Message + Default>(
+        &self,
+        scope: &StationRequestScope,
+        path: &str,
+        token: &str,
+        body: &Req,
+        deadline: std::time::Instant,
+        check: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<Resp, StationClientError> {
+        let cancelled = || {
+            StationClientError::new(
+                StationClientErrorKind::Cancelled,
+                "read cancelled or deadline expired",
+                None,
+            )
+        };
+        check().map_err(|_| cancelled())?;
+        let (mut request, replay) = wire_request(
+            Method::POST,
+            path,
+            None,
+            Some(token),
+            self.device_id().as_deref(),
+            Some("application/protobuf"),
+            "application/protobuf",
+            proto_body(Some(body)),
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            Some(ReplayPolicy::SafeRead),
+        )?;
+        request.expected_scope = Some(scope.clone());
+        request.timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        request.admission_timeout = request.admission_timeout.min(request.timeout);
+        if request.timeout.is_zero() {
+            return Err(cancelled());
+        }
+        let cancellation = request.cancellation.clone();
+        // Admission, response and SafeRead replay have separate transport
+        // budgets. One watcher bounds all of them, including body consumption.
+        let result = std::thread::scope(|scope| {
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            scope.spawn(move || loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() || check().is_err() {
+                    cancellation.cancel();
+                    break;
+                }
+                match stopped.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            });
+            let result = self
+                .executor
+                .execute_bounded(request, deadline)
+                .map_err(|error| map_transport_error(error, replay.clone()))
+                .and_then(|response| buffer_response(path, response, &replay))
+                .and_then(|response| {
+                    Resp::decode(response.body.as_slice()).map_err(|_| {
+                        StationClientError::new(
+                            StationClientErrorKind::Decode,
+                            "invalid generated read response",
+                            None,
+                        )
+                    })
+                });
+            drop(stop);
+            result
+        });
+        check().map_err(|_| cancelled())?;
+        if std::time::Instant::now() >= deadline {
+            return Err(cancelled());
+        }
+        result
+    }
+
+    pub fn open_json_stream(
+        &self,
+        path: &str,
+        token: &str,
+        body: &Value,
+        timeout: Duration,
+        replay_policy: ReplayPolicy,
+        cancellation: CancellationToken,
+    ) -> Result<StationResponse, StationClientError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(header_error)?,
+        );
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        self.execute_raw(StationRequest {
+            method: Method::POST,
+            path_and_query: path.to_string(),
+            headers,
+            body: StationRequestBody::Bytes(serde_json::to_vec(body).map_err(|error| {
+                StationClientError::new(
+                    StationClientErrorKind::Decode,
+                    format!("encode stream request: {error}"),
+                    None,
+                )
+            })?),
+            timeout,
+            admission_timeout: Duration::from_secs(30).min(timeout),
+            traffic_class: TrafficClass::Realtime,
+            route_security: StationRouteSecurity::VerifiedRoute,
+            route_policy: StationRoutePolicy::Auto,
+            replay_policy,
+            cancellation,
+            expected_scope: None,
+        })
+    }
+
+    pub fn post_json_with_auth(
+        &self,
+        path: &str,
+        token: &str,
+        body: Value,
+    ) -> Result<Value, StationClientError> {
+        self.request_json_auth(Method::POST, path, token, None, Some(&body))
+    }
+
+    pub fn post_json_no_auth(&self, path: &str, body: Value) -> Result<Value, StationClientError> {
+        self.request_json_internal(
+            Method::POST,
+            path,
+            None,
+            None,
+            Some(body),
+            StationTransportPolicy::Interactive,
+            None,
+        )
+    }
+
+    pub fn request_peers_proto_no_body<Payload: Message + Default>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+    ) -> Result<Payload, StationClientError> {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            Some(token),
+            self.device_id().as_deref(),
+            Some("application/protobuf"),
+            "application/protobuf",
+            StationRequestBody::Empty,
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        decode_peers_envelope(&response.body)
+    }
+
+    pub fn request_peers_proto_no_payload<Req: Message>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+    ) -> Result<(), StationClientError> {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            Some(token),
+            self.device_id().as_deref(),
+            Some("application/protobuf"),
+            "application/protobuf",
+            proto_body(body),
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        PeersResponse::decode(response.body.as_slice()).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Decode,
+                format!("decode PeersResponse: {error}"),
+                None,
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn request_peers_proto<Req, Payload>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+    ) -> Result<Payload, StationClientError>
+    where
+        Req: Message,
+        Payload: Message + Default,
+    {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            Some(token),
+            self.device_id().as_deref(),
+            Some("application/protobuf"),
+            "application/protobuf",
+            proto_body(body),
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        decode_peers_envelope(&response.body)
+    }
+
+    pub fn request_proto_for_device<Req, Payload>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+        device_id: &str,
+    ) -> Result<Payload, StationClientError>
+    where
+        Req: Message,
+        Payload: Message + Default,
+    {
+        self.request_proto_internal(
+            method,
+            path,
+            Some(token),
+            query,
+            body,
+            Some(device_id),
+            StationTransportPolicy::Interactive,
+        )
+    }
+
+    pub fn request_proto_for_actor<Req, Payload>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+    ) -> Result<Payload, StationClientError>
+    where
+        Req: Message,
+        Payload: Message + Default,
+    {
+        self.request_proto_internal(
+            method,
+            path,
+            Some(token),
+            query,
+            body,
+            None,
+            StationTransportPolicy::Interactive,
+        )
+    }
+
+    pub fn request_proto_for_actor_at_station<Req, Payload>(
+        &self,
+        station_peer_id: &str,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+    ) -> Result<Payload, StationClientError>
+    where
+        Req: Message,
+        Payload: Message + Default,
+    {
+        let response = self.execute_wire_for_station(
+            station_peer_id,
+            method,
+            path,
+            query,
+            Some(token),
+            None,
+            Some("application/protobuf"),
+            "application/protobuf",
+            proto_body(body),
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        Payload::decode(response.body.as_slice()).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Decode,
+                format!("decode target Station proto response failed: {error}"),
+                None,
+            )
+        })
+    }
+
+    pub fn request_peers_proto_no_body_at_station<Payload: Message + Default>(
+        &self,
+        station_peer_id: &str,
+        method: Method,
+        path: &str,
+        token: &str,
+    ) -> Result<Payload, StationClientError> {
+        let response = self.execute_wire_for_station(
+            station_peer_id,
+            method,
+            path,
+            None,
+            Some(token),
+            None,
+            Some("application/protobuf"),
+            "application/protobuf",
+            StationRequestBody::Empty,
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        decode_peers_envelope(&response.body)
+    }
+
+    pub fn request_peers_proto_no_body_for_device<Payload>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        device_id: &str,
+    ) -> Result<Payload, StationClientError>
+    where
+        Payload: Message + Default,
+    {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            Some(token),
+            Some(device_id),
+            Some("application/protobuf"),
+            "application/protobuf",
+            StationRequestBody::Empty,
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        decode_peers_envelope(&response.body)
+    }
+
+    pub fn request_proto_no_auth<Req, Payload>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &Req,
+    ) -> Result<Payload, StationClientError>
+    where
+        Req: Message,
+        Payload: Message + Default,
+    {
+        self.request_proto_internal(
+            method,
+            path,
+            None,
+            None,
+            Some(body),
+            None,
+            StationTransportPolicy::Interactive,
+        )
+    }
+
+    pub fn post_peers_proto_no_auth<Req, Payload>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<Payload, StationClientError>
+    where
+        Req: Message,
+        Payload: Message + Default,
+    {
+        let response = self.execute_wire(
+            Method::POST,
+            path,
+            None,
+            None,
+            None,
+            Some("application/protobuf"),
+            "application/protobuf",
+            StationRequestBody::Bytes(body.encode_to_vec()),
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        decode_peers_envelope(&response.body)
+    }
+
+    pub fn request_json(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<Value>,
+    ) -> Result<Value, StationClientError> {
+        self.request_json_with_policy(
+            method,
+            path,
+            token,
+            query,
+            body,
+            StationTransportPolicy::Interactive,
+        )
+    }
+
+    pub fn request_json_with_policy(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<Value>,
+        policy: StationTransportPolicy,
+    ) -> Result<Value, StationClientError> {
+        self.request_json_internal(method, path, Some(token), query, body, policy, None)
+    }
+
+    pub fn request_json_response(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<Value>,
+    ) -> Result<JsonHttpResponse, StationClientError> {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            Some(token),
+            self.device_id().as_deref(),
+            Some("application/json"),
+            "application/json",
+            json_body(body.as_ref())?,
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        Ok(JsonHttpResponse {
+            status: response.status,
+            headers: headers_to_json(&response.headers),
+            body: decode_json_or_text(&response.body),
+        })
+    }
+
+    pub fn request_json_response_base_url(
+        &self,
+        base_url: &str,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<Value>,
+    ) -> Result<JsonHttpResponse, StationClientError> {
+        external_json_response(base_url, method, path, token, query, body)
+    }
+
+    pub fn request_proto<Req, Resp>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+    ) -> Result<Resp, StationClientError>
+    where
+        Req: Message,
+        Resp: Message + Default,
+    {
+        self.request_proto_with_policy(
+            method,
+            path,
+            token,
+            query,
+            body,
+            StationTransportPolicy::Interactive,
+        )
+    }
+
+    pub fn request_proto_optional_auth<Req, Resp>(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+    ) -> Result<Resp, StationClientError>
+    where
+        Req: Message,
+        Resp: Message + Default,
+    {
+        self.request_proto_internal(
+            method,
+            path,
+            token,
+            query,
+            body,
+            token.and_then(|_| self.device_id()).as_deref(),
+            StationTransportPolicy::Interactive,
+        )
+    }
+
+    pub fn request_proto_with_policy<Req, Resp>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+        policy: StationTransportPolicy,
+    ) -> Result<Resp, StationClientError>
+    where
+        Req: Message,
+        Resp: Message + Default,
+    {
+        self.request_proto_internal(
+            method,
+            path,
+            Some(token),
+            query,
+            body,
+            self.device_id().as_deref(),
+            policy,
+        )
+    }
+
+    pub fn request_json_auth(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Value>,
+    ) -> Result<Value, StationClientError> {
+        self.request_json_auth_with_optional_device_id(
+            method,
+            path,
+            token,
+            query,
+            body,
+            self.device_id().as_deref(),
+        )
+    }
+
+    pub fn request_json_auth_with_device_id(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Value>,
+        device_id: &str,
+    ) -> Result<Value, StationClientError> {
+        self.request_json_auth_with_optional_device_id(
+            method,
+            path,
+            token,
+            query,
+            body,
+            Some(device_id),
+        )
+    }
+
+    fn request_json_auth_with_optional_device_id(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Value>,
+        device_id: Option<&str>,
+    ) -> Result<Value, StationClientError> {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            Some(token),
+            device_id,
+            Some("application/json"),
+            "application/json",
+            json_body(body)?,
+            StationTransportPolicy::Interactive,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        if response.body.is_empty() {
+            return Ok(Value::Null);
+        }
+        let result = serde_json::from_slice::<Value>(&response.body).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Decode,
+                format!("decode json response failed: {error}"),
+                None,
+            )
+        })?;
+        if let Some(status) = embedded_http_status(&result) {
+            return Err(build_error_for_status(status, path, &result.to_string()));
+        }
+        Ok(result)
+    }
+
+    pub fn upload_multipart(
+        &self,
+        path: &str,
+        token: &str,
+        file_path: &str,
+        bucket: &str,
+        visibility: &str,
+        chat_session_id: Option<&str>,
+        progress: Option<UploadProgressSink>,
+    ) -> Result<Value, StationClientError> {
+        let multipart = MultipartBody::open(file_path, bucket, visibility, chat_session_id)?;
+        let content_type = format!("multipart/form-data; boundary={}", multipart.boundary);
+        let content_length = multipart.content_length;
+        let reader: Box<dyn Read + Send> = match progress {
+            Some(sink) => Box::new(ProgressReader::new(multipart.reader, content_length, sink)),
+            None => multipart.reader,
+        };
+        let response = self.execute_wire(
+            Method::POST,
+            path,
+            None,
+            Some(token),
+            self.device_id().as_deref(),
+            Some(&content_type),
+            "application/json",
+            StationRequestBody::Reader {
+                reader,
+                content_length,
+            },
+            StationTransportPolicy::TurnExecution,
+            TrafficClass::Bulk,
+            Some(ReplayPolicy::Never),
+        )?;
+        serde_json::from_slice(&response.body).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Decode,
+                format!("decode json response failed: {error}"),
+                None,
+            )
+        })
+    }
+
+    pub fn put_presigned_url(
+        &self,
+        url: &str,
+        headers: &HashMap<String, String>,
+        file_path: &str,
+    ) -> Result<(), StationClientError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(network_error)?;
+        let file = std::fs::File::open(file_path).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Network,
+                format!("open {file_path}: {error}"),
+                None,
+            )
+        })?;
+        let mut request = client.put(url).body(file);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().map_err(network_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(StationClientError::new(
+                StationClientErrorKind::HttpStatus(status.as_u16()),
+                format!("presigned put returned {}: {body}", status.as_u16()),
+                Some(serde_json::json!({"status": status.as_u16(), "body": body})),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn download_owned_oss_file(
+        &self,
+        token: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, StationClientError> {
+        let query = [("key", key.to_string())];
+        let response = self.execute_wire(
+            Method::GET,
+            "/sub-oss/file",
+            Some(&query),
+            Some(token),
+            self.device_id().as_deref(),
+            None,
+            "application/octet-stream",
+            StationRequestBody::Empty,
+            StationTransportPolicy::TurnExecution,
+            TrafficClass::Bulk,
+            Some(ReplayPolicy::SafeRead),
+        )?;
+        Ok(response.body)
+    }
+
+    pub fn probe_station(&self, url: &str) -> (bool, Option<String>, Option<String>, Option<u32>) {
+        probe_station(url)
+    }
+
+    fn request_proto_internal<Req, Resp>(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        query: Option<&[(&str, String)]>,
+        body: Option<&Req>,
+        device_id: Option<&str>,
+        policy: StationTransportPolicy,
+    ) -> Result<Resp, StationClientError>
+    where
+        Req: Message,
+        Resp: Message + Default,
+    {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            token,
+            device_id,
+            Some("application/protobuf"),
+            "application/protobuf",
+            proto_body(body),
+            policy,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        Resp::decode(response.body.as_slice()).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Decode,
+                format!("decode proto response failed: {error}"),
+                None,
+            )
+        })
+    }
+
+    fn request_json_internal(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        query: Option<&[(&str, String)]>,
+        body: Option<Value>,
+        policy: StationTransportPolicy,
+        device_id: Option<&str>,
+    ) -> Result<Value, StationClientError> {
+        let response = self.execute_wire(
+            method,
+            path,
+            query,
+            token,
+            device_id,
+            Some("application/json"),
+            "application/json",
+            json_body(body.as_ref())?,
+            policy,
+            TrafficClass::Interactive,
+            None,
+        )?;
+        if response.body.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&response.body).map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::Decode,
+                format!("decode json response failed: {error}"),
+                None,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_wire(
+        &self,
+        method: Method,
+        path: &str,
+        query: Option<&[(&str, String)]>,
+        token: Option<&str>,
+        device_id: Option<&str>,
+        content_type: Option<&str>,
+        accept: &str,
+        body: StationRequestBody,
+        policy: StationTransportPolicy,
+        traffic_class: TrafficClass,
+        replay_policy: Option<ReplayPolicy>,
+    ) -> Result<BufferedResponse, StationClientError> {
+        let (request, replay_policy) = wire_request(
+            method,
+            path,
+            query,
+            token,
+            device_id,
+            content_type,
+            accept,
+            body,
+            policy,
+            traffic_class,
+            replay_policy,
+        )?;
+        let response = self.execute_raw(request)?;
+        buffer_response(path, response, &replay_policy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_wire_for_station(
+        &self,
+        station_peer_id: &str,
+        method: Method,
+        path: &str,
+        query: Option<&[(&str, String)]>,
+        token: Option<&str>,
+        device_id: Option<&str>,
+        content_type: Option<&str>,
+        accept: &str,
+        body: StationRequestBody,
+        policy: StationTransportPolicy,
+        traffic_class: TrafficClass,
+        replay_policy: Option<ReplayPolicy>,
+    ) -> Result<BufferedResponse, StationClientError> {
+        let (request, replay_policy) = wire_request(
+            method,
+            path,
+            query,
+            token,
+            device_id,
+            content_type,
+            accept,
+            body,
+            policy,
+            traffic_class,
+            replay_policy,
+        )?;
+        let response = self
+            .executor
+            .execute_for_station(station_peer_id, request)
+            .map_err(|error| map_transport_error(error, replay_policy.clone()))?;
+        buffer_response(path, response, &replay_policy)
+    }
+}
+
+#[cfg(test)]
+struct UnavailableTestExecutor {
+    scope: Option<StationRequestScope>,
+}
+
+#[cfg(test)]
+impl StationRequestExecutor for UnavailableTestExecutor {
+    fn execute(&self, _request: StationRequest) -> Result<StationResponse, StationTransportError> {
+        Err(StationTransportError::new(
+            StationTransportErrorKind::Unavailable,
+            "test Station transport is unavailable",
+            false,
+        ))
+    }
+
+    fn active_scope(&self) -> Option<StationRequestScope> {
+        self.scope.clone()
+    }
+
+    fn active_station_peer_id(&self) -> Option<String> {
+        self.scope
+            .as_ref()
+            .map(|scope| scope.station_peer_id.clone())
+    }
+
+    fn active_endpoint_origin(&self) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct BufferedResponse {
+    status: u16,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_request(
+    method: Method,
+    path: &str,
+    query: Option<&[(&str, String)]>,
+    token: Option<&str>,
+    device_id: Option<&str>,
+    content_type: Option<&str>,
+    accept: &str,
+    body: StationRequestBody,
+    policy: StationTransportPolicy,
+    traffic_class: TrafficClass,
+    replay_policy: Option<ReplayPolicy>,
+) -> Result<(StationRequest, ReplayPolicy), StationClientError> {
+    let path_and_query = encode_path_and_query(path, query)?;
+    let mut headers = HeaderMap::new();
+    if let Some(token) = token {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(header_error)?,
+        );
+    }
+    if let Some(device_id) = device_id.filter(|value| !value.trim().is_empty()) {
+        headers.insert(
+            HeaderName::from_static("x-device-id"),
+            HeaderValue::from_str(device_id).map_err(header_error)?,
+        );
+    }
+    if let Some(content_type) = content_type {
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_str(content_type).map_err(header_error)?,
+        );
+    }
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_str(accept).map_err(header_error)?,
+    );
+    let replay_policy = replay_policy.unwrap_or_else(|| default_replay_policy(&method));
+    Ok((
+        StationRequest {
+            method,
+            path_and_query,
+            headers,
+            body,
+            timeout: policy.timeout(),
+            admission_timeout: policy.timeout(),
+            traffic_class,
+            route_security: StationRouteSecurity::VerifiedRoute,
+            route_policy: StationRoutePolicy::Auto,
+            replay_policy: replay_policy.clone(),
+            cancellation: CancellationToken::new(),
+            expected_scope: None,
+        },
+        replay_policy,
+    ))
+}
+
+fn buffer_response(
+    path: &str,
+    mut response: StationResponse,
+    replay_policy: &ReplayPolicy,
+) -> Result<BufferedResponse, StationClientError> {
+    let mut body = Vec::new();
+    response.body.read_to_end(&mut body).map_err(|error| {
+        let (kind, code) = if matches!(replay_policy, ReplayPolicy::Never) {
+            (
+                StationClientErrorKind::AmbiguousOutcome,
+                "station_ambiguous_outcome",
+            )
+        } else {
+            (StationClientErrorKind::Decode, "station_body_read_failed")
+        };
+        StationClientError::new(
+            kind,
+            format!("read body failed: {error}"),
+            Some(serde_json::json!({
+                "code": code,
+                "submitted": true,
+            })),
+        )
+    })?;
+    if !(200..300).contains(&response.status) {
+        // Decode protocol details before display; safe HTTP error headers
+        // remain authoritative over the numeric protobuf error code.
+        let decoded = peers_failure_error(response.status, &body);
+        let content_type = response
+            .headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let display_message = decoded
+            .details
+            .as_ref()
+            .and_then(|details| details.get("server_message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| status_error_display_message(content_type, &body));
+        let mut error = build_error_for_status_with_headers(
+            response.status,
+            path,
+            &display_message,
+            Some(&headers_to_json(&response.headers)),
+        );
+        if let (Some(details), Some(protocol)) = (
+            error.details.as_mut().and_then(Value::as_object_mut),
+            decoded.details.as_ref().and_then(Value::as_object),
+        ) {
+            for field in ["server_message", "error_code"] {
+                if let Some(value) = protocol.get(field) {
+                    details.entry(field.to_owned()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        return Err(error);
+    }
+    Ok(BufferedResponse {
+        status: response.status,
+        headers: response.headers,
+        body,
+    })
+}
+
+fn default_replay_policy(method: &Method) -> ReplayPolicy {
+    if matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    ) {
+        ReplayPolicy::SafeRead
+    } else {
+        ReplayPolicy::Never
+    }
+}
+
+fn map_transport_error(
+    error: StationTransportError,
+    replay_policy: ReplayPolicy,
+) -> StationClientError {
+    let (kind, code) = match error.kind {
+        _ if error.submitted && matches!(replay_policy, ReplayPolicy::Never) => (
+            StationClientErrorKind::AmbiguousOutcome,
+            "station_ambiguous_outcome",
+        ),
+        StationTransportErrorKind::Overloaded => {
+            (StationClientErrorKind::Overloaded, "station_overloaded")
+        }
+        StationTransportErrorKind::Cancelled | StationTransportErrorKind::Shutdown => {
+            (StationClientErrorKind::Cancelled, "station_cancelled")
+        }
+        StationTransportErrorKind::StaleRoute => {
+            (StationClientErrorKind::StaleRoute, "station_stale_route")
+        }
+        StationTransportErrorKind::NoRoute => (StationClientErrorKind::NoRoute, "station_no_route"),
+        StationTransportErrorKind::RoutePolicyConflict => (
+            StationClientErrorKind::RoutePolicyConflict,
+            "station_route_policy_conflict",
+        ),
+        StationTransportErrorKind::Unavailable => {
+            (StationClientErrorKind::Unavailable, "station_unavailable")
+        }
+        _ => (StationClientErrorKind::Network, "station_transport_failed"),
+    };
+    StationClientError::new(
+        kind,
+        error.message,
+        Some(serde_json::json!({
+            "code": code,
+            "submitted": error.submitted,
+        })),
+    )
+}
+
+fn proto_body<Req: Message>(body: Option<&Req>) -> StationRequestBody {
+    body.map_or(StationRequestBody::Empty, |body| {
+        StationRequestBody::Bytes(body.encode_to_vec())
+    })
+}
+
+fn json_body(body: Option<&Value>) -> Result<StationRequestBody, StationClientError> {
+    body.map_or(Ok(StationRequestBody::Empty), |body| {
+        serde_json::to_vec(body)
+            .map(StationRequestBody::Bytes)
+            .map_err(|error| {
+                StationClientError::new(
+                    StationClientErrorKind::Decode,
+                    format!("encode json request failed: {error}"),
+                    None,
+                )
+            })
+    })
+}
+
+fn encode_path_and_query(
+    path: &str,
+    query: Option<&[(&str, String)]>,
+) -> Result<String, StationClientError> {
+    let mut url = reqwest::Url::parse("http://station.invalid")
+        .and_then(|base| base.join(path))
+        .map_err(|error| {
+            StationClientError::new(
+                StationClientErrorKind::InvalidResponse,
+                format!("invalid Station request path: {error}"),
+                None,
+            )
+        })?;
+    if let Some(query) = query {
+        url.query_pairs_mut()
+            .extend_pairs(query.iter().map(|(name, value)| (*name, value.as_str())));
+    }
+    let mut value = url.path().to_string();
+    if let Some(query) = url.query() {
+        value.push('?');
+        value.push_str(query);
+    }
+    Ok(value)
+}
+
+fn decode_peers_envelope<Payload: Message + Default>(
+    raw: &[u8],
+) -> Result<Payload, StationClientError> {
+    let envelope = PeersResponse::decode(raw).map_err(|error| {
+        StationClientError::new(
+            StationClientErrorKind::Decode,
+            format!("decode PeersResponse: {error}"),
+            None,
+        )
+    })?;
+    decode_peers_payload(envelope)
+}
+
+fn decode_peers_payload<Payload: Message + Default>(
+    envelope: PeersResponse,
+) -> Result<Payload, StationClientError> {
+    if !envelope.code.is_empty() && envelope.code != "200" {
+        return Err(StationClientError::new(
+            StationClientErrorKind::InvalidResponse,
+            format!("Station returned Peers error code {}", envelope.code),
+            Some(serde_json::json!({
+                "code": envelope.code,
+                "message": envelope.msg,
+            })),
+        ));
+    }
+    let any = envelope.data.ok_or_else(|| {
+        StationClientError::new(
+            StationClientErrorKind::InvalidResponse,
+            "station response missing data envelope",
+            None,
+        )
+    })?;
+    Payload::decode(any.value.as_slice()).map_err(|error| {
+        StationClientError::new(
+            StationClientErrorKind::Decode,
+            format!("decode envelope payload: {error}"),
+            None,
+        )
+    })
+}
+
+fn build_error_for_status(status: u16, path: &str, body: &str) -> StationClientError {
+    build_error_for_status_with_headers(status, path, body, None)
+}
+
+fn build_error_for_status_with_headers(
+    status: u16,
+    path: &str,
+    body: &str,
+    headers: Option<&Value>,
+) -> StationClientError {
+    if status == 401 && body.contains("session_revoked") {
+        tracing::warn!(path, "Session revoked by Station");
+        return StationClientError::session_revoked(body);
+    }
+    let mut details = serde_json::json!({ "status": status, "body": body });
+    if let (Some(details), Some(headers)) =
+        (details.as_object_mut(), headers.and_then(Value::as_object))
+    {
+        for (header, field) in [
+            ("x-peers-error-code", "error_code"),
+            ("x-peers-error-locale-key", "locale_key"),
+            ("x-peers-error-retryable", "retryable"),
+            ("x-peers-error-terminal", "terminal"),
+            ("x-peers-required-gate", "required_gate"),
+        ] {
+            if let Some(value) = headers.get(header).and_then(Value::as_str) {
+                details.insert(field.to_string(), Value::String(value.to_string()));
+            }
+        }
+        merge_safe_error_detail_header(details, headers);
+    }
+    StationClientError::new(
+        StationClientErrorKind::HttpStatus(status),
+        format!("station returned {status}: {body}"),
+        Some(details),
+    )
+}
+
+fn merge_safe_error_detail_header(
+    details: &mut serde_json::Map<String, Value>,
+    headers: &serde_json::Map<String, Value>,
+) {
+    let Some(raw_details) = headers.get("x-peers-error-details").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(Value::Object(header_details)) = serde_json::from_str::<Value>(raw_details) else {
+        return;
+    };
+    for field in SAFE_ERROR_DETAIL_FIELDS {
+        if let Some(Value::String(value)) = header_details.get(field) {
+            details.insert(field.to_string(), Value::String(value.clone()));
+        }
+    }
+}
+
+fn headers_to_json(headers: &HeaderMap) -> Value {
+    Value::Object(
+        headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), Value::String(value.to_string())))
+            })
+            .collect(),
+    )
+}
+
+fn embedded_http_status(value: &Value) -> Option<u16> {
+    value
+        .get("code")
+        .and_then(|code| {
+            code.as_u64()
+                .or_else(|| code.as_str().and_then(|value| value.parse::<u64>().ok()))
+        })
+        .filter(|code| (400..=u16::MAX as u64).contains(code))
+        .map(|code| code as u16)
+}
+
+fn decode_json_or_text(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).to_string()))
+}
+
+fn network_error(error: impl fmt::Display) -> StationClientError {
+    StationClientError::new(
+        StationClientErrorKind::Network,
+        format!("request failed: {error}"),
+        None,
+    )
+}
+
+fn header_error(error: impl fmt::Display) -> StationClientError {
+    StationClientError::new(
+        StationClientErrorKind::InvalidResponse,
+        format!("invalid Station request header: {error}"),
+        None,
+    )
+}
+
+fn external_json_response(
+    base_url: &str,
+    method: Method,
+    path: &str,
+    token: &str,
+    query: Option<&[(&str, String)]>,
+    body: Option<Value>,
+) -> Result<JsonHttpResponse, StationClientError> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let client = Client::builder()
+        .timeout(INTERACTIVE_REQUEST_TIMEOUT)
+        .build()
+        .map_err(network_error)?;
+    let mut request = client
+        .request(method, url)
+        .bearer_auth(token)
+        .header("Accept", "application/json");
+    if let Some(query) = query {
+        request = request.query(query);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().map_err(network_error)?;
+    let status = response.status().as_u16();
+    let headers = headers_to_json(response.headers());
+    let bytes = response.bytes().map_err(network_error)?;
+    Ok(JsonHttpResponse {
+        status,
+        headers,
+        body: decode_json_or_text(&bytes),
+    })
+}
+
+struct MultipartBody {
+    boundary: String,
+    reader: Box<dyn Read + Send>,
+    content_length: u64,
+}
+
+impl MultipartBody {
+    fn open(
+        file_path: &str,
+        bucket: &str,
+        visibility: &str,
+        chat_session_id: Option<&str>,
+    ) -> Result<Self, StationClientError> {
+        let path = Path::new(file_path);
+        let file = std::fs::File::open(path).map_err(network_error)?;
+        let file_length = file.metadata().map_err(network_error)?.len();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("upload.bin")
+            .replace(['"', '\r', '\n'], "_");
+        let boundary = format!("peers-touch-{}", ulid::Ulid::new());
+        let mut prefix = Vec::new();
+        for (name, value) in [
+            ("bucket", Some(bucket)),
+            ("visibility", Some(visibility)),
+            ("chat_session_id", chat_session_id),
+        ] {
+            if let Some(value) = value {
+                prefix.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{}\r\n",
+                        value.replace(['\r', '\n'], " ")
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        prefix.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let suffix = format!("\r\n--{boundary}--\r\n").into_bytes();
+        let content_length = prefix.len() as u64 + file_length + suffix.len() as u64;
+        let reader = Cursor::new(prefix).chain(file).chain(Cursor::new(suffix));
+        Ok(Self {
+            boundary,
+            reader: Box::new(reader),
+            content_length,
+        })
+    }
+}
+
+/// Wraps a streaming upload body and reports real drained-byte progress.
+///
+/// Notifications are throttled to at least a 2-percent step or 200 ms gap so
+/// large uploads do not flood the UI event channel; EOF always emits a final
+/// `(total, total)` sample.
+struct ProgressReader<R: Read> {
+    inner: R,
+    total: u64,
+    sent: u64,
+    last_percent: Option<u8>,
+    last_flush: Instant,
+    sink: UploadProgressSink,
+    finished: bool,
+}
+
+impl<R: Read> ProgressReader<R> {
+    fn new(inner: R, total: u64, sink: UploadProgressSink) -> Self {
+        Self {
+            inner,
+            total,
+            sent: 0,
+            last_percent: None,
+            last_flush: Instant::now(),
+            sink,
+            finished: false,
+        }
+    }
+
+    fn flush(&mut self, force: bool) {
+        if self.total == 0 {
+            return;
+        }
+        let percent = ((self.sent.saturating_mul(100)) / self.total).min(100) as u8;
+        let stepped = self
+            .last_percent
+            .map(|previous| percent.saturating_sub(previous) >= 2)
+            .unwrap_or(true);
+        let due = self.last_flush.elapsed() >= Duration::from_millis(200);
+        let reached_end = percent == 100 && self.last_percent != Some(100);
+        if force || (percent != self.last_percent.unwrap_or(255) && (stepped || due)) || reached_end
+        {
+            (self.sink)(self.sent.min(self.total), self.total);
+            self.last_percent = Some(percent);
+            self.last_flush = Instant::now();
+        }
+    }
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.sent = self.sent.saturating_add(read as u64);
+            self.flush(false);
+        } else if !self.finished {
+            self.finished = true;
+            self.flush(true);
+        }
+        Ok(read)
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct StationErrorBody {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+/// Render a non-2xx Station body as display text.
+///
+/// Protobuf-accepting endpoints (`application/protobuf`) receive a binary
+/// `ErrorResponse` on failure (tag 1 = code, tag 2 = message). Dumping that
+/// body as lossy UTF-8 surfaces wire control bytes (e.g. `\x08\x01\x12\x19`)
+/// as tofu glyphs in the UI. Decode the proto message whenever the wire
+/// content type says protobuf or the body contains non-text control bytes;
+/// fall back to lossy UTF-8 for plain-text/JSON errors.
+fn status_error_display_message(content_type: Option<&str>, body: &[u8]) -> String {
+    let protobuf_content_type = content_type.is_some_and(|value| {
+        value.to_ascii_lowercase().contains("protobuf")
+    });
+    let contains_wire_control = body.iter().any(|byte| {
+        matches!(byte, b'\0'..=b'\x08' | b'\x0b' | b'\x0c' | b'\x0e'..=b'\x1f')
+    });
+    if protobuf_content_type || contains_wire_control {
+        if let Ok(parsed) = StationErrorBody::decode(body) {
+            if !parsed.message.is_empty() {
+                return parsed.message;
+            }
+        }
+    }
+    String::from_utf8_lossy(body).into_owned()
+}
+
+pub fn peers_failure_error(status: u16, bytes: &[u8]) -> StationClientError {
+    let mut details = serde_json::json!({ "status": status });
+    if let Ok(body) = StationErrorBody::decode(bytes) {
+        details["error_code"] = serde_json::json!(body.code);
+        if !body.message.is_empty() {
+            details["server_message"] = serde_json::json!(body.message);
+        }
+        return StationClientError::new(
+            StationClientErrorKind::HttpStatus(status),
+            format!("station returned {status}: {}", body.message),
+            Some(details),
+        );
+    }
+    let raw = String::from_utf8_lossy(bytes).to_string();
+    details["body"] = Value::String(raw.clone());
+    StationClientError::new(
+        StationClientErrorKind::HttpStatus(status),
+        format!("station returned {status}: {raw}"),
+        Some(details),
+    )
+}
+
+pub fn probe_station(url: &str) -> (bool, Option<String>, Option<String>, Option<u32>) {
+    let Ok(client) = Client::builder().timeout(Duration::from_secs(5)).build() else {
+        return (false, None, None, None);
+    };
+    let origin = url.trim().trim_end_matches('/');
+    let base = if origin.contains("://") {
+        origin.to_string()
+    } else {
+        format!("http://{origin}")
+    };
+    let online = client
+        .get(format!("{base}/sub-oss/healthz"))
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    if !online {
+        return (false, None, None, None);
+    }
+    let metadata = client
+        .get(format!("{base}/sub-bootstrap/info"))
+        .send()
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .unwrap_or(Value::Null);
+    let data = metadata.get("data").unwrap_or(&metadata);
+    (
+        true,
+        data.get("label")
+            .or_else(|| data.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        data.get("peer_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        data.get("peers_count")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use search_core::model::wire::{HydrationRequest, QueryIntent, SearchResponse};
+
+    #[test]
+    fn buffered_protobuf_failure_keeps_readable_message_and_error_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/x-protobuf"),
+        );
+        headers.insert(
+            "x-peers-error-code",
+            HeaderValue::from_static("user_not_found"),
+        );
+        headers.insert(
+            "x-peers-error-locale-key",
+            HeaderValue::from_static("auth.userNotFound"),
+        );
+        let error = buffer_response(
+            "/api/v1/auth/login",
+            StationResponse {
+                status: 404,
+                headers,
+                body: Box::new(Cursor::new(b"\x08\x01\x12\x0euser not found".to_vec())),
+            },
+            &ReplayPolicy::Never,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error.kind,
+            StationClientErrorKind::HttpStatus(404)
+        ));
+        assert_eq!(error.message, "station returned 404: user not found");
+        assert!(!error.message.chars().any(char::is_control));
+        let details = error.details.unwrap();
+        assert_eq!(details["body"], "user not found");
+        assert_eq!(details["server_message"], "user not found");
+        assert_eq!(details["error_code"], "user_not_found");
+        assert_eq!(details["locale_key"], "auth.userNotFound");
+    }
+
+    #[test]
+    fn buffered_protobuf_session_revocation_keeps_session_error_kind() {
+        let body = StationErrorBody {
+            code: 1,
+            message: "session_revoked".into(),
+        }
+        .encode_to_vec();
+        let error = buffer_response(
+            "/api/v1/auth/session",
+            StationResponse {
+                status: 401,
+                headers: HeaderMap::new(),
+                body: Box::new(Cursor::new(body)),
+            },
+            &ReplayPolicy::SafeRead,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error.kind, StationClientErrorKind::SessionRevoked));
+        assert!(!error.message.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn buffered_text_failure_and_success_payload_keep_existing_semantics() {
+        let error = buffer_response(
+            "/api/v1/auth/login",
+            StationResponse {
+                status: 429,
+                headers: HeaderMap::new(),
+                body: Box::new(Cursor::new(b"rate limited".to_vec())),
+            },
+            &ReplayPolicy::Never,
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "station returned 429: rate limited");
+        assert_eq!(error.details.unwrap()["body"], "rate limited");
+
+        let body = b"\x08\x01\x12\x0euser not found".to_vec();
+        let response = buffer_response(
+            "/api/v1/test",
+            StationResponse {
+                status: 200,
+                headers: HeaderMap::new(),
+                body: Box::new(Cursor::new(body.clone())),
+            },
+            &ReplayPolicy::SafeRead,
+        )
+        .unwrap();
+        assert_eq!(response.body, body);
+    }
+
+    struct SwitchedScopeExecutor {
+        captured: StationRequestScope,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StationRequestExecutor for SwitchedScopeExecutor {
+        fn execute(&self, request: StationRequest) -> Result<StationResponse, StationTransportError> {
+            // The original executor rejects this scope before submitting bytes.
+            // A request with None would instead inherit the replacement Station.
+            assert_eq!(request.expected_scope.as_ref(), Some(&self.captured));
+            assert_ne!(request.expected_scope, self.active_scope());
+            self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(StationTransportError::new(
+                StationTransportErrorKind::StaleRoute, "Station switched before dispatch", false,
+            ))
+        }
+        fn active_scope(&self) -> Option<StationRequestScope> {
+            Some(StationRequestScope { station_peer_id: "station-b".into(), lifecycle_generation: 2 })
+        }
+        fn active_station_peer_id(&self) -> Option<String> { Some("station-b".into()) }
+        fn active_endpoint_origin(&self) -> Option<String> { None }
+    }
+
+    #[test]
+    fn captured_scope_survives_switch_for_submission_and_nested_identity_reads() {
+        let scope = StationRequestScope { station_peer_id: "station-a".into(), lifecycle_generation: 1 };
+        let executor = Arc::new(SwitchedScopeExecutor {
+            captured: scope.clone(), requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let original = StationClient::new(executor.clone());
+        let client = original.bound_to_scope(&scope);
+        assert_eq!(original.expected_scope, None);
+        for path in [
+            "/api/v1/social/feed/events/submit", "/api/v1/social/feed/read",
+            "/actor/endpoint-manifest", "/actor/federation/profile",
+            "/sub-federation/contexts", "/actor/federation/resolve",
+        ] {
+            let error = client.request_proto_for_device::<(), ()>(
+                Method::POST, path, "captured-token", None, None, "captured-device",
+            ).unwrap_err();
+            assert!(matches!(error.kind, StationClientErrorKind::StaleRoute));
+        }
+        assert_eq!(executor.requests.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReadWait {
+        Admission,
+        Replay,
+        Body,
+        Reply,
+    }
+
+    fn await_read_cancellation(cancellation: &CancellationToken) {
+        let guard = std::time::Instant::now() + Duration::from_secs(1);
+        while !cancellation.is_cancelled() && std::time::Instant::now() < guard {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            cancellation.is_cancelled(),
+            "shared read did not cancel its transport"
+        );
+    }
+
+    #[test]
+    fn status_error_display_message_decodes_binary_error_response() {
+        // Captured Station 400 body: tag1 code=1, tag2 message (25 bytes).
+        let message = "invalid email or password";
+        let mut body = vec![0x08, 0x01, 0x12, message.len() as u8];
+        body.extend_from_slice(message.as_bytes());
+
+        let rendered = status_error_display_message(Some("application/protobuf"), &body);
+        assert_eq!(rendered, message);
+
+        // Control-byte heuristic also catches servers that omit the content type.
+        let rendered_sniffed = status_error_display_message(None, &body);
+        assert_eq!(rendered_sniffed, message);
+    }
+
+    #[test]
+    fn status_error_display_message_keeps_plain_text_errors() {
+        let body = b"invalid email or password";
+        let rendered = status_error_display_message(Some("text/plain; charset=utf-8"), body);
+        assert_eq!(rendered, "invalid email or password");
+    }
+
+    #[test]
+    fn progress_reader_reports_real_bytes_and_final_total() {
+        use std::sync::Mutex;
+        let data = vec![7u8; 1000];
+        let samples = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+        let sink_samples = samples.clone();
+        let sink: UploadProgressSink =
+            Arc::new(move |sent, total| sink_samples.lock().unwrap().push((sent, total)));
+        let mut reader = ProgressReader::new(Cursor::new(data), 1000, sink);
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            let read = reader.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            collected.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(collected.len(), 1000);
+        let recorded = samples.lock().unwrap();
+        assert_eq!(*recorded.last().unwrap(), (1000, 1000));
+        let mut previous = 0;
+        for (sent, total) in recorded.iter().copied() {
+            assert_eq!(total, 1000);
+            assert!(sent >= previous && sent <= 1000);
+            previous = sent;
+        }
+    }
+
+    struct CancelledReadBody(CancellationToken);
+
+    impl Read for CancelledReadBody {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            await_read_cancellation(&self.0);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "read cancelled",
+            ))
+        }
+    }
+
+    struct WaitingReadExecutor {
+        phase: ReadWait,
+        entered: std::sync::mpsc::Sender<CancellationToken>,
+    }
+
+    impl StationRequestExecutor for WaitingReadExecutor {
+        fn execute(
+            &self,
+            request: StationRequest,
+        ) -> Result<StationResponse, StationTransportError> {
+            assert_eq!(request.expected_scope, self.active_scope());
+            assert_eq!(request.replay_policy, ReplayPolicy::SafeRead);
+            let cancellation = if matches!(self.phase, ReadWait::Replay) {
+                // RuntimeRequestExecutor's safe replay retains this same token
+                // and durations, even after the first attempt spent admission time.
+                std::thread::sleep(request.admission_timeout / 2);
+                request.replay_copy().unwrap().cancellation
+            } else {
+                request.cancellation.clone()
+            };
+            self.entered.send(cancellation.clone()).unwrap();
+            if matches!(self.phase, ReadWait::Body) {
+                Ok(StationResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    body: Box::new(CancelledReadBody(cancellation)),
+                })
+            } else if matches!(self.phase, ReadWait::Reply) {
+                Ok(StationResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    body: Box::new(Cursor::new(SearchResponse::default().encode_to_vec())),
+                })
+            } else {
+                await_read_cancellation(&cancellation);
+                Err(StationTransportError::new(
+                    StationTransportErrorKind::Cancelled,
+                    "read cancelled",
+                    matches!(self.phase, ReadWait::Replay),
+                ))
+            }
+        }
+
+        fn active_scope(&self) -> Option<StationRequestScope> {
+            Some(StationRequestScope {
+                station_peer_id: "station-1".into(),
+                lifecycle_generation: 1,
+            })
+        }
+
+        fn active_station_peer_id(&self) -> Option<String> {
+            Some("station-1".into())
+        }
+
+        fn active_endpoint_origin(&self) -> Option<String> {
+            Some("http://station.test".into())
+        }
+    }
+
+    #[test]
+    fn bounded_proto_read_cancels_admission_replay_and_body_at_absolute_deadline() {
+        for phase in [ReadWait::Admission, ReadWait::Replay, ReadWait::Body] {
+            let (entered, tokens) = std::sync::mpsc::channel();
+            let client = StationClient::new(Arc::new(WaitingReadExecutor { phase, entered }));
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            let result: Result<SearchResponse, _> = client.request_bounded_proto_read(
+                &client.active_scope().unwrap(),
+                "/api/v1/social/search/query",
+                "test-token",
+                &QueryIntent::default(),
+                deadline,
+                &|| Ok(()),
+            );
+            assert!(matches!(
+                result.unwrap_err().kind,
+                StationClientErrorKind::Cancelled
+            ));
+            assert!(tokens.try_recv().unwrap().is_cancelled());
+        }
+    }
+
+    #[test]
+    fn bounded_proto_read_only_cancels_when_last_shared_member_leaves() {
+        for phase in [ReadWait::Admission, ReadWait::Replay, ReadWait::Body] {
+            let (entered, tokens) = std::sync::mpsc::channel();
+            let client = StationClient::new(Arc::new(WaitingReadExecutor { phase, entered }));
+            let first = search_core::CancelToken::new();
+            let second = search_core::CancelToken::new();
+            let shared = search_core::CancelToken::all(vec![first.clone(), second.clone()]);
+            let (checked, checks) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let read = scope.spawn(|| {
+                    client.request_bounded_proto_read::<_, SearchResponse>(
+                        &client.active_scope().unwrap(),
+                        "/api/v1/social/search/hydrate",
+                        "test-token",
+                        &HydrationRequest::default(),
+                        std::time::Instant::now() + Duration::from_secs(1),
+                        &|| {
+                            if first.is_cancelled() && !second.is_cancelled() {
+                                let _ = checked.send(());
+                            }
+                            shared.check().map_err(|error| error.to_string())
+                        },
+                    )
+                });
+                let transport = tokens.recv_timeout(Duration::from_secs(1)).unwrap();
+                first.cancel();
+                checks.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(!transport.is_cancelled());
+                second.cancel();
+                assert!(matches!(
+                    read.join().unwrap().unwrap_err().kind,
+                    StationClientErrorKind::Cancelled
+                ));
+                assert!(transport.is_cancelled());
+            });
+        }
+    }
+
+    #[test]
+    fn bounded_proto_read_stops_watcher_after_success_and_rejects_closed_admission() {
+        let (entered, tokens) = std::sync::mpsc::channel();
+        let client = StationClient::new(Arc::new(WaitingReadExecutor {
+            phase: ReadWait::Reply,
+            entered,
+        }));
+        let scope = client.active_scope().unwrap();
+        let input = QueryIntent::default();
+        let response: SearchResponse = client
+            .request_bounded_proto_read(
+                &scope,
+                "/api/v1/social/search/query",
+                "test-token",
+                &input,
+                std::time::Instant::now() + Duration::from_secs(1),
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(response, SearchResponse::default());
+        assert!(!tokens.try_recv().unwrap().is_cancelled());
+        for expired in [false, true] {
+            let result = client.request_bounded_proto_read::<_, SearchResponse>(
+                &scope,
+                "/api/v1/social/search/query",
+                "test-token",
+                &input,
+                if expired {
+                    std::time::Instant::now()
+                } else {
+                    std::time::Instant::now() + Duration::from_secs(1)
+                },
+                &|| {
+                    if expired {
+                        Ok(())
+                    } else {
+                        Err("cancelled".into())
+                    }
+                },
+            );
+            assert!(matches!(
+                result.unwrap_err().kind,
+                StationClientErrorKind::Cancelled
+            ));
+            assert!(tokens.try_recv().is_err());
+        }
+    }
+
+    struct FailingBody;
+
+    impl Read for FailingBody {
+        fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "route revoked",
+            ))
+        }
+    }
+
+    #[test]
+    fn transport_policies_are_bounded_by_operation_semantics() {
+        assert_eq!(
+            StationTransportPolicy::Interactive.timeout(),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            StationTransportPolicy::TurnExecution.timeout(),
+            Duration::from_secs(305)
+        );
+    }
+
+    #[test]
+    fn service_unavailability_preserves_a_typed_app_error() {
+        let error = map_transport_error(
+            StationTransportError::new(
+                StationTransportErrorKind::Unavailable,
+                "Station unavailable",
+                false,
+            ),
+            ReplayPolicy::SafeRead,
+        );
+        let result: AppResult<Value> = error.into_app_result("Federation sequencer unavailable");
+
+        assert_eq!(
+            result.error.expect("typed error").code,
+            ErrorCode::Unavailable
+        );
+    }
+
+    #[test]
+    fn only_safe_reads_receive_implicit_replay() {
+        assert_eq!(default_replay_policy(&Method::GET), ReplayPolicy::SafeRead);
+        assert_eq!(default_replay_policy(&Method::POST), ReplayPolicy::Never);
+    }
+
+    #[test]
+    fn authenticated_route_security_accepts_user_selected_http_or_https() {
+        for policy in [
+            StationRouteSecurity::VerifiedRoute,
+            StationRouteSecurity::HttpOrHttps,
+        ] {
+            assert!(policy.permits("https://station.test"));
+            assert!(policy.permits("http://127.0.0.1:18080"));
+            assert!(policy.permits("http://localhost:18080"));
+            assert!(policy.permits("http://station.test"));
+            assert!(!policy.permits("ftp://station.test"));
+            assert!(!policy.permits("http://station.test/path"));
+        }
+    }
+
+    #[test]
+    fn route_policy_is_closed_over_direct_relay_and_auto() {
+        assert_eq!(
+            serde_json::to_string(&StationRoutePolicy::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StationRoutePolicy::DirectOnly).unwrap(),
+            "\"direct_only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StationRoutePolicy::RelayOnly).unwrap(),
+            "\"relay_only\""
+        );
+    }
+
+    #[test]
+    fn route_selection_failures_preserve_closed_typed_codes() {
+        let no_route = map_transport_error(
+            StationTransportError::new(
+                StationTransportErrorKind::NoRoute,
+                "no verified route",
+                false,
+            ),
+            ReplayPolicy::SafeRead,
+        );
+        let policy_conflict = map_transport_error(
+            StationTransportError::new(
+                StationTransportErrorKind::RoutePolicyConflict,
+                "active route conflicts with request policy",
+                false,
+            ),
+            ReplayPolicy::SafeRead,
+        );
+
+        assert!(matches!(no_route.kind, StationClientErrorKind::NoRoute));
+        assert!(matches!(
+            policy_conflict.kind,
+            StationClientErrorKind::RoutePolicyConflict
+        ));
+        assert_eq!(
+            no_route
+                .details
+                .as_ref()
+                .and_then(|details| details.get("code"))
+                .and_then(Value::as_str),
+            Some("station_no_route")
+        );
+        assert_eq!(
+            policy_conflict
+                .details
+                .as_ref()
+                .and_then(|details| details.get("code"))
+                .and_then(Value::as_str),
+            Some("station_route_policy_conflict")
+        );
+    }
+
+    #[test]
+    fn replay_copy_retains_caller_cancellation() {
+        let cancellation = CancellationToken::new();
+        let request = StationRequest {
+            method: Method::GET,
+            path_and_query: "/actor/profile".to_string(),
+            headers: HeaderMap::new(),
+            body: StationRequestBody::Empty,
+            timeout: Duration::from_secs(30),
+            admission_timeout: Duration::from_secs(5),
+            traffic_class: TrafficClass::Interactive,
+            route_security: StationRouteSecurity::VerifiedRoute,
+            route_policy: StationRoutePolicy::Auto,
+            replay_policy: ReplayPolicy::SafeRead,
+            cancellation: cancellation.clone(),
+            expected_scope: Some(StationRequestScope {
+                station_peer_id: "station-a".to_string(),
+                lifecycle_generation: 7,
+            }),
+        };
+        let replay = request.replay_copy().expect("safe read is replayable");
+
+        cancellation.cancel();
+
+        assert!(replay.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn request_path_query_is_encoded_once() {
+        assert_eq!(
+            encode_path_and_query(
+                "/actor/profile?view=compact",
+                Some(&[("actor", "ptid:a/b".to_string())])
+            )
+            .unwrap(),
+            "/actor/profile?view=compact&actor=ptid%3Aa%2Fb"
+        );
+    }
+
+    #[test]
+    fn failed_mutation_response_body_is_an_ambiguous_outcome() {
+        let error = buffer_response(
+            "/conversation/command",
+            StationResponse {
+                status: 200,
+                headers: HeaderMap::new(),
+                body: Box::new(FailingBody),
+            },
+            &ReplayPolicy::Never,
+        )
+        .expect_err("submitted mutation with unreadable response is ambiguous");
+
+        assert!(matches!(
+            error.kind,
+            StationClientErrorKind::AmbiguousOutcome
+        ));
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("submitted"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn failed_safe_read_response_body_remains_a_decode_failure() {
+        let error = buffer_response(
+            "/actor/profile",
+            StationResponse {
+                status: 200,
+                headers: HeaderMap::new(),
+                body: Box::new(FailingBody),
+            },
+            &ReplayPolicy::SafeRead,
+        )
+        .expect_err("safe read body failure");
+
+        assert!(matches!(error.kind, StationClientErrorKind::Decode));
+    }
+}

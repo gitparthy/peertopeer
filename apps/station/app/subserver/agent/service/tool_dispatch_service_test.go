@@ -1,0 +1,6048 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/domain"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/errcode"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/infrastructure/persistence"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/model"
+	touchmodel "github.com/peers-labs/peers-touch/station/frame/touch/model"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"gorm.io/gorm"
+)
+
+type toolDispatchFixture struct {
+	db         *gorm.DB
+	service    *ToolDispatchService
+	now        time.Time
+	actorID    string
+	deviceID   string
+	session    *model.ClientCapabilityLease
+	privateKey ed25519.PrivateKey
+}
+
+func newToolDispatchFixture(t *testing.T) toolDispatchFixture {
+	t.Helper()
+	db := openConversationAuthorityDB(t, "tool_dispatch_"+strings.ReplaceAll(t.Name(), "/", "_"))
+	return newToolDispatchFixtureWithDB(t, db)
+}
+
+func newToolDispatchFixtureWithDB(t *testing.T, db *gorm.DB) toolDispatchFixture {
+	t.Helper()
+	if err := db.AutoMigrate(
+		&persistence.ToolCall{},
+		&persistence.ClientCapabilityLease{},
+		&persistence.ClientCapabilityResourceGrant{},
+		&persistence.ToolBatch{},
+		&persistence.ToolDecisionCommand{},
+		&persistence.ToolDispatchOutbox{},
+		&persistence.ReceiptRecoveryCredential{},
+		&persistence.ClientCapabilityCommand{},
+		&persistence.Conversation{},
+		&persistence.AgentTurn{},
+		&persistence.TurnEvent{},
+		&persistence.ToolReceiptAttempt{},
+		&persistence.ToolResult{},
+		&persistence.ToolContinuation{},
+		&persistence.TurnAttempt{},
+		&persistence.TurnTrace{},
+		&persistence.ExecutionStep{},
+		&persistence.ExecutorLease{},
+		&persistence.CapabilityManifest{},
+		&persistence.AgentCapabilityBinding{},
+		&persistence.CapabilityBindingCommand{},
+		&persistence.CapabilityReadinessSnapshot{},
+	); err != nil {
+		t.Fatalf("migrate tool dispatch models: %v", err)
+	}
+	// Provider control-plane schema and KEK env required by the runtime
+	// authority resolver seeded below.
+	ensureProviderAuthorityTestSchema(t, db)
+	now := time.Now().UTC()
+	dispatch := NewToolDispatchService()
+	dispatch.now = func() time.Time { return now }
+	publicKey, privateKey := deterministicProofTestKey()
+	dispatch.SetCapabilityProofService(NewClientCapabilityProofService(
+		&deterministicDeviceSigningKeyResolver{key: &touchmodel.VerifiedActorDeviceSigningKey{
+			ActorPtid:          proofTestActorID,
+			ActorDeviceId:      proofTestDeviceID,
+			SigningKeyId:       proofTestSigningKeyID,
+			Ed25519PublicKey:   publicKey[:],
+			VerificationSource: touchmodel.ActorSigningKeyVerificationSource_ACTOR_SIGNING_KEY_VERIFICATION_SOURCE_LOCAL_DEVICE_REGISTRATION,
+		}},
+		nil,
+		func() time.Time { return now },
+	))
+	dispatch.SetConversationService(NewConversationService())
+	fixture := toolDispatchFixture{
+		db:         db,
+		service:    dispatch,
+		now:        now,
+		actorID:    proofTestActorID,
+		deviceID:   proofTestDeviceID,
+		privateKey: privateKey,
+	}
+	registerRequest := &model.RegisterClientCapabilityLeaseRequest{
+		Advertisement: &model.ClientCapabilityAdvertisement{
+			AdvertisementId:    "advertisement-1",
+			DeviceId:           fixture.deviceID,
+			DeviceSigningKeyId: proofTestSigningKeyID,
+			Platform:           model.ClientPlatform_CLIENT_PLATFORM_DESKTOP,
+			ConnectionId:       "connection-1",
+			Capabilities: []*model.ClientCapability{
+				{
+					CapabilityId:  "filesystem.read",
+					SchemaVersion: "1",
+					Permission:    model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_GRANTED,
+					Constraints:   &model.CapabilityConstraints{MaxRequestBytes: 4096},
+				},
+				{
+					CapabilityId:  "shell.execute",
+					SchemaVersion: "1",
+					Permission:    model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_GRANTED,
+					Constraints:   &model.CapabilityConstraints{MaxRequestBytes: 4096},
+				},
+			},
+		},
+	}
+	fixture.signRequest(t, registerRequest, model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REGISTER_LEASE, "register", 1)
+	response, err := dispatch.RegisterCapabilityLease(
+		context.Background(),
+		fixture.actorID,
+		"auth-session-1",
+		fixture.deviceID,
+		registerRequest,
+	)
+	if err != nil {
+		t.Fatalf("register capability lease: %v", err)
+	}
+	seedLiveActorSession(t, db, "auth-session-1", now)
+	fixture.session = response.GetLease()
+	return fixture
+}
+
+func (f *toolDispatchFixture) setNow(now time.Time) {
+	f.now = now.UTC()
+	f.service.now = func() time.Time { return f.now }
+	f.service.capabilityProof.now = func() time.Time { return f.now }
+}
+
+func (f toolDispatchFixture) seedTurnAuthority(
+	t *testing.T,
+	proposal ToolBatchProposal,
+) {
+	t.Helper()
+	conversation := &persistence.Conversation{
+		ID:         proposal.ConversationID,
+		AgentID:    proposal.AgentID,
+		ActorPTID:  f.actorID,
+		Title:      "Tool dispatch fixture",
+		ProviderID: proposal.Provider,
+		Status:     "active",
+		CreatedAt:  f.now,
+		UpdatedAt:  f.now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             proposal.TurnID,
+		ConversationID: proposal.ConversationID,
+		AgentID:        proposal.AgentID,
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      f.now,
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:           proposal.AttemptID,
+		TurnID:       proposal.TurnID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    f.now,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation": conversation,
+		"turn":         turn,
+		"attempt":      attempt,
+	} {
+		if err := f.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+}
+
+func (f toolDispatchFixture) signRequest(
+	t *testing.T,
+	request proto.Message,
+	domain model.ClientCapabilityCommandDomain,
+	commandID string,
+	nonceByte byte,
+) {
+	t.Helper()
+	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal command body: %v", err)
+	}
+	bodyHash := sha256.Sum256(body)
+	proof := &model.ClientCapabilityCommandProof{
+		CommandId:          commandID,
+		DeviceSigningKeyId: proofTestSigningKeyID,
+		Nonce:              bytes.Repeat([]byte{nonceByte}, clientCapabilityCommandNonceSize),
+		IssuedAt:           timestamppb.New(f.now),
+	}
+	signingPayload := &model.ClientCapabilityCommandSigningPayload{
+		Domain:    domain,
+		ActorPtid: f.actorID,
+		DeviceId:  f.deviceID,
+		CommandId: commandID,
+		BodyHash:  bodyHash[:],
+		Nonce:     proof.GetNonce(),
+		IssuedAt:  proof.GetIssuedAt(),
+	}
+	signingBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(signingPayload)
+	if err != nil {
+		t.Fatalf("marshal signing payload: %v", err)
+	}
+	proof.Signature = ed25519.Sign(f.privateKey, signingBytes)
+	attachCapabilityCommandProofForTest(t, request, proof)
+}
+
+func (f toolDispatchFixture) signedReceiptRequest(
+	t *testing.T,
+	receipt *model.ClientCapabilityReceipt,
+) *model.SubmitClientCapabilityReceiptRequest {
+	t.Helper()
+	request := &model.SubmitClientCapabilityReceiptRequest{Receipt: receipt}
+	f.signRequest(
+		t,
+		request,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_SUBMIT_ACTIVE_RECEIPT,
+		fmt.Sprintf("receipt-%s-%d", receipt.GetRequestId(), receipt.GetSequence()),
+		byte(receipt.GetSequence()+10),
+	)
+	return request
+}
+
+func (f toolDispatchFixture) propose(t *testing.T, callIDs ...string) ToolBatchProposal {
+	t.Helper()
+	proposal := f.authorizedProposal(
+		t,
+		"fixture",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	calls := make([]AuthorizedToolProposal, 0, len(callIDs))
+	for _, callID := range callIDs {
+		calls = append(calls, AuthorizedToolProposal{
+			ToolCallID:      callID,
+			ToolName:        "local_file_read",
+			CapabilityID:    "filesystem.read",
+			SchemaVersion:   "1",
+			BindingID:       proposal.Calls[0].BindingID,
+			BindingRevision: proposal.Calls[0].BindingRevision,
+			ExecutionOwner:  proposal.Calls[0].ExecutionOwner,
+			Arguments:       []byte(`{"resource_ref":"resource-1"}`),
+		})
+	}
+	proposal.TurnID = "turn-1"
+	proposal.AttemptID = "attempt-1"
+	proposal.ToolBatchID = "batch-1"
+	proposal.Calls = calls
+	if _, err := f.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("propose tool batch: %v", err)
+	}
+	return proposal
+}
+
+func (f toolDispatchFixture) pullSingleEnvelope(t *testing.T) *model.ClientCapabilityRequest {
+	t.Helper()
+	request := f.signedPullRequest(t, "single", 2)
+	response, err := f.service.PullCapabilityRequests(
+		context.Background(),
+		f.actorID,
+		f.deviceID,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("pull capability requests: %v", err)
+	}
+	if len(response.GetRequests()) != 1 {
+		t.Fatalf("expected one capability request, got %d", len(response.GetRequests()))
+	}
+	return response.GetRequests()[0]
+}
+
+func TestValidateCapabilityCallReturnsClientPermissionDenied(t *testing.T) {
+	lease := &model.ClientCapabilityLease{
+		Capabilities: []*model.ClientCapability{{
+			CapabilityId:   "filesystem.read",
+			SchemaVersion:  "1",
+			Permission:     model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_DENIED,
+			PermissionKind: model.CapabilityPermissionKind_CAPABILITY_PERMISSION_KIND_FILESYSTEM,
+			Constraints: &model.CapabilityConstraints{
+				MaxRequestBytes: 4096,
+			},
+		}},
+	}
+	err := validateCapabilityCall(lease, AuthorizedToolProposal{
+		CapabilityID:  "filesystem.read",
+		SchemaVersion: "1",
+		Arguments:     []byte(`{"resource_ref":"resource-1"}`),
+	})
+	var biz *errcode.BizError
+	if !errors.As(err, &biz) {
+		t.Fatalf("expected typed permission denial, got %v", err)
+	}
+	if biz.Code != errcode.AgentClientPermissionDenied ||
+		biz.Payload.GetErrorType() != string(errcode.AgentClientPermissionDenied) ||
+		biz.Payload.GetLocaleKey() != errcode.AgentClientPermissionDeniedLocaleKey ||
+		biz.Payload.GetRetryable() ||
+		!biz.Payload.GetTerminal() {
+		t.Fatalf("unexpected permission denial payload: %+v", biz.Payload)
+	}
+	expectedDetails := map[string]string{
+		"capability_id":   "filesystem.read",
+		"permission_kind": "filesystem",
+	}
+	if !reflect.DeepEqual(biz.Payload.GetDetails(), expectedDetails) {
+		t.Fatalf(
+			"unexpected permission denial details: got %v want %v",
+			biz.Payload.GetDetails(),
+			expectedDetails,
+		)
+	}
+}
+
+func TestToolDispatchServicePermissionDeniedRejectsBeforePersistence(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	deniedLease := proto.Clone(fixture.session).(*model.ClientCapabilityLease)
+	for _, capability := range deniedLease.GetCapabilities() {
+		if capability.GetCapabilityId() != "filesystem.read" {
+			continue
+		}
+		capability.Permission =
+			model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_DENIED
+		capability.PermissionKind =
+			model.CapabilityPermissionKind_CAPABILITY_PERMISSION_KIND_FILESYSTEM
+	}
+	encodedLease, err := proto.MarshalOptions{Deterministic: true}.Marshal(deniedLease)
+	if err != nil {
+		t.Fatalf("encode denied capability lease: %v", err)
+	}
+	if err := fixture.db.Model(&persistence.ClientCapabilityLease{}).
+		Where("session_id = ?", deniedLease.GetCapabilitySessionId()).
+		Update("lease_payload", encodedLease).Error; err != nil {
+		t.Fatalf("persist denied capability lease: %v", err)
+	}
+
+	proposal := fixture.authorizedProposal(
+		t,
+		"permission-denied",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	_, err = fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	var businessError *errcode.BizError
+	if !errors.As(err, &businessError) ||
+		businessError.Code != errcode.AgentClientPermissionDenied {
+		t.Fatalf("expected typed permission denial, got %v", err)
+	}
+
+	for name, value := range map[string]interface{}{
+		"tool batches": &persistence.ToolBatch{},
+		"tool calls":   &persistence.ToolCall{},
+	} {
+		var count int64
+		if err := fixture.db.Model(value).
+			Where("turn_id = ?", proposal.TurnID).
+			Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("permission denial persisted %d %s", count, name)
+		}
+	}
+}
+
+func TestValidateClientCapabilityAdvertisementRequiresDeniedPermissionKind(t *testing.T) {
+	err := validateClientCapabilityAdvertisement([]*model.ClientCapability{{
+		CapabilityId:  "filesystem.read",
+		SchemaVersion: "1",
+		Permission:    model.CapabilityPermissionState_CAPABILITY_PERMISSION_STATE_DENIED,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "requires permission kind") {
+		t.Fatalf("expected missing permission kind rejection, got %v", err)
+	}
+}
+
+func TestCapabilitySessionReadbackUsesCanonicalLeasePTID(t *testing.T) {
+	row := &persistence.ClientCapabilityLease{
+		SessionID:    "session-1",
+		ActorID:      "347760690666143747",
+		DeviceID:     "device-1",
+		PlatformKind: int32(model.ClientPlatform_CLIENT_PLATFORM_DESKTOP),
+		ExpiresAt:    time.Now().Add(time.Minute),
+	}
+	lease := &model.ClientCapabilityLease{
+		Ptid: "ptid:v1:actor:peers:p:alice:fixture",
+	}
+
+	session := capabilitySessionFromLeaseRow(row, lease)
+
+	if session.GetPtid() != lease.GetPtid() {
+		t.Fatalf(
+			"capability session leaked internal actor ID: got %q want %q",
+			session.GetPtid(),
+			lease.GetPtid(),
+		)
+	}
+}
+
+func TestToolDispatchServiceRejectsCrossDeviceCapabilitySessionPull(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	foreignLease := proto.Clone(fixture.session).(*model.ClientCapabilityLease)
+	foreignLease.DeviceId = "device-other"
+	encodedLease, err := proto.MarshalOptions{Deterministic: true}.Marshal(foreignLease)
+	if err != nil {
+		t.Fatalf("encode foreign-device lease: %v", err)
+	}
+	if err := fixture.db.Model(&persistence.ClientCapabilityLease{}).
+		Where("session_id = ?", fixture.session.GetCapabilitySessionId()).
+		Updates(map[string]interface{}{
+			"device_id":     foreignLease.GetDeviceId(),
+			"lease_payload": encodedLease,
+		}).Error; err != nil {
+		t.Fatalf("persist foreign-device lease: %v", err)
+	}
+
+	response, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedPullRequest(t, "cross-device-session", 22),
+	)
+	if response != nil {
+		t.Fatalf("cross-device capability pull returned response: %+v", response)
+	}
+	var businessError *errcode.BizError
+	if !errors.As(err, &businessError) ||
+		businessError.Code != errcode.AgentUnauthorized {
+		t.Fatalf("cross-device capability pull error = %v", err)
+	}
+
+	var commandCount int64
+	if err := fixture.db.Model(&persistence.ClientCapabilityCommand{}).
+		Where("command_id = ?", "pull-cross-device-session").
+		Count(&commandCount).Error; err != nil {
+		t.Fatalf("count rejected capability command: %v", err)
+	}
+	if commandCount != 0 {
+		t.Fatalf("cross-device capability pull committed %d command rows", commandCount)
+	}
+}
+
+func (f toolDispatchFixture) signedPullRequest(
+	t *testing.T,
+	suffix string,
+	nonceByte byte,
+) *model.PullClientCapabilityRequestsRequest {
+	t.Helper()
+	request := &model.PullClientCapabilityRequestsRequest{
+		CapabilitySessionId: f.session.GetCapabilitySessionId(),
+		DeviceId:            f.deviceID,
+	}
+	f.signRequest(
+		t,
+		request,
+		model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_PULL_REQUESTS,
+		"pull-"+suffix,
+		nonceByte,
+	)
+	return request
+}
+
+func TestToolDispatchServiceExpiredLeasePullCommitsAuditEventAndReplays(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"lease-expired",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	proposal.Deadline = fixture.now.Add(10 * time.Minute)
+	fixture.seedTurnAuthority(t, proposal)
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("propose expired-lease tool: %v", err)
+	}
+
+	var oldLeaseBefore persistence.ClientCapabilityLease
+	if err := fixture.db.First(
+		&oldLeaseBefore,
+		"session_id = ?",
+		fixture.session.GetCapabilitySessionId(),
+	).Error; err != nil {
+		t.Fatalf("load old lease before expiry: %v", err)
+	}
+	fixture.setNow(oldLeaseBefore.ExpiresAt.Add(time.Second))
+	currentLease := fixture.registerReplacementLease(
+		t,
+		"lease-expired",
+		fixture.session.GetCapabilities(),
+		41,
+	)
+
+	var currentLeaseBefore persistence.ClientCapabilityLease
+	if err := fixture.db.First(
+		&currentLeaseBefore,
+		"session_id = ?",
+		currentLease.GetCapabilitySessionId(),
+	).Error; err != nil {
+		t.Fatalf("load current lease before expired pull: %v", err)
+	}
+	var callBefore persistence.ToolCall
+	if err := fixture.db.First(
+		&callBefore,
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).Error; err != nil {
+		t.Fatalf("load pending tool call before expired pull: %v", err)
+	}
+	if callBefore.Status != persistence.ToolCallStatusDispatchCommitted {
+		t.Fatalf("tool call status = %q, want dispatch_committed", callBefore.Status)
+	}
+	var outboxBefore persistence.ToolDispatchOutbox
+	if err := fixture.db.First(
+		&outboxBefore,
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).Error; err != nil {
+		t.Fatalf("load outbox before expired pull: %v", err)
+	}
+	var batchBefore persistence.ToolBatch
+	if err := fixture.db.First(&batchBefore, "id = ?", proposal.ToolBatchID).Error; err != nil {
+		t.Fatalf("load batch before expired pull: %v", err)
+	}
+
+	notifications, _, _, unsubscribe, err := fixture.service.conversations.SubscribeTurnEvents(
+		context.Background(),
+		fixture.actorID,
+		proposal.ConversationID,
+		proposal.TurnID,
+	)
+	if err != nil {
+		t.Fatalf("subscribe to expired-lease turn: %v", err)
+	}
+	defer unsubscribe()
+
+	request := fixture.signedPullRequest(t, "lease-expired", 42)
+	response, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		request,
+	)
+	if response != nil {
+		t.Fatalf("expired pull response = %+v, want nil", response)
+	}
+	var leaseError *errcode.BizError
+	if !errors.As(err, &leaseError) ||
+		leaseError.Code != errcode.AgentClientLeaseExpired {
+		t.Fatalf("expired pull error = %T %v, want CLIENT_LEASE_EXPIRED", err, err)
+	}
+	assertClientLeaseExpiredPayload(
+		t,
+		leaseError.Payload,
+		oldLeaseBefore.SessionID,
+		oldLeaseBefore.LeaseID,
+		oldLeaseBefore.ExpiresAt,
+	)
+	select {
+	case <-notifications:
+	default:
+		t.Fatal("committed expired-lease event did not notify turn subscribers")
+	}
+
+	var command persistence.ClientCapabilityCommand
+	if err := fixture.db.First(
+		&command,
+		"command_id = ?",
+		request.GetCommandProof().GetCommandId(),
+	).Error; err != nil {
+		t.Fatalf("load expired-lease command audit: %v", err)
+	}
+	expectedResponseRef, err := proto.MarshalOptions{Deterministic: true}.Marshal(
+		leaseError.Payload,
+	)
+	if err != nil {
+		t.Fatalf("encode expected expired-lease response ref: %v", err)
+	}
+	if !bytes.Equal(command.ResponseRef, expectedResponseRef) ||
+		command.LeaseID != oldLeaseBefore.LeaseID ||
+		command.LeaseRevision != oldLeaseBefore.LeaseRevision {
+		t.Fatalf("expired-lease command audit = %+v", command)
+	}
+
+	var events []persistence.TurnEvent
+	if err := fixture.db.Where(
+		"turn_id = ? AND attempt_id = ? AND event_type = ?",
+		proposal.TurnID,
+		proposal.AttemptID,
+		"progress",
+	).Find(&events).Error; err != nil {
+		t.Fatalf("load expired-lease progress event: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expired pull emitted %d progress events, want 1", len(events))
+	}
+	var event TurnEvent
+	if err := json.Unmarshal([]byte(events[0].Payload), &event); err != nil {
+		t.Fatalf("decode expired-lease progress event: %v", err)
+	}
+	if event.Type != "progress" ||
+		event.Stage != "client_lease_expired" ||
+		event.ErrorType != string(errcode.AgentClientLeaseExpired) ||
+		event.LocaleKey != errcode.AgentClientLeaseExpiredLocaleKey ||
+		event.Retryable == nil ||
+		!*event.Retryable ||
+		event.Terminal == nil ||
+		*event.Terminal ||
+		!reflect.DeepEqual(event.Details, leaseError.Payload.GetDetails()) {
+		t.Fatalf("expired-lease progress event = %+v", event)
+	}
+	var eventOutcome model.ErrorPayload
+	if err := json.Unmarshal(event.OutcomeError, &eventOutcome); err != nil {
+		t.Fatalf("decode expired-lease event outcome: %v", err)
+	}
+	if !proto.Equal(leaseError.Payload, &eventOutcome) {
+		t.Fatalf("event outcome = %+v, want %+v", &eventOutcome, leaseError.Payload)
+	}
+
+	replayedResponse, replayErr := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		request,
+	)
+	if replayedResponse != nil {
+		t.Fatalf("expired pull replay response = %+v, want nil", replayedResponse)
+	}
+	var replayedLeaseError *errcode.BizError
+	if !errors.As(replayErr, &replayedLeaseError) ||
+		!proto.Equal(leaseError.Payload, replayedLeaseError.Payload) {
+		t.Fatalf("expired pull replay error = %T %v", replayErr, replayErr)
+	}
+	select {
+	case <-notifications:
+		t.Fatal("expired pull replay emitted a duplicate subscriber notification")
+	default:
+	}
+	if err := fixture.db.Where(
+		"turn_id = ? AND event_type = ?",
+		proposal.TurnID,
+		"progress",
+	).Find(&events).Error; err != nil {
+		t.Fatalf("reload expired-lease progress events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expired pull replay emitted %d progress events, want 1", len(events))
+	}
+
+	distinctRequest := fixture.signedPullRequest(t, "lease-expired-distinct", 43)
+	distinctResponse, distinctErr := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		distinctRequest,
+	)
+	if distinctResponse != nil {
+		t.Fatalf("distinct expired pull response = %+v, want nil", distinctResponse)
+	}
+	var distinctLeaseError *errcode.BizError
+	if !errors.As(distinctErr, &distinctLeaseError) ||
+		!proto.Equal(leaseError.Payload, distinctLeaseError.Payload) {
+		t.Fatalf("distinct expired pull error = %T %v", distinctErr, distinctErr)
+	}
+	var distinctCommand persistence.ClientCapabilityCommand
+	if err := fixture.db.First(
+		&distinctCommand,
+		"command_id = ?",
+		distinctRequest.GetCommandProof().GetCommandId(),
+	).Error; err != nil {
+		t.Fatalf("load distinct expired-lease command audit: %v", err)
+	}
+	if !bytes.Equal(distinctCommand.ResponseRef, expectedResponseRef) {
+		t.Fatalf(
+			"distinct expired-lease command response ref = %x, want %x",
+			distinctCommand.ResponseRef,
+			expectedResponseRef,
+		)
+	}
+	select {
+	case <-notifications:
+		t.Fatal("distinct expired pull emitted a duplicate subscriber notification")
+	default:
+	}
+	if err := fixture.db.Where(
+		"turn_id = ? AND event_type = ?",
+		proposal.TurnID,
+		"progress",
+	).Find(&events).Error; err != nil {
+		t.Fatalf("reload progress events after distinct expired pull: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf(
+			"distinct expired pull emitted %d progress events, want 1",
+			len(events),
+		)
+	}
+
+	var oldLeaseAfter persistence.ClientCapabilityLease
+	var currentLeaseAfter persistence.ClientCapabilityLease
+	var callAfter persistence.ToolCall
+	var outboxAfter persistence.ToolDispatchOutbox
+	var batchAfter persistence.ToolBatch
+	for label, query := range map[string]func() error{
+		"old lease": func() error {
+			return fixture.db.First(&oldLeaseAfter, "session_id = ?", oldLeaseBefore.SessionID).Error
+		},
+		"current lease": func() error {
+			return fixture.db.First(&currentLeaseAfter, "session_id = ?", currentLeaseBefore.SessionID).Error
+		},
+		"tool call": func() error {
+			return fixture.db.First(&callAfter, "id = ?", callBefore.ID).Error
+		},
+		"outbox": func() error {
+			return fixture.db.First(&outboxAfter, "request_id = ?", outboxBefore.RequestID).Error
+		},
+		"batch": func() error {
+			return fixture.db.First(&batchAfter, "id = ?", batchBefore.ID).Error
+		},
+	} {
+		if err := query(); err != nil {
+			t.Fatalf("reload unchanged %s: %v", label, err)
+		}
+	}
+	if !reflect.DeepEqual(oldLeaseBefore, oldLeaseAfter) ||
+		!reflect.DeepEqual(currentLeaseBefore, currentLeaseAfter) ||
+		!reflect.DeepEqual(callBefore, callAfter) ||
+		!reflect.DeepEqual(outboxBefore, outboxAfter) ||
+		!reflect.DeepEqual(batchBefore, batchAfter) {
+		t.Fatalf(
+			"expired pull mutated authority: old=%v current=%v call=%v outbox=%v batch=%v",
+			reflect.DeepEqual(oldLeaseBefore, oldLeaseAfter),
+			reflect.DeepEqual(currentLeaseBefore, currentLeaseAfter),
+			reflect.DeepEqual(callBefore, callAfter),
+			reflect.DeepEqual(outboxBefore, outboxAfter),
+			reflect.DeepEqual(batchBefore, batchAfter),
+		)
+	}
+	activeCurrent, err := fixture.service.GetActiveCapabilitySession(
+		context.Background(),
+		fixture.actorID,
+		currentLease.GetCapabilitySessionId(),
+	)
+	if err != nil {
+		t.Fatalf("resolve current lease after expired pull: %v", err)
+	}
+	if activeCurrent == nil ||
+		activeCurrent.GetLeaseId() != currentLease.GetLeaseId() ||
+		activeCurrent.GetLeaseRevision() != currentLease.GetLeaseRevision() {
+		t.Fatalf("current lease authority changed: %+v", activeCurrent)
+	}
+	for label, value := range map[string]interface{}{
+		"result":       &persistence.ToolResult{},
+		"continuation": &persistence.ToolContinuation{},
+	} {
+		var count int64
+		if err := fixture.db.Model(value).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", label, err)
+		}
+		if count != 0 {
+			t.Fatalf("expired pull created %d %s rows", count, label)
+		}
+	}
+}
+
+func TestToolDispatchServiceExpiredLeasePullRollsBackAuditAndEvent(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"lease-expired-rollback",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	proposal.Deadline = fixture.now.Add(10 * time.Minute)
+	fixture.seedTurnAuthority(t, proposal)
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("propose rollback tool: %v", err)
+	}
+	var callBefore persistence.ToolCall
+	if err := fixture.db.First(
+		&callBefore,
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).Error; err != nil {
+		t.Fatalf("load rollback tool call: %v", err)
+	}
+	var leaseBefore persistence.ClientCapabilityLease
+	if err := fixture.db.First(
+		&leaseBefore,
+		"session_id = ?",
+		fixture.session.GetCapabilitySessionId(),
+	).Error; err != nil {
+		t.Fatalf("load rollback lease: %v", err)
+	}
+	fixture.setNow(leaseBefore.ExpiresAt.Add(time.Second))
+
+	notifications, _, _, unsubscribe, err := fixture.service.conversations.SubscribeTurnEvents(
+		context.Background(),
+		fixture.actorID,
+		proposal.ConversationID,
+		proposal.TurnID,
+	)
+	if err != nil {
+		t.Fatalf("subscribe to rollback turn: %v", err)
+	}
+	defer unsubscribe()
+
+	const callbackName = "test:reject_expired_lease_turn_event"
+	if err := fixture.db.Callback().Create().Before("gorm:create").Register(
+		callbackName,
+		func(tx *gorm.DB) {
+			if tx.Statement.Table == (persistence.TurnEvent{}).TableName() {
+				tx.AddError(errors.New("injected turn event persistence failure"))
+			}
+		},
+	); err != nil {
+		t.Fatalf("register turn event failure callback: %v", err)
+	}
+	defer fixture.db.Callback().Create().Remove(callbackName)
+
+	request := fixture.signedPullRequest(t, "lease-expired-rollback", 43)
+	if response, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		request,
+	); err == nil || response != nil {
+		t.Fatalf("expired pull rollback = response %+v, err %v", response, err)
+	}
+
+	var commandCount int64
+	if err := fixture.db.Model(&persistence.ClientCapabilityCommand{}).
+		Where("command_id = ?", request.GetCommandProof().GetCommandId()).
+		Count(&commandCount).Error; err != nil {
+		t.Fatalf("count rolled-back command audit: %v", err)
+	}
+	var eventCount int64
+	if err := fixture.db.Model(&persistence.TurnEvent{}).
+		Where("turn_id = ?", proposal.TurnID).
+		Count(&eventCount).Error; err != nil {
+		t.Fatalf("count rolled-back turn events: %v", err)
+	}
+	if commandCount != 0 || eventCount != 0 {
+		t.Fatalf("rollback retained command/event rows: command=%d event=%d", commandCount, eventCount)
+	}
+	select {
+	case <-notifications:
+		t.Fatal("rolled-back expired-lease event notified subscribers")
+	default:
+	}
+
+	var callAfter persistence.ToolCall
+	if err := fixture.db.First(&callAfter, "id = ?", callBefore.ID).Error; err != nil {
+		t.Fatalf("reload rollback tool call: %v", err)
+	}
+	var leaseAfter persistence.ClientCapabilityLease
+	if err := fixture.db.First(&leaseAfter, "session_id = ?", leaseBefore.SessionID).Error; err != nil {
+		t.Fatalf("reload rollback lease: %v", err)
+	}
+	if !reflect.DeepEqual(callBefore, callAfter) ||
+		!reflect.DeepEqual(leaseBefore, leaseAfter) {
+		t.Fatalf("rollback mutated tool or lease authority")
+	}
+}
+
+func TestToolDispatchServiceExpiredLeasePullPreservesMissingAndRevokedBehavior(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		fixture := newToolDispatchFixture(t)
+		request := &model.PullClientCapabilityRequestsRequest{
+			CapabilitySessionId: "missing-session",
+			DeviceId:            fixture.deviceID,
+		}
+		fixture.signRequest(
+			t,
+			request,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_PULL_REQUESTS,
+			"pull-missing-session",
+			44,
+		)
+		assertCapabilityPullNotFoundWithoutAudit(t, fixture, request)
+	})
+
+	t.Run("revoked", func(t *testing.T) {
+		fixture := newToolDispatchFixture(t)
+		revoke := &model.RevokeClientCapabilityLeaseRequest{
+			CapabilitySessionId:   fixture.session.GetCapabilitySessionId(),
+			LeaseId:               fixture.session.GetLeaseId(),
+			ExpectedLeaseRevision: fixture.session.GetLeaseRevision(),
+			Reason:                model.ClientCapabilityLeaseRevokeReason_CLIENT_CAPABILITY_LEASE_REVOKE_REASON_USER_LOGOUT,
+		}
+		fixture.signRequest(
+			t,
+			revoke,
+			model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REVOKE_LEASE,
+			"revoke-before-expired-pull",
+			45,
+		)
+		if response, err := fixture.service.RevokeCapabilityLease(
+			context.Background(),
+			fixture.actorID,
+			"auth-session-1",
+			fixture.deviceID,
+			revoke,
+		); err != nil || response.GetRevokedAt() == nil {
+			t.Fatalf("revoke capability lease: response=%+v err=%v", response, err)
+		}
+		request := fixture.signedPullRequest(t, "revoked-session", 46)
+		assertCapabilityPullNotFoundWithoutAudit(t, fixture, request)
+	})
+}
+
+func assertClientLeaseExpiredPayload(
+	t *testing.T,
+	payload *model.ErrorPayload,
+	sessionID string,
+	leaseID string,
+	expiredAt time.Time,
+) {
+	t.Helper()
+	expectedDetails := map[string]string{
+		"session_id": sessionID,
+		"lease_id":   leaseID,
+		"expired_at": expiredAt.UTC().Format(time.RFC3339Nano),
+	}
+	if payload == nil ||
+		payload.GetError() != errcode.AgentClientLeaseExpiredLocaleKey ||
+		payload.GetErrorType() != string(errcode.AgentClientLeaseExpired) ||
+		payload.GetLocaleKey() != errcode.AgentClientLeaseExpiredLocaleKey ||
+		!payload.GetRetryable() ||
+		payload.GetTerminal() ||
+		!reflect.DeepEqual(payload.GetDetails(), expectedDetails) {
+		t.Fatalf("client lease-expired payload = %+v, want details %+v", payload, expectedDetails)
+	}
+}
+
+func assertCapabilityPullNotFoundWithoutAudit(
+	t *testing.T,
+	fixture toolDispatchFixture,
+	request *model.PullClientCapabilityRequestsRequest,
+) {
+	t.Helper()
+	response, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		request,
+	)
+	if response != nil {
+		t.Fatalf("unavailable capability pull response = %+v, want nil", response)
+	}
+	var businessError *errcode.BizError
+	if !errors.As(err, &businessError) ||
+		businessError.Code != errcode.AgentNotFound {
+		t.Fatalf("unavailable capability pull error = %T %v, want AGENT_4004", err, err)
+	}
+	var commandCount int64
+	if err := fixture.db.Model(&persistence.ClientCapabilityCommand{}).
+		Where("command_id = ?", request.GetCommandProof().GetCommandId()).
+		Count(&commandCount).Error; err != nil {
+		t.Fatalf("count unavailable capability command: %v", err)
+	}
+	if commandCount != 0 {
+		t.Fatalf("unavailable capability pull committed %d command rows", commandCount)
+	}
+}
+
+func TestCapabilitySessionRejectsEmptyCapabilities(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	request := &model.RegisterClientCapabilityLeaseRequest{
+		Advertisement: &model.ClientCapabilityAdvertisement{
+			AdvertisementId:    "empty-advertisement",
+			DeviceId:           fixture.deviceID,
+			DeviceSigningKeyId: proofTestSigningKeyID,
+			Platform:           model.ClientPlatform_CLIENT_PLATFORM_DESKTOP,
+			ConnectionId:       "empty-connection",
+		},
+	}
+	fixture.signRequest(t, request, model.ClientCapabilityCommandDomain_CLIENT_CAPABILITY_COMMAND_DOMAIN_REGISTER_LEASE, "register-empty", 31)
+	response, err := fixture.service.RegisterCapabilityLease(context.Background(), fixture.actorID, "auth-session-1", fixture.deviceID, request)
+	if response != nil {
+		t.Fatalf("empty capability response = %+v, want nil", response)
+	}
+	if err == nil || !strings.Contains(err.Error(), "at least one client capability is required") {
+		t.Fatalf("empty capability error = %v", err)
+	}
+}
+
+func TestToolDispatchServiceProposeAuthorizedBatchPersistsEveryCall(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(t, "tool-call-1", "tool-call-2")
+
+	var count int64
+	if err := fixture.db.Model(&persistence.ToolCall{}).
+		Where("tool_batch_id = ?", "batch-1").
+		Count(&count).Error; err != nil {
+		t.Fatalf("count tool calls: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected two tool calls, got %d", count)
+	}
+}
+
+func TestToolDispatchServiceProposeAuthorizedBatchUsesCapabilityAuthority(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"authorized-batch",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(context.Background(), proposal)
+	if err != nil {
+		t.Fatalf("propose authorized batch: %v", err)
+	}
+	if len(decisions) != 1 ||
+		decisions[0].Status != persistence.ToolCallStatusWaitingApproval {
+		t.Fatalf("binding policy did not govern proposal: %+v", decisions)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.Where("tool_batch_id = ?", proposal.ToolBatchID).First(&call).Error; err != nil {
+		t.Fatalf("load authorized tool call: %v", err)
+	}
+	if call.ManifestID != "filesystem.read" ||
+		call.BindingID != "binding-authorized-batch" ||
+		call.ReadinessSnapID != "readiness-authorized-batch" ||
+		call.ApprovalPolicy != string(ToolPolicyManual) {
+		t.Fatalf("tool call authority lineage mismatch: %+v", call)
+	}
+}
+
+func TestToolDispatchServiceAuthorizesSkillViewByPinnedSkillSource(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		requested  string
+		wantAccept bool
+	}{
+		{name: "matching Skill", requested: "Bound Skill", wantAccept: true},
+		{name: "different Skill", requested: "Other Skill", wantAccept: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			proposal := fixture.authorizedProposalForOwner(
+				t,
+				strings.ReplaceAll(test.name, " ", "-"),
+				model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+				model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+				true,
+				model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+			)
+			call := &proposal.Calls[0]
+			if err := fixture.db.Model(&persistence.CapabilityManifest{}).
+				Where(
+					"capability_id = ? AND version = ?",
+					call.CapabilityID,
+					call.SchemaVersion,
+				).
+				Updates(map[string]interface{}{
+					"source_kind": int32(
+						model.CapabilitySourceKind_CAPABILITY_SOURCE_KIND_SKILL,
+					),
+					"source_instance_id": "Bound Skill",
+				}).Error; err != nil {
+				t.Fatalf("persist Skill manifest identity: %v", err)
+			}
+			call.ToolName = "skill_view"
+			call.Arguments = []byte(fmt.Sprintf(`{"name":%q}`, test.requested))
+
+			_, err := fixture.service.ProposeAuthorizedBatch(
+				context.Background(),
+				proposal,
+			)
+			if test.wantAccept {
+				if err != nil {
+					t.Fatalf("matching pinned Skill rejected: %v", err)
+				}
+				return
+			}
+			if !isCapabilityError(err, errcode.AgentInvalidSourceState) {
+				t.Fatalf("different Skill authority accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestToolDispatchServiceProposeAuthorizedBatchFailsClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		enabled   bool
+		readiness model.CapabilityReadinessState
+		wantCode  errcode.Code
+	}{
+		{
+			name:      "disabled binding",
+			enabled:   false,
+			readiness: model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+			wantCode:  errcode.AgentToolUnknown,
+		},
+		{
+			name:      "unavailable snapshot",
+			enabled:   true,
+			readiness: model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_UNAVAILABLE,
+			wantCode:  errcode.AgentInvalidSourceState,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			proposal := fixture.authorizedProposal(
+				t,
+				strings.ReplaceAll(test.name, " ", "-"),
+				model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+				test.readiness,
+				test.enabled,
+			)
+			if _, err := fixture.service.ProposeAuthorizedBatch(
+				context.Background(), proposal,
+			); !isCapabilityError(err, test.wantCode) {
+				t.Fatalf("invalid authority accepted: %v", err)
+			}
+			var count int64
+			if err := fixture.db.Model(&persistence.ToolCall{}).
+				Where("tool_batch_id = ?", proposal.ToolBatchID).
+				Count(&count).Error; err != nil {
+				t.Fatalf("count rejected tool calls: %v", err)
+			}
+			if count != 0 {
+				t.Fatalf("invalid authority persisted %d tool calls", count)
+			}
+		})
+	}
+}
+
+func TestToolDispatchServiceMapsRetiredToolToUnknownBeforeProjection(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"retired-before-projection",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	fixture.seedTurnAuthority(t, proposal)
+	retiredAt := fixture.now.Add(time.Second)
+	if err := fixture.db.Model(&persistence.CapabilityManifest{}).
+		Where(
+			"capability_id = ? AND version = ?",
+			proposal.Calls[0].CapabilityID,
+			proposal.Calls[0].SchemaVersion,
+		).
+		Updates(map[string]interface{}{
+			"availability": int32(
+				model.CapabilityAvailability_CAPABILITY_AVAILABILITY_BLOCKED,
+			),
+			"retired_at": retiredAt,
+		}).Error; err != nil {
+		t.Fatalf("retire advertised Tool manifest: %v", err)
+	}
+	projected := false
+	decisions, projectionCommitted, err :=
+		fixture.service.proposeAuthorizedBatchWithProjection(
+			context.Background(),
+			proposal,
+			func(*gorm.DB) error {
+				projected = true
+				return nil
+			},
+		)
+	var toolErr *errcode.BizError
+	if decisions != nil ||
+		projectionCommitted ||
+		projected ||
+		!errors.As(err, &toolErr) ||
+		toolErr.Code != errcode.AgentToolUnknown ||
+		toolErr.Payload.GetDetails()["tool_id"] != proposal.Calls[0].ToolName ||
+		toolErr.Payload.GetDetails()["tool_version"] !=
+			proposal.Calls[0].SchemaVersion {
+		t.Fatalf(
+			"retired advertised Tool result: decisions=%+v projected=%v callback=%v err=%#v",
+			decisions,
+			projectionCommitted,
+			projected,
+			err,
+		)
+	}
+	for name, record := range map[string]interface{}{
+		"tool batch": &persistence.ToolBatch{},
+		"tool call":  &persistence.ToolCall{},
+	} {
+		var count int64
+		if err := fixture.db.Model(record).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("retired advertised Tool persisted %d %s rows", count, name)
+		}
+	}
+}
+
+func TestToolDispatchServiceKeepsAuthorityDriftInvalidSourceState(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, toolDispatchFixture, ToolBatchProposal)
+	}{
+		{
+			name: "binding ownership",
+			mutate: func(
+				t *testing.T,
+				fixture toolDispatchFixture,
+				proposal ToolBatchProposal,
+			) {
+				if err := fixture.db.Model(&persistence.AgentCapabilityBinding{}).
+					Where("binding_id = ?", proposal.Calls[0].BindingID).
+					Update("ptid", "ptid:person:other").Error; err != nil {
+					t.Fatalf("change advertised Tool binding owner: %v", err)
+				}
+			},
+		},
+		{
+			name: "manifest availability without retirement",
+			mutate: func(
+				t *testing.T,
+				fixture toolDispatchFixture,
+				proposal ToolBatchProposal,
+			) {
+				if err := fixture.db.Model(&persistence.CapabilityManifest{}).
+					Where(
+						"capability_id = ? AND version = ?",
+						proposal.Calls[0].CapabilityID,
+						proposal.Calls[0].SchemaVersion,
+					).
+					Update(
+						"availability",
+						int32(
+							model.CapabilityAvailability_CAPABILITY_AVAILABILITY_BLOCKED,
+						),
+					).Error; err != nil {
+					t.Fatalf("block advertised Tool manifest: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			proposal := fixture.authorizedProposal(
+				t,
+				"authority-drift-"+strings.ReplaceAll(test.name, " ", "-"),
+				model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+				model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+				true,
+			)
+			fixture.seedTurnAuthority(t, proposal)
+			test.mutate(t, fixture, proposal)
+			projected := false
+			decisions, projectionCommitted, err :=
+				fixture.service.proposeAuthorizedBatchWithProjection(
+					context.Background(),
+					proposal,
+					func(*gorm.DB) error {
+						projected = true
+						return nil
+					},
+				)
+			if decisions != nil ||
+				projectionCommitted ||
+				projected ||
+				!isCapabilityError(err, errcode.AgentInvalidSourceState) {
+				t.Fatalf(
+					"authority drift result: decisions=%+v projected=%v callback=%v err=%#v",
+					decisions,
+					projectionCommitted,
+					projected,
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestToolDispatchServiceReplaysPinnedBatchAfterBindingDisabled(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"replay-after-disable",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	fixture.seedTurnAuthority(t, proposal)
+	projectionCount := 0
+	first, projected, err := fixture.service.proposeAuthorizedBatchWithProjection(
+		context.Background(),
+		proposal,
+		func(*gorm.DB) error {
+			projectionCount++
+			return nil
+		},
+	)
+	if err != nil || !projected || len(first) != 1 || projectionCount != 1 {
+		t.Fatalf(
+			"initial Tool batch: decisions=%+v projected=%v projections=%d err=%v",
+			first,
+			projected,
+			projectionCount,
+			err,
+		)
+	}
+	if err := fixture.db.Model(&persistence.AgentCapabilityBinding{}).
+		Where("binding_id = ?", proposal.Calls[0].BindingID).
+		Updates(map[string]interface{}{
+			"enabled":  false,
+			"revision": proposal.Calls[0].BindingRevision + 1,
+		}).Error; err != nil {
+		t.Fatalf("disable binding after Tool batch commit: %v", err)
+	}
+
+	replayed, replayProjected, err :=
+		fixture.service.proposeAuthorizedBatchWithProjection(
+			context.Background(),
+			proposal,
+			func(*gorm.DB) error {
+				projectionCount++
+				return nil
+			},
+		)
+	if err != nil ||
+		replayProjected ||
+		len(replayed) != 1 ||
+		projectionCount != 1 ||
+		replayed[0].ToolCallID != first[0].ToolCallID {
+		t.Fatalf(
+			"pinned Tool batch replay: decisions=%+v projected=%v projections=%d err=%v",
+			replayed,
+			replayProjected,
+			projectionCount,
+			err,
+		)
+	}
+	var call persistence.ToolCall
+	if err := fixture.db.First(
+		&call,
+		"actor_id = ? AND tool_call_id = ?",
+		proposal.ActorID,
+		proposal.Calls[0].ToolCallID,
+	).Error; err != nil {
+		t.Fatalf("load replayed ToolCall: %v", err)
+	}
+	if call.DuplicateDeliveryCount != 1 {
+		t.Fatalf(
+			"replayed ToolCall duplicate count = %d, want 1",
+			call.DuplicateDeliveryCount,
+		)
+	}
+}
+
+func TestToolDispatchServiceProjectionFailureRollsBackNewBatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"projection-rollback",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	fixture.seedTurnAuthority(t, proposal)
+	projectionErr := errors.New("projection failed")
+	decisions, projected, err :=
+		fixture.service.proposeAuthorizedBatchWithProjection(
+			context.Background(),
+			proposal,
+			func(tx *gorm.DB) error {
+				if err := tx.Create(&persistence.TurnEvent{
+					ID:             "projection-event",
+					ConversationID: proposal.ConversationID,
+					TurnID:         proposal.TurnID,
+					AttemptID:      proposal.AttemptID,
+					EventSeq:       1,
+					EventType:      "tool_call",
+					Payload:        "{}",
+					CreatedAt:      fixture.now,
+				}).Error; err != nil {
+					return err
+				}
+				return projectionErr
+			},
+		)
+	if decisions != nil || projected || !errors.Is(err, projectionErr) {
+		t.Fatalf(
+			"projection rollback result: decisions=%+v projected=%v err=%v",
+			decisions,
+			projected,
+			err,
+		)
+	}
+	for name, record := range map[string]interface{}{
+		"projection event": &persistence.TurnEvent{},
+		"tool batch":       &persistence.ToolBatch{},
+		"tool call":        &persistence.ToolCall{},
+	} {
+		var count int64
+		if err := fixture.db.Model(record).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("failed projection persisted %d %s rows", count, name)
+		}
+	}
+}
+
+func TestTurnServiceExecutesAuthorizedStationToolExactlyOnce(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	restore := setupTestCatalog()
+	t.Cleanup(restore)
+	proposal := fixture.authorizedProposalForOwner(
+		t,
+		"station-auto",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+	)
+	proposal.Provider = "test-provider"
+	proposal.Model = "test-model"
+	proposal.DelegationDepth = 2
+	resolver := fixture.seedPinnedRuntimeAuthority(t, proposal, 2)
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("propose Station tool: %v", err)
+	}
+
+	executionCount := 0
+	registry := NewToolRegistryService(nil, nil)
+	registry.Register(&domain.ToolDefinition{
+		Name:       proposal.Calls[0].ToolName,
+		JSONSchema: []byte(`{"type":"object"}`),
+		Handler: func(
+			_ context.Context,
+			_ *domain.ToolCallMeta,
+			_ json.RawMessage,
+		) (*domain.ToolResult, error) {
+			executionCount++
+			return &domain.ToolResult{Content: "station result"}, nil
+		},
+	})
+	turnService := &TurnService{
+		toolDispatch:      fixture.service,
+		toolRegistry:      registry,
+		admissionResolver: resolver,
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+		t.Fatalf("execute Station tool: %v", err)
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+		t.Fatalf("repeat Station tool worker: %v", err)
+	}
+	if executionCount != 1 {
+		t.Fatalf("Station tool execution count = %d, want 1", executionCount)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.Where(
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).First(&call).Error; err != nil {
+		t.Fatalf("load Station tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusSucceeded ||
+		call.ExecutionAttemptCount != 1 ||
+		call.ExecutionClaimID == "" ||
+		call.SideEffectReceipt == "" ||
+		call.ResultID == "" {
+		t.Fatalf("Station tool lineage is incomplete: %+v", call)
+	}
+	var resultCount int64
+	if err := fixture.db.Model(&persistence.ToolResult{}).
+		Where("tool_call_id = ?", call.ToolCallID).
+		Count(&resultCount).Error; err != nil {
+		t.Fatalf("count Station tool results: %v", err)
+	}
+	var continuationCount int64
+	if err := fixture.db.Model(&persistence.ToolContinuation{}).
+		Where("tool_batch_id = ?", call.ToolBatchID).
+		Count(&continuationCount).Error; err != nil {
+		t.Fatalf("count Station tool continuations: %v", err)
+	}
+	if resultCount != 1 || continuationCount != 1 {
+		t.Fatalf(
+			"Station result/continuation counts = %d/%d, want 1/1",
+			resultCount,
+			continuationCount,
+		)
+	}
+
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("replay Station tool proposal: %v", err)
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+		t.Fatalf("execute after duplicate proposal: %v", err)
+	}
+	if executionCount != 1 {
+		t.Fatalf("duplicate proposal executed Station tool %d times", executionCount)
+	}
+	if err := fixture.db.Where("id = ?", call.ID).First(&call).Error; err != nil {
+		t.Fatalf("reload duplicate Station tool call: %v", err)
+	}
+	if call.DuplicateDeliveryCount != 1 {
+		t.Fatalf(
+			"duplicate delivery count = %d, want 1",
+			call.DuplicateDeliveryCount,
+		)
+	}
+}
+
+func TestTurnServicePersistsAppliedSkillBodyInContextLedger(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	restore := setupTestCatalog()
+	t.Cleanup(restore)
+	if err := fixture.db.AutoMigrate(
+		&persistence.Skill{},
+		&persistence.SkillVersion{},
+		&persistence.SkillResource{},
+		&persistence.ImmutableContentBlob{},
+	); err != nil {
+		t.Fatalf("migrate Skill persistence: %v", err)
+	}
+
+	const (
+		skillID      = "skill-context-ledger"
+		skillName    = "Context Ledger Skill"
+		skillContent = "Preserve this exact Skill body."
+	)
+	proposal := fixture.authorizedProposalForOwner(
+		t,
+		"skill-context-ledger",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+	)
+	proposal.Provider = "test-provider"
+	proposal.Model = "test-model"
+	call := &proposal.Calls[0]
+	var originalManifest persistence.CapabilityManifest
+	if err := fixture.db.Where(
+		"capability_id = ? AND version = ?",
+		call.CapabilityID,
+		call.SchemaVersion,
+	).First(&originalManifest).Error; err != nil {
+		t.Fatalf("load original capability manifest: %v", err)
+	}
+	skillCapabilityID := "skill:" + skillID
+	skillManifest := originalManifest
+	skillManifest.CapabilityID = skillCapabilityID
+	skillManifest.SourceKind = int32(
+		model.CapabilitySourceKind_CAPABILITY_SOURCE_KIND_SKILL,
+	)
+	skillManifest.SourceInstanceID = skillName
+	skillManifest.PayloadHash = hashString("skill-context-ledger-manifest")
+	if err := fixture.db.Create(&skillManifest).Error; err != nil {
+		t.Fatalf("persist Skill capability manifest: %v", err)
+	}
+	if err := fixture.db.Model(&persistence.AgentCapabilityBinding{}).
+		Where("binding_id = ?", call.BindingID).
+		Update("capability_id", skillCapabilityID).Error; err != nil {
+		t.Fatalf("pin Skill capability binding: %v", err)
+	}
+	var snapshotRecord persistence.CapabilityReadinessSnapshot
+	if err := fixture.db.First(
+		&snapshotRecord,
+		"snapshot_id = ?",
+		proposal.ReadinessSnapshotID,
+	).Error; err != nil {
+		t.Fatalf("load Skill readiness snapshot: %v", err)
+	}
+	var snapshot model.CapabilityReadinessSnapshot
+	if err := proto.Unmarshal(snapshotRecord.Payload, &snapshot); err != nil {
+		t.Fatalf("decode Skill readiness snapshot: %v", err)
+	}
+	snapshot.Capabilities[0].CapabilityId = skillCapabilityID
+	snapshotPayload, err := proto.MarshalOptions{Deterministic: true}.Marshal(&snapshot)
+	if err != nil {
+		t.Fatalf("encode Skill readiness snapshot: %v", err)
+	}
+	if err := fixture.db.Model(&snapshotRecord).Updates(map[string]interface{}{
+		"payload":      snapshotPayload,
+		"payload_hash": hashBytes(snapshotPayload),
+	}).Error; err != nil {
+		t.Fatalf("persist Skill readiness snapshot: %v", err)
+	}
+	call.ToolName = "skill_view"
+	call.CapabilityID = skillCapabilityID
+	call.Arguments = []byte(fmt.Sprintf(`{"name":%q}`, skillName))
+
+	now := fixture.now
+	if err := fixture.db.Create(&persistence.Skill{
+		ID: skillID, AgentID: proposal.AgentID, Name: skillName,
+		Description: "ContextLedger regression fixture", Content: skillContent,
+		TrustLevel: string(domain.TrustLevelCommunity), Version: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("persist Skill: %v", err)
+	}
+	if err := fixture.db.Create(&persistence.SkillVersion{
+		ID: "skill-version-context-ledger", SkillID: skillID,
+		AgentID: proposal.AgentID, Version: 1, Content: skillContent,
+		Trigger: "create", CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("persist Skill version: %v", err)
+	}
+
+	resolver := fixture.seedPinnedRuntimeAuthority(t, proposal, 0)
+	ledger := &model.ContextLedger{
+		ContextLedgerId: "context:" + proposal.AttemptID,
+		TurnId:          proposal.TurnID,
+		AttemptId:       proposal.AttemptID,
+		PromptVersion:   "v1",
+	}
+	ledgerJSON, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(ledger)
+	if err != nil {
+		t.Fatalf("encode initial ContextLedger: %v", err)
+	}
+	if err := fixture.db.Model(&persistence.TurnAttempt{}).
+		Where("id = ?", proposal.AttemptID).
+		Update("context_ledger", string(ledgerJSON)).Error; err != nil {
+		t.Fatalf("persist initial ContextLedger: %v", err)
+	}
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("propose Skill tool: %v", err)
+	}
+
+	skills := NewSkillService(NewSkillsGuardService(), nil)
+	skills.db = fixture.db
+	turnService := &TurnService{
+		toolDispatch:      fixture.service,
+		toolRegistry:      NewToolRegistryService(nil, skills),
+		admissionResolver: resolver,
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+		t.Fatalf("execute Skill tool: %v", err)
+	}
+
+	var attempt persistence.TurnAttempt
+	if err := fixture.db.First(
+		&attempt,
+		"id = ?",
+		proposal.AttemptID,
+	).Error; err != nil {
+		t.Fatalf("reload Skill attempt: %v", err)
+	}
+	var persisted model.ContextLedger
+	if err := protojson.Unmarshal([]byte(attempt.ContextLedger), &persisted); err != nil {
+		t.Fatalf("decode persisted ContextLedger: %v", err)
+	}
+	expectedRef := "skill:" + skillID + ":version=1"
+	bodyCount := 0
+	for _, segment := range persisted.GetSegments() {
+		if segment.GetType() !=
+			model.ContextSegmentType_CONTEXT_SEGMENT_TYPE_SKILL_BODY {
+			continue
+		}
+		bodyCount++
+		if !containsStr(segment.GetSourceRefs(), expectedRef) ||
+			segment.GetContentHash() != sha256Hex(skillContent) {
+			t.Fatalf("persisted Skill body lineage is invalid: %+v", segment)
+		}
+	}
+	if bodyCount != 1 {
+		t.Fatalf("persisted Skill body segment count = %d, want 1", bodyCount)
+	}
+}
+
+func TestTurnServiceRejectsStaleStationToolBeforeHandlerExecution(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	restore := setupTestCatalog()
+	t.Cleanup(restore)
+	proposal := fixture.authorizedProposalForOwner(
+		t,
+		"station-stale",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+	)
+	proposal.Provider = "test-provider"
+	proposal.Model = "test-model"
+	proposal.DelegationDepth = 1
+	resolver := fixture.seedPinnedRuntimeAuthority(t, proposal, 1)
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	); err != nil {
+		t.Fatalf("propose Station tool: %v", err)
+	}
+	if err := fixture.db.Model(&persistence.AgentProvider{}).
+		Where("actor_ptid = ? AND name = ?", fixture.actorID, proposal.Provider).
+		Update("version", 2).Error; err != nil {
+		t.Fatalf("advance provider capability source: %v", err)
+	}
+
+	executionCount := 0
+	registry := NewToolRegistryService(nil, nil)
+	registry.Register(&domain.ToolDefinition{
+		Name:       proposal.Calls[0].ToolName,
+		JSONSchema: []byte(`{"type":"object"}`),
+		Handler: func(
+			context.Context,
+			*domain.ToolCallMeta,
+			json.RawMessage,
+		) (*domain.ToolResult, error) {
+			executionCount++
+			return &domain.ToolResult{Content: "unexpected"}, nil
+		},
+	})
+	turnService := &TurnService{
+		toolDispatch:      fixture.service,
+		toolRegistry:      registry,
+		admissionResolver: resolver,
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err == nil {
+		t.Fatal("expected stale Station tool authority rejection")
+	}
+	if executionCount != 0 {
+		t.Fatalf("stale Station tool executed handler %d times", executionCount)
+	}
+	var call persistence.ToolCall
+	if err := fixture.db.Where(
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).First(&call).Error; err != nil {
+		t.Fatalf("load rejected Station tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusFailed {
+		t.Fatalf("stale Station tool status = %q, want failed", call.Status)
+	}
+}
+
+func (f toolDispatchFixture) seedPinnedRuntimeAuthority(
+	t *testing.T,
+	proposal ToolBatchProposal,
+	delegationDepth uint32,
+) *RuntimeAdmissionResolver {
+	t.Helper()
+	if err := f.db.AutoMigrate(
+		&persistence.AgentProvider{},
+		&persistence.AgentModel{},
+		&persistence.AgentTurn{},
+	); err != nil {
+		t.Fatalf("migrate Station tool runtime authority: %v", err)
+	}
+	seedTestProvider(
+		t,
+		f.db,
+		f.actorID,
+		proposal.Provider,
+		true,
+		`{"api_key":"test-key"}`,
+	)
+	resolver := NewRuntimeAdmissionResolver(
+		NewProviderConfigService(),
+		NewModelConfigService(),
+	)
+	admission, err := resolver.Resolve(
+		context.Background(),
+		f.actorID,
+		proposal.Provider,
+		proposal.Model,
+	)
+	if err != nil {
+		t.Fatalf("resolve Station tool runtime authority: %v", err)
+	}
+	snapshot := newDirectRuntimeSnapshot(
+		admission,
+		"1",
+		domain.ThinkingModeDisabled,
+	)
+	encoded, err := persistence.MarshalRuntimeSnapshot(snapshot)
+	if err != nil {
+		t.Fatalf("encode Station tool runtime authority: %v", err)
+	}
+	snapshotHash, err := runtimeSnapshotHash(snapshot)
+	if err != nil {
+		t.Fatalf("hash Station tool runtime authority: %v", err)
+	}
+	conversation := &persistence.Conversation{
+		ID:        proposal.ConversationID,
+		AgentID:   proposal.AgentID,
+		ActorPTID: f.actorID,
+		Title:     "Station tool authority",
+		Status:    "active",
+		CreatedAt: f.now,
+		UpdatedAt: f.now,
+	}
+	if err := f.db.Create(conversation).Error; err != nil {
+		t.Fatalf("seed Station tool conversation: %v", err)
+	}
+	if err := f.db.Create(&persistence.AgentTurn{
+		ID:             proposal.TurnID,
+		ConversationID: proposal.ConversationID,
+		AgentID:        proposal.AgentID,
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      f.now,
+	}).Error; err != nil {
+		t.Fatalf("seed Station tool turn: %v", err)
+	}
+	if err := f.db.Create(&persistence.TurnAttempt{
+		ID:                  proposal.AttemptID,
+		TurnID:              proposal.TurnID,
+		AttemptIndex:        1,
+		Status:              string(domain.TurnStatusWaitingLocalTool),
+		ReadinessSnapshotID: proposal.ReadinessSnapshotID,
+		RuntimeSnapshot:     encoded,
+		RuntimeSnapshotHash: snapshotHash,
+		StartedAt:           f.now,
+	}).Error; err != nil {
+		t.Fatalf("seed Station tool attempt: %v", err)
+	}
+	if proposal.DelegationDepth != delegationDepth {
+		t.Fatalf(
+			"Station tool delegation depth = %d, want %d",
+			proposal.DelegationDepth,
+			delegationDepth,
+		)
+	}
+	return resolver
+}
+
+func TestStationToolPolicyBlocksExecutionUntilApproved(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	restore := setupTestCatalog()
+	t.Cleanup(restore)
+	proposal := fixture.authorizedProposalForOwner(
+		t,
+		"station-manual",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+	)
+	proposal.Provider = "test-provider"
+	proposal.Model = "test-model"
+	resolver := fixture.seedPinnedRuntimeAuthority(t, proposal, 0)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose manual Station tool: %v", err)
+	}
+
+	executionCount := 0
+	registry := NewToolRegistryService(nil, nil)
+	registry.Register(&domain.ToolDefinition{
+		Name:       proposal.Calls[0].ToolName,
+		JSONSchema: []byte(`{"type":"object"}`),
+		Handler: func(
+			_ context.Context,
+			_ *domain.ToolCallMeta,
+			_ json.RawMessage,
+		) (*domain.ToolResult, error) {
+			executionCount++
+			return &domain.ToolResult{Content: "approved result"}, nil
+		},
+	})
+	turnService := &TurnService{
+		toolDispatch:      fixture.service,
+		toolRegistry:      registry,
+		admissionResolver: resolver,
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+		t.Fatalf("execute unapproved Station tool: %v", err)
+	}
+	if executionCount != 0 {
+		t.Fatalf("manual Station tool executed before approval")
+	}
+	if len(decisions) != 1 {
+		t.Fatalf("manual Station decision count = %d, want 1", len(decisions))
+	}
+	decision := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-station-manual",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-station-manual",
+	}
+	decision.PayloadHash = decisionPayloadHash(decision)
+	if _, err := fixture.service.SubmitDecision(
+		context.Background(),
+		fixture.actorID,
+		decision,
+	); err != nil {
+		t.Fatalf("approve Station tool: %v", err)
+	}
+	if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+		t.Fatalf("execute approved Station tool: %v", err)
+	}
+	if executionCount != 1 {
+		t.Fatalf("approved Station tool execution count = %d, want 1", executionCount)
+	}
+}
+
+func TestStationToolDenyAndExpiryExecuteZeroTimes(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy model.CapabilityApprovalPolicy
+		expire bool
+	}{
+		{
+			name:   "deny",
+			policy: model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_DENY,
+		},
+		{
+			name:   "expiry",
+			policy: model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+			expire: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			proposal := fixture.authorizedProposalForOwner(
+				t,
+				"station-"+test.name,
+				test.policy,
+				model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+				true,
+				model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+			)
+			if _, err := fixture.service.ProposeAuthorizedBatch(
+				context.Background(),
+				proposal,
+			); err != nil {
+				t.Fatalf("propose %s Station tool: %v", test.name, err)
+			}
+			if test.expire {
+				fixture.service.now = func() time.Time {
+					return proposal.Deadline.Add(time.Second)
+				}
+				if _, err := fixture.service.SettleExpiredToolCalls(
+					context.Background(),
+				); err != nil {
+					t.Fatalf("expire Station tool: %v", err)
+				}
+			}
+
+			executionCount := 0
+			registry := NewToolRegistryService(nil, nil)
+			registry.Register(&domain.ToolDefinition{
+				Name:       proposal.Calls[0].ToolName,
+				JSONSchema: []byte(`{"type":"object"}`),
+				Handler: func(
+					_ context.Context,
+					_ *domain.ToolCallMeta,
+					_ json.RawMessage,
+				) (*domain.ToolResult, error) {
+					executionCount++
+					return &domain.ToolResult{Content: "unexpected"}, nil
+				},
+			})
+			turnService := &TurnService{
+				toolDispatch: fixture.service,
+				toolRegistry: registry,
+			}
+			if err := turnService.executeReadyStationTools(context.Background()); err != nil {
+				t.Fatalf("execute %s Station tool: %v", test.name, err)
+			}
+			if executionCount != 0 {
+				t.Fatalf("%s Station tool executed %d times", test.name, executionCount)
+			}
+
+			var call persistence.ToolCall
+			if err := fixture.db.Where(
+				"tool_call_id = ?",
+				proposal.Calls[0].ToolCallID,
+			).First(&call).Error; err != nil {
+				t.Fatalf("load %s Station tool: %v", test.name, err)
+			}
+			expectedStatus := persistence.ToolCallStatusDenied
+			if test.expire {
+				expectedStatus = persistence.ToolCallStatusExpired
+			}
+			if call.Status != expectedStatus ||
+				call.ExecutionAttemptCount != 0 ||
+				call.ResultID != "" {
+				t.Fatalf("%s Station tool state is invalid: %+v", test.name, call)
+			}
+			if test.expire && call.ErrorCode != string(errcode.AgentToolApprovalExpired) {
+				t.Fatalf(
+					"expired approval error code = %q, want %q",
+					call.ErrorCode,
+					errcode.AgentToolApprovalExpired,
+				)
+			}
+		})
+	}
+}
+
+func (f toolDispatchFixture) authorizedProposal(
+	t *testing.T,
+	suffix string,
+	policy model.CapabilityApprovalPolicy,
+	readiness model.CapabilityReadinessState,
+	enabled bool,
+) ToolBatchProposal {
+	return f.authorizedProposalForOwner(
+		t,
+		suffix,
+		policy,
+		readiness,
+		enabled,
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_CLIENT_CAPABILITY,
+	)
+}
+
+func (f toolDispatchFixture) authorizedProposalForOwner(
+	t *testing.T,
+	suffix string,
+	policy model.CapabilityApprovalPolicy,
+	readiness model.CapabilityReadinessState,
+	enabled bool,
+	executionOwner model.ToolExecutionOwner,
+) ToolBatchProposal {
+	t.Helper()
+	bindingID := "binding-" + suffix
+	snapshotID := "readiness-" + suffix
+	toolName := "local_file_read"
+	capabilityID := "filesystem.read"
+	selectedSessionID := f.session.GetCapabilitySessionId()
+	if executionOwner == model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION {
+		toolName = "station_test_tool"
+		capabilityID = "tool:station_test_tool"
+		selectedSessionID = ""
+	}
+	manifest := &persistence.CapabilityManifest{
+		CapabilityID: capabilityID, Version: "1",
+		SourceKind:       int32(model.CapabilitySourceKind_CAPABILITY_SOURCE_KIND_BUILTIN_TOOL),
+		SourceInstanceID: toolName, DisplayMetadataJSON: "{}",
+		InputSchemaRef: "schema://" + capabilityID + "/input", OutputSchemaRef: "schema://" + capabilityID + "/output",
+		ExecutionOwner:           int32(executionOwner),
+		RequiredCapabilitiesJSON: "[]", RiskClass: "read", DefaultApprovalPolicy: int32(policy),
+		SecretBoundary: "station", Availability: int32(model.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE),
+		PayloadHash: hashString("manifest-" + suffix), CreatedAt: f.now,
+	}
+	if executionOwner == model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_CLIENT_CAPABILITY {
+		manifest.SecretBoundary = "client"
+	}
+	if err := f.db.Create(manifest).Error; err != nil {
+		t.Fatalf("persist authority manifest: %v", err)
+	}
+	binding := &persistence.AgentCapabilityBinding{
+		BindingID: bindingID, Ptid: f.actorID, AgentID: "agent-1",
+		CapabilityID: manifest.CapabilityID, CapabilityVersion: manifest.Version,
+		Enabled: enabled, ApprovalPolicy: int32(policy), AgentVersion: 1, Revision: 1, UpdatedAt: f.now,
+	}
+	if err := f.db.Create(binding).Error; err != nil {
+		t.Fatalf("persist authority binding: %v", err)
+	}
+	snapshot := &model.CapabilityReadinessSnapshot{
+		SnapshotId: snapshotID, Ptid: f.actorID, AgentId: binding.AgentID,
+		SelectedClientSessionId: &selectedSessionID,
+		Capabilities: []*model.CapabilityReadiness{{
+			CapabilityId: manifest.CapabilityID, CapabilityVersion: manifest.Version,
+			BindingId: bindingID, BindingRevision: binding.Revision, State: readiness,
+		}},
+		CreatedAt: timestamppb.New(f.now), ExpiresAt: timestamppb.New(f.now.Add(time.Minute)),
+	}
+	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("encode readiness snapshot: %v", err)
+	}
+	if err := f.db.Create(&persistence.CapabilityReadinessSnapshot{
+		SnapshotID: snapshotID, Ptid: f.actorID, AgentID: binding.AgentID,
+		Payload: payload, PayloadHash: hashBytes(payload), CreatedAt: f.now,
+		ExpiresAt: f.now.Add(time.Minute),
+	}).Error; err != nil {
+		t.Fatalf("persist readiness snapshot: %v", err)
+	}
+	return ToolBatchProposal{
+		ActorID: f.actorID, TurnID: "turn-" + suffix, AttemptID: "attempt-" + suffix,
+		ToolBatchID: "batch-" + suffix, ConversationID: "conversation-1", AgentID: binding.AgentID,
+		Provider: "provider-1", Model: "model-1", ThinkingMode: string(domain.ThinkingModeDisabled),
+		MaxRetries: 3, ContextWindowSize: 128000,
+		ClientCapabilitySessionID: selectedSessionID, ReadinessSnapshotID: snapshotID,
+		Deadline: f.now.Add(time.Minute),
+		Calls: []AuthorizedToolProposal{{
+			ToolCallID: "tool-call-" + suffix, ToolName: toolName,
+			CapabilityID: manifest.CapabilityID, SchemaVersion: manifest.Version,
+			BindingID: bindingID, BindingRevision: binding.Revision,
+			ExecutionOwner: executionOwner,
+			Arguments:      []byte(`{"value":"fixture"}`),
+		}},
+	}
+}
+
+func TestToolDispatchServiceSubmitReceipt(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(t, "tool-call-1")
+	envelope := fixture.pullSingleEnvelope(t)
+
+	receipt := &model.ClientCapabilityReceipt{
+		RequestId:           envelope.GetRequestId(),
+		TurnId:              envelope.GetTurnId(),
+		ToolCallId:          envelope.GetToolCallId(),
+		CapabilitySessionId: envelope.GetCapabilitySessionId(),
+		TargetDeviceId:      envelope.GetTargetDeviceId(),
+		DecisionId:          envelope.GetDecisionId(),
+		DecisionRevision:    envelope.GetDecisionRevision(),
+		ExecutionClaimId:    envelope.GetExecutionClaimId(),
+		ExecutorLeaseId:     envelope.GetExecutorLeaseId(),
+		FencingToken:        envelope.GetFencingToken(),
+		DispatchSequence:    envelope.GetDispatchSequence(),
+		PayloadHash:         envelope.GetPayloadHash(),
+		SideEffectReceiptId: "side-effect-1",
+		Status:              model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED,
+		ResultId:            "result-1",
+		ToolBatchId:         envelope.GetToolBatchId(),
+		Sequence:            1,
+		OccurredAt:          timestamppb.New(fixture.now),
+	}
+	response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, receipt),
+	)
+	if err != nil {
+		t.Fatalf("submit out-of-order receipt: %v", err)
+	}
+	if response.GetAccepted() {
+		t.Fatal("out-of-order APPLIED receipt must not be accepted")
+	}
+	if response.GetErrorCode() != model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_INVALID_TRANSITION {
+		t.Fatalf("expected invalid transition, got %s", response.GetErrorCode())
+	}
+
+	var attempt persistence.ToolReceiptAttempt
+	if err := fixture.db.Where("request_id = ? AND sequence = ?", envelope.GetRequestId(), 1).
+		First(&attempt).Error; err != nil {
+		t.Fatalf("load rejected receipt attempt: %v", err)
+	}
+	if attempt.Accepted {
+		t.Fatal("rejected receipt attempt must be persisted with accepted=false")
+	}
+}
+
+func TestToolDispatchServicePreparedReceiptRechecksDeadlineAfterLocks(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(t, "tool-call-fresh-receipt-clock")
+	envelope := fixture.pullSingleEnvelope(t)
+	prepared := receiptForEnvelope(
+		envelope,
+		1,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+	)
+
+	clockReads := 0
+	fixture.service.now = func() time.Time {
+		clockReads++
+		if clockReads == 1 {
+			return fixture.now
+		}
+		return envelope.GetExecutionDeadline().AsTime().Add(time.Second)
+	}
+	response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	)
+	if err != nil {
+		t.Fatalf("submit deadline-crossing PREPARED receipt: %v", err)
+	}
+	if response.GetAccepted() ||
+		response.GetErrorCode() != model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED {
+		t.Fatalf("deadline-crossing PREPARED receipt response = %+v", response)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.First(&call, "tool_call_id = ?", envelope.GetToolCallId()).Error; err != nil {
+		t.Fatalf("reload deadline-crossing tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusDispatchCommitted || call.StartedAt != nil {
+		t.Fatalf("deadline-crossing PREPARED receipt changed call: %+v", call)
+	}
+}
+
+func TestToolDispatchServicePreparedReceiptRejectsRenewedLeaseRevision(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(t, "tool-call-renewed-before-prepared")
+	envelope := fixture.pullSingleEnvelope(t)
+	if err := fixture.db.Model(&persistence.ClientCapabilityLease{}).
+		Where("session_id = ?", envelope.GetCapabilitySessionId()).
+		Update("lease_revision", envelope.GetCapabilityLeaseRevision()+1).Error; err != nil {
+		t.Fatalf("advance capability lease revision: %v", err)
+	}
+
+	prepared := receiptForEnvelope(
+		envelope,
+		1,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+	)
+	response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	)
+	if err != nil {
+		t.Fatalf("submit stale-revision PREPARED receipt: %v", err)
+	}
+	if response.GetAccepted() ||
+		response.GetErrorCode() != model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH {
+		t.Fatalf("stale-revision PREPARED receipt response = %+v", response)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.First(&call, "tool_call_id = ?", envelope.GetToolCallId()).Error; err != nil {
+		t.Fatalf("reload stale-revision tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusDispatchCommitted || call.StartedAt != nil {
+		t.Fatalf("stale-revision PREPARED receipt changed call: %+v", call)
+	}
+}
+
+func TestToolDispatchServiceRejectsInvalidReceiptAuthority(t *testing.T) {
+	testCases := []struct {
+		name              string
+		mutate            func(toolDispatchFixture, *model.ClientCapabilityReceipt)
+		actorID           string
+		deviceID          string
+		expectCode        model.ClientCapabilityReceiptErrorCode
+		expectCommandCode model.ClientCapabilityCommandErrorCode
+	}{
+		{
+			name:              "actor",
+			mutate:            func(_ toolDispatchFixture, _ *model.ClientCapabilityReceipt) {},
+			actorID:           "actor-other",
+			expectCommandCode: model.ClientCapabilityCommandErrorCode_CLIENT_CAPABILITY_COMMAND_ERROR_CODE_KEY_NOT_FOUND,
+		},
+		{
+			name:              "device",
+			mutate:            func(_ toolDispatchFixture, _ *model.ClientCapabilityReceipt) {},
+			deviceID:          "device-other",
+			expectCommandCode: model.ClientCapabilityCommandErrorCode_CLIENT_CAPABILITY_COMMAND_ERROR_CODE_SIGNATURE_INVALID,
+		},
+		{
+			name: "session",
+			mutate: func(_ toolDispatchFixture, receipt *model.ClientCapabilityReceipt) {
+				receipt.CapabilitySessionId = "session-other"
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH,
+		},
+		{
+			name: "claim",
+			mutate: func(_ toolDispatchFixture, receipt *model.ClientCapabilityReceipt) {
+				receipt.ExecutionClaimId = "claim-other"
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH,
+		},
+		{
+			name: "revision",
+			mutate: func(_ toolDispatchFixture, receipt *model.ClientCapabilityReceipt) {
+				receipt.DecisionRevision++
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH,
+		},
+		{
+			name: "fence",
+			mutate: func(_ toolDispatchFixture, receipt *model.ClientCapabilityReceipt) {
+				receipt.FencingToken++
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_STALE_FENCE,
+		},
+		{
+			name: "payload",
+			mutate: func(_ toolDispatchFixture, receipt *model.ClientCapabilityReceipt) {
+				receipt.PayloadHash = "payload-other"
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_PAYLOAD_CONFLICT,
+		},
+		{
+			name: "expired",
+			mutate: func(fixture toolDispatchFixture, _ *model.ClientCapabilityReceipt) {
+				fixture.service.now = func() time.Time { return fixture.now.Add(2 * time.Minute) }
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+		},
+		{
+			name: "revoked",
+			mutate: func(fixture toolDispatchFixture, _ *model.ClientCapabilityReceipt) {
+				revokedAt := fixture.now
+				if err := fixture.db.Model(&persistence.ClientCapabilityLease{}).
+					Where("session_id = ?", fixture.session.GetCapabilitySessionId()).
+					Update("revoked_at", revokedAt).Error; err != nil {
+					t.Fatalf("revoke capability lease: %v", err)
+				}
+			},
+			expectCode: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_AUTHORITY_MISMATCH,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			fixture.propose(t, "tool-call-1")
+			envelope := fixture.pullSingleEnvelope(t)
+			prepared := receiptForEnvelope(
+				envelope,
+				1,
+				model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+			)
+			if response, err := fixture.service.SubmitReceipt(
+				context.Background(),
+				fixture.actorID,
+				fixture.deviceID,
+				fixture.signedReceiptRequest(t, prepared),
+			); err != nil || !response.GetAccepted() {
+				t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+			}
+
+			receipt := receiptForEnvelope(
+				envelope,
+				2,
+				model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED,
+			)
+			receipt.ResultId = "result-1"
+			receipt.BoundedResult = []byte(`{"ok":true}`)
+			testCase.mutate(fixture, receipt)
+			actorID := testCase.actorID
+			if actorID == "" {
+				actorID = fixture.actorID
+			}
+			deviceID := testCase.deviceID
+			if deviceID == "" {
+				deviceID = fixture.deviceID
+			}
+			response, err := fixture.service.SubmitReceipt(
+				context.Background(),
+				actorID,
+				deviceID,
+				fixture.signedReceiptRequest(t, receipt),
+			)
+			if err != nil {
+				t.Fatalf("submit mismatched receipt: %v", err)
+			}
+			if response.GetAccepted() ||
+				response.GetErrorCode() != testCase.expectCode ||
+				response.GetCommandErrorCode() != testCase.expectCommandCode {
+				t.Fatalf(
+					"expected receipt=%s command=%s, got %+v",
+					testCase.expectCode,
+					testCase.expectCommandCode,
+					response,
+				)
+			}
+		})
+	}
+}
+
+func TestToolDispatchServiceTerminalReceiptRollsBackAtomically(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(t, "tool-call-1")
+	envelope := fixture.pullSingleEnvelope(t)
+	prepared := receiptForEnvelope(envelope, 1, model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	); err != nil || !response.GetAccepted() {
+		t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+	}
+
+	const callbackName = "test:reject_tool_result_create"
+	if err := fixture.db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == (persistence.ToolResult{}).TableName() {
+			tx.AddError(errors.New("injected tool result persistence failure"))
+		}
+	}); err != nil {
+		t.Fatalf("register create failure callback: %v", err)
+	}
+	defer fixture.db.Callback().Create().Remove(callbackName)
+
+	applied := receiptForEnvelope(envelope, 2, model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED)
+	applied.ResultId = "result-1"
+	applied.BoundedResult = []byte(`{"ok":true}`)
+	if _, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, applied),
+	); err == nil {
+		t.Fatal("expected terminal receipt transaction to fail")
+	}
+
+	for table, modelValue := range map[string]interface{}{
+		"tool result":  &persistence.ToolResult{},
+		"continuation": &persistence.ToolContinuation{},
+		"tool message": &persistence.AgentMessage{},
+	} {
+		var count int64
+		if err := fixture.db.Model(modelValue).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s must roll back with terminal receipt, got %d rows", table, count)
+		}
+	}
+	var call persistence.ToolCall
+	if err := fixture.db.First(&call, "tool_call_id = ?", envelope.GetToolCallId()).Error; err != nil {
+		t.Fatalf("reload tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusPrepared {
+		t.Fatalf("tool call must remain prepared after rollback, got %s", call.Status)
+	}
+}
+
+func TestToolDispatchServiceSettleExpiredToolCalls(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(
+		t,
+		"tool-call-dispatched",
+		"tool-call-prepared",
+		"tool-call-cancelled",
+	)
+	pulled, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedPullRequest(t, "settle", 3),
+	)
+	if err != nil {
+		t.Fatalf("pull capability requests: %v", err)
+	}
+	if len(pulled.GetRequests()) != 3 {
+		t.Fatalf("expected three capability requests, got %d", len(pulled.GetRequests()))
+	}
+	for index, request := range pulled.GetRequests()[1:] {
+		prepared := receiptForEnvelope(
+			request,
+			uint64(index+1),
+			model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+		)
+		if response, err := fixture.service.SubmitReceipt(
+			context.Background(),
+			fixture.actorID,
+			fixture.deviceID,
+			fixture.signedReceiptRequest(t, prepared),
+		); err != nil || !response.GetAccepted() {
+			t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+		}
+	}
+	if err := fixture.db.Model(&persistence.ToolCall{}).
+		Where("tool_call_id = ?", "tool-call-cancelled").
+		Updates(map[string]interface{}{
+			"status":     persistence.ToolCallStatusCancelled,
+			"error_code": "turn_cancelled_after_dispatch",
+			"ended_at":   fixture.now,
+		}).Error; err != nil {
+		t.Fatalf("seed cancellation-fenced tool call: %v", err)
+	}
+
+	fixture.service.now = func() time.Time { return fixture.now.Add(2 * time.Minute) }
+	affected, err := fixture.service.SettleExpiredToolCalls(context.Background())
+	if err != nil {
+		t.Fatalf("settle expired tool calls: %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("expected only the unprepared call to expire, got %d", affected)
+	}
+
+	var calls []persistence.ToolCall
+	if err := fixture.db.Order("tool_call_id ASC").Find(&calls).Error; err != nil {
+		t.Fatalf("load settled tool calls: %v", err)
+	}
+	statusByID := make(map[string]string, len(calls))
+	errorCodeByID := make(map[string]string, len(calls))
+	for i := range calls {
+		statusByID[calls[i].ToolCallID] = calls[i].Status
+		errorCodeByID[calls[i].ToolCallID] = calls[i].ErrorCode
+	}
+	if statusByID["tool-call-dispatched"] != persistence.ToolCallStatusExpired {
+		t.Fatalf("unprepared call must expire, got %s", statusByID["tool-call-dispatched"])
+	}
+	if errorCodeByID["tool-call-dispatched"] != "tool_deadline_expired" {
+		t.Fatalf(
+			"committed dispatch must retain execution deadline code, got %s",
+			errorCodeByID["tool-call-dispatched"],
+		)
+	}
+	if statusByID["tool-call-prepared"] != persistence.ToolCallStatusPrepared {
+		t.Fatalf("prepared call must remain reconcilable, got %s", statusByID["tool-call-prepared"])
+	}
+	if statusByID["tool-call-cancelled"] != persistence.ToolCallStatusCancelled {
+		t.Fatalf("cancelled call must remain reconcilable, got %s", statusByID["tool-call-cancelled"])
+	}
+	fixture.service.now = func() time.Time { return fixture.now.Add(12 * time.Minute) }
+	affected, err = fixture.service.SettleExpiredToolCalls(context.Background())
+	if err != nil || affected != 2 {
+		t.Fatalf("settle reconciliation deadline: affected=%d err=%v", affected, err)
+	}
+	calls = nil
+	if err := fixture.db.Order("tool_call_id ASC").Find(&calls).Error; err != nil {
+		t.Fatalf("reload reconciled tool calls: %v", err)
+	}
+	for i := range calls {
+		statusByID[calls[i].ToolCallID] = calls[i].Status
+		errorCodeByID[calls[i].ToolCallID] = calls[i].ErrorCode
+	}
+	if statusByID["tool-call-prepared"] != persistence.ToolCallStatusUnknownSideEffect {
+		t.Fatalf("prepared call must become unknown side effect, got %s", statusByID["tool-call-prepared"])
+	}
+	if statusByID["tool-call-cancelled"] != persistence.ToolCallStatusUnknownSideEffect {
+		t.Fatalf("unreconciled cancelled call must become unknown side effect, got %s", statusByID["tool-call-cancelled"])
+	}
+	if errorCodeByID["tool-call-cancelled"] != "turn_cancelled_after_dispatch" {
+		t.Fatalf(
+			"unreconciled cancelled call lost its lifecycle error, got %s",
+			errorCodeByID["tool-call-cancelled"],
+		)
+	}
+	var batch persistence.ToolBatch
+	if err := fixture.db.First(&batch, "id = ?", "batch-1").Error; err != nil {
+		t.Fatalf("load settled batch: %v", err)
+	}
+	if batch.Status != persistence.ToolBatchStatusBlocked {
+		t.Fatalf("expired batch must be blocked, got %s", batch.Status)
+	}
+}
+
+func TestToolDispatchServiceReconcileExpiredContinuations(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	expiredAt := fixture.now.Add(-time.Minute)
+	row := &persistence.ToolContinuation{
+		ID:                     "continuation-1",
+		TurnID:                 "turn-1",
+		AttemptID:              "attempt-1",
+		ToolBatchID:            "batch-1",
+		Status:                 persistence.ToolContinuationStatusClaimed,
+		LeaseID:                "continuation-lease-1",
+		FencingToken:           1,
+		LeaseExpiresAt:         &expiredAt,
+		ProviderRequestEmitted: true,
+		ProviderIdempotent:     true,
+		CreatedAt:              fixture.now.Add(-2 * time.Minute),
+		UpdatedAt:              fixture.now.Add(-2 * time.Minute),
+	}
+	if err := fixture.db.Create(row).Error; err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+
+	if err := fixture.service.ReconcileExpiredContinuations(context.Background()); err != nil {
+		t.Fatalf("reconcile expired continuations: %v", err)
+	}
+	var reloaded persistence.ToolContinuation
+	if err := fixture.db.First(&reloaded, "id = ?", row.ID).Error; err != nil {
+		t.Fatalf("reload continuation: %v", err)
+	}
+	if reloaded.Status != persistence.ToolContinuationStatusReady {
+		t.Fatalf("expected provider-idempotent continuation to return to ready, got %s", reloaded.Status)
+	}
+	if reloaded.LeaseID != "" || reloaded.LeaseExpiresAt != nil {
+		t.Fatalf("expected reclaimed continuation lease to be cleared: %+v", reloaded)
+	}
+}
+
+func TestToolDispatchServiceClaimReadyContinuation(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	row := &persistence.ToolContinuation{
+		ID:          "continuation-claim-once",
+		TurnID:      "turn-claim-once",
+		AttemptID:   "attempt-claim-once",
+		ToolBatchID: "batch-claim-once",
+		Status:      persistence.ToolContinuationStatusReady,
+		CreatedAt:   fixture.now,
+		UpdatedAt:   fixture.now,
+	}
+	if err := fixture.db.Create(row).Error; err != nil {
+		t.Fatalf("seed ready continuation: %v", err)
+	}
+
+	claimed, err := fixture.service.ClaimReadyContinuation(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatalf("claim ready continuation: %v", err)
+	}
+	if claimed.ID != row.ID || claimed.Status != persistence.ToolContinuationStatusClaimed {
+		t.Fatalf("unexpected claimed continuation: %+v", claimed)
+	}
+	if claimed.LeaseID == "" || claimed.FencingToken != 1 || claimed.LeaseExpiresAt == nil {
+		t.Fatalf("claim must assign a fenced lease: %+v", claimed)
+	}
+
+	if _, err := fixture.service.ClaimReadyContinuation(context.Background(), time.Minute); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("second claim must not acquire an active lease, got %v", err)
+	}
+	if err := fixture.service.ReleaseContinuationClaim(
+		context.Background(),
+		claimed.ID,
+		claimed.LeaseID,
+		claimed.FencingToken,
+	); err != nil {
+		t.Fatalf("release unused continuation claim: %v", err)
+	}
+	reclaimed, err := fixture.service.ClaimReadyContinuation(
+		context.Background(),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("reclaim released continuation: %v", err)
+	}
+	if reclaimed.ID != row.ID ||
+		reclaimed.FencingToken != claimed.FencingToken+1 {
+		t.Fatalf("released continuation was not fenced on reclaim: %+v", reclaimed)
+	}
+}
+
+func TestTurnServiceReleasesContinuationClaimBeforeProviderEmission(
+	t *testing.T,
+) {
+	fixture := newToolDispatchFixture(t)
+	row := &persistence.ToolContinuation{
+		ID:          "continuation-release-before-provider",
+		TurnID:      "turn-missing",
+		AttemptID:   "attempt-missing",
+		ToolBatchID: "batch-missing",
+		Status:      persistence.ToolContinuationStatusReady,
+		CreatedAt:   fixture.now,
+		UpdatedAt:   fixture.now,
+	}
+	if err := fixture.db.Create(row).Error; err != nil {
+		t.Fatalf("seed ready continuation: %v", err)
+	}
+	service := &TurnService{toolDispatch: fixture.service}
+
+	resumed, err := service.ResumeReadyToolContinuation(
+		context.Background(),
+		time.Minute,
+	)
+	if !resumed || err == nil {
+		t.Fatalf(
+			"missing batch result: resumed=%v err=%v",
+			resumed,
+			err,
+		)
+	}
+
+	var released persistence.ToolContinuation
+	if err := fixture.db.First(&released, "id = ?", row.ID).Error; err != nil {
+		t.Fatalf("reload released continuation: %v", err)
+	}
+	if released.Status != persistence.ToolContinuationStatusReady ||
+		released.LeaseID != "" ||
+		released.LeaseExpiresAt != nil ||
+		released.ProviderRequestEmitted {
+		t.Fatalf(
+			"pre-provider continuation claim was not released: %+v",
+			released,
+		)
+	}
+}
+
+func TestToolDispatchServiceSubmitDecision(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"decision",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose manual tool: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Status != persistence.ToolCallStatusWaitingApproval {
+		t.Fatalf("expected one waiting decision, got %+v", decisions)
+	}
+
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-1",
+		ExpectedRevision: 0,
+		Approved:         true,
+		IdempotencyKey:   "decision-command-1",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+	first, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+	if err != nil {
+		t.Fatalf("submit decision: %v", err)
+	}
+	if !first.GetAccepted() || first.GetDecisionRevision() != 1 {
+		t.Fatalf("unexpected decision acknowledgement: %+v", first)
+	}
+	replayed, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+	if err != nil {
+		t.Fatalf("replay decision: %v", err)
+	}
+	if !replayed.GetAccepted() || replayed.GetDecisionRevision() != first.GetDecisionRevision() {
+		t.Fatalf("expected original acknowledgement, got %+v", replayed)
+	}
+
+	conflict := protoCloneDecisionRequest(request)
+	conflict.Approved = false
+	conflict.PayloadHash = decisionPayloadHash(conflict)
+	conflictResponse, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, conflict)
+	if err != nil {
+		t.Fatalf("submit payload conflict: %v", err)
+	}
+	if conflictResponse.GetErrorCode() != model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_IDEMPOTENCY_CONFLICT {
+		t.Fatalf("expected idempotency conflict, got %+v", conflictResponse)
+	}
+
+	stale := protoCloneDecisionRequest(request)
+	stale.IdempotencyKey = "decision-command-2"
+	stale.PayloadHash = decisionPayloadHash(stale)
+	staleResponse, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, stale)
+	if err != nil {
+		t.Fatalf("submit stale decision: %v", err)
+	}
+	if staleResponse.GetErrorCode() != model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION {
+		t.Fatalf("expected stale revision, got %+v", staleResponse)
+	}
+
+	var outboxCount int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).Count(&outboxCount).Error; err != nil {
+		t.Fatalf("count outbox rows: %v", err)
+	}
+	if outboxCount != 1 {
+		t.Fatalf("expected one targeted dispatch, got %d", outboxCount)
+	}
+}
+
+func TestToolDispatchServiceRejectsDecisionAfterPinnedBindingDeletion(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"binding-deleted-before-decision",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose manual tool: %v", err)
+	}
+	deletedAt := fixture.now
+	nextRevision := proposal.Calls[0].BindingRevision + 1
+	if err := fixture.db.Model(&persistence.AgentCapabilityBinding{}).
+		Where(
+			"binding_id = ? AND ptid = ?",
+			proposal.Calls[0].BindingID,
+			fixture.actorID,
+		).
+		Updates(map[string]interface{}{
+			"revision":      nextRevision,
+			"tombstoned_at": deletedAt,
+			"updated_at":    deletedAt,
+		}).Error; err != nil {
+		t.Fatalf("tombstone pinned binding: %v", err)
+	}
+
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-binding-deleted-1",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-binding-deleted-command-1",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+	response, err := fixture.service.SubmitDecision(
+		context.Background(),
+		fixture.actorID,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("submit decision after binding deletion: %v", err)
+	}
+	if response.GetAccepted() ||
+		response.GetErrorCode() !=
+			model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION ||
+		response.GetOutcomeError().GetErrorType() !=
+			string(errcode.AgentCapabilityBindingVersionConflict) ||
+		response.GetOutcomeError().GetDetails()["binding_id"] !=
+			proposal.Calls[0].BindingID ||
+		response.GetOutcomeError().GetDetails()["actual_revision"] !=
+			fmt.Sprintf("%d", nextRevision) {
+		t.Fatalf("unexpected deleted-binding acknowledgement: %+v", response)
+	}
+	var call persistence.ToolCall
+	if err := fixture.db.First(
+		&call,
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).Error; err != nil {
+		t.Fatalf("load rejected ToolCall: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusWaitingApproval ||
+		call.ExecutionAttemptCount != 0 ||
+		call.ExecutionClaimID != "" {
+		t.Fatalf("deleted binding admitted ToolCall execution: %+v", call)
+	}
+	var outboxCount int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Count(&outboxCount).Error; err != nil {
+		t.Fatalf("count deleted-binding dispatch rows: %v", err)
+	}
+	if outboxCount != 0 {
+		t.Fatalf("deleted binding created %d dispatch rows", outboxCount)
+	}
+}
+
+func TestToolDispatchServiceRevokeFirstRaceRejectsBeforeDispatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	authority := NewCapabilityAuthorityService(fixture.db)
+	scenarios := NewCapabilityAcceptanceScenarioService(authority, "run-1")
+	scenarios.SetToolDispatchService(fixture.service)
+	fixture.service.SetAcceptanceScenarioService(scenarios)
+	scenarioRequest := capabilityAcceptanceRequest(
+		"run-1",
+		"R-05",
+		"execution-revoke-first",
+	)
+	scenarioRequest.Family =
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03
+	scenarioRequest.Ordering = "A"
+	scenarioRequest.RuntimeAttestationProfile =
+		model.CapabilityAcceptanceRuntimeProfile_CAPABILITY_ACCEPTANCE_RUNTIME_PROFILE_STATION_TURN
+	prepared, err := scenarios.Prepare(
+		context.Background(),
+		fixture.actorID,
+		scenarioRequest,
+	)
+	if err != nil {
+		t.Fatalf("prepare R-05/A scenario: %v", err)
+	}
+	proposal := fixture.authorizedProposal(
+		t,
+		"revoke-first",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose revoke-first ToolCall: %v", err)
+	}
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-revoke-first",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-revoke-first-command",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+	type decisionResult struct {
+		response *model.SubmitToolApprovalDecisionResponse
+		err      error
+	}
+	result := make(chan decisionResult, 1)
+	go func() {
+		response, submitErr := fixture.service.SubmitDecision(
+			context.Background(),
+			fixture.actorID,
+			request,
+		)
+		result <- decisionResult{response: response, err: submitErr}
+	}()
+	if _, err := scenarios.WaitBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.WaitCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierRevokeDispatchRace,
+		},
+	); err != nil {
+		t.Fatalf("wait revoke-first barrier: %v", err)
+	}
+	if _, err := scenarios.ReleaseBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.ReleaseCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierRevokeDispatchRace,
+		},
+	); err != nil {
+		t.Fatalf("release revoke-first barrier: %v", err)
+	}
+	select {
+	case submitted := <-result:
+		if submitted.err != nil {
+			t.Fatalf("submit revoke-first decision: %v", submitted.err)
+		}
+		if submitted.response.GetAccepted() ||
+			submitted.response.GetErrorCode() !=
+				model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_EXECUTOR_UNAVAILABLE {
+			t.Fatalf(
+				"unexpected revoke-first acknowledgement: %+v",
+				submitted.response,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("revoke-first decision did not resume")
+	}
+	var lease persistence.ClientCapabilityLease
+	if err := fixture.db.First(
+		&lease,
+		"session_id = ?",
+		fixture.session.GetCapabilitySessionId(),
+	).Error; err != nil {
+		t.Fatalf("reload revoked lease: %v", err)
+	}
+	if lease.RevokedAt == nil {
+		t.Fatal("revoke-first action left the selected session active")
+	}
+	var outboxCount int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Count(&outboxCount).Error; err != nil {
+		t.Fatalf("count revoke-first dispatch rows: %v", err)
+	}
+	if outboxCount != 0 {
+		t.Fatalf("revoke-first action created %d dispatch rows", outboxCount)
+	}
+}
+
+func TestToolDispatchServiceConnectorDisconnectFirstPausesBeforeDispatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	authority := NewCapabilityAuthorityService(fixture.db)
+	scenarios := NewCapabilityAcceptanceScenarioService(authority, "run-1")
+	scenarios.SetToolDispatchService(fixture.service)
+	fixture.service.SetAcceptanceScenarioService(scenarios)
+	scenarioRequest := capabilityAcceptanceRequest(
+		"run-1",
+		"R-06",
+		"execution-connector-disconnect-first",
+	)
+	scenarioRequest.Family =
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_CONNECTOR_J05
+	scenarioRequest.Ordering = "A"
+	scenarioRequest.RuntimeAttestationProfile =
+		model.CapabilityAcceptanceRuntimeProfile_CAPABILITY_ACCEPTANCE_RUNTIME_PROFILE_STATION_TURN
+	prepared, err := scenarios.Prepare(
+		context.Background(),
+		fixture.actorID,
+		scenarioRequest,
+	)
+	if err != nil {
+		t.Fatalf("prepare Connector R-06/A scenario: %v", err)
+	}
+	proposal := fixture.authorizedProposal(
+		t,
+		"connector-disconnect-first",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose Connector ToolCall: %v", err)
+	}
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-connector-disconnect-first",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-connector-disconnect-first-command",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+	type decisionResult struct {
+		response *model.SubmitToolApprovalDecisionResponse
+		err      error
+	}
+	result := make(chan decisionResult, 1)
+	go func() {
+		response, submitErr := fixture.service.SubmitDecision(
+			context.Background(),
+			fixture.actorID,
+			request,
+		)
+		result <- decisionResult{response: response, err: submitErr}
+	}()
+	if _, err := scenarios.WaitBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.WaitCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierConnectorDisconnect,
+		},
+	); err != nil {
+		t.Fatalf("wait Connector disconnect-first barrier: %v", err)
+	}
+	var outboxBeforeRelease int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Count(&outboxBeforeRelease).Error; err != nil {
+		t.Fatalf("count Connector outbox before release: %v", err)
+	}
+	if outboxBeforeRelease != 0 {
+		t.Fatalf("Connector dispatch crossed its barrier: %d rows", outboxBeforeRelease)
+	}
+	if _, err := scenarios.ReleaseBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.ReleaseCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierConnectorDisconnect,
+		},
+	); err != nil {
+		t.Fatalf("release Connector disconnect-first barrier: %v", err)
+	}
+	select {
+	case submitted := <-result:
+		if submitted.err != nil || !submitted.response.GetAccepted() {
+			t.Fatalf(
+				"submit Connector decision after release: response=%+v err=%v",
+				submitted.response,
+				submitted.err,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Connector decision did not resume")
+	}
+	var outboxAfterRelease int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Count(&outboxAfterRelease).Error; err != nil {
+		t.Fatalf("count Connector outbox after release: %v", err)
+	}
+	if outboxAfterRelease != 1 {
+		t.Fatalf(
+			"Connector dispatch rows after release = %d, want 1",
+			outboxAfterRelease,
+		)
+	}
+}
+
+func TestToolDispatchServiceDeleteFirstRaceRejectsBeforeDispatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	authority := NewCapabilityAuthorityService(fixture.db)
+	scenarios := NewCapabilityAcceptanceScenarioService(authority, "run-1")
+	scenarios.SetToolDispatchService(fixture.service)
+	fixture.service.SetAcceptanceScenarioService(scenarios)
+	scenarioRequest := capabilityAcceptanceRequest(
+		"run-1",
+		"R-07",
+		"execution-delete-first",
+	)
+	scenarioRequest.Family =
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03
+	scenarioRequest.Ordering = "A"
+	scenarioRequest.RuntimeAttestationProfile =
+		model.CapabilityAcceptanceRuntimeProfile_CAPABILITY_ACCEPTANCE_RUNTIME_PROFILE_STATION_TURN
+	prepared, err := scenarios.Prepare(
+		context.Background(),
+		fixture.actorID,
+		scenarioRequest,
+	)
+	if err != nil {
+		t.Fatalf("prepare R-07/A scenario: %v", err)
+	}
+	proposal := fixture.authorizedProposal(
+		t,
+		"delete-first",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose delete-first ToolCall: %v", err)
+	}
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-delete-first",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-delete-first-command",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+	type decisionResult struct {
+		response *model.SubmitToolApprovalDecisionResponse
+		err      error
+	}
+	result := make(chan decisionResult, 1)
+	go func() {
+		response, submitErr := fixture.service.SubmitDecision(
+			context.Background(),
+			fixture.actorID,
+			request,
+		)
+		result <- decisionResult{response: response, err: submitErr}
+	}()
+	if _, err := scenarios.WaitBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.WaitCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierDeleteDispatchRace,
+		},
+	); err != nil {
+		t.Fatalf("wait delete-first barrier: %v", err)
+	}
+	if _, err := scenarios.ReleaseBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.ReleaseCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierDeleteDispatchRace,
+		},
+	); err != nil {
+		t.Fatalf("release delete-first barrier: %v", err)
+	}
+	select {
+	case submitted := <-result:
+		if submitted.err != nil {
+			t.Fatalf("submit delete-first decision: %v", submitted.err)
+		}
+		if submitted.response.GetAccepted() ||
+			submitted.response.GetErrorCode() !=
+				model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION ||
+			submitted.response.GetOutcomeError().GetErrorType() !=
+				string(errcode.AgentCapabilityBindingVersionConflict) {
+			t.Fatalf(
+				"unexpected delete-first acknowledgement: %+v",
+				submitted.response,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delete-first decision did not resume")
+	}
+	var binding persistence.AgentCapabilityBinding
+	if err := fixture.db.First(
+		&binding,
+		"binding_id = ?",
+		proposal.Calls[0].BindingID,
+	).Error; err != nil {
+		t.Fatalf("reload deleted binding: %v", err)
+	}
+	if binding.TombstonedAt == nil ||
+		binding.Revision != proposal.Calls[0].BindingRevision+1 {
+		t.Fatalf("delete-first action did not tombstone binding: %+v", binding)
+	}
+	var outboxCount int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Count(&outboxCount).Error; err != nil {
+		t.Fatalf("count delete-first dispatch rows: %v", err)
+	}
+	if outboxCount != 0 {
+		t.Fatalf("delete-first action created %d dispatch rows", outboxCount)
+	}
+}
+
+func TestToolDispatchServiceDeleteAfterStationClaimPausesAtDispatchCommit(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	restore := setupTestCatalog()
+	t.Cleanup(restore)
+	authority := NewCapabilityAuthorityService(fixture.db)
+	scenarios := NewCapabilityAcceptanceScenarioService(authority, "run-1")
+	scenarios.SetToolDispatchService(fixture.service)
+	fixture.service.SetAcceptanceScenarioService(scenarios)
+	scenarioRequest := capabilityAcceptanceRequest(
+		"run-1",
+		"R-07",
+		"execution-delete-after-station-claim",
+	)
+	scenarioRequest.Family =
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03
+	scenarioRequest.Platform = "secondary"
+	scenarioRequest.Ordering = "B"
+	scenarioRequest.RuntimeAttestationProfile =
+		model.CapabilityAcceptanceRuntimeProfile_CAPABILITY_ACCEPTANCE_RUNTIME_PROFILE_STATION_CAPABILITY_TURN
+	prepared, err := scenarios.Prepare(
+		context.Background(),
+		fixture.actorID,
+		scenarioRequest,
+	)
+	if err != nil {
+		t.Fatalf("prepare R-07/B scenario: %v", err)
+	}
+	proposal := fixture.authorizedProposalForOwner(
+		t,
+		"delete-after-station-claim",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+		model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+	)
+	proposal.Provider = "test-provider"
+	proposal.Model = "test-model"
+	proposal.DelegationDepth = 2
+	resolver := fixture.seedPinnedRuntimeAuthority(t, proposal, 2)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose dispatch-first Station ToolCall: %v", err)
+	}
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-delete-after-station-claim",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-delete-after-station-claim-command",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+	decision, err := fixture.service.SubmitDecision(
+		context.Background(),
+		fixture.actorID,
+		request,
+	)
+	if err != nil || !decision.GetAccepted() || !decision.GetApproved() {
+		t.Fatalf("submit dispatch-first Station decision: response=%+v err=%v", decision, err)
+	}
+
+	executionCount := 0
+	registry := NewToolRegistryService(nil, nil)
+	registry.Register(&domain.ToolDefinition{
+		Name:       proposal.Calls[0].ToolName,
+		JSONSchema: []byte(`{"type":"object"}`),
+		Handler: func(
+			_ context.Context,
+			_ *domain.ToolCallMeta,
+			_ json.RawMessage,
+		) (*domain.ToolResult, error) {
+			executionCount++
+			return &domain.ToolResult{Content: "station result"}, nil
+		},
+	})
+	turnService := &TurnService{
+		toolDispatch:      fixture.service,
+		toolRegistry:      registry,
+		admissionResolver: resolver,
+	}
+	executed := make(chan error, 1)
+	go func() {
+		executed <- turnService.executeReadyStationTools(context.Background())
+	}()
+	if _, err := scenarios.WaitBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.WaitCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierDeleteDispatchRace,
+		},
+	); err != nil {
+		t.Fatalf("wait dispatch-first binding-delete barrier: %v", err)
+	}
+	select {
+	case err := <-executed:
+		t.Fatalf("Station execution crossed unreleased binding-delete barrier: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := scenarios.BindToolCall(
+		fixture.actorID,
+		model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03,
+		"R-07",
+		"B",
+		proposal.Calls[0].ToolCallID,
+	); err != nil {
+		t.Fatalf("bind scenario ToolCall identity: %v", err)
+	}
+	distractor := fixture.authorizedProposal(
+		t,
+		"delete-after-station-claim-distractor",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		distractor,
+	); err != nil {
+		t.Fatalf("propose newer distractor ToolCall: %v", err)
+	}
+	if _, err := scenarios.ReleaseBarrier(
+		context.Background(),
+		fixture.actorID,
+		&model.ReleaseCapabilityAcceptanceBarrierRequest{
+			ScenarioHandle: prepared.GetScenarioHandle(),
+			Barrier:        capabilityBarrierDeleteDispatchRace,
+		},
+	); err != nil {
+		t.Fatalf("release dispatch-first binding-delete barrier: %v", err)
+	}
+	select {
+	case err := <-executed:
+		if err != nil {
+			t.Fatalf("execute Station ToolCall after binding delete: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Station execution did not resume after binding delete")
+	}
+	var binding persistence.AgentCapabilityBinding
+	if err := fixture.db.First(
+		&binding,
+		"binding_id = ?",
+		proposal.Calls[0].BindingID,
+	).Error; err != nil {
+		t.Fatalf("reload dispatch-first deleted binding: %v", err)
+	}
+	if binding.TombstonedAt == nil ||
+		binding.Revision != proposal.Calls[0].BindingRevision+1 {
+		t.Fatalf("dispatch-first action did not tombstone binding: %+v", binding)
+	}
+	var distractorBinding persistence.AgentCapabilityBinding
+	if err := fixture.db.First(
+		&distractorBinding,
+		"binding_id = ?",
+		distractor.Calls[0].BindingID,
+	).Error; err != nil {
+		t.Fatalf("reload distractor binding: %v", err)
+	}
+	if distractorBinding.TombstonedAt != nil ||
+		distractorBinding.Revision != distractor.Calls[0].BindingRevision {
+		t.Fatalf(
+			"dispatch-first action mutated unrelated binding: %+v",
+			distractorBinding,
+		)
+	}
+	var call persistence.ToolCall
+	if err := fixture.db.First(
+		&call,
+		"tool_call_id = ?",
+		proposal.Calls[0].ToolCallID,
+	).Error; err != nil {
+		t.Fatalf("reload dispatch-first Station ToolCall: %v", err)
+	}
+	if executionCount != 1 ||
+		call.Status != persistence.ToolCallStatusSucceeded ||
+		call.ResultID == "" {
+		t.Fatalf(
+			"pinned Station claim did not settle after binding delete: count=%d call=%+v",
+			executionCount,
+			call,
+		)
+	}
+}
+
+func TestToolDispatchServiceAcceptanceStationReceiptRejections(t *testing.T) {
+	tests := []struct {
+		cell         string
+		rejection    model.ClientCapabilityReceiptErrorCode
+		interrupt    bool
+		assertAction func(*testing.T, toolDispatchFixture, *persistence.ToolCall)
+	}{
+		{
+			cell:      "ERR-O02",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+			assertAction: func(t *testing.T, fixture toolDispatchFixture, claim *persistence.ToolCall) {
+				t.Helper()
+				var call persistence.ToolCall
+				if err := fixture.db.First(&call, "id = ?", claim.ID).Error; err != nil {
+					t.Fatalf("reload lease-expired Station call: %v", err)
+				}
+				if call.ExecutorLeaseID == claim.ExecutorLeaseID {
+					t.Fatal("business lease expiry did not advance Station executor authority")
+				}
+			},
+		},
+		{
+			cell:      "ERR-O04",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+			assertAction: func(t *testing.T, fixture toolDispatchFixture, claim *persistence.ToolCall) {
+				t.Helper()
+				var call persistence.ToolCall
+				if err := fixture.db.First(&call, "id = ?", claim.ID).Error; err != nil {
+					t.Fatalf("reload deadline-expired Station call: %v", err)
+				}
+				if call.ExecutionDeadline == nil ||
+					call.ExecutionDeadline.After(fixture.now) {
+					t.Fatalf("execution deadline did not expire: %+v", call)
+				}
+				if call.ReconciliationDeadline == nil ||
+					!call.ReconciliationDeadline.After(fixture.now) {
+					t.Fatalf("reconciliation deadline expired before terminal rejection: %+v", call)
+				}
+			},
+		},
+		{
+			cell:      "ERR-O06",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_RECOVERY_CREDENTIAL_EXPIRED,
+			interrupt: true,
+			assertAction: func(t *testing.T, fixture toolDispatchFixture, claim *persistence.ToolCall) {
+				t.Helper()
+				var credential persistence.ReceiptRecoveryCredential
+				if err := fixture.db.Where("tool_call_id = ?", claim.ToolCallID).
+					First(&credential).Error; err != nil {
+					t.Fatalf("load expired Station recovery credential: %v", err)
+				}
+				if credential.ExpiresAt.After(fixture.now) {
+					t.Fatalf("Station recovery credential is still active: %+v", credential)
+				}
+			},
+		},
+		{
+			cell:      "ERR-O08",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_STALE_FENCE,
+			assertAction: func(t *testing.T, fixture toolDispatchFixture, claim *persistence.ToolCall) {
+				t.Helper()
+				var call persistence.ToolCall
+				if err := fixture.db.First(&call, "id = ?", claim.ID).Error; err != nil {
+					t.Fatalf("reload stale-fence Station call: %v", err)
+				}
+				if call.FencingToken != claim.FencingToken+1 {
+					t.Fatalf("Station fence = %d, want %d", call.FencingToken, claim.FencingToken+1)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.cell, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			authority := NewCapabilityAuthorityService(fixture.db)
+			scenarios := NewCapabilityAcceptanceScenarioService(authority, "run-1")
+			scenarios.SetToolDispatchService(fixture.service)
+			fixture.service.SetAcceptanceScenarioService(scenarios)
+			scenarioRequest := capabilityAcceptanceRequest(
+				"run-1",
+				test.cell,
+				"execution-"+strings.ToLower(test.cell),
+			)
+			scenarioRequest.Family =
+				model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03
+			scenarioRequest.Platform = "secondary"
+			scenarioRequest.RuntimeAttestationProfile =
+				model.CapabilityAcceptanceRuntimeProfile_CAPABILITY_ACCEPTANCE_RUNTIME_PROFILE_STATION_CAPABILITY_TURN
+			prepared, err := scenarios.Prepare(
+				context.Background(),
+				fixture.actorID,
+				scenarioRequest,
+			)
+			if err != nil {
+				t.Fatalf("prepare %s scenario: %v", test.cell, err)
+			}
+			proposal := fixture.authorizedProposalForOwner(
+				t,
+				strings.ToLower(test.cell),
+				model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+				model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+				true,
+				model.ToolExecutionOwner_TOOL_EXECUTION_OWNER_STATION,
+			)
+			decisions, err := fixture.service.ProposeAuthorizedBatch(
+				context.Background(),
+				proposal,
+			)
+			if err != nil {
+				t.Fatalf("propose %s Station ToolCall: %v", test.cell, err)
+			}
+			decision := &model.SubmitToolApprovalDecisionRequest{
+				ApprovalId:       decisions[0].ApprovalID,
+				ToolCallId:       proposal.Calls[0].ToolCallID,
+				DecisionId:       "decision-" + strings.ToLower(test.cell),
+				ExpectedRevision: decisions[0].DecisionRevision,
+				Approved:         true,
+				IdempotencyKey:   "decision-command-" + strings.ToLower(test.cell),
+			}
+			decision.PayloadHash = decisionPayloadHash(decision)
+			if response, err := fixture.service.SubmitDecision(
+				context.Background(),
+				fixture.actorID,
+				decision,
+			); err != nil || !response.GetAccepted() {
+				t.Fatalf(
+					"submit %s decision: response=%+v err=%v",
+					test.cell,
+					response,
+					err,
+				)
+			}
+			claim, err := fixture.service.ClaimReadyStationTool(
+				context.Background(),
+			)
+			if err != nil || claim == nil {
+				t.Fatalf("claim %s Station ToolCall: claim=%+v err=%v", test.cell, claim, err)
+			}
+			if err := fixture.service.BeginStationToolEffect(
+				context.Background(),
+				claim,
+			); err != nil {
+				t.Fatalf("begin %s Station effect: %v", test.cell, err)
+			}
+			if _, err := fixture.service.RecordStationToolExecutionReceipt(
+				context.Background(),
+				claim,
+				`{"ok":true}`,
+				nil,
+			); err != nil {
+				t.Fatalf("record %s Station receipt: %v", test.cell, err)
+			}
+			barrier := acceptanceResource(
+				prepared.GetOpaqueResourceIds(),
+				"barrier:",
+			)
+			if test.interrupt {
+				if _, err := scenarios.InterruptWorker(
+					fixture.actorID,
+					&model.InterruptCapabilityAcceptanceWorkerRequest{
+						ScenarioHandle: prepared.GetScenarioHandle(),
+						Barrier:        barrier,
+					},
+				); err != nil {
+					t.Fatalf("interrupt %s scenario: %v", test.cell, err)
+				}
+			} else if _, err := scenarios.ReleaseBarrier(
+				context.Background(),
+				fixture.actorID,
+				&model.ReleaseCapabilityAcceptanceBarrierRequest{
+					ScenarioHandle: prepared.GetScenarioHandle(),
+					Barrier:        barrier,
+				},
+			); err != nil {
+				t.Fatalf("release %s scenario: %v", test.cell, err)
+			}
+			test.assertAction(t, fixture, claim)
+			handled, err := fixture.service.rejectAcceptanceStationReceiptIfNeeded(
+				context.Background(),
+				claim,
+			)
+			if err != nil || !handled {
+				t.Fatalf(
+					"reject %s Station receipt: handled=%v err=%v",
+					test.cell,
+					handled,
+					err,
+				)
+			}
+			var call persistence.ToolCall
+			if err := fixture.db.First(&call, "id = ?", claim.ID).Error; err != nil {
+				t.Fatalf("reload rejected %s ToolCall: %v", test.cell, err)
+			}
+			if call.Status != persistence.ToolCallStatusUnknownSideEffect ||
+				call.ErrorCode != test.rejection.String() ||
+				call.ResultID != "" {
+				t.Fatalf("unexpected rejected %s ToolCall: %+v", test.cell, call)
+			}
+			var attempt persistence.ToolReceiptAttempt
+			if err := fixture.db.Where(
+				"tool_call_id = ? AND rejection_code = ?",
+				claim.ToolCallID,
+				test.rejection.String(),
+			).First(&attempt).Error; err != nil {
+				t.Fatalf("load rejected %s receipt attempt: %v", test.cell, err)
+			}
+			if attempt.Accepted {
+				t.Fatalf("%s rejected receipt was marked accepted", test.cell)
+			}
+			var resultCount int64
+			var continuationCount int64
+			if err := fixture.db.Model(&persistence.ToolResult{}).
+				Where("tool_call_id = ?", claim.ToolCallID).
+				Count(&resultCount).Error; err != nil {
+				t.Fatalf("count %s results: %v", test.cell, err)
+			}
+			if err := fixture.db.Model(&persistence.ToolContinuation{}).
+				Where("tool_batch_id = ?", claim.ToolBatchID).
+				Count(&continuationCount).Error; err != nil {
+				t.Fatalf("count %s continuations: %v", test.cell, err)
+			}
+			if resultCount != 0 || continuationCount != 0 {
+				t.Fatalf(
+					"%s created result=%d continuation=%d",
+					test.cell,
+					resultCount,
+					continuationCount,
+				)
+			}
+		})
+	}
+}
+
+func TestToolDispatchServiceAcceptanceClientReceiptRejections(t *testing.T) {
+	tests := []struct {
+		cell      string
+		rejection model.ClientCapabilityReceiptErrorCode
+		recovery  bool
+	}{
+		{
+			cell:      "ERR-O02",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+		},
+		{
+			cell:      "ERR-O04",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_EXPIRED,
+		},
+		{
+			cell:      "ERR-O06",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_RECOVERY_CREDENTIAL_EXPIRED,
+			recovery:  true,
+		},
+		{
+			cell:      "ERR-O08",
+			rejection: model.ClientCapabilityReceiptErrorCode_CLIENT_CAPABILITY_RECEIPT_ERROR_CODE_STALE_FENCE,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.cell, func(t *testing.T) {
+			fixture := newToolDispatchFixture(t)
+			authority := NewCapabilityAuthorityService(fixture.db)
+			scenarios := NewCapabilityAcceptanceScenarioService(authority, "run-1")
+			scenarios.SetToolDispatchService(fixture.service)
+			fixture.service.SetAcceptanceScenarioService(scenarios)
+			scenarioRequest := capabilityAcceptanceRequest(
+				"run-1",
+				test.cell,
+				"execution-client-"+strings.ToLower(test.cell),
+			)
+			scenarioRequest.Family =
+				model.CapabilityAcceptanceScenarioFamily_CAPABILITY_ACCEPTANCE_SCENARIO_FAMILY_GOVERNED_TOOL_J03
+			scenarioRequest.RuntimeAttestationProfile =
+				model.CapabilityAcceptanceRuntimeProfile_CAPABILITY_ACCEPTANCE_RUNTIME_PROFILE_CLIENT_CAPABILITY_TURN
+			preparedScenario, err := scenarios.Prepare(
+				context.Background(),
+				fixture.actorID,
+				scenarioRequest,
+			)
+			if err != nil {
+				t.Fatalf("prepare %s client scenario: %v", test.cell, err)
+			}
+			fixture.propose(t, "client-"+strings.ToLower(test.cell))
+			envelope := fixture.pullSingleEnvelope(t)
+			prepared := receiptForEnvelope(
+				envelope,
+				1,
+				model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+			)
+			if response, err := fixture.service.SubmitReceipt(
+				context.Background(),
+				fixture.actorID,
+				fixture.deviceID,
+				fixture.signedReceiptRequest(t, prepared),
+			); err != nil || !response.GetAccepted() {
+				t.Fatalf(
+					"submit %s PREPARED: response=%+v err=%v",
+					test.cell,
+					response,
+					err,
+				)
+			}
+			barrier := acceptanceResource(
+				preparedScenario.GetOpaqueResourceIds(),
+				"barrier:",
+			)
+			if test.recovery {
+				if _, err := scenarios.InterruptWorker(
+					fixture.actorID,
+					&model.InterruptCapabilityAcceptanceWorkerRequest{
+						ScenarioHandle: preparedScenario.GetScenarioHandle(),
+						Barrier:        barrier,
+					},
+				); err != nil {
+					t.Fatalf("interrupt %s client scenario: %v", test.cell, err)
+				}
+			} else if _, err := scenarios.ReleaseBarrier(
+				context.Background(),
+				fixture.actorID,
+				&model.ReleaseCapabilityAcceptanceBarrierRequest{
+					ScenarioHandle: preparedScenario.GetScenarioHandle(),
+					Barrier:        barrier,
+				},
+			); err != nil {
+				t.Fatalf("release %s client scenario: %v", test.cell, err)
+			}
+			terminal := receiptForEnvelope(
+				envelope,
+				2,
+				model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED,
+			)
+			terminal.ResultId = "result-" + strings.ToLower(test.cell)
+			terminal.BoundedResult = []byte(`{"ok":true}`)
+			var rejection model.ClientCapabilityReceiptErrorCode
+			if test.recovery {
+				signRecoveryReceipt(t, fixture, envelope, terminal)
+				response, err := fixture.service.SubmitRecoveryReceipt(
+					context.Background(),
+					&model.SubmitClientCapabilityRecoveryReceiptRequest{
+						Receipt: terminal,
+					},
+				)
+				if err != nil {
+					t.Fatalf("submit %s recovery receipt: %v", test.cell, err)
+				}
+				rejection = response.GetResult().GetErrorCode()
+			} else {
+				response, err := fixture.service.SubmitReceipt(
+					context.Background(),
+					fixture.actorID,
+					fixture.deviceID,
+					fixture.signedReceiptRequest(t, terminal),
+				)
+				if err != nil {
+					t.Fatalf("submit %s active receipt: %v", test.cell, err)
+				}
+				rejection = response.GetErrorCode()
+			}
+			if rejection != test.rejection {
+				t.Fatalf(
+					"%s rejection = %s, want %s",
+					test.cell,
+					rejection,
+					test.rejection,
+				)
+			}
+			var replayed *model.SubmitClientCapabilityReceiptResponse
+			if test.recovery {
+				response, err := fixture.service.SubmitRecoveryReceipt(
+					context.Background(),
+					&model.SubmitClientCapabilityRecoveryReceiptRequest{
+						Receipt: terminal,
+					},
+				)
+				if err != nil {
+					t.Fatalf("replay %s recovery receipt: %v", test.cell, err)
+				}
+				replayed = response.GetResult()
+			} else {
+				response, err := fixture.service.SubmitReceipt(
+					context.Background(),
+					fixture.actorID,
+					fixture.deviceID,
+					fixture.signedReceiptRequest(t, terminal),
+				)
+				if err != nil {
+					t.Fatalf("replay %s active receipt: %v", test.cell, err)
+				}
+				replayed = response
+			}
+			if replayed == nil ||
+				!replayed.GetReplayed() ||
+				replayed.GetAccepted() ||
+				replayed.GetErrorCode() != test.rejection {
+				t.Fatalf(
+					"unexpected replayed %s rejection: %+v",
+					test.cell,
+					replayed,
+				)
+			}
+			var call persistence.ToolCall
+			if err := fixture.db.First(
+				&call,
+				"tool_call_id = ?",
+				envelope.GetToolCallId(),
+			).Error; err != nil {
+				t.Fatalf("reload rejected %s client ToolCall: %v", test.cell, err)
+			}
+			if call.Status != persistence.ToolCallStatusUnknownSideEffect ||
+				call.ErrorCode != test.rejection.String() ||
+				call.ResultID != "" {
+				t.Fatalf("unexpected rejected %s client ToolCall: %+v", test.cell, call)
+			}
+			var attempt persistence.ToolReceiptAttempt
+			if err := fixture.db.Where(
+				"tool_call_id = ? AND rejection_code = ?",
+				envelope.GetToolCallId(),
+				test.rejection.String(),
+			).First(&attempt).Error; err != nil {
+				t.Fatalf("load rejected %s client attempt: %v", test.cell, err)
+			}
+			if attempt.Accepted {
+				t.Fatalf("%s rejected client receipt was marked accepted", test.cell)
+			}
+		})
+	}
+}
+
+func TestToolDispatchServiceSubmitDeniedDecisionReturnsTypedOutcome(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"denied-decision",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(context.Background(), proposal)
+	if err != nil {
+		t.Fatalf("propose manual tool: %v", err)
+	}
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-denied-1",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         false,
+		IdempotencyKey:   "decision-denied-command-1",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+
+	first, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+	if err != nil {
+		t.Fatalf("submit denied decision: %v", err)
+	}
+	outcome := first.GetOutcomeError()
+	if !first.GetAccepted() || first.GetApproved() || outcome == nil {
+		t.Fatalf("unexpected denied acknowledgement: %+v", first)
+	}
+	if outcome.GetErrorType() != string(errcode.AgentToolApprovalDenied) ||
+		outcome.GetLocaleKey() != errcode.AgentToolApprovalDeniedLocaleKey ||
+		outcome.GetRetryable() ||
+		!outcome.GetTerminal() ||
+		len(outcome.GetDetails()) != 2 ||
+		outcome.GetDetails()["tool_call_id"] != request.GetToolCallId() ||
+		outcome.GetDetails()["decision_id"] != request.GetDecisionId() {
+		t.Fatalf("unexpected denied outcome: %+v", outcome)
+	}
+
+	replayed, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+	if err != nil {
+		t.Fatalf("replay denied decision: %v", err)
+	}
+	if !proto.Equal(first, replayed) {
+		t.Fatalf("denied replay differs: first=%+v replayed=%+v", first, replayed)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.Where("tool_call_id = ?", request.GetToolCallId()).First(&call).Error; err != nil {
+		t.Fatalf("load denied tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusDenied ||
+		call.DecisionID != request.GetDecisionId() ||
+		call.ErrorCode != string(errcode.AgentToolApprovalDenied) {
+		t.Fatalf("unexpected denied tool call: %+v", call)
+	}
+	var outboxCount int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).Count(&outboxCount).Error; err != nil {
+		t.Fatalf("count denied outbox rows: %v", err)
+	}
+	var continuationCount int64
+	if err := fixture.db.Model(&persistence.ToolContinuation{}).Count(&continuationCount).Error; err != nil {
+		t.Fatalf("count denied continuation rows: %v", err)
+	}
+	if outboxCount != 0 || continuationCount != 0 {
+		t.Fatalf("denied decision dispatched work: outbox=%d continuation=%d", outboxCount, continuationCount)
+	}
+}
+
+func TestToolDispatchServiceRejectsUnavailableClientExecutorBeforeClaim(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"executor-unavailable",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(context.Background(), proposal)
+	if err != nil {
+		t.Fatalf("propose manual client tool: %v", err)
+	}
+	revokedAt := fixture.now
+	if err := fixture.db.Model(&persistence.ClientCapabilityLease{}).
+		Where("session_id = ?", fixture.session.GetCapabilitySessionId()).
+		Updates(map[string]interface{}{
+			"revoked_at":    revokedAt,
+			"revoke_reason": int32(model.ClientCapabilityLeaseRevokeReason_CLIENT_CAPABILITY_LEASE_REVOKE_REASON_WORKER_SHUTDOWN),
+			"updated_at":    revokedAt,
+		}).Error; err != nil {
+		t.Fatalf("revoke client executor lease: %v", err)
+	}
+
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-executor-unavailable-1",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-executor-unavailable-command-1",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+
+	first, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+	if err != nil {
+		t.Fatalf("submit unavailable executor decision: %v", err)
+	}
+	outcome := first.GetOutcomeError()
+	if first.GetAccepted() ||
+		first.GetErrorCode() != model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_EXECUTOR_UNAVAILABLE ||
+		outcome == nil {
+		t.Fatalf("unexpected executor unavailable acknowledgement: %+v", first)
+	}
+	if outcome.GetErrorType() != string(errcode.AgentClientExecutorUnavailable) ||
+		outcome.GetLocaleKey() != errcode.AgentClientExecutorUnavailableLocaleKey ||
+		!outcome.GetRetryable() ||
+		!outcome.GetTerminal() ||
+		len(outcome.GetDetails()) != 2 ||
+		outcome.GetDetails()["target_device_id"] != fixture.deviceID ||
+		outcome.GetDetails()["capability_id"] != proposal.Calls[0].CapabilityID {
+		t.Fatalf("unexpected executor unavailable outcome: %+v", outcome)
+	}
+
+	replayed, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+	if err != nil {
+		t.Fatalf("replay unavailable executor decision: %v", err)
+	}
+	if !proto.Equal(first, replayed) {
+		t.Fatalf("executor unavailable replay differs: first=%+v replayed=%+v", first, replayed)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.Where("tool_call_id = ?", request.GetToolCallId()).First(&call).Error; err != nil {
+		t.Fatalf("load waiting tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusWaitingApproval ||
+		call.DecisionID != "" ||
+		call.DecisionRevision != decisions[0].DecisionRevision ||
+		call.ExecutionClaimID != "" ||
+		call.ExecutionAttemptCount != 0 ||
+		call.ResultID != "" ||
+		call.ErrorCode != "" {
+		t.Fatalf("unavailable executor mutated ToolCall authority: %+v", call)
+	}
+	for name, modelValue := range map[string]interface{}{
+		"dispatch":     &persistence.ToolDispatchOutbox{},
+		"result":       &persistence.ToolResult{},
+		"continuation": &persistence.ToolContinuation{},
+	} {
+		var count int64
+		if err := fixture.db.Model(modelValue).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("unavailable executor created %d %s rows", count, name)
+		}
+	}
+}
+
+func TestToolDispatchServiceSubmitExpiredDecisionReturnsTypedOutcome(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.authorizedProposal(
+		t,
+		"expired-decision",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	proposal.Deadline = proposal.Deadline.Add(789 * time.Nanosecond)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(context.Background(), proposal)
+	if err != nil {
+		t.Fatalf("propose manual tool: %v", err)
+	}
+	expectedDeadline := proposal.Deadline.UTC().Truncate(time.Microsecond)
+	if !decisions[0].ExpiresAt.Equal(expectedDeadline) {
+		t.Fatalf(
+			"proposal deadline = %s, want canonical %s",
+			decisions[0].ExpiresAt.Format(time.RFC3339Nano),
+			expectedDeadline.Format(time.RFC3339Nano),
+		)
+	}
+	fixture.service.now = func() time.Time {
+		return proposal.Deadline.Add(time.Second)
+	}
+	request := &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       decisions[0].ApprovalID,
+		ToolCallId:       proposal.Calls[0].ToolCallID,
+		DecisionId:       "decision-expired-1",
+		ExpectedRevision: decisions[0].DecisionRevision,
+		Approved:         true,
+		IdempotencyKey:   "decision-expired-command-1",
+	}
+	request.PayloadHash = decisionPayloadHash(request)
+
+	first, err := fixture.service.SubmitDecision(
+		context.Background(),
+		fixture.actorID,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("submit expired decision: %v", err)
+	}
+	outcome := first.GetOutcomeError()
+	if first.GetAccepted() ||
+		first.GetErrorCode() != model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_EXPIRED ||
+		outcome == nil {
+		t.Fatalf("unexpected expired acknowledgement: %+v", first)
+	}
+	if outcome.GetErrorType() != string(errcode.AgentToolApprovalExpired) ||
+		outcome.GetLocaleKey() != errcode.AgentToolApprovalExpiredLocaleKey ||
+		!outcome.GetRetryable() ||
+		!outcome.GetTerminal() ||
+		len(outcome.GetDetails()) != 2 ||
+		outcome.GetDetails()["decision_id"] != request.GetDecisionId() ||
+		outcome.GetDetails()["expires_at"] != expectedDeadline.Format(time.RFC3339Nano) {
+		t.Fatalf("unexpected expired outcome: %+v", outcome)
+	}
+
+	replayed, err := fixture.service.SubmitDecision(
+		context.Background(),
+		fixture.actorID,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("replay expired decision: %v", err)
+	}
+	if !proto.Equal(first, replayed) {
+		t.Fatalf("expired rejection changed: first=%+v replayed=%+v", first, replayed)
+	}
+	conflicting := proto.Clone(request).(*model.SubmitToolApprovalDecisionRequest)
+	conflicting.Approved = false
+	conflicting.PayloadHash = decisionPayloadHash(conflicting)
+	conflict, err := fixture.service.SubmitDecision(
+		context.Background(),
+		fixture.actorID,
+		conflicting,
+	)
+	if err != nil {
+		t.Fatalf("submit conflicting expired decision: %v", err)
+	}
+	if conflict.GetAccepted() ||
+		conflict.GetErrorCode() != model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_IDEMPOTENCY_CONFLICT {
+		t.Fatalf("unexpected expired decision conflict: %+v", conflict)
+	}
+	var commandCount int64
+	if err := fixture.db.Model(&persistence.ToolDecisionCommand{}).Count(&commandCount).Error; err != nil {
+		t.Fatalf("count expired decision commands: %v", err)
+	}
+	if commandCount != 1 {
+		t.Fatalf("expired decision command count = %d, want 1", commandCount)
+	}
+
+	var call persistence.ToolCall
+	if err := fixture.db.Where("tool_call_id = ?", request.GetToolCallId()).First(&call).Error; err != nil {
+		t.Fatalf("load expired tool call: %v", err)
+	}
+	if call.Status != persistence.ToolCallStatusExpired ||
+		call.DecisionID != "" ||
+		call.DecisionRevision != decisions[0].DecisionRevision ||
+		call.ExecutionAttemptCount != 0 ||
+		call.DuplicateDeliveryCount != 1 ||
+		call.ResultID != "" ||
+		call.ErrorCode != string(errcode.AgentToolApprovalExpired) {
+		t.Fatalf("expired tool call mutated incorrectly: %+v", call)
+	}
+	for name, modelValue := range map[string]interface{}{
+		"dispatch":     &persistence.ToolDispatchOutbox{},
+		"result":       &persistence.ToolResult{},
+		"continuation": &persistence.ToolContinuation{},
+	} {
+		var count int64
+		if err := fixture.db.Model(modelValue).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("expired approval created %d %s rows", count, name)
+		}
+	}
+}
+
+func TestToolDispatchServiceConcurrentDecisionCAS(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	sqlDB, err := fixture.db.DB()
+	if err != nil {
+		t.Fatalf("open sql db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	proposal := fixture.authorizedProposal(
+		t,
+		"concurrent-decision",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_MANUAL,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	decisions, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		proposal,
+	)
+	if err != nil {
+		t.Fatalf("propose manual tool: %v", err)
+	}
+
+	responses := make(chan *model.SubmitToolApprovalDecisionResponse, 2)
+	errorsCh := make(chan error, 2)
+	start := make(chan struct{})
+	for index := 0; index < 2; index++ {
+		go func(index int) {
+			<-start
+			request := &model.SubmitToolApprovalDecisionRequest{
+				ApprovalId:       decisions[0].ApprovalID,
+				ToolCallId:       proposal.Calls[0].ToolCallID,
+				DecisionId:       "decision-" + string(rune('a'+index)),
+				ExpectedRevision: 0,
+				Approved:         true,
+				IdempotencyKey:   "decision-command-" + string(rune('a'+index)),
+			}
+			request.PayloadHash = decisionPayloadHash(request)
+			response, err := fixture.service.SubmitDecision(context.Background(), fixture.actorID, request)
+			responses <- response
+			errorsCh <- err
+		}(index)
+	}
+	close(start)
+
+	accepted := 0
+	stale := 0
+	for range 2 {
+		if err := <-errorsCh; err != nil {
+			t.Fatalf("submit concurrent decision: %v", err)
+		}
+		response := <-responses
+		if response.GetAccepted() {
+			accepted++
+		}
+		if response.GetErrorCode() == model.ToolApprovalDecisionErrorCode_TOOL_APPROVAL_DECISION_ERROR_CODE_STALE_REVISION {
+			stale++
+		}
+	}
+	if accepted != 1 || stale != 1 {
+		t.Fatalf("expected one accepted and one stale decision, accepted=%d stale=%d", accepted, stale)
+	}
+}
+
+func TestToolDispatchServiceToolBatchBarrier(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	fixture.propose(t, "tool-call-1", "tool-call-2")
+
+	pulled, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedPullRequest(t, "barrier", 4),
+	)
+	if err != nil {
+		t.Fatalf("pull capability requests: %v", err)
+	}
+	if len(pulled.GetRequests()) != 2 {
+		t.Fatalf("expected two capability requests, got %d", len(pulled.GetRequests()))
+	}
+
+	for index, envelope := range pulled.GetRequests() {
+		prepared := receiptForEnvelope(envelope, uint64(index*2+1), model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED)
+		if response, err := fixture.service.SubmitReceipt(
+			context.Background(),
+			fixture.actorID,
+			fixture.deviceID,
+			fixture.signedReceiptRequest(t, prepared),
+		); err != nil || !response.GetAccepted() {
+			t.Fatalf("submit prepared receipt %d: response=%+v err=%v", index, response, err)
+		}
+
+		applied := receiptForEnvelope(envelope, uint64(index*2+2), model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED)
+		applied.ResultId = "result-" + envelope.GetToolCallId()
+		applied.BoundedResult = []byte(`{"ok":true}`)
+		response, err := fixture.service.SubmitReceipt(
+			context.Background(),
+			fixture.actorID,
+			fixture.deviceID,
+			fixture.signedReceiptRequest(t, applied),
+		)
+		if err != nil || !response.GetAccepted() {
+			t.Fatalf("submit applied receipt %d: response=%+v err=%v", index, response, err)
+		}
+		if index == 0 && response.GetContinuationId() != "" {
+			t.Fatalf("first batch result must not create continuation: %+v", response)
+		}
+		if index == 1 {
+			if response.GetContinuationId() == "" {
+				t.Fatal("final batch result must create continuation")
+			}
+			replayed, err := fixture.service.SubmitReceipt(
+				context.Background(),
+				fixture.actorID,
+				fixture.deviceID,
+				fixture.signedReceiptRequest(t, applied),
+			)
+			if err != nil {
+				t.Fatalf("replay final result: %v", err)
+			}
+			if !replayed.GetReplayed() || replayed.GetContinuationId() != response.GetContinuationId() {
+				t.Fatalf("expected original continuation acknowledgement, got %+v", replayed)
+			}
+		}
+	}
+
+	var continuationCount int64
+	if err := fixture.db.Model(&persistence.ToolContinuation{}).Count(&continuationCount).Error; err != nil {
+		t.Fatalf("count continuations: %v", err)
+	}
+	if continuationCount != 1 {
+		t.Fatalf("expected one batch continuation, got %d", continuationCount)
+	}
+}
+
+func TestToolDispatchServicePullRepinsStaleLeaseRevision(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	proposal := fixture.propose(t, "stale-revision")
+	callID := proposal.Calls[0].ToolCallID
+
+	// A routine renewal bumps the lease revision after the call was already
+	// dispatched (outbox pinned to revision 1).
+	if err := fixture.db.Model(&persistence.ClientCapabilityLease{}).
+		Where("session_id = ?", fixture.session.GetCapabilitySessionId()).
+		Update("lease_revision", 2).Error; err != nil {
+		t.Fatalf("renew lease revision: %v", err)
+	}
+
+	pulled, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedPullRequest(t, "stale-revision", 9),
+	)
+	if err != nil {
+		t.Fatalf("pull capability requests: %v", err)
+	}
+	if len(pulled.GetRequests()) != 1 {
+		t.Fatalf("expected one re-pinned request, got %d", len(pulled.GetRequests()))
+	}
+	if pulled.Requests[0].GetCapabilityLeaseRevision() != 2 {
+		t.Fatalf(
+			"re-pinned envelope revision = %d, want 2",
+			pulled.Requests[0].GetCapabilityLeaseRevision(),
+		)
+	}
+
+	var deliverable int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Where("tool_call_id = ? AND invalidated_at IS NULL", callID).
+		Count(&deliverable).Error; err != nil {
+		t.Fatalf("count deliverable outbox rows: %v", err)
+	}
+	if deliverable != 1 {
+		t.Fatalf("deliverable outbox rows = %d, want 1", deliverable)
+	}
+}
+
+func TestToolDispatchServiceConcurrentFinalReceiptCreatesOneContinuation(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	sqlDB, err := fixture.db.DB()
+	if err != nil {
+		t.Fatalf("open sql db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	fixture.propose(t, "tool-call-1")
+	envelope := fixture.pullSingleEnvelope(t)
+	prepared := receiptForEnvelope(envelope, 1, model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	); err != nil || !response.GetAccepted() {
+		t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+	}
+
+	start := make(chan struct{})
+	responses := make(chan *model.SubmitClientCapabilityReceiptResponse, 2)
+	errorsCh := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			applied := receiptForEnvelope(envelope, 2, model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED)
+			applied.ResultId = "result-1"
+			applied.BoundedResult = []byte(`{"ok":true}`)
+			response, err := fixture.service.SubmitReceipt(
+				context.Background(),
+				fixture.actorID,
+				fixture.deviceID,
+				fixture.signedReceiptRequest(t, applied),
+			)
+			responses <- response
+			errorsCh <- err
+		}()
+	}
+	close(start)
+
+	replayed := 0
+	for range 2 {
+		if err := <-errorsCh; err != nil {
+			t.Fatalf("submit concurrent final receipt: %v", err)
+		}
+		response := <-responses
+		if !response.GetAccepted() || response.GetContinuationId() == "" {
+			t.Fatalf("expected accepted receipt with continuation, got %+v", response)
+		}
+		if response.GetReplayed() {
+			replayed++
+		}
+	}
+	if replayed != 1 {
+		t.Fatalf("expected exactly one replayed acknowledgement, got %d", replayed)
+	}
+	for table, modelValue := range map[string]interface{}{
+		"tool result":  &persistence.ToolResult{},
+		"continuation": &persistence.ToolContinuation{},
+		"tool message": &persistence.AgentMessage{},
+	} {
+		var count int64
+		if err := fixture.db.Model(modelValue).Count(&count).Error; err != nil {
+			t.Fatalf("count %s rows: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected one %s row, got %d", table, count)
+		}
+	}
+}
+
+func TestTurnServiceProcessToolCallsPausesAfterDurableDispatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	proposal := fixture.authorizedProposal(
+		t,
+		"turn-service",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	conversation := &persistence.Conversation{
+		ID:        "conversation-pause",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Pause",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := fixture.db.Create(conversation).Error; err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if err := fixture.db.Create(&persistence.AgentTurn{
+		ID:             proposal.TurnID,
+		ConversationID: conversation.ID,
+		AgentID:        proposal.AgentID,
+		Status:         string(domain.TurnStatusRunning),
+		StartedAt:      now,
+	}).Error; err != nil {
+		t.Fatalf("seed turn: %v", err)
+	}
+	if err := fixture.db.Create(&persistence.TurnAttempt{
+		ID:                  proposal.AttemptID,
+		TurnID:              proposal.TurnID,
+		AttemptIndex:        1,
+		Status:              string(domain.TurnStatusRunning),
+		ReadinessSnapshotID: proposal.ReadinessSnapshotID,
+		StartedAt:           now,
+	}).Error; err != nil {
+		t.Fatalf("seed turn attempt: %v", err)
+	}
+
+	service := &TurnService{
+		toolDispatch: fixture.service,
+		nudgeState:   domain.NewNudgeState(),
+	}
+	config := &TurnConfig{
+		AgentID:                   "agent-1",
+		ActorID:                   fixture.actorID,
+		ConversationID:            conversation.ID,
+		Provider:                  "provider-1",
+		Model:                     "model-1",
+		ContextWindowSize:         128000,
+		MaxRetries:                3,
+		ClientCapabilitySessionID: fixture.session.GetCapabilitySessionId(),
+		AttemptID:                 proposal.AttemptID,
+		TurnID:                    proposal.TurnID,
+		RuntimeCapabilities: &model.RuntimeCapabilitySnapshot{
+			Agentic: &model.RuntimeAgenticCapabilities{NativeTools: true},
+		},
+		RestrictedTools: []string{"local_file_read"},
+		Depth:           2,
+	}
+	authorized, err := LoadAuthorizedCapabilitySet(
+		context.Background(),
+		fixture.db,
+		config,
+	)
+	if err != nil {
+		t.Fatalf("load turn capability authority: %v", err)
+	}
+	config.AuthorizedCapabilities = authorized
+	response := ""
+	providerToolCalls := []ProviderToolCall{{
+		ID:        "provider-call-1",
+		Name:      "local_file_read",
+		Arguments: `{"resource_ref":"resource-1"}`,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	iterations, paused, err := service.processToolCalls(
+		ctx,
+		config,
+		proposal.TurnID,
+		&domain.TurnTrace{TraceID: "trace-pause", TurnID: proposal.TurnID},
+		"system prompt",
+		nil,
+		&response,
+		providerToolCalls,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("process client tool call: %v", err)
+	}
+	if !paused || iterations != 1 {
+		t.Fatalf("expected durable pause after first tool batch, paused=%v iterations=%d", paused, iterations)
+	}
+
+	var batch persistence.ToolBatch
+	if err := fixture.db.First(&batch, "turn_id = ?", proposal.TurnID).Error; err != nil {
+		t.Fatalf("load durable tool batch: %v", err)
+	}
+	if batch.CapabilitySessionID != fixture.session.GetCapabilitySessionId() {
+		t.Fatalf("capability session was not frozen on batch: %+v", batch)
+	}
+	if batch.DelegationDepth != uint32(config.Depth) {
+		t.Fatalf(
+			"delegation depth was not frozen on batch: got=%d want=%d",
+			batch.DelegationDepth,
+			config.Depth,
+		)
+	}
+	var restrictedTools []string
+	if err := json.Unmarshal(batch.RestrictedToolsJSON, &restrictedTools); err != nil {
+		t.Fatalf("decode frozen restricted tools: %v", err)
+	}
+	if len(restrictedTools) != 1 || restrictedTools[0] != "local_file_read" {
+		t.Fatalf("restricted tools were not frozen on batch: %v", restrictedTools)
+	}
+	var call persistence.ToolCall
+	if err := fixture.db.First(&call, "tool_batch_id = ?", batch.ID).Error; err != nil {
+		t.Fatalf("load governed tool call: %v", err)
+	}
+	if call.ManifestID != "filesystem.read" ||
+		call.BindingID != "binding-turn-service" ||
+		call.ReadinessSnapID != proposal.ReadinessSnapshotID {
+		t.Fatalf("turn tool call lost capability authority lineage: %+v", call)
+	}
+	var assistantMessage persistence.AgentMessage
+	if err := fixture.db.
+		Where("turn_id = ? AND role = ?", proposal.TurnID, string(domain.MessageRoleAssistant)).
+		First(&assistantMessage).Error; err != nil {
+		t.Fatalf("load assistant ToolCall message: %v", err)
+	}
+	var persistedCalls []openAIToolCall
+	if err := json.Unmarshal(assistantMessage.ToolCallsJSON, &persistedCalls); err != nil {
+		t.Fatalf("decode assistant ToolCalls: %v", err)
+	}
+	if len(persistedCalls) != 1 ||
+		persistedCalls[0].ID != call.ToolCallID ||
+		persistedCalls[0].Function.Name != "local_file_read" {
+		t.Fatalf("assistant ToolCall linkage = %+v, call=%+v", persistedCalls, call)
+	}
+}
+
+func TestTurnServiceResumeReadyToolContinuation(t *testing.T) {
+	restore := setupTestCatalog()
+	defer restore()
+	fixture := newToolDispatchFixture(t)
+	if err := fixture.db.AutoMigrate(
+		&persistence.AgentProvider{},
+		&persistence.AgentModel{},
+	); err != nil {
+		t.Fatalf("migrate continuation runtime authority: %v", err)
+	}
+	seedTestProvider(
+		t,
+		fixture.db,
+		fixture.actorID,
+		"test-provider",
+		true,
+		`{"api_key":"test-key"}`,
+	)
+	admissionResolver := NewRuntimeAdmissionResolver(
+		NewProviderConfigService(),
+		NewModelConfigService(),
+	)
+	now := fixture.now
+	authority := fixture.authorizedProposal(
+		t,
+		"resume",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	authority.Provider = "test-provider"
+	authority.Model = "test-model"
+	conversation := &persistence.Conversation{
+		ID:        "conversation-1",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Resume",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	userInput := "continue"
+	turn := &persistence.AgentTurn{
+		ID:             "turn-1",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		UserInput:      &userInput,
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	pinnedBudget := &model.RuntimeBudget{
+		MaxAttempts:           3,
+		MaxAgentSteps:         50,
+		MaxToolCalls:          7,
+		MaxIdenticalToolCalls: 2,
+	}
+	admission, err := admissionResolver.Resolve(
+		context.Background(),
+		fixture.actorID,
+		authority.Provider,
+		authority.Model,
+	)
+	if err != nil {
+		t.Fatalf("resolve continuation runtime authority: %v", err)
+	}
+	pinnedSnapshot := newDirectRuntimeSnapshot(
+		admission,
+		"1",
+		domain.ThinkingModeDisabled,
+	)
+	pinnedSnapshot.Budget = pinnedBudget
+	runtimeSnapshot, err := persistence.MarshalRuntimeSnapshot(pinnedSnapshot)
+	if err != nil {
+		t.Fatalf("encode pinned runtime budget: %v", err)
+	}
+	snapshotHash, err := runtimeSnapshotHash(pinnedSnapshot)
+	if err != nil {
+		t.Fatalf("hash pinned runtime snapshot: %v", err)
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:                  "attempt-1",
+		TurnID:              turn.ID,
+		AttemptIndex:        1,
+		Status:              string(domain.TurnStatusWaitingLocalTool),
+		ReadinessSnapshotID: authority.ReadinessSnapshotID,
+		RuntimeSnapshot:     runtimeSnapshot,
+		RuntimeSnapshotHash: snapshotHash,
+		StartedAt:           now,
+	}
+	if err := fixture.db.Create(conversation).Error; err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if err := fixture.db.Create(turn).Error; err != nil {
+		t.Fatalf("seed turn: %v", err)
+	}
+	if err := fixture.db.Create(attempt).Error; err != nil {
+		t.Fatalf("seed attempt: %v", err)
+	}
+
+	authority.TurnID = turn.ID
+	authority.AttemptID = attempt.ID
+	authority.ToolBatchID = "batch-1"
+	authority.Calls[0].ToolCallID = "tool-call-1"
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		authority,
+	); err != nil {
+		t.Fatalf("propose initial governed tool call: %v", err)
+	}
+	envelope := fixture.pullSingleEnvelope(t)
+	prepared := receiptForEnvelope(envelope, 1, model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	); err != nil || !response.GetAccepted() {
+		t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+	}
+	applied := receiptForEnvelope(envelope, 2, model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED)
+	applied.ResultId = "result-1"
+	applied.BoundedResult = []byte(`{"ok":true}`)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, applied),
+	); err != nil || !response.GetAccepted() || response.GetContinuationId() == "" {
+		t.Fatalf("submit applied receipt: response=%+v err=%v", response, err)
+	}
+	var toolMessage persistence.AgentMessage
+	if err := fixture.db.
+		Where("turn_id = ? AND role = ?", turn.ID, string(domain.MessageRoleTool)).
+		First(&toolMessage).Error; err != nil {
+		t.Fatalf("load persisted tool result message: %v", err)
+	}
+	var toolMetadata map[string]string
+	if err := json.Unmarshal(toolMessage.MetadataJSON, &toolMetadata); err != nil {
+		t.Fatalf("decode tool result metadata: %v", err)
+	}
+	if toolMetadata["tool_call_id"] != authority.Calls[0].ToolCallID {
+		t.Fatalf("tool result linkage = %#v", toolMetadata)
+	}
+
+	providerCalls := 0
+	resumedThinkingMode := domain.ThinkingMode("")
+	var resumedBudget *model.RuntimeBudget
+	service := &TurnService{
+		toolDispatch:      fixture.service,
+		nudgeState:        domain.NewNudgeState(),
+		admissionResolver: admissionResolver,
+		resumeProviderCall: func(
+			_ context.Context,
+			config *TurnConfig,
+			_ string,
+			_ *domain.TurnTrace,
+			_ string,
+			_ []domain.Message,
+		) (string, []ProviderToolCall, []domain.ProviderCallRecord, bool, error) {
+			providerCalls++
+			resumedThinkingMode = config.ThinkingMode
+			resumedBudget = cloneRuntimeBudget(config.RuntimeBudget)
+			return "",
+				[]ProviderToolCall{{
+					ID:        "provider-call-2",
+					Name:      "local_file_read",
+					Arguments: `{"resource_ref":"resource-2"}`,
+				}},
+				[]domain.ProviderCallRecord{{Provider: "provider-1", Model: "model-1"}},
+				false,
+				nil
+		},
+	}
+
+	resumed, err := service.ResumeReadyToolContinuation(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatalf("resume ready continuation: %v", err)
+	}
+	if !resumed || providerCalls != 1 {
+		t.Fatalf("expected one resumed provider call, resumed=%v calls=%d", resumed, providerCalls)
+	}
+	if resumedThinkingMode != domain.ThinkingModeDisabled {
+		t.Fatalf("resumed thinking mode = %q, want disabled", resumedThinkingMode)
+	}
+	if !proto.Equal(resumedBudget, pinnedBudget) {
+		t.Fatalf("resumed budget = %+v, want persisted %+v", resumedBudget, pinnedBudget)
+	}
+
+	var completed persistence.ToolContinuation
+	if err := fixture.db.First(&completed, "tool_batch_id = ?", "batch-1").Error; err != nil {
+		t.Fatalf("load completed continuation: %v", err)
+	}
+	if completed.Status != persistence.ToolContinuationStatusCompleted {
+		t.Fatalf("expected completed continuation, got %s", completed.Status)
+	}
+	var batchCount int64
+	if err := fixture.db.Model(&persistence.ToolBatch{}).
+		Where("turn_id = ?", turn.ID).
+		Count(&batchCount).Error; err != nil {
+		t.Fatalf("count tool batches: %v", err)
+	}
+	if batchCount != 2 {
+		t.Fatalf("expected resumed response to create the next durable batch, got %d", batchCount)
+	}
+	var trace persistence.TurnTrace
+	if err := fixture.db.First(&trace, "turn_id = ?", turn.ID).Error; err != nil {
+		t.Fatalf("load resumed trace: %v", err)
+	}
+}
+
+func TestTurnServiceResumeCommittedContinuationAfterBindingDeletion(t *testing.T) {
+	restore := setupTestCatalog()
+	defer restore()
+	fixture := newToolDispatchFixture(t)
+	authority := fixture.authorizedProposal(
+		t,
+		"resume-after-binding-delete",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	authority.Provider = "test-provider"
+	authority.Model = "test-model"
+	resolver := fixture.seedPinnedRuntimeAuthority(t, authority, 0)
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		authority,
+	); err != nil {
+		t.Fatalf("propose governed ToolCall before binding delete: %v", err)
+	}
+	envelope := fixture.pullSingleEnvelope(t)
+	prepared := receiptForEnvelope(
+		envelope,
+		1,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+	)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	); err != nil || !response.GetAccepted() {
+		t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+	}
+	applied := receiptForEnvelope(
+		envelope,
+		2,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED,
+	)
+	applied.ResultId = "result-resume-after-binding-delete"
+	applied.BoundedResult = []byte(`{"ok":true}`)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, applied),
+	); err != nil || !response.GetAccepted() ||
+		response.GetContinuationId() == "" {
+		t.Fatalf("submit applied receipt: response=%+v err=%v", response, err)
+	}
+	if _, err := NewCapabilityAuthorityService(fixture.db).DeleteBinding(
+		context.Background(),
+		fixture.actorID,
+		&model.DeleteAgentCapabilityBindingRequest{
+			BindingId:               authority.Calls[0].BindingID,
+			ExpectedBindingRevision: authority.Calls[0].BindingRevision,
+			IdempotencyKey:          "delete-before-committed-continuation",
+			Reason:                  "test authority contraction",
+		},
+	); err != nil {
+		t.Fatalf("delete binding after committed ToolCall result: %v", err)
+	}
+
+	providerCalls := 0
+	service := &TurnService{
+		toolDispatch:      fixture.service,
+		nudgeState:        domain.NewNudgeState(),
+		memoryService:     NewMemoryService(nil),
+		admissionResolver: resolver,
+		resumeProviderCall: func(
+			_ context.Context,
+			config *TurnConfig,
+			_ string,
+			_ *domain.TurnTrace,
+			_ string,
+			_ []domain.Message,
+		) (string, []ProviderToolCall, []domain.ProviderCallRecord, bool, error) {
+			providerCalls++
+			if config.ProviderAuthorityMode !=
+				providerRuntimeAuthorityCommittedToolContinuation {
+				t.Fatalf(
+					"continuation authority mode = %d",
+					config.ProviderAuthorityMode,
+				)
+			}
+			if config.ProviderConfigVersion == "" ||
+				config.CapabilitySourceVersion == "" {
+				t.Fatal("continuation lost pinned provider authority versions")
+			}
+			if len(config.AvailableTools) != 0 {
+				t.Fatalf(
+					"deleted capability was re-advertised: %v",
+					config.AvailableTools,
+				)
+			}
+			return "continued after authority contraction",
+				nil,
+				[]domain.ProviderCallRecord{{
+					Provider: config.Provider,
+					Model:    config.Model,
+				}},
+				false,
+				nil
+		},
+	}
+	resumed, err := service.ResumeReadyToolContinuation(
+		context.Background(),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("resume committed continuation after binding delete: %v", err)
+	}
+	if !resumed || providerCalls != 1 {
+		t.Fatalf(
+			"committed continuation resumed=%v providerCalls=%d",
+			resumed,
+			providerCalls,
+		)
+	}
+	var completed persistence.ToolContinuation
+	if err := fixture.db.First(
+		&completed,
+		"tool_batch_id = ?",
+		authority.ToolBatchID,
+	).Error; err != nil {
+		t.Fatalf("load completed continuation: %v", err)
+	}
+	if completed.Status != persistence.ToolContinuationStatusCompleted {
+		t.Fatalf("continuation status = %q", completed.Status)
+	}
+	var completedTurn persistence.AgentTurn
+	if err := fixture.db.First(
+		&completedTurn,
+		"id = ?",
+		authority.TurnID,
+	).Error; err != nil {
+		t.Fatalf("load completed turn: %v", err)
+	}
+	if completedTurn.Status != string(domain.TurnStatusCompleted) {
+		t.Fatalf("turn status = %q", completedTurn.Status)
+	}
+	var batchCount int64
+	if err := fixture.db.Model(&persistence.ToolBatch{}).
+		Where("turn_id = ?", authority.TurnID).
+		Count(&batchCount).Error; err != nil {
+		t.Fatalf("count continuation tool batches: %v", err)
+	}
+	if batchCount != 1 {
+		t.Fatalf("deleted capability created %d total tool batches", batchCount)
+	}
+}
+
+func TestTurnServiceLifecycleCancellationPreservesResumedContinuation(t *testing.T) {
+	restore := setupTestCatalog()
+	defer restore()
+	fixture := newToolDispatchFixture(t)
+	if err := fixture.db.AutoMigrate(
+		&persistence.TaskRun{},
+		&persistence.AgentProvider{},
+		&persistence.AgentModel{},
+	); err != nil {
+		t.Fatalf("migrate chat task run: %v", err)
+	}
+	seedTestProvider(
+		t,
+		fixture.db,
+		fixture.actorID,
+		"test-provider",
+		true,
+		`{"api_key":"test-key"}`,
+	)
+	admissionResolver := NewRuntimeAdmissionResolver(
+		NewProviderConfigService(),
+		NewModelConfigService(),
+	)
+
+	authority := fixture.authorizedProposal(
+		t,
+		"lifecycle-cancel",
+		model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO,
+		model.CapabilityReadinessState_CAPABILITY_READINESS_STATE_READY,
+		true,
+	)
+	authority.Provider = "test-provider"
+	authority.Model = "test-model"
+	authority.TaskID = "task-lifecycle-cancel"
+	authority.StepID = "step-lifecycle-cancel"
+	conversation := &persistence.Conversation{
+		ID:        authority.ConversationID,
+		AgentID:   authority.AgentID,
+		ActorPTID: fixture.actorID,
+		Title:     "Lifecycle cancellation",
+		Status:    "active",
+		CreatedAt: fixture.now,
+		UpdatedAt: fixture.now,
+	}
+	userInput := "continue"
+	turn := &persistence.AgentTurn{
+		ID:             authority.TurnID,
+		ConversationID: authority.ConversationID,
+		AgentID:        authority.AgentID,
+		UserInput:      &userInput,
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      fixture.now,
+	}
+	pinnedBudget := &model.RuntimeBudget{
+		MaxAttempts:           3,
+		MaxAgentSteps:         50,
+		MaxToolCalls:          7,
+		MaxIdenticalToolCalls: 2,
+	}
+	admission, err := admissionResolver.Resolve(
+		context.Background(),
+		fixture.actorID,
+		authority.Provider,
+		authority.Model,
+	)
+	if err != nil {
+		t.Fatalf("resolve lifecycle runtime authority: %v", err)
+	}
+	pinnedSnapshot := newDirectRuntimeSnapshot(
+		admission,
+		"1",
+		domain.ThinkingModeDisabled,
+	)
+	pinnedSnapshot.Budget = pinnedBudget
+	runtimeSnapshot, err := persistence.MarshalRuntimeSnapshot(pinnedSnapshot)
+	if err != nil {
+		t.Fatalf("encode runtime snapshot: %v", err)
+	}
+	snapshotHash, err := runtimeSnapshotHash(pinnedSnapshot)
+	if err != nil {
+		t.Fatalf("hash runtime snapshot: %v", err)
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:                  authority.AttemptID,
+		TurnID:              authority.TurnID,
+		AttemptIndex:        1,
+		Status:              string(domain.TurnStatusWaitingLocalTool),
+		ReadinessSnapshotID: authority.ReadinessSnapshotID,
+		RuntimeSnapshot:     runtimeSnapshot,
+		RuntimeSnapshotHash: snapshotHash,
+		StartedAt:           fixture.now,
+	}
+	task := &persistence.TaskRun{
+		TaskID:         authority.TaskID,
+		Surface:        int32(model.TaskSurface_TASK_SURFACE_CHAT),
+		Status:         int32(model.CollaborationTaskStatus_COLLABORATION_TASK_STATUS_RUNNING),
+		OwnerActorPTID: fixture.actorID,
+		ConversationID: authority.ConversationID,
+		CreatedAt:      fixture.now,
+		StartedAt:      fixture.now,
+		UpdatedAt:      fixture.now,
+	}
+	step := &persistence.ExecutionStep{
+		StepID:    authority.StepID,
+		TaskID:    authority.TaskID,
+		AgentID:   authority.AgentID,
+		TurnID:    authority.TurnID,
+		Status:    int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING),
+		StartedAt: fixture.now,
+	}
+	chatTasks := NewChatTaskService(nil, ChatTaskExecutorIdentity{
+		NodeID:      "node-lifecycle",
+		Incarnation: "incarnation-lifecycle",
+	})
+	executorLease := &persistence.ExecutorLease{
+		LeaseID:          "lease-lifecycle-cancel",
+		TaskID:           authority.TaskID,
+		StepID:           authority.StepID,
+		ExecutorID:       "node-lifecycle/incarnation-lifecycle",
+		ExecutorKind:     int32(model.ExecutorKind_EXECUTOR_KIND_STATION_HOSTED),
+		OwnerNodeID:      "node-lifecycle",
+		OwnerIncarnation: "incarnation-lifecycle",
+		FencingToken:     1,
+		Status:           executorLeaseStatusActive,
+		AcquiredAt:       fixture.now,
+		HeartbeatAt:      fixture.now,
+		ExpiresAt:        time.Now().UTC().Add(time.Minute),
+	}
+	for name, record := range map[string]interface{}{
+		"conversation":   conversation,
+		"turn":           turn,
+		"attempt":        attempt,
+		"task":           task,
+		"step":           step,
+		"executor lease": executorLease,
+	} {
+		if err := fixture.db.Create(record).Error; err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+	if _, err := fixture.service.ProposeAuthorizedBatch(
+		context.Background(),
+		authority,
+	); err != nil {
+		t.Fatalf("propose governed tool call: %v", err)
+	}
+	envelope := fixture.pullSingleEnvelope(t)
+	prepared := receiptForEnvelope(
+		envelope,
+		1,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+	)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	); err != nil || !response.GetAccepted() {
+		t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+	}
+	applied := receiptForEnvelope(
+		envelope,
+		2,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_APPLIED,
+	)
+	applied.ResultId = "result-lifecycle-cancel"
+	applied.BoundedResult = []byte(`{"ok":true}`)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, applied),
+	); err != nil || !response.GetAccepted() || response.GetContinuationId() == "" {
+		t.Fatalf("submit applied receipt: response=%+v err=%v", response, err)
+	}
+
+	providerStarted := make(chan struct{})
+	service := &TurnService{
+		toolDispatch:      fixture.service,
+		nudgeState:        domain.NewNudgeState(),
+		admissionResolver: admissionResolver,
+		chatTaskService:   chatTasks,
+		resumeProviderCall: func(
+			ctx context.Context,
+			_ *TurnConfig,
+			_ string,
+			_ *domain.TurnTrace,
+			_ string,
+			_ []domain.Message,
+		) (string, []ProviderToolCall, []domain.ProviderCallRecord, bool, error) {
+			close(providerStarted)
+			<-ctx.Done()
+			return "", nil, nil, false, ctx.Err()
+		},
+	}
+	service.SetExecutionLifecycle(context.Background())
+	result := make(chan error, 1)
+	if !service.RunExecutionWorker(func(ctx context.Context) {
+		_, err := service.ResumeReadyToolContinuation(ctx, time.Minute)
+		result <- err
+	}) {
+		t.Fatal("continuation worker was rejected before shutdown")
+	}
+	select {
+	case <-providerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("continuation provider did not start")
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := service.StopExecutionLifecycle(stopCtx); err != nil {
+		t.Fatalf("stop execution lifecycle: %v", err)
+	}
+	if err := <-result; err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("resume cancellation error = %v, want context cancellation", err)
+	}
+
+	var continuation persistence.ToolContinuation
+	if err := fixture.db.First(
+		&continuation,
+		"tool_batch_id = ?",
+		authority.ToolBatchID,
+	).Error; err != nil {
+		t.Fatalf("reload cancelled continuation: %v", err)
+	}
+	if continuation.Status != persistence.ToolContinuationStatusClaimed ||
+		!continuation.ProviderRequestEmitted ||
+		continuation.CompletedAt != nil {
+		t.Fatalf("lifecycle cancellation consumed continuation: %+v", continuation)
+	}
+	var persistedTurn persistence.AgentTurn
+	if err := fixture.db.First(&persistedTurn, "id = ?", authority.TurnID).Error; err != nil {
+		t.Fatalf("reload turn: %v", err)
+	}
+	if persistedTurn.Status != string(domain.TurnStatusWaitingLocalTool) ||
+		persistedTurn.EndedAt != nil {
+		t.Fatalf("lifecycle cancellation terminally settled turn: %+v", persistedTurn)
+	}
+
+	fixture.service.now = func() time.Time {
+		return fixture.now.Add(2 * time.Minute)
+	}
+	if err := fixture.service.ReconcileExpiredContinuations(context.Background()); err != nil {
+		t.Fatalf("reconcile cancelled continuation: %v", err)
+	}
+	if err := fixture.db.First(&continuation, "id = ?", continuation.ID).Error; err != nil {
+		t.Fatalf("reload reconciled continuation: %v", err)
+	}
+	if continuation.Status != persistence.ToolContinuationStatusReconciliationRequired {
+		t.Fatalf("continuation status = %q, want reconciliation_required", continuation.Status)
+	}
+	if err := NewChatTaskService(nil).RecoverRunningChatTasks(context.Background()); err != nil {
+		t.Fatalf("recover chat task with reconciliable continuation: %v", err)
+	}
+	var persistedStep persistence.ExecutionStep
+	if err := fixture.db.First(&persistedStep, "step_id = ?", authority.StepID).Error; err != nil {
+		t.Fatalf("reload recoverable step: %v", err)
+	}
+	if persistedStep.Status != int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING) ||
+		persistedStep.EndedAt != nil {
+		t.Fatalf("recovery consumed reconciliable step: %+v", persistedStep)
+	}
+}
+
+func TestChatTaskServicePreservesDurableToolContinuation(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	if err := fixture.db.AutoMigrate(&persistence.TaskRun{}); err != nil {
+		t.Fatalf("migrate chat task runs: %v", err)
+	}
+	steps := []*persistence.ExecutionStep{
+		{
+			StepID:    "step-waiting-receipt",
+			TaskID:    "task-waiting-receipt",
+			AgentID:   "agent-1",
+			Status:    int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING),
+			StartedAt: fixture.now,
+		},
+		{
+			StepID:    "step-ready-continuation",
+			TaskID:    "task-ready-continuation",
+			AgentID:   "agent-1",
+			Status:    int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING),
+			StartedAt: fixture.now,
+		},
+		{
+			StepID:    "step-reconciliation-required",
+			TaskID:    "task-reconciliation-required",
+			AgentID:   "agent-1",
+			Status:    int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING),
+			StartedAt: fixture.now,
+		},
+	}
+	tasks := []*persistence.TaskRun{
+		{
+			TaskID:         steps[0].TaskID,
+			Surface:        int32(model.TaskSurface_TASK_SURFACE_CHAT),
+			Status:         int32(model.CollaborationTaskStatus_COLLABORATION_TASK_STATUS_RUNNING),
+			OwnerActorPTID: fixture.actorID,
+			ConversationID: "conversation-waiting-receipt",
+			CreatedAt:      fixture.now,
+			StartedAt:      fixture.now,
+			UpdatedAt:      fixture.now,
+		},
+		{
+			TaskID:         steps[1].TaskID,
+			Surface:        int32(model.TaskSurface_TASK_SURFACE_CHAT),
+			Status:         int32(model.CollaborationTaskStatus_COLLABORATION_TASK_STATUS_RUNNING),
+			OwnerActorPTID: fixture.actorID,
+			ConversationID: "conversation-ready-continuation",
+			CreatedAt:      fixture.now,
+			StartedAt:      fixture.now,
+			UpdatedAt:      fixture.now,
+		},
+		{
+			TaskID:         steps[2].TaskID,
+			Surface:        int32(model.TaskSurface_TASK_SURFACE_CHAT),
+			Status:         int32(model.CollaborationTaskStatus_COLLABORATION_TASK_STATUS_RUNNING),
+			OwnerActorPTID: fixture.actorID,
+			ConversationID: "conversation-reconciliation-required",
+			CreatedAt:      fixture.now,
+			StartedAt:      fixture.now,
+			UpdatedAt:      fixture.now,
+		},
+	}
+	if err := fixture.db.Create(&tasks).Error; err != nil {
+		t.Fatalf("seed chat tasks: %v", err)
+	}
+	if err := fixture.db.Create(&steps).Error; err != nil {
+		t.Fatalf("seed running chat steps: %v", err)
+	}
+	batches := []*persistence.ToolBatch{
+		{
+			ID:                  "batch-waiting-receipt",
+			ActorID:             fixture.actorID,
+			TurnID:              "turn-waiting-receipt",
+			AttemptID:           "attempt-waiting-receipt",
+			ConversationID:      "conversation-waiting-receipt",
+			AgentID:             "agent-1",
+			Provider:            "provider-1",
+			Model:               "model-1",
+			SystemPrompt:        "system",
+			Iteration:           1,
+			StepID:              steps[0].StepID,
+			CapabilitySessionID: fixture.session.GetCapabilitySessionId(),
+			ExpectedCallCount:   1,
+			Status:              persistence.ToolBatchStatusOpen,
+			CreatedAt:           fixture.now,
+			UpdatedAt:           fixture.now,
+		},
+		{
+			ID:                  "batch-ready-continuation",
+			ActorID:             fixture.actorID,
+			TurnID:              "turn-ready-continuation",
+			AttemptID:           "attempt-ready-continuation",
+			ConversationID:      "conversation-ready-continuation",
+			AgentID:             "agent-1",
+			Provider:            "provider-1",
+			Model:               "model-1",
+			SystemPrompt:        "system",
+			Iteration:           1,
+			StepID:              steps[1].StepID,
+			CapabilitySessionID: fixture.session.GetCapabilitySessionId(),
+			ExpectedCallCount:   1,
+			Status:              persistence.ToolBatchStatusReadyForContinuation,
+			CreatedAt:           fixture.now,
+			UpdatedAt:           fixture.now,
+		},
+		{
+			ID:                  "batch-reconciliation-required",
+			ActorID:             fixture.actorID,
+			TurnID:              "turn-reconciliation-required",
+			AttemptID:           "attempt-reconciliation-required",
+			ConversationID:      "conversation-reconciliation-required",
+			AgentID:             "agent-1",
+			Provider:            "provider-1",
+			Model:               "model-1",
+			SystemPrompt:        "system",
+			Iteration:           1,
+			StepID:              steps[2].StepID,
+			CapabilitySessionID: fixture.session.GetCapabilitySessionId(),
+			ExpectedCallCount:   1,
+			Status:              persistence.ToolBatchStatusReadyForContinuation,
+			CreatedAt:           fixture.now,
+			UpdatedAt:           fixture.now,
+		},
+	}
+	if err := fixture.db.Create(&batches).Error; err != nil {
+		t.Fatalf("seed recoverable tool batches: %v", err)
+	}
+	if err := fixture.db.Create(&persistence.ToolContinuation{
+		ID:          "continuation-recoverable",
+		TurnID:      batches[1].TurnID,
+		AttemptID:   batches[1].AttemptID,
+		ToolBatchID: batches[1].ID,
+		Status:      persistence.ToolContinuationStatusReady,
+		CreatedAt:   fixture.now,
+		UpdatedAt:   fixture.now,
+	}).Error; err != nil {
+		t.Fatalf("seed recoverable continuation: %v", err)
+	}
+	if err := fixture.db.Create(&persistence.ToolContinuation{
+		ID:          "continuation-reconciliation-required",
+		TurnID:      batches[2].TurnID,
+		AttemptID:   batches[2].AttemptID,
+		ToolBatchID: batches[2].ID,
+		Status:      persistence.ToolContinuationStatusReconciliationRequired,
+		CreatedAt:   fixture.now,
+		UpdatedAt:   fixture.now,
+	}).Error; err != nil {
+		t.Fatalf("seed reconciliation-required continuation: %v", err)
+	}
+
+	service := NewChatTaskService(nil)
+	if err := service.RecoverRunningChatTasks(context.Background()); err != nil {
+		t.Fatalf("recover running chat tasks: %v", err)
+	}
+
+	for _, step := range steps {
+		var reloaded persistence.ExecutionStep
+		if err := fixture.db.First(&reloaded, "step_id = ?", step.StepID).Error; err != nil {
+			t.Fatalf("reload chat step %s: %v", step.StepID, err)
+		}
+		if reloaded.Status != int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING) {
+			t.Fatalf("recoverable tool work must remain running: step=%s status=%d", step.StepID, reloaded.Status)
+		}
+	}
+}
+
+func TestChatTaskServiceBindChatStepToTurn(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	step := &persistence.ExecutionStep{
+		StepID:    "step-bind",
+		TaskID:    "task-bind",
+		AgentID:   "agent-1",
+		Status:    int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING),
+		StartedAt: fixture.now,
+	}
+	lease := &persistence.ExecutorLease{
+		LeaseID:          "lease-bind",
+		TaskID:           step.TaskID,
+		StepID:           step.StepID,
+		ExecutorID:       "node-bind/incarnation-bind",
+		ExecutorKind:     int32(model.ExecutorKind_EXECUTOR_KIND_STATION_HOSTED),
+		OwnerNodeID:      "node-bind",
+		OwnerIncarnation: "incarnation-bind",
+		FencingToken:     1,
+		Status:           executorLeaseStatusActive,
+		AcquiredAt:       fixture.now,
+		HeartbeatAt:      fixture.now,
+		ExpiresAt:        time.Now().UTC().Add(time.Minute),
+	}
+	if err := fixture.db.Create(step).Error; err != nil {
+		t.Fatalf("seed running chat step: %v", err)
+	}
+	if err := fixture.db.Create(lease).Error; err != nil {
+		t.Fatalf("seed chat step lease: %v", err)
+	}
+
+	service := NewChatTaskService(nil, ChatTaskExecutorIdentity{
+		NodeID:      "node-bind",
+		Incarnation: "incarnation-bind",
+	})
+	if err := service.BindChatStepToTurn(
+		context.Background(),
+		step.TaskID,
+		step.StepID,
+		"turn-bind",
+		lease.LeaseID,
+		lease.FencingToken,
+	); err != nil {
+		t.Fatalf("bind chat step to turn: %v", err)
+	}
+
+	var reloaded persistence.ExecutionStep
+	if err := fixture.db.First(&reloaded, "step_id = ?", step.StepID).Error; err != nil {
+		t.Fatalf("reload chat step: %v", err)
+	}
+	if reloaded.TurnID != "turn-bind" ||
+		reloaded.Status != int32(model.TaskNodeStatus_TASK_NODE_STATUS_RUNNING) {
+		t.Fatalf("chat step must remain running and bind the turn: %+v", reloaded)
+	}
+}
+
+func TestTurnServiceSettlesReconciliationRequiredTurn(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	conversation := &persistence.Conversation{
+		ID:        "conversation-reconciliation",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Reconciliation",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             "turn-reconciliation",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:           "attempt-reconciliation",
+		TurnID:       turn.ID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    now,
+	}
+	batch := &persistence.ToolBatch{
+		ID:                  "batch-reconciliation",
+		ActorID:             fixture.actorID,
+		TurnID:              turn.ID,
+		AttemptID:           attempt.ID,
+		ConversationID:      conversation.ID,
+		AgentID:             "agent-1",
+		Provider:            "provider-1",
+		Model:               "model-1",
+		SystemPrompt:        "system",
+		Iteration:           1,
+		CapabilitySessionID: fixture.session.GetCapabilitySessionId(),
+		ExpectedCallCount:   1,
+		Status:              persistence.ToolBatchStatusReadyForContinuation,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}
+	continuation := &persistence.ToolContinuation{
+		ID:                     "continuation-reconciliation",
+		TurnID:                 turn.ID,
+		AttemptID:              attempt.ID,
+		ToolBatchID:            batch.ID,
+		Status:                 persistence.ToolContinuationStatusReconciliationRequired,
+		ProviderRequestEmitted: true,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation": conversation,
+		"turn":         turn,
+		"attempt":      attempt,
+		"batch":        batch,
+		"continuation": continuation,
+	} {
+		if err := fixture.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+
+	service := &TurnService{}
+	if err := service.settleReconciliationRequiredTurns(context.Background()); err != nil {
+		t.Fatalf("settle reconciliation-required turn: %v", err)
+	}
+
+	var reloadedTurn persistence.AgentTurn
+	if err := fixture.db.First(&reloadedTurn, "id = ?", turn.ID).Error; err != nil {
+		t.Fatalf("reload turn: %v", err)
+	}
+	if reloadedTurn.Status != string(domain.TurnStatusInterrupted) {
+		t.Fatalf("expected interrupted turn, got %s", reloadedTurn.Status)
+	}
+	var reloadedAttempt persistence.TurnAttempt
+	if err := fixture.db.First(&reloadedAttempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatalf("reload attempt: %v", err)
+	}
+	if reloadedAttempt.Status != string(domain.TurnStatusInterrupted) || reloadedAttempt.EndedAt == nil {
+		t.Fatalf("expected interrupted terminal attempt, got %+v", reloadedAttempt)
+	}
+}
+
+func TestTurnServiceSettlesBlockedToolBatchForCurrentAttempt(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	conversation := &persistence.Conversation{
+		ID:        "conversation-current-blocked",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Current blocked batch",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             "turn-current-blocked",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:           "attempt-current-blocked",
+		TurnID:       turn.ID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    now,
+	}
+	batch := &persistence.ToolBatch{
+		ID:             "batch-current-blocked",
+		ActorID:        fixture.actorID,
+		TurnID:         turn.ID,
+		AttemptID:      attempt.ID,
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Provider:       "provider-1",
+		Model:          "model-1",
+		SystemPrompt:   "system",
+		Iteration:      1,
+		Status:         persistence.ToolBatchStatusBlocked,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation": conversation,
+		"turn":         turn,
+		"attempt":      attempt,
+		"batch":        batch,
+	} {
+		if err := fixture.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+
+	service := &TurnService{}
+	if err := service.settleBlockedToolBatches(context.Background()); err != nil {
+		t.Fatalf("settle blocked tool batches: %v", err)
+	}
+
+	var reloadedTurn persistence.AgentTurn
+	if err := fixture.db.First(&reloadedTurn, "id = ?", turn.ID).Error; err != nil {
+		t.Fatalf("reload turn: %v", err)
+	}
+	if reloadedTurn.Status != string(domain.TurnStatusInterrupted) {
+		t.Fatalf("expected interrupted turn, got %s", reloadedTurn.Status)
+	}
+	var reloadedAttempt persistence.TurnAttempt
+	if err := fixture.db.First(&reloadedAttempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatalf("reload attempt: %v", err)
+	}
+	if reloadedAttempt.Status != string(domain.TurnStatusInterrupted) ||
+		reloadedAttempt.EndedAt == nil {
+		t.Fatalf("expected interrupted terminal attempt, got %+v", reloadedAttempt)
+	}
+}
+
+func TestTurnServicePreservesInvalidResourceFailureFromBlockedToolBatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	resourceRefHash := strings.Repeat("a", sha256.Size*2)
+	conversation := &persistence.Conversation{
+		ID:        "conversation-invalid-resource",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Invalid resource",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             "turn-invalid-resource",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:           "attempt-invalid-resource",
+		TurnID:       turn.ID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    now,
+	}
+	batch := &persistence.ToolBatch{
+		ID:             "batch-invalid-resource",
+		ActorID:        fixture.actorID,
+		TurnID:         turn.ID,
+		AttemptID:      attempt.ID,
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Provider:       "provider-1",
+		Model:          "model-1",
+		SystemPrompt:   "system",
+		Iteration:      1,
+		Status:         persistence.ToolBatchStatusBlocked,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	assistantContent := ""
+	assistant := &persistence.AgentMessage{
+		ID:             "message-invalid-resource",
+		ConversationID: conversation.ID,
+		TurnID:         &turn.ID,
+		Role:           string(domain.MessageRoleAssistant),
+		Status:         "completed",
+		Content:        &assistantContent,
+		Seq:            1,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	result := &persistence.ToolResult{
+		ID:          "result-invalid-resource",
+		ToolCallID:  "tool-call-invalid-resource",
+		MessageID:   "tool-message-invalid-resource",
+		ToolBatchID: batch.ID,
+		TurnID:      turn.ID,
+		AttemptID:   attempt.ID,
+		Status:      persistence.ToolReceiptStatusFailed,
+		PayloadHash: strings.Repeat("b", sha256.Size*2),
+		BoundedResult: []byte(fmt.Sprintf(
+			`{"resource_kind":"file","resource_ref_hash":"%s"}`,
+			resourceRefHash,
+		)),
+		ErrorCode: string(errcode.AgentClientInvalidResourceReference),
+		CreatedAt: now,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation": conversation,
+		"turn":         turn,
+		"attempt":      attempt,
+		"batch":        batch,
+		"assistant":    assistant,
+		"tool result":  result,
+	} {
+		if err := fixture.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+
+	service := &TurnService{}
+	if err := service.settleBlockedToolBatches(context.Background()); err != nil {
+		t.Fatalf("settle invalid-resource ToolBatch: %v", err)
+	}
+
+	var reloadedAttempt persistence.TurnAttempt
+	if err := fixture.db.First(&reloadedAttempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatalf("reload invalid-resource attempt: %v", err)
+	}
+	if reloadedAttempt.Status != string(domain.TurnStatusInterrupted) ||
+		reloadedAttempt.ErrorCode != string(errcode.AgentClientInvalidResourceReference) ||
+		reloadedAttempt.EndedAt == nil {
+		t.Fatalf("invalid-resource attempt terminal state = %+v", reloadedAttempt)
+	}
+
+	var reloadedMessage persistence.AgentMessage
+	if err := fixture.db.First(&reloadedMessage, "id = ?", assistant.ID).Error; err != nil {
+		t.Fatalf("reload invalid-resource assistant message: %v", err)
+	}
+	var messageError model.ErrorPayload
+	if err := json.Unmarshal(reloadedMessage.ErrorJSON, &messageError); err != nil {
+		t.Fatalf("decode invalid-resource assistant error: %v", err)
+	}
+	if messageError.GetErrorType() != string(errcode.AgentClientInvalidResourceReference) ||
+		messageError.GetLocaleKey() != errcode.AgentClientInvalidResourceReferenceLocaleKey ||
+		messageError.GetRetryable() ||
+		!messageError.GetTerminal() ||
+		len(messageError.GetDetails()) != 2 ||
+		messageError.GetDetails()["resource_kind"] != "file" ||
+		messageError.GetDetails()["resource_ref_hash"] != resourceRefHash {
+		t.Fatalf("invalid-resource assistant error = %+v", &messageError)
+	}
+
+	var event persistence.TurnEvent
+	if err := fixture.db.First(
+		&event,
+		"turn_id = ? AND attempt_id = ? AND event_type = ?",
+		turn.ID,
+		attempt.ID,
+		"error",
+	).Error; err != nil {
+		t.Fatalf("load invalid-resource terminal event: %v", err)
+	}
+	var eventPayload TurnEvent
+	if err := json.Unmarshal([]byte(event.Payload), &eventPayload); err != nil {
+		t.Fatalf("decode invalid-resource terminal event: %v", err)
+	}
+	var eventError model.ErrorPayload
+	if err := json.Unmarshal(eventPayload.OutcomeError, &eventError); err != nil {
+		t.Fatalf("decode invalid-resource event outcome: %v", err)
+	}
+	if !proto.Equal(&messageError, &eventError) {
+		t.Fatalf("event outcome differs from assistant error: message=%+v event=%+v", &messageError, &eventError)
+	}
+
+	var continuationCount int64
+	if err := fixture.db.Model(&persistence.ToolContinuation{}).
+		Where("tool_batch_id = ?", batch.ID).
+		Count(&continuationCount).Error; err != nil {
+		t.Fatalf("count invalid-resource continuations: %v", err)
+	}
+	if continuationCount != 0 {
+		t.Fatalf("invalid-resource failure created %d continuations", continuationCount)
+	}
+	if err := service.settleBlockedToolBatches(context.Background()); err != nil {
+		t.Fatalf("replay invalid-resource ToolBatch settlement: %v", err)
+	}
+	var eventCount int64
+	if err := fixture.db.Model(&persistence.TurnEvent{}).
+		Where("turn_id = ? AND event_type = ?", turn.ID, "error").
+		Count(&eventCount).Error; err != nil {
+		t.Fatalf("count invalid-resource terminal events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("invalid-resource settlement emitted %d terminal events", eventCount)
+	}
+}
+
+func TestTurnServiceIgnoresBlockedToolBatchFromPreviousAttempt(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	endedAt := now.Add(-time.Minute)
+	conversation := &persistence.Conversation{
+		ID:        "conversation-retry-blocked",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Retry blocked batch",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             "turn-retry-blocked",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	previousAttempt := &persistence.TurnAttempt{
+		ID:           "attempt-retry-blocked-1",
+		TurnID:       turn.ID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusInterrupted),
+		StartedAt:    now.Add(-2 * time.Minute),
+		EndedAt:      &endedAt,
+	}
+	currentAttempt := &persistence.TurnAttempt{
+		ID:           "attempt-retry-blocked-2",
+		TurnID:       turn.ID,
+		AttemptIndex: 2,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    now,
+	}
+	staleBatch := &persistence.ToolBatch{
+		ID:             "batch-retry-blocked-1",
+		ActorID:        fixture.actorID,
+		TurnID:         turn.ID,
+		AttemptID:      previousAttempt.ID,
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Provider:       "provider-1",
+		Model:          "model-1",
+		SystemPrompt:   "system",
+		Iteration:      1,
+		Status:         persistence.ToolBatchStatusBlocked,
+		CreatedAt:      now.Add(-2 * time.Minute),
+		UpdatedAt:      endedAt,
+		SettledAt:      &endedAt,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation":     conversation,
+		"turn":             turn,
+		"previous attempt": previousAttempt,
+		"current attempt":  currentAttempt,
+		"stale batch":      staleBatch,
+	} {
+		if err := fixture.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+
+	service := &TurnService{}
+	if err := service.settleBlockedToolBatches(context.Background()); err != nil {
+		t.Fatalf("settle blocked tool batches: %v", err)
+	}
+
+	var reloadedTurn persistence.AgentTurn
+	if err := fixture.db.First(&reloadedTurn, "id = ?", turn.ID).Error; err != nil {
+		t.Fatalf("reload turn: %v", err)
+	}
+	if reloadedTurn.Status != string(domain.TurnStatusWaitingLocalTool) {
+		t.Fatalf("stale batch interrupted current retry: %s", reloadedTurn.Status)
+	}
+	var reloadedAttempt persistence.TurnAttempt
+	if err := fixture.db.First(&reloadedAttempt, "id = ?", currentAttempt.ID).Error; err != nil {
+		t.Fatalf("reload current attempt: %v", err)
+	}
+	if reloadedAttempt.Status != string(domain.TurnStatusWaitingLocalTool) ||
+		reloadedAttempt.EndedAt != nil {
+		t.Fatalf("current retry attempt was settled by stale batch: %+v", reloadedAttempt)
+	}
+}
+
+func TestTurnServiceIgnoresReconciliationFromPreviousAttempt(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	endedAt := now.Add(-time.Minute)
+	conversation := &persistence.Conversation{
+		ID:        "conversation-retry-reconciliation",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Retry reconciliation",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             "turn-retry-reconciliation",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	previousAttempt := &persistence.TurnAttempt{
+		ID:           "attempt-retry-reconciliation-1",
+		TurnID:       turn.ID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusInterrupted),
+		StartedAt:    now.Add(-2 * time.Minute),
+		EndedAt:      &endedAt,
+	}
+	currentAttempt := &persistence.TurnAttempt{
+		ID:           "attempt-retry-reconciliation-2",
+		TurnID:       turn.ID,
+		AttemptIndex: 2,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    now,
+	}
+	staleBatch := &persistence.ToolBatch{
+		ID:             "batch-retry-reconciliation-1",
+		ActorID:        fixture.actorID,
+		TurnID:         turn.ID,
+		AttemptID:      previousAttempt.ID,
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Provider:       "provider-1",
+		Model:          "model-1",
+		SystemPrompt:   "system",
+		Iteration:      1,
+		Status:         persistence.ToolBatchStatusReadyForContinuation,
+		CreatedAt:      now.Add(-2 * time.Minute),
+		UpdatedAt:      endedAt,
+	}
+	staleContinuation := &persistence.ToolContinuation{
+		ID:                     "continuation-retry-reconciliation-1",
+		TurnID:                 turn.ID,
+		AttemptID:              previousAttempt.ID,
+		ToolBatchID:            staleBatch.ID,
+		Status:                 persistence.ToolContinuationStatusReconciliationRequired,
+		ProviderRequestEmitted: true,
+		CreatedAt:              now.Add(-2 * time.Minute),
+		UpdatedAt:              endedAt,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation":       conversation,
+		"turn":               turn,
+		"previous attempt":   previousAttempt,
+		"current attempt":    currentAttempt,
+		"stale batch":        staleBatch,
+		"stale continuation": staleContinuation,
+	} {
+		if err := fixture.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+
+	service := &TurnService{}
+	if err := service.settleReconciliationRequiredTurns(context.Background()); err != nil {
+		t.Fatalf("settle reconciliation-required turns: %v", err)
+	}
+
+	var reloadedTurn persistence.AgentTurn
+	if err := fixture.db.First(&reloadedTurn, "id = ?", turn.ID).Error; err != nil {
+		t.Fatalf("reload turn: %v", err)
+	}
+	if reloadedTurn.Status != string(domain.TurnStatusWaitingLocalTool) {
+		t.Fatalf("stale continuation interrupted current retry: %s", reloadedTurn.Status)
+	}
+	var reloadedAttempt persistence.TurnAttempt
+	if err := fixture.db.First(&reloadedAttempt, "id = ?", currentAttempt.ID).Error; err != nil {
+		t.Fatalf("reload current attempt: %v", err)
+	}
+	if reloadedAttempt.Status != string(domain.TurnStatusWaitingLocalTool) ||
+		reloadedAttempt.EndedAt != nil {
+		t.Fatalf("current retry attempt was settled by stale continuation: %+v", reloadedAttempt)
+	}
+}
+
+func TestTurnServiceCancelWaitingToolTurnBlocksBatch(t *testing.T) {
+	fixture := newToolDispatchFixture(t)
+	now := fixture.now
+	conversation := &persistence.Conversation{
+		ID:        "conversation-cancel",
+		AgentID:   "agent-1",
+		ActorPTID: fixture.actorID,
+		Title:     "Cancel",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	turn := &persistence.AgentTurn{
+		ID:             "turn-1",
+		ConversationID: conversation.ID,
+		AgentID:        "agent-1",
+		Status:         string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:      now,
+	}
+	attempt := &persistence.TurnAttempt{
+		ID:           "attempt-1",
+		TurnID:       turn.ID,
+		AttemptIndex: 1,
+		Status:       string(domain.TurnStatusWaitingLocalTool),
+		StartedAt:    now,
+	}
+	for label, value := range map[string]interface{}{
+		"conversation": conversation,
+		"turn":         turn,
+		"attempt":      attempt,
+	} {
+		if err := fixture.db.Create(value).Error; err != nil {
+			t.Fatalf("seed %s: %v", label, err)
+		}
+	}
+	fixture.propose(t, "tool-call-unprepared", "tool-call-prepared")
+	pulled, err := fixture.service.PullCapabilityRequests(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedPullRequest(t, "cancel", 5),
+	)
+	if err != nil {
+		t.Fatalf("pull capability requests: %v", err)
+	}
+	prepared := receiptForEnvelope(
+		pulled.GetRequests()[1],
+		1,
+		model.ClientCapabilityReceiptStatus_CLIENT_CAPABILITY_RECEIPT_STATUS_PREPARED,
+	)
+	if response, err := fixture.service.SubmitReceipt(
+		context.Background(),
+		fixture.actorID,
+		fixture.deviceID,
+		fixture.signedReceiptRequest(t, prepared),
+	); err != nil || !response.GetAccepted() {
+		t.Fatalf("submit prepared receipt: response=%+v err=%v", response, err)
+	}
+	if err := fixture.db.Create(&persistence.ToolCall{
+		ID:                        "call-station-applied",
+		ActorID:                   fixture.actorID,
+		TurnID:                    turn.ID,
+		AttemptID:                 attempt.ID,
+		ToolBatchID:               "batch-1",
+		ToolName:                  "station-applied",
+		ToolCallID:                "tool-call-station-applied",
+		CapabilityID:              "station-applied",
+		ExecutionOwner:            persistence.ToolOwnerStation,
+		BoundedArguments:          []byte(`{}`),
+		ResourceRefs:              []byte(`{}`),
+		ExecutionClaimID:          "claim-station-applied",
+		FencingToken:              1,
+		StationReceiptStatus:      persistence.ToolReceiptStatusApplied,
+		StationReceiptPayloadHash: strings.Repeat("a", 64),
+		StationReceiptCommittedAt: &now,
+		Status:                    persistence.ToolCallStatusPrepared,
+		CreatedAt:                 now,
+		UpdatedAt:                 now,
+	}).Error; err != nil {
+		t.Fatalf("seed applied Station receipt: %v", err)
+	}
+
+	service := &TurnService{}
+	if err := service.cancelTurn(context.Background(), "agent-1", turn.ID, "", ""); err != nil {
+		t.Fatalf("cancel waiting tool turn: %v", err)
+	}
+
+	var reloadedTurn persistence.AgentTurn
+	if err := fixture.db.First(&reloadedTurn, "id = ?", turn.ID).Error; err != nil {
+		t.Fatalf("reload turn: %v", err)
+	}
+	if reloadedTurn.Status != string(domain.TurnStatusCancelled) {
+		t.Fatalf("expected cancelled turn, got %s", reloadedTurn.Status)
+	}
+	var reloadedAttempt persistence.TurnAttempt
+	if err := fixture.db.First(&reloadedAttempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatalf("reload attempt: %v", err)
+	}
+	if reloadedAttempt.Status != string(domain.TurnStatusCancelled) || reloadedAttempt.EndedAt == nil {
+		t.Fatalf("expected cancelled terminal attempt, got %+v", reloadedAttempt)
+	}
+	var batch persistence.ToolBatch
+	if err := fixture.db.First(&batch, "id = ?", "batch-1").Error; err != nil {
+		t.Fatalf("reload tool batch: %v", err)
+	}
+	if batch.Status != persistence.ToolBatchStatusBlocked {
+		t.Fatalf("cancelled turn must block its tool batch, got %s", batch.Status)
+	}
+	var calls []persistence.ToolCall
+	if err := fixture.db.Where("tool_batch_id = ?", batch.ID).Find(&calls).Error; err != nil {
+		t.Fatalf("reload tool calls: %v", err)
+	}
+	statusByID := make(map[string]string, len(calls))
+	for i := range calls {
+		statusByID[calls[i].ToolCallID] = calls[i].Status
+	}
+	if statusByID["tool-call-unprepared"] != persistence.ToolCallStatusUnknownSideEffect {
+		t.Fatalf(
+			"dispatch-committed tool call must become unknown side effect, got %s",
+			statusByID["tool-call-unprepared"],
+		)
+	}
+	if statusByID["tool-call-prepared"] != persistence.ToolCallStatusCancelled {
+		t.Fatalf("prepared tool call must follow the winning cancel fence, got %s", statusByID["tool-call-prepared"])
+	}
+	if statusByID["tool-call-station-applied"] != persistence.ToolCallStatusCancelled {
+		t.Fatalf(
+			"applied Station receipt must follow the winning cancel fence, got %s",
+			statusByID["tool-call-station-applied"],
+		)
+	}
+	var pendingOutbox int64
+	if err := fixture.db.Model(&persistence.ToolDispatchOutbox{}).
+		Where("tool_call_id IN ? AND acknowledged_at IS NULL", []string{
+			"tool-call-unprepared",
+			"tool-call-prepared",
+		}).
+		Count(&pendingOutbox).Error; err != nil {
+		t.Fatalf("count pending cancellation outbox: %v", err)
+	}
+	if pendingOutbox != 0 {
+		t.Fatalf("cancel left %d dispatch envelopes deliverable", pendingOutbox)
+	}
+	var activePreparedRecovery int64
+	if err := fixture.db.Model(&persistence.ReceiptRecoveryCredential{}).
+		Where("tool_call_id = ? AND invalidated_at IS NULL", "tool-call-prepared").
+		Count(&activePreparedRecovery).Error; err != nil {
+		t.Fatalf("count prepared recovery credentials: %v", err)
+	}
+	if activePreparedRecovery != 1 {
+		t.Fatalf(
+			"cancel left %d prepared recovery credentials active, want 1",
+			activePreparedRecovery,
+		)
+	}
+	var activeUnpreparedRecovery int64
+	if err := fixture.db.Model(&persistence.ReceiptRecoveryCredential{}).
+		Where("tool_call_id = ? AND invalidated_at IS NULL", "tool-call-unprepared").
+		Count(&activeUnpreparedRecovery).Error; err != nil {
+		t.Fatalf("count unprepared recovery credentials: %v", err)
+	}
+	if activeUnpreparedRecovery != 0 {
+		t.Fatalf(
+			"cancel left %d unprepared recovery credentials active",
+			activeUnpreparedRecovery,
+		)
+	}
+}
+
+func receiptForEnvelope(
+	envelope *model.ClientCapabilityRequest,
+	sequence uint64,
+	status model.ClientCapabilityReceiptStatus,
+) *model.ClientCapabilityReceipt {
+	return &model.ClientCapabilityReceipt{
+		RequestId:           envelope.GetRequestId(),
+		TurnId:              envelope.GetTurnId(),
+		ToolCallId:          envelope.GetToolCallId(),
+		CapabilitySessionId: envelope.GetCapabilitySessionId(),
+		TargetDeviceId:      envelope.GetTargetDeviceId(),
+		DecisionId:          envelope.GetDecisionId(),
+		DecisionRevision:    envelope.GetDecisionRevision(),
+		ExecutionClaimId:    envelope.GetExecutionClaimId(),
+		ExecutorLeaseId:     envelope.GetExecutorLeaseId(),
+		FencingToken:        envelope.GetFencingToken(),
+		DispatchSequence:    envelope.GetDispatchSequence(),
+		PayloadHash:         envelope.GetPayloadHash(),
+		SideEffectReceiptId: "side-effect-" + envelope.GetToolCallId(),
+		Status:              status,
+		Sequence:            sequence,
+		OccurredAt:          timestamppb.New(time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)),
+		ToolBatchId:         envelope.GetToolBatchId(),
+	}
+}
+
+func protoCloneDecisionRequest(
+	request *model.SubmitToolApprovalDecisionRequest,
+) *model.SubmitToolApprovalDecisionRequest {
+	return &model.SubmitToolApprovalDecisionRequest{
+		ApprovalId:       request.GetApprovalId(),
+		ToolCallId:       request.GetToolCallId(),
+		DecisionId:       request.GetDecisionId(),
+		ExpectedRevision: request.GetExpectedRevision(),
+		Approved:         request.GetApproved(),
+		IdempotencyKey:   request.GetIdempotencyKey(),
+		PayloadHash:      request.GetPayloadHash(),
+	}
+}

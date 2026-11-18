@@ -1,0 +1,133 @@
+import type { ReactNode } from 'react';
+import { Flexbox } from 'react-layout-kit';
+import { Tag } from '@lobehub/ui';
+import { theme } from 'antd';
+import {
+  Clock,
+  CheckCircle2,
+  XCircle,
+  Info,
+  AlertTriangle,
+  ExternalLink,
+} from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+export interface CardData {
+  type: string;
+  title?: string;
+  body?: string;
+  status?: 'ok' | 'error' | 'info' | 'warning';
+  link?: string;
+  linkText?: string;
+  meta?: Record<string, unknown>;
+}
+
+interface Props {
+  card: CardData;
+  onNavigate?: (uri: string) => void;
+}
+
+const statusConfig: Record<string, { color: string; icon: ReactNode; labelKey: string }> = {
+  ok: { color: 'success', icon: <CheckCircle2 size={14} />, labelKey: 'chat.card.status.ok' },
+  error: { color: 'error', icon: <XCircle size={14} />, labelKey: 'chat.card.status.error' },
+  info: { color: 'processing', icon: <Info size={14} />, labelKey: 'chat.card.status.info' },
+  warning: { color: 'warning', icon: <AlertTriangle size={14} />, labelKey: 'chat.card.status.warning' },
+};
+
+const typeLabels: Record<string, { icon: ReactNode; labelKey: string }> = {
+  'cron-run': { icon: <Clock size={14} />, labelKey: 'chat.card.type.cronRun' },
+  'channel-sent': { icon: <CheckCircle2 size={14} />, labelKey: 'chat.card.type.channelSent' },
+  system: { icon: <Info size={14} />, labelKey: 'chat.card.type.system' },
+};
+
+export default function MessageCard({ card, onNavigate }: Props) {
+  const { token } = theme.useToken();
+  const { t } = useTranslation('chat');
+  const sc = card.status ? statusConfig[card.status] : undefined;
+  const tl = typeLabels[card.type] || { icon: <Info size={14} />, labelKey: card.type };
+
+  const borderColor =
+    card.status === 'error'
+      ? token.colorErrorBorder
+      : card.status === 'warning'
+        ? token.colorWarningBorder
+        : token.colorBorderSecondary;
+
+  return (
+    <Flexbox
+      style={{
+        border: `1px solid ${borderColor}`,
+        borderRadius: token.borderRadiusLG,
+        padding: '12px 16px',
+        background: token.colorBgContainer,
+        maxWidth: 480,
+        gap: 8,
+      }}
+    >
+      {/* Header: type badge + status */}
+      <Flexbox horizontal align="center" gap={8}>
+        <Tag
+          icon={tl.icon}
+          style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: 4 }}
+        >
+          {t(tl.labelKey)}
+        </Tag>
+        {sc && (
+          <Tag
+            color={sc.color}
+            icon={sc.icon}
+            style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: 4 }}
+          >
+            {t(sc.labelKey)}
+          </Tag>
+        )}
+        {card.meta?.duration != null && (
+          <span style={{ fontSize: 12, color: token.colorTextTertiary }}>
+            {Number(card.meta.duration)}ms
+          </span>
+        )}
+      </Flexbox>
+
+      {/* Title */}
+      {card.title && (
+        <div style={{ fontWeight: 500, fontSize: 14, color: token.colorText }}>
+          {card.title}
+        </div>
+      )}
+
+      {/* Body */}
+      {card.body && (
+        <div
+          className="selectable"
+          style={{
+            fontSize: 13,
+            color: card.status === 'error' ? token.colorErrorText : token.colorTextSecondary,
+            lineHeight: 1.5,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+          }}
+        >
+          {card.body}
+        </div>
+      )}
+
+      {/* Deep link */}
+      {card.link && (
+        <div
+          style={{
+            fontSize: 13,
+            color: token.colorPrimary,
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+          }}
+          onClick={() => onNavigate?.(card.link!)}
+        >
+          <ExternalLink size={12} />
+          {card.linkText || t('chat.card.viewDetails')}
+        </div>
+      )}
+    </Flexbox>
+  );
+}

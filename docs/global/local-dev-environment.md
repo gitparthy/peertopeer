@@ -1,0 +1,610 @@
+# Local Development Environment
+
+> **Status**: active
+> **Version**: v1.4
+> **Created**: 2026-07-23 | **Updated**: 2026-10-15
+> **Owner**: Platform Team
+
+---
+
+Station API ownership remains unchanged in every profile: Conversation is the
+sole Chat business entry point under `/conversation/*`; Device, Inbox,
+Recovery, Key Exchange, and Federation expose `/device/*`,
+`/device/inbox/*`, `/recovery/*`, `/key-exchange/*`, and peer-only
+`/federation/*`. Local topology never enables a Station Messaging facade.
+
+## 1. Document Scope
+
+This document defines:
+- Profile system: what a profile is, field semantics, mode types
+- Deploy model: how code reaches remote stations
+- Runtime topology: ports, services, connections per profile
+- Make targets: what each command does under each mode
+
+This document does NOT define:
+- When to restart vs hot-reload (see `pt-dev-runtime-handoff` skill for decision logic)
+- How to create/switch profiles (see `pt-local-dev-env` skill for interactive workflow)
+- CI/CD pipeline (out of scope for local dev)
+
+The machine-global ownership and allocation architecture is defined in
+[`docs/architecture/engineering/local-dev/`](../architecture/engineering/local-dev/README.md).
+The registration, binding, slot, and capability-lease runtime is implemented by
+`tooling/scripts/local-dev/machine-dev.mjs`. Evidence-root relocation remains a
+separate migration.
+
+### 1.1 Current Machine-State Boundary
+
+The authoritative machine-global registry path is:
+
+```text
+~/.peers-touch/dev/registry.json
+```
+
+It becomes runtime authority only through explicit `make profile <name>` or
+`make env-register`. An existing `authority: observed-snapshot` remains
+diagnostic and makes normal runtime resolution fail closed. Legacy
+`.local/dev/active/` pointers have no runtime authority.
+
+Do not interpret discovered worktrees or profile pointers as active usage:
+
+- registration is created only by canonical `make profile` or
+  `make env-register`;
+- `active` requires a matching live process/listener or valid lease;
+- a registered worktree without live resources is `idle`;
+- an unregistered worktree remains an observation only.
+
+`make env-status-all` reports registration and live OS-held leases separately.
+Lease JSON is metadata only; the held advisory lock plus matching
+PID/process-start identity establishes possession.
+
+Acceptance evidence is also development state. Its canonical local target is:
+
+```text
+~/.peers-touch/dev/acceptance
+```
+
+`~/Library/Application Support/PeersTouch/` is reserved for formal product
+data. The existing `acceptance/` child there is legacy data pending a verified
+resolver cutover and one-time migration. The migration is not complete until
+every current Git worktree uses the canonical root, the old directory is
+deleted, and the live registry plus active docs remove their legacy fields and
+migration branches.
+
+Complex work may optionally keep repository-local recovery state at:
+
+```text
+.dev-workflow/tasks/<taskId>/
+```
+
+It is task-local progress for recovery, not Profile allocation, a live lease,
+write permission, or runtime authorization. Ordinary work creates no record.
+Formal Plans are read directly from explicit paths and never occupy a
+worktree.
+
+---
+
+### 1.2 iOS Profile Resources
+
+The existing Machine Dev owner stores assignments and observed contents in
+`~/.peers-touch/dev/resources.json`. This is subordinate machine state under
+the registry fence; shared Profile source contains compatibility requirements,
+never machine UUIDs. The canonical contract is
+[Local Dev resource dependencies](../architecture/engineering/local-dev/data-model.md#12-resource-dependency-contract).
+
+Declare `PT_MOBILE_IOS_RUNTIME` and `PT_MOBILE_IOS_DEVICE_TYPE` in a reviewed
+Profile. `PT_MOBILE_IOS_DATA=preserve|fresh` states its data requirement.
+Specify a positive count, purpose or readable device selection:
+
+```bash
+node tooling/scripts/local-dev/machine-dev.mjs resource-discover
+node tooling/scripts/local-dev/machine-dev.mjs resource-assign --count 2 --purpose 'Messaging'
+node tooling/scripts/local-dev/machine-dev.mjs resource-assign \
+  --count 2 --purpose 'Messaging' --create true --preparation-id 'messaging-fixture-001'
+node tooling/scripts/local-dev/machine-dev.mjs resource-inspect
+make mobile RESOURCE='Messaging 1'
+```
+
+Creation is explicit and retrying the same preparation recovers its original
+devices. Assignment does not overwrite installed content. Readable selections
+resolve internal IDs; discovery lists shared Profiles, actual contents and
+holders. An ambiguous name returns candidates for selection from that list.
+
+Both Make and `pnpm --dir apps/mobile run tauri:ios:dev -- '<name-or-purpose>'`
+use the same slot and physical-device owner. Xcode builds for the held UUID;
+the generated Tauri build phase uses the configured dev URL. Web edits reload;
+native edits require rerunning the entry. Mobile checks the configured Station
+connection and starts offline when unavailable.
+
+A conflicting operation returns its concrete impact and pending operation.
+Review shared Profiles, current/target content, app data, Keychain and active
+sessions, then make that operation's decision with `resource-decide
+--operation-id <agent-resolved-operation> --impact-digest <displayed-digest>
+--decision force|decline`. Resume with `make mobile OPERATION=<operation>`.
+The Agent resolves these internal values; humans need not copy or memorize
+IDs. A changed impact invalidates the decision. Force never bypasses a physical
+lock or becomes a permanent preference.
+
+Acceptance supplies `PT_IOS_RESOURCE_SELECTIONS_JSON`, for example
+`{"sim-ios":{"profile":"test-ios","selector":"Messaging 1"}}`.
+Base, selected and layout Provisioners bind these references once per Suite;
+they retain their own Fixture, Harness and evidence responsibilities. Cleanup
+releases owned sessions and locks while retaining assignments, installations
+and data. `resource-detach` removes one Profile reference; physical reset/delete
+is a separate exact operation with its own impact/decision and provider readback.
+Current source tests cover the cut; native proof is separately required.
+
+## 2. Profile System
+
+### 2.1 What Is A Profile
+
+A deployable profile is a `.env` source at
+`../env/peers-touch/<name>/profile.env.example` that configures one complete
+development topology: which Station to use, which ports, and which mode.
+`.local/dev/profiles/<name>.env` is an imported cache, not a competing source
+for a same-named deployable profile. A worktree-local compose Profile may be
+created with `make profile-init` and never authorizes remote deployment.
+
+Each Git worktree selects its profile through the machine registry binding keyed
+by canonical `workspaceId`. `make profile PROFILE=<name>` creates a minimum
+registration on first explicit selection and updates it thereafter; it never
+writes a legacy active-profile pointer. Runtime commands load the sibling `env`
+repository source directly.
+
+The registration stores the canonical root and registered branch, but not Git
+HEAD. Current HEAD is read directly from the worktree for each command.
+The registry remains schema v1. Runtime does not migrate or accept
+head-bearing registrations; machine-local files produced by superseded
+development code must be corrected explicitly.
+
+Local slot and Desktop/Mobile ports come from the machine binding. A profile's
+`PT_DEV_SLOT` and local client port fields are legacy topology observations and
+cannot override the allocation. See
+[`local-dev-control-plane/design.md`](../architecture/engineering/local-dev/design.md).
+
+### 2.2 Environment Creation And Operation
+
+Existing reviewed Profiles are direct development-operation authority. Agents
+may select and register them, create their runtime instances, deploy, restart,
+and reset non-stable Profiles as needed by the task without another approval
+prompt. The concrete operation still checks binding capability, exact target or
+reset scope, current source identity, topology, and OS-held lease.
+
+A local compose Profile can be created directly:
+
+```bash
+make profile-init PROFILE=<name> SLOT=<n>
+```
+
+This creates one non-overwriting Profile under the current worktree. It does
+not create a worktree or grant remote delivery permission. Runtime accepts the
+file only when it is a non-symlink regular file directly inside the local
+Profile directory, owned by the current user, private to that user, and made
+only of shell-safe literal assignments. The resolver emits shell-quoted
+exports; normal development never executes the local file with `source`.
+
+Remote deployment continues to require exactly one Git-tracked, clean Profile
+and deploy definition from the sibling `env` repository. New remote topology is
+an ordinary source change only when that repository is explicitly in task
+scope. Agents must not invent hosts, credentials, or dirty local deploy
+fallbacks.
+
+`PT_DEV_PROFILE_FILE` is not a general override. It is accepted only with
+`PT_DEV_PROFILE_FILE_AUTHORITY=acceptance-runtime-manifest`, and the owned
+regular profile file must be directly contained by the absolute
+`PT_ACCEPTANCE_RUNTIME_PROFILE_ROOT`. Normal development resolves reviewed
+env-repository topology or a validated worktree-local compose Profile.
+
+### 2.3 Existing Profile Operation Admission
+
+Multi-service equipment uses an operation target independently of the active
+workspace binding: `node tooling/devctl/index.mjs station start
+--target-profile <name> --json`. Machine Dev `--target-profile` resolves the
+same reviewed definition and preserves the registration and local slot.
+The workspace's capability and the target's stable policy still apply.
+Stable deployment needs an explicit binding to that stable Profile; stable
+reset is always refused. Target, exact deployment and current source are
+revalidated after lease acquisition. Acceptance callers share
+`tooling/acceptance/provisioners/station_equipment.py`, equip before retaining
+the remote source lease, and re-attest under that lease.
+
+The selected directory name and `PT_DEV_PROFILE` value must match exactly. The
+verified canonical ID then determines reset policy:
+
+- case-insensitive ID ending in `stable`: `stable-protected`, so autonomous
+  `station.reset` is rejected;
+- every other reviewed ID: `agent-resettable`, so the Agent may choose reset
+  without human involvement.
+
+There is no reset-policy environment field or machine-state override. For
+non-stable Profiles, reset still requires the workspace `station.reset`
+capability, the same exact command scope, matching tracked-clean remote
+topology and source identity, and the OS-held reset lease.
+
+Deploy/restart of an existing reviewed non-stable remote Profile is authorized
+by the Profile and workspace capability binding. It needs no separate Plan or
+chat grant. Stable selection defaults to `station.connect`; stable deploy or
+restart requires a user-directed explicit `station.deploy` binding, and stable
+reset remains forbidden.
+
+### 2.4 Profile Fields
+
+| Field | Required | Example | Semantics |
+|-------|----------|---------|-----------|
+| `PT_DEV_PROFILE` | yes | `one` | Profile name identifier |
+| `PT_DEV_SLOT` | yes | `0` | Port slot for multi-profile isolation |
+| `PT_STATION_MODE` | yes | `local` or `remote` | How Station is run (see §3) |
+| `PT_STATION_NAME` | yes | `one` | Human-readable Station label |
+| `PT_STATION_URL` | yes | `http://192.0.2.10:18080` | Station base URL |
+| `PT_STATION_PORT` | yes | `18080` | Station HTTP port |
+| `PT_STATION_DEPLOY_ENV` | if remote | `station-1` | Maps to `.local/deploy/envs/<name>.env` |
+| `PT_STATION_HEALTH_URL` | recommended | `http://host:port/sub-oss/healthz` | Health check endpoint |
+| `PT_RELAY_MODE` | if relay used | `remote` | Relay run mode |
+| `PT_RELAY_URL` | if relay used | `http://host:port` | Relay base URL |
+| `PT_RELAY_DEPLOY_ENV` | if relay remote | `relay-1` | Maps to deploy env |
+| `PT_DESKTOP_APP_GATEWAY_PORT` | yes | `3030` | Desktop Tauri BFF port |
+| `PT_DESKTOP_APP_WEB_PORT` | yes | `3210` | Desktop Tauri web port |
+| `PT_MOBILE_WEB_PORT` | if mobile | `5173` | Mobile dev server port |
+
+Addresses in this document use RFC 5737 TEST-NET ranges. Real deployment
+coordinates belong only to the sibling environment repository or machine-local
+profile state.
+
+### 2.5 Deploy Env Files
+
+Canonical definitions live at
+`../env/peers-touch/<profile>/deploy/<name>.env.example`. Remote deploy commands
+resolve exactly one Git-tracked, clean definition directly from the env
+repository. `.local/deploy/envs/<name>.env` is legacy cache/observation only
+and cannot authorize deployment. These definitions contain:
+
+| Field | Semantics |
+|-------|-----------|
+| `PT_DEPLOY_HOST` | SSH target host IP |
+| `PT_DEPLOY_USER` | SSH user (default: current user) |
+| `PT_DEPLOY_DIR` | Remote working directory |
+| `PT_DEPLOY_SOURCE` | `central` / `local` / `github` — how remote pulls code |
+
+---
+
+## 3. Station Mode
+
+### 3.1 `local` mode
+
+Station runs on the developer's machine. `make station` compiles and starts the
+Go binary locally. Suitable when:
+- Debugging Station code with breakpoints
+- No network access to remote hosts
+- Testing against local PostgreSQL
+
+### 3.2 `remote` mode
+
+Station runs on a remote host. `make station` triggers a full deploy cycle:
+
+```
+make station (remote mode)
+  1. Make current HEAD available through the configured source transport
+  2. SSH to remote host
+  3. Remote fetches the exact commit
+  4. Remote rebuilds Go binary
+  5. Remote restarts Station service
+  6. Health check until ready
+  7. Reports "Station ready at <URL>"
+```
+
+**Key implication**: `make station` in remote mode **deploys the current local
+branch's HEAD commit** to the remote Station. Uncommitted changes are NOT deployed.
+If you have local changes that need to be tested remotely, commit them first
+(even as a WIP commit on a feature branch), then run `make station`.
+
+For `direct` and `central` modes, source sync force-updates only the namespaced
+internal ref `refs/peers-touch/deploy/<environment>/<branch>`. The bare
+repository is a deployment transport, not a collaboration remote: this update
+is covered by the Profile deploy capability and does not publish a branch,
+deliver a stage, or authorize push to origin/GitHub.
+
+### 3.3 Mode-specific behavior summary
+
+| Command | `local` mode | `remote` mode |
+|---------|-------------|---------------|
+| `make station` | Compile + start locally | Deploy + restart remote |
+| `make station-restart` | Kill + restart local process | SSH restart remote service |
+| `make station-check` | Curl local health endpoint | Curl remote health endpoint |
+| `make station-logs` | Tail local log file | SSH tail remote logs |
+| `make station-stop` | Kill local process | SSH stop remote service |
+
+---
+
+## 4. Runtime Topology
+
+With profile active, the developer's machine runs:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Developer Machine                                    │
+│                                                      │
+│  Desktop App (Tauri)  → localhost:3030 (BFF)         │
+│  Mobile Dev Server    → localhost:5173               │
+│                                                      │
+│  [local mode only]                                   │
+│  Station              → localhost:18080              │
+│  PostgreSQL           → localhost:5432 (Docker)      │
+└──────────────────────────────┬───────────────────────┘
+                               │ (if remote mode)
+                               ▼
+┌─────────────────────────────────────────────────────┐
+│ Remote Station Host (e.g. 192.0.2.10)              │
+│  Station              → :18080                       │
+│  PostgreSQL           → :5432                        │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Make Targets Reference
+
+All commands run from repository root. The workspace must be explicitly
+registered and its binding must resolve.
+
+### Core
+
+| Target | What it does |
+|--------|-------------|
+| `make profile <name>` | Select a reviewed Profile; on first use, allocate the lowest free slot; non-stable remote gets connect+deploy, while stable/local/compose gets connect only |
+| `make env-register ...` | Explicitly register this verified workspace and allocate profile, slot, and allowed capabilities |
+| `make env-update ...` | Update requested binding fields and current registered branch while no lease is held |
+| `make env-unregister [WORKSPACE_ID=<id>]` | Remove the exact owned idle registration; rejects a live OS-held lease |
+| `make env-check ...` | Verify stable workspace binding, current Git source, tracked-clean topology, slot, capabilities, target match, and budget |
+| `make env-status-all` | Report all registrations and observed OS-held leases |
+| `make dev-start TASK=<id> ...` | Optionally create task-local recovery state |
+| `make dev-update TASK=<id> EXPECTED_REVISION=<n> ...` | Update one explicit task with revision/CAS |
+| `make dev-status TASK=<id>` | Read one explicit task |
+| `make dev-status-all` | Read this worktree's task records and isolate corrupt tasks |
+| `make dev-close TASK=<id> ...` | Close only the selected task and its owned resources |
+| `make plan-validate PLAN=<path>` | Validate one explicit frozen Plan Version |
+| `make plan-inspect PLAN=<path>` | Inspect one explicit Plan without workspace occupancy |
+| `make plan-task PLAN=<path> TASK=<id>` | Read one explicit Plan task |
+| `make station` | Reuse a healthy source-matched Station, otherwise deploy the current commit and verify its live build identity |
+| `make desktop` | Start Desktop Tauri app |
+| `make desktop-install` | Build the current source and atomically install the platform-native development artifact: macOS `.app` or Linux AppImage/XDG entry |
+| `make mobile` | Start Mobile iOS simulator |
+
+For a native semantic development Journey, `PT_ACCEPTANCE_NATIVE_DEV=1 make
+desktop` enables the embedded `acceptance-webdriver` feature and renderer
+diagnostics. `PT_ACCEPTANCE_WEBDRIVER_PORT` selects that task's driver port.
+The command retains Profile, process ownership, source identity and startup
+checks. Enabling this driver does not publish formal Acceptance evidence.
+
+Normal initial registration is explicit and one-step:
+
+```bash
+make profile <name>
+```
+
+Use the advanced form only when the Owner needs an exact slot, purpose, or
+capability set:
+
+```bash
+make env-register \
+  PROFILE=<name> \
+  SLOT=<n> \
+  CAPABILITIES='station.connect,station.deploy' \
+  PURPOSE='<owner-approved purpose>'
+make env-check \
+  PROFILE=<name> \
+  SLOT=<n> \
+  CAPABILITIES='station.connect,station.deploy' \
+  BUDGET_SECONDS=1200
+```
+
+For an explicit human `make station`, the command owns one bounded
+`make.station` deployment intent and acquires the exact `station.deploy` lease
+it needs. No task record is required. Agent-driven runtime work uses the same
+operation-specific admission and lease path.
+
+After a normal commit, merge, rebase, or pull on the same branch, every command
+immediately uses the new Git HEAD without mutating the machine registration.
+Root or branch changes remain explicit binding changes. Runtime admission
+captures the current source and revalidates it after lock acquisition.
+
+`make desktop` is self-preparing. It resolves ports,
+Station topology, and runtime settings from the selected Profile; resolve
+package requirements from the repository manifests and `pnpm-lock.yaml`;
+install missing packages with `pnpm install --frozen-lockfile`; generate missing
+Desktop TypeScript proto bindings through `model/build.sh`; and run the
+source-aware Station ready closure before starting Desktop. A complete managed
+Vite/Tauri pair is reused only when both records match the current Git commit.
+Partial or source-stale managed pairs are stopped as one owned runtime before
+ports are checked and the pair is restarted. A separate `pnpm install`,
+`make model-gen`, or `make station` is not required.
+
+There is no supported Desktop browser launch path. Native Tauri is the only
+Desktop development and product-proof runtime.
+
+`make desktop-install` uses one install orchestrator with a platform adapter.
+It prepares the same package, generated-source, applet, source-identity, build,
+installation and verification lifecycle on every supported platform.
+
+- macOS builds only the Tauri `.app` bundle, ad-hoc signs and verifies it, then
+  atomically replaces `~/Applications/Peers Dev.app`.
+- Linux builds only the Tauri AppImage and installs it without root:
+  `${XDG_DATA_HOME:-$HOME/.local/share}/peers-touch/apps/peers-dev.AppImage`,
+  `${PT_DESKTOP_INSTALL_BIN_DIR:-$HOME/.local/bin}/peers-dev`, the matching
+  XDG desktop entry, and hicolor icon. The AppImage, launcher, source receipt,
+  desktop entry and icon are same-directory staged, fsynced and atomically
+  replaced. A running old inode may finish; the next launch uses the new
+  artifact. Verification failure restores every previous file and protocol
+  association.
+
+Both use application identifier `com.peers.touch.desktop.dev` and deep-link
+scheme `peers-touch-dev://`. Override the identifier with
+`PT_DESKTOP_APP_ID` or artifact destination with
+`PT_DESKTOP_INSTALL_DIR`; Linux also accepts `PT_DESKTOP_INSTALL_BIN_DIR`.
+Missing Linux system prerequisites fail before build with exact `pkg-config`
+module and distro package hints. The command never installs OS packages,
+requests root, starts Station or deploys Station.
+
+Registration does not create or edit an environment definition. A later
+destructive wrapper uses the generic lease API after deriving Profile reset
+policy and declaring the exact reset scope:
+
+```bash
+node tooling/scripts/local-dev/machine-dev.mjs lease \
+  --resource-kind station.reset \
+  --resource-id <station-fixture-scope> \
+  --reset-scope <station-fixture-scope> \
+  --budget-seconds <seconds> \
+  -- <reset-command>
+```
+
+The reset API owns scope validation and lease lifetime only; it does not
+implement deletion.
+
+Parent runtimes use the same `MachineLease` implementation in
+`tooling/scripts/local-dev/machine-dev-lease.py` as the CLI. They acquire only
+after `validate-lease`, revalidate the frozen identity while holding the lock,
+retain the actual descriptor through resource cleanup, and release in reverse
+acquisition order. A failed post-lock validation clears metadata and unlocks.
+Acceptance derives this lifetime from the Gate's remaining lifecycle budget;
+an injected reset reference is scope metadata, not a second permission source.
+
+### Lifecycle
+
+| Target | What it does |
+|--------|-------------|
+| `make status` | Show all running services |
+| `make stop` | Stop all services |
+| `make restart` | Restart all services |
+| `make station-restart` | Restart Station only |
+| `make desktop-restart` | Restart Desktop only |
+| `make station-check` | Health-check Station |
+| `make station-logs` | Tail Station logs |
+
+### Deploy (explicit)
+
+| Target | What it does |
+|--------|-------------|
+| `make deploy ENV=station-1` | Deploy to named env (branch defaults to current) |
+| `make deploy ENV=station-1 BRANCH=feat/x` | Deploy specific branch |
+| `make deploy-status ENV=station-1` | Check deploy status |
+| `make deploy-logs ENV=station-1` | Tail remote logs |
+
+### Docker
+
+| Target | What it does |
+|--------|-------------|
+| `make docker-station` | Build + deploy Station container (local Docker) |
+| `make docker-station REMOTE=pt-station-1` | Build + deploy to remote Docker host |
+| `make docker-relay` | Build + deploy Relay container |
+| `make docker-all` | Build + deploy all containers |
+
+### Proto + Quality
+
+| Target | What it does |
+|--------|-------------|
+| `make model-gen` | Run `./model/build.sh` (proto generation) |
+| `make check` | Go fmt check |
+| `make style` | Full Go style check |
+| `make test-unit` | Run Go unit tests |
+
+---
+
+## 6. E2E Verification Pattern
+
+After deploying Station with new code:
+
+```bash
+# 1. Deploy
+make station
+
+# 2. Verify health
+make station-check
+
+# 3. Call API (example: new provider list endpoint)
+curl -X POST "$PT_STATION_URL/sub-agent/agent/provider/list" \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# 4. Start Desktop to test full flow
+make desktop
+```
+
+---
+
+## 7. Station DB Access (Debug / Read-Only)
+
+For debugging and data inspection, agents can query Station's PostgreSQL directly.
+
+**Connection via SSH tunnel** (remote Station):
+
+```bash
+# From profile env: PT_STATION_URL tells the host, DB name is peers_touch_<profile>
+ssh <station-host> -L 15432:localhost:5432 -N &
+psql -h localhost -p 15432 -U peers -d peers_touch_<profile_name>
+```
+
+**Connection via MCP** (if PostgreSQL MCP server is configured):
+
+```
+postgresql://peers:peers123@localhost:15432/peers_touch_<profile_name>
+```
+
+**Useful debug queries**:
+
+```sql
+-- Check registered actors
+SELECT ptid, created_at FROM actor_identity_keys;
+
+-- Check active conversations
+SELECT conversation_id, kind, current_seq FROM conversations;
+
+-- Check enrolled devices per conversation
+SELECT conversation_id, ptid, device_id, active FROM conversation_member_devices;
+
+-- Check message queue
+SELECT id, conversation_id, created_at FROM device_queue_lanes ORDER BY created_at DESC LIMIT 10;
+```
+
+**Rules**:
+- Read-only for debugging and acceptance diagnostics.
+- Never use direct DB writes as a standard recovery path — implement admin commands instead.
+- Connection details (host, port, DB name) come from the active profile, not hardcoded.
+
+---
+
+## 8. Conventions
+
+1. **Never SSH manually to deploy** — Station deployment always uses
+   `make station`, which owns the canonical deploy lease and health closure.
+2. **Never edit code on remote hosts** — deploy env discipline (AGENTS.md §12).
+3. **Profile selection per worktree** — each Git worktree selects independently
+   through its authoritative `workspaceId` binding. Profiles may be shared;
+   slots may not.
+4. **Health check is the contract** — `make station` is not done until health passes.
+5. **Current branch deploys** — remote mode transports current HEAD, not
+   necessarily main; internal transport refs are not collaboration branches.
+6. **Environment repository is authoritative for remote topology** — do not
+   repurpose a canonical Profile by editing only its `.local` cache. New remote
+   topology must be a tracked source change in the explicitly selected
+   environment-repository worktree.
+7. **No implicit global fallback** — an unregistered or stale worktree fails
+   closed; do not infer profile or slot from another worktree, a legacy pointer,
+   profile metadata, basename, or branch.
+8. **Local creation is direct** — `profile-init` creates one non-overwriting
+   worktree-local development Profile.
+9. **Operation admission, then lease** — each runtime operation validates the
+   authoritative binding, current source, target, Profile policy, exact scope,
+   and operation-specific authorization before acquiring its OS-held lease.
+10. **Station deploy lease covers the closure** — `make station` holds
+    `station.deploy` across deploy, restart, and health readback, and releases
+    on success, failure, signal, or timeout.
+11. **Apply Profile-ID reset policy once** — Profiles whose ID does not end in
+    `stable`, case-insensitively, may be reset by
+    the Agent without human confirmation; stable Profiles fail before lease
+    acquisition. Runtime scope and ownership guards still apply.
+12. **Explicit unregister** — normal task completion retains the registration.
+    Explicit worktree removal invokes unregister separately; it fails while an
+    OS-held lease remains or the exact caller/root ownership does not match.
+13. **Resolve contention from facts first** — reuse, serialize, or choose a
+    non-conflicting slot/target from current leases and process identity. Ask
+    the user only when ownership or safe ordering cannot be determined.

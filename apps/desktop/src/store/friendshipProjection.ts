@@ -1,0 +1,344 @@
+import type {
+  Follower,
+  Following,
+} from '../gen/proto/domain/social/relationship_pb';
+import type { AccountProfile } from '../services/desktop_api';
+import type { DesktopIMConversationProjection } from './socialProjection';
+import type { FriendRequestData } from './socialNormalizers';
+import {
+  actorDisplayName,
+  canonicalProfileAvatar,
+  remoteProfileHandle,
+} from './socialProfileProjection';
+import { isRawStationAuthority } from './federation';
+
+export interface MutualFriendProjection {
+  actorPtid: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string;
+  federatedHandle: string;
+  homeStationDomain: string;
+  homeStationPeerId: string;
+  homeStationName?: string;
+}
+
+export interface ChatActorIdentityProjection extends MutualFriendProjection {
+  conversationId?: string;
+  federationId: string;
+  federationName: string;
+}
+
+export type ChatFriendContactProjection = ChatActorIdentityProjection;
+
+export interface ChatFederationProjection {
+  federationId: string;
+  name: string;
+}
+
+export interface ChatActorIdentityMetadataParts {
+  federation: string;
+  station: string;
+}
+
+export interface ChatFriendRequestPeerProjection {
+  peerPtid: string;
+  request: FriendRequestData;
+  direction: 'incoming' | 'outgoing';
+  attemptCount: number;
+}
+
+export interface ProjectChatFriendContactsInput {
+  conversations: readonly DesktopIMConversationProjection[];
+  friendRequests: readonly FriendRequestData[];
+  peerProfiles: Readonly<Record<string, AccountProfile | null>>;
+  currentUserPtid: string;
+  federations: readonly ChatFederationProjection[];
+  stationNamesByPeerId?: Readonly<Record<string, string>>;
+  stationNamesByActorPtid?: Readonly<Record<string, string>>;
+}
+
+export function singleFederationId(
+  federations: readonly { federationId: string }[],
+): string {
+  const ids = Array.from(new Set(
+    federations
+      .map((federation) => federation.federationId.trim())
+      .filter(Boolean),
+  ));
+  return ids.length === 1 ? ids[0] : '';
+}
+
+/**
+ * The Station's federation-context endpoint returns only federations the local
+ * Station actively participates in. When several exist there is no single
+ * default, but a same-Station friend command never crosses a federation
+ * boundary — the Station only requires a non-empty local federation
+ * identifier. The first active context is therefore a deterministic, valid
+ * fallback for a local actor. Returns '' when no context exists so callers
+ * keep the identity-incomplete guard for genuinely federated targets.
+ */
+export function localFederationFallback(
+  federations: readonly { federationId: string }[],
+): string {
+  for (const federation of federations) {
+    const id = federation.federationId.trim();
+    if (id) return id;
+  }
+  return '';
+}
+
+/**
+ * A local actor shares the viewer's Home Station. Same-Station friend requests
+ * route inside the Station and may use any local federation context; a
+ * federated actor instead keeps requiring its explicit Federation scope.
+ */
+export function isSameStationActor(input: {
+  selfHomeStationPeerId?: string | null;
+  targetHomeStationPeerId: string;
+}): boolean {
+  const self = input.selfHomeStationPeerId?.trim() ?? '';
+  const target = input.targetHomeStationPeerId.trim();
+  return Boolean(self && target && self === target);
+}
+
+export function projectMutualFriends(
+  followers: readonly Follower[],
+  following: readonly Following[],
+): MutualFriendProjection[] {
+  const followersByPtid = new Map(
+    followers
+      .filter((follower) => follower.actorPtid)
+      .map((follower) => [follower.actorPtid, follower] as const),
+  );
+
+  return following
+    .filter((candidate) => candidate.actorPtid && followersByPtid.has(candidate.actorPtid))
+    .map((candidate) => {
+      const follower = followersByPtid.get(candidate.actorPtid);
+      return {
+        actorPtid: candidate.actorPtid,
+        username: candidate.username || follower?.username || '',
+        displayName: candidate.displayName || follower?.displayName || '',
+        avatarUrl: candidate.avatarUrl || follower?.avatarUrl || '',
+        federatedHandle: candidate.federatedHandle || follower?.federatedHandle || '',
+        homeStationDomain: candidate.homeStationDomain || follower?.homeStationDomain || '',
+        homeStationPeerId: candidate.homeStationPeerId || follower?.homeStationPeerId || '',
+      };
+    })
+    .sort((left, right) => left.actorPtid.localeCompare(right.actorPtid));
+}
+
+export function projectChatFriendContacts({
+  conversations,
+  friendRequests,
+  peerProfiles,
+  currentUserPtid,
+  federations,
+  stationNamesByPeerId = {},
+  stationNamesByActorPtid = {},
+}: ProjectChatFriendContactsInput): ChatFriendContactProjection[] {
+  const conversationsByPeer = new Map(
+    conversations
+      .filter((conversation) => conversation.kind === 'friend' && conversation.peerPtid)
+      .map((conversation) => [conversation.peerPtid as string, conversation] as const),
+  );
+  const acceptedRequestByPeer = new Map<string, FriendRequestData>();
+
+  for (const request of friendRequests) {
+    if (request.status !== 2) continue;
+    const peerPtid = request.senderPtid === currentUserPtid
+      ? request.receiverPtid
+      : request.receiverPtid === currentUserPtid
+        ? request.senderPtid
+        : '';
+    if (
+      peerPtid
+      && (
+        !acceptedRequestByPeer.has(peerPtid)
+        || friendRequestTime(request)
+          >= friendRequestTime(acceptedRequestByPeer.get(peerPtid)!)
+      )
+    ) {
+      acceptedRequestByPeer.set(peerPtid, request);
+    }
+  }
+
+  const defaultFederationId = singleFederationId(federations);
+  const federationNames = new Map(
+    federations.map((federation) => [
+      federation.federationId,
+      federation.name.trim(),
+    ]),
+  );
+
+  return [...acceptedRequestByPeer.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([actorPtid, request]) => {
+    const conversation = conversationsByPeer.get(actorPtid);
+    const profile = peerProfiles[actorPtid];
+    const profileHandle = profile ? remoteProfileHandle(profile) : '';
+    const federatedHandle = profileHandle;
+    const requestAvatar = request.senderPtid === actorPtid
+      ? request.senderAvatar
+      : request.receiverAvatar;
+    const requestDisplayName = request.senderPtid === actorPtid
+      ? request.senderDisplayName
+      : request.receiverDisplayName;
+    const homeStationDomain = profile?.home_station_domain?.trim()
+      || homeStationDomainFromHandle(federatedHandle);
+    const homeStationPeerId = profile?.home_station_peer_id?.trim()
+      || (request.senderPtid === actorPtid
+        ? request.senderHomeStationPeerId
+        : request.receiverHomeStationPeerId);
+    const federationId = conversation?.federationId
+      || request.federationId
+      || defaultFederationId;
+    const username = profile?.username?.trim()
+      || localPartFromHandle(federatedHandle);
+
+    return {
+      actorPtid,
+      ...(conversation ? { conversationId: conversation.id } : {}),
+      username,
+      displayName: actorDisplayName(profile?.display_name)
+        || actorDisplayName(requestDisplayName)
+        || actorDisplayName(username)
+        || actorDisplayName(conversation?.title)
+        || actorPtid,
+      // Canonical identity only: profile.avatar is the per-process projected
+      // station-resource token and rotates; request/conversation payloads stay
+      // raw Station media paths.
+      avatarUrl: (profile ? canonicalProfileAvatar(profile) : '')
+        || requestAvatar
+        || conversation?.avatar
+        || '',
+      federatedHandle,
+      homeStationDomain,
+      homeStationPeerId,
+      homeStationName: stationNamesByActorPtid[actorPtid]?.trim()
+        || stationNamesByPeerId[homeStationPeerId]?.trim()
+        || '',
+      federationId,
+      federationName: federationNames.get(federationId) || '',
+    };
+  });
+}
+
+export function projectChatFriendRequestPeers(
+  friendRequests: readonly FriendRequestData[],
+  currentUserPtid: string,
+): ChatFriendRequestPeerProjection[] {
+  const currentPtid = currentUserPtid.trim();
+  if (!currentPtid) return [];
+
+  const byPeer = new Map<string, {
+    peerPtid: string;
+    request: FriendRequestData;
+    direction: 'incoming' | 'outgoing';
+    attemptCount: number;
+    latestTime: number;
+    latestIndex: number;
+  }>();
+
+  friendRequests.forEach((request, index) => {
+    const outgoing = request.senderPtid === currentPtid;
+    const incoming = request.receiverPtid === currentPtid;
+    if (!outgoing && !incoming) return;
+    const peerPtid = outgoing ? request.receiverPtid : request.senderPtid;
+    if (!peerPtid) return;
+    const direction = outgoing ? 'outgoing' as const : 'incoming' as const;
+    const requestTime = friendRequestTime(request);
+    const current = byPeer.get(peerPtid);
+    if (!current) {
+      byPeer.set(peerPtid, {
+        peerPtid,
+        request,
+        direction,
+        attemptCount: 1,
+        latestTime: requestTime,
+        latestIndex: index,
+      });
+      return;
+    }
+
+    current.attemptCount += 1;
+    if (
+      requestTime > current.latestTime
+      || (requestTime === current.latestTime && index < current.latestIndex)
+    ) {
+      current.request = request;
+      current.direction = direction;
+      current.latestTime = requestTime;
+      current.latestIndex = index;
+    }
+  });
+
+  return [...byPeer.values()]
+    .sort((left, right) => (
+      right.latestTime - left.latestTime
+      || left.latestIndex - right.latestIndex
+      || left.peerPtid.localeCompare(right.peerPtid)
+    ))
+    .map(({ peerPtid, request, direction, attemptCount }) => ({
+      peerPtid,
+      request,
+      direction,
+      attemptCount,
+    }));
+}
+
+export function friendRequestTime(request: FriendRequestData): number {
+  return Date.parse(request.respondedAt || request.createdAt) || 0;
+}
+
+function localPartFromHandle(handle: string): string {
+  const value = handle.trim().replace(/^@/, '');
+  const separator = value.indexOf('@');
+  return separator >= 0 ? value.slice(0, separator) : value;
+}
+
+export function chatActorIdentityMetadata(
+  identity: Pick<
+    ChatActorIdentityProjection,
+    | 'federatedHandle'
+    | 'actorPtid'
+    | 'homeStationDomain'
+    | 'homeStationPeerId'
+    | 'homeStationName'
+    | 'federationId'
+    | 'federationName'
+  >,
+): string {
+  const { federation, station } = chatActorIdentityMetadataParts(identity);
+  return [federation, station].filter(Boolean).join(' · ')
+    || identity.actorPtid;
+}
+
+export function chatActorIdentityMetadataParts(
+  identity: Pick<
+    ChatActorIdentityProjection,
+    | 'federatedHandle'
+    | 'homeStationDomain'
+    | 'homeStationPeerId'
+    | 'homeStationName'
+    | 'federationId'
+    | 'federationName'
+  >,
+): ChatActorIdentityMetadataParts {
+  const federation = identity.federationName.trim()
+    || identity.federationId.trim();
+  // Only human station names are user-visible identity metadata. Raw
+  // endpoints (IP/host/domain) are routing details, never labels.
+  const stationCandidate = identity.homeStationName?.trim() || '';
+  const station = stationCandidate && !isRawStationAuthority(stationCandidate)
+    ? stationCandidate
+    : '';
+  return { federation, station };
+}
+
+function homeStationDomainFromHandle(handle: string): string {
+  const value = handle.trim().replace(/^@/, '');
+  const separator = value.indexOf('@');
+  return separator >= 0 ? value.slice(separator + 1) : '';
+}

@@ -1,0 +1,1104 @@
+#!/usr/bin/env python3
+"""Station-bound Mobile simulator proof for AS-04 and AS-10."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+from tooling.acceptance.core import (
+    AcceptanceGate,
+    ArtifactSession,
+    DriverError,
+    EphemeralCapabilityBlocked,
+    GateError,
+    REPO_ROOT,
+)
+from tooling.acceptance.core.redaction import redact_text
+from tooling.acceptance.gates.mobile.simulator_runtime_binding import (
+    MobileSimulatorBindingActivation,
+    MobileSimulatorBindingSelection,
+    MobileSimulatorRuntimeBinding,
+)
+
+
+GATE_ID = "mobile-simulator-station-lifecycle-e2e"
+ENVIRONMENT_ID = "mobile-station-lifecycle-simulator"
+IOS_CLIENT = "sim-ios"
+PEER_IOS_CLIENT = "sim-ios-peer"
+PRIMARY_BINDING = "station-primary"
+SECONDARY_BINDING = "station-secondary"
+SWITCH_COUNT = 10
+MIN_ROUTE_EXPIRY_WAIT_SECONDS = 310
+MAX_ROUTE_EXPIRY_WAIT_SECONDS = 360
+PROVEN_SCOPE = (
+    "AS-04 simulator valid-session restore and same-account multi-device coexistence",
+    (
+        "AS-10 simulator Station switching, generation fencing, "
+        "old-scope absence, and logout"
+    ),
+)
+ROUTE_EXPIRY_PROVEN_SCOPE = (
+    "expired-route same-session resume and secondary Station selection"
+)
+UNPROVEN_SCOPE = (
+    "Android runtime behavior",
+    "physical-device lifecycle behavior",
+    "physical Keychain or Keystore deletion failure",
+    "W4 command and draft recovery",
+    "W5 event-ingress projection convergence",
+    "physical MS-AG05",
+)
+
+
+class SimulatorStationLifecycleGate(AcceptanceGate):
+    gate_id = GATE_ID
+
+    def __init__(
+        self,
+        *,
+        binding_factory: Callable[[], MobileSimulatorRuntimeBinding] | None = None,
+        route_expiry_wait_seconds: int = 0,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        super().__init__()
+        if route_expiry_wait_seconds != 0 and not (
+            MIN_ROUTE_EXPIRY_WAIT_SECONDS
+            <= route_expiry_wait_seconds
+            <= MAX_ROUTE_EXPIRY_WAIT_SECONDS
+        ):
+            raise GateError("route expiry observation must wait 310-360 seconds")
+        self.binding_factory = (
+            binding_factory or MobileSimulatorRuntimeBinding.from_environment
+        )
+        self.route_expiry_wait_seconds = route_expiry_wait_seconds
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleep or time.sleep
+        self.events: list[dict[str, Any]] = []
+        self.cleanup: list[dict[str, Any]] = []
+        self._activated_clients: list[str] = []
+        self._product_cleaned: set[str] = set()
+
+    def run(self) -> dict[str, Any]:
+        raise GateError(
+            "SimulatorStationLifecycleGate uses its evidence-aware execute entrypoint"
+        )
+
+    def execute(self) -> int:
+        with ArtifactSession(repo_root=REPO_ROOT, gate_id=self.gate_id) as artifacts:
+            status = "FAIL"
+            completion_status = "PARTIAL"
+            proof_status = "UNPROVEN"
+            exit_code = 1
+            result = self._result_base(status)
+            binding: MobileSimulatorRuntimeBinding | None = None
+            try:
+                binding = self.binding_factory()
+                journey_result = self._run_journey(binding)
+                assertions = self._assertions_from_lifecycle_evidence(
+                    journey_result,
+                    result,
+                )
+                failed_assertions = [
+                    item["name"]
+                    for item in assertions
+                    if not item["passed"]
+                ]
+                if failed_assertions:
+                    raise GateError(
+                        "Mobile lifecycle evidence assertions failed: "
+                        + ", ".join(failed_assertions)
+                    )
+                journey_result["assertions"] = assertions
+                status = "PASS"
+                if self.route_expiry_wait_seconds:
+                    completion_status = "DONE"
+                    proof_status = "PROVEN"
+                exit_code = 0
+                result = self._result_base(status)
+                result.update(journey_result)
+            except EphemeralCapabilityBlocked as error:
+                status = "BLOCKED"
+                completion_status = "BLOCKED"
+                result.update(
+                    {
+                        "blockedReason": redact_text(error.reason),
+                        "blockedResource": error.resource,
+                    }
+                )
+                exit_code = 2
+            except (DriverError, GateError) as error:
+                result.update(
+                    {
+                        "reason": redact_text(str(error)),
+                        "errorType": type(error).__name__,
+                    }
+                )
+            except Exception as error:
+                result.update(
+                    {
+                        "reason": (
+                            "unexpected Mobile Station lifecycle Gate failure: "
+                            f"{type(error).__name__}"
+                        ),
+                        "errorType": type(error).__name__,
+                    }
+                )
+            finally:
+                cleanup_error = self._cleanup(binding)
+
+            if cleanup_error is not None:
+                journey_succeeded = exit_code == 0
+                status = "FAIL"
+                completion_status = "PARTIAL"
+                proof_status = "UNPROVEN"
+                exit_code = 1
+                result["cleanupReason"] = cleanup_error
+                if journey_succeeded:
+                    result["reason"] = cleanup_error
+            result.update(
+                {
+                    "status": status,
+                    "completionStatus": completion_status,
+                    "proofStatus": proof_status,
+                    "cleanup": list(self.cleanup),
+                }
+            )
+            artifacts.write_json(
+                "mobile-station-lifecycle/events.json",
+                {
+                    "artifactKind": "mobile-station-lifecycle-events",
+                    "gateId": self.gate_id,
+                    "events": list(self.events),
+                },
+                role="mobile-station-lifecycle-events",
+            )
+            artifacts.write_json(
+                "mobile-station-lifecycle/result.json",
+                result,
+                role="mobile-station-lifecycle-result",
+            )
+            artifacts.complete(
+                status=status,
+                completion_status=completion_status,
+                proof_status=proof_status,
+                runtime={
+                    "environment": ENVIRONMENT_ID,
+                    "runtimeCell": "dual-ios-simulator",
+                    "physicalDeviceClaimed": False,
+                    "declaredScenarios": ["AS-04", "AS-10"],
+                },
+            )
+
+        stream = sys.stdout if exit_code == 0 else sys.stderr
+        stream.write(f"{status}: {self.gate_id}\n")
+        return exit_code
+
+    def _run_journey(
+        self,
+        binding: MobileSimulatorRuntimeBinding,
+    ) -> dict[str, Any]:
+        ios_primary = self._launch(
+            binding,
+            IOS_CLIENT,
+        )
+        self._require_launch_bindings(
+            ios_primary,
+            active_binding_role=PRIMARY_BINDING,
+            required_binding_roles={PRIMARY_BINDING, SECONDARY_BINDING},
+        )
+        alice_ptid = self._authenticate(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=str(
+                ios_primary.scope["activeStationPeerId"]
+            ),
+        )
+        ios_authenticated = self._wait_for_authenticated_scope(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=str(
+                ios_primary.scope["activeStationPeerId"]
+            ),
+            expected_actor_ptid=alice_ptid,
+        )
+
+        expiry_wait = self.route_expiry_wait_seconds
+        if expiry_wait:
+            binding.call_action(IOS_CLIENT, "lifecycle.suspend")
+            deadline = self._monotonic() + expiry_wait
+            while True:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    break
+                self._sleep(min(0.25, remaining))
+            binding.call_action(IOS_CLIENT, "lifecycle.resume")
+            renewed_scope = self._wait_for_authenticated_scope(
+                binding,
+                IOS_CLIENT,
+                expected_station_peer_id=str(
+                    ios_primary.scope["activeStationPeerId"]
+                ),
+                expected_actor_ptid=alice_ptid,
+            )
+            self._record(
+                "expired-route-resumed-with-same-session",
+                IOS_CLIENT, generation=int(renewed_scope["generation"]),
+                waitSeconds=expiry_wait,
+            )
+
+        restart_result = binding.call_action(
+            IOS_CLIENT,
+            "lifecycle.restart",
+        )
+        if restart_result != {"requested": True, "scope": "webview"}:
+            raise GateError("iOS lifecycle.restart response is invalid")
+        restored_scope = self._wait_for_authenticated_scope(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=str(
+                ios_primary.scope["activeStationPeerId"]
+            ),
+            expected_actor_ptid=alice_ptid,
+            minimum_generation=int(ios_authenticated["generation"]),
+        )
+        self._record(
+            "valid-session-restored",
+            IOS_CLIENT,
+            generation=int(restored_scope["generation"]),
+        )
+
+        peer_primary = self._launch(
+            binding,
+            PEER_IOS_CLIENT,
+        )
+        self._require_launch_bindings(
+            peer_primary,
+            active_binding_role=PRIMARY_BINDING,
+            required_binding_roles={PRIMARY_BINDING},
+        )
+        peer_alice_ptid = self._authenticate(
+            binding,
+            PEER_IOS_CLIENT,
+            expected_station_peer_id=str(
+                peer_primary.scope["activeStationPeerId"]
+            ),
+        )
+        if peer_alice_ptid != alice_ptid:
+            raise GateError(
+                "same-account peer iOS login resolved a different Alice PTID"
+            )
+        # SAL-D12: the peer is a distinct installation. A same-account login on
+        # another device occupies its own (Station, Actor, device_id) slot and
+        # must coexist with the primary session rather than evict it.
+        primary_station_peer_id = str(
+            ios_primary.scope["activeStationPeerId"]
+        )
+        primary_coexistence_scope = self._wait_for_authenticated_scope(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=primary_station_peer_id,
+            expected_actor_ptid=alice_ptid,
+        )
+        peer_coexistence_scope = self._wait_for_authenticated_scope(
+            binding,
+            PEER_IOS_CLIENT,
+            expected_station_peer_id=primary_station_peer_id,
+            expected_actor_ptid=peer_alice_ptid,
+        )
+        primary_device_id = primary_coexistence_scope.get("deviceId")
+        peer_device_id = peer_coexistence_scope.get("deviceId")
+        if (
+            not isinstance(primary_device_id, str)
+            or not isinstance(peer_device_id, str)
+            or primary_device_id == peer_device_id
+        ):
+            raise GateError(
+                "same-account simulator clients must present distinct device ids"
+            )
+        self._record(
+            "same-account-multi-device-coexistence",
+            PEER_IOS_CLIENT,
+            primaryDeviceId=primary_device_id,
+            peerDeviceId=peer_device_id,
+        )
+
+        # Foreground suspend/resume revalidates the primary session. The peer
+        # login did not revoke it, so the primary must remain authenticated
+        # instead of being cleared to the Access Gate, and the peer stays live.
+        binding.call_action(IOS_CLIENT, "lifecycle.suspend")
+        binding.call_action(IOS_CLIENT, "lifecycle.resume")
+        resumed_primary_scope = self._wait_for_authenticated_scope(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=primary_station_peer_id,
+            expected_actor_ptid=alice_ptid,
+        )
+        self._wait_for_authenticated_scope(
+            binding,
+            PEER_IOS_CLIENT,
+            expected_station_peer_id=primary_station_peer_id,
+            expected_actor_ptid=peer_alice_ptid,
+        )
+        self._record(
+            "same-account-session-preserved-after-resume",
+            IOS_CLIENT,
+            generation=int(resumed_primary_scope["generation"]),
+        )
+
+        ios_secondary = self._select(
+            binding,
+            IOS_CLIENT,
+            SECONDARY_BINDING,
+        )
+        if ios_secondary.remote_revocation != "confirmed":
+            raise GateError(
+                "active primary session switch did not confirm remote revocation"
+            )
+        self._assert_cleared_scope(
+            ios_secondary.scope,
+            expected_station_peer_id=str(
+                ios_secondary.scope["activeStationPeerId"]
+            ),
+        )
+        if int(ios_secondary.scope["generation"]) <= int(
+            resumed_primary_scope["generation"]
+        ):
+            raise GateError(
+                "secondary Station binding did not advance generation"
+            )
+        secondary_alice_ptid = self._authenticate(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=str(
+                ios_secondary.scope["activeStationPeerId"]
+            ),
+        )
+        if expiry_wait:
+            self._record(
+                "expired-secondary-route-selected",
+                IOS_CLIENT,
+                bindingRole=SECONDARY_BINDING,
+                generation=int(ios_secondary.scope["generation"]),
+                waitSeconds=expiry_wait,
+            )
+        current_scope = self._wait_for_authenticated_scope(
+            binding,
+            IOS_CLIENT,
+            expected_station_peer_id=str(
+                ios_secondary.scope["activeStationPeerId"]
+            ),
+            expected_actor_ptid=secondary_alice_ptid,
+        )
+
+        switch_evidence: list[dict[str, Any]] = []
+        launch_generation = ios_primary.launch_generation
+        for index in range(SWITCH_COUNT):
+            binding_role = (
+                PRIMARY_BINDING
+                if index % 2 == 0
+                else SECONDARY_BINDING
+            )
+            previous_generation = int(current_scope["generation"])
+            activation = self._select(
+                binding,
+                IOS_CLIENT,
+                binding_role,
+            )
+            if activation.launch_generation != launch_generation:
+                raise GateError(
+                    "Station selection changed the Runtime Binding launch generation"
+                )
+            if activation.remote_revocation != "confirmed":
+                raise GateError(
+                    "Station switch did not confirm remote session revocation: "
+                    f"{activation.remote_revocation}"
+                )
+            if int(activation.scope["generation"]) <= previous_generation:
+                raise GateError(
+                    "Station switch did not advance lifecycle generation"
+                )
+            station_peer_id = str(
+                activation.scope["activeStationPeerId"]
+            )
+            self._assert_cleared_scope(
+                activation.scope,
+                expected_station_peer_id=station_peer_id,
+            )
+            self._authenticate(
+                binding,
+                IOS_CLIENT,
+                expected_station_peer_id=station_peer_id,
+                expected_actor_ptid=(
+                    alice_ptid
+                    if binding_role == PRIMARY_BINDING
+                    else secondary_alice_ptid
+                ),
+            )
+            current_scope = self._wait_for_authenticated_scope(
+                binding,
+                IOS_CLIENT,
+                expected_station_peer_id=station_peer_id,
+                expected_actor_ptid=(
+                    alice_ptid
+                    if binding_role == PRIMARY_BINDING
+                    else secondary_alice_ptid
+                ),
+            )
+            switch_evidence.append(
+                {
+                    "ordinal": index + 1,
+                    "bindingRole": binding_role,
+                    "launchGeneration": activation.launch_generation,
+                    "lifecycleGeneration": int(
+                        activation.scope["generation"]
+                    ),
+                    "bindingProof": activation.binding_proof.to_dict(),
+                    "remoteRevocation": activation.remote_revocation,
+                    "oldScopeAbsent": True,
+                    "authenticated": True,
+                }
+            )
+
+        logout_result = _mapping(
+            binding.call_action(IOS_CLIENT, "session.logout"),
+            "iOS logout",
+        )
+        logout = _mapping(
+            logout_result.get("logout"),
+            "iOS logout revocation",
+        )
+        if logout.get("remoteRevocation") != "confirmed":
+            raise GateError(
+                "logout did not confirm Station session revocation"
+            )
+        logout_scope = self._wait_for_scope(
+            binding,
+            IOS_CLIENT,
+            self._scope_is_cleared,
+        )
+        self._assert_cleared_scope(
+            logout_scope,
+            expected_station_peer_id=str(
+                current_scope["activeStationPeerId"]
+            ),
+            require_access_gate=True,
+        )
+        if int(logout_scope["generation"]) <= int(
+            current_scope["generation"]
+        ):
+            raise GateError("logout did not advance lifecycle generation")
+        self._record(
+            "logout-cleared",
+            IOS_CLIENT,
+            generation=int(logout_scope["generation"]),
+        )
+
+        for client_id in (PEER_IOS_CLIENT, IOS_CLIENT):
+            cleanup_result = binding.call_action(client_id, "cleanup")
+            if not isinstance(cleanup_result, Mapping):
+                raise GateError(
+                    f"{client_id} cleanup response is invalid"
+                )
+            self._product_cleaned.add(client_id)
+            self.cleanup.append(
+                {
+                    "clientId": client_id,
+                    "resource": "product-harness",
+                    "status": "passed",
+                }
+            )
+
+        result = {
+            "routeExpiry": (
+                {
+                    "waitSeconds": expiry_wait,
+                    "sameSessionResumed": True,
+                    "secondaryBindingSelected": True,
+                }
+                if expiry_wait
+                else None
+            ),
+            "restored": {
+                "clientId": IOS_CLIENT,
+                "generationAdvanced": True,
+                "actorIdentityMatched": True,
+                "bindingProof": ios_primary.binding_proofs[
+                    PRIMARY_BINDING
+                ].to_dict(),
+            },
+            "secondaryBinding": {
+                "clientId": IOS_CLIENT,
+                "bindingRole": SECONDARY_BINDING,
+                "bindingProof": ios_secondary.binding_proof.to_dict(),
+            },
+            "switches": switch_evidence,
+            "logout": {
+                "generationAdvanced": True,
+                "remoteRevocationConfirmed": True,
+                "authCleared": True,
+                "accessGateVisible": True,
+                "oldScopeAbsent": True,
+            },
+            "coexistence": {
+                "primaryClientId": IOS_CLIENT,
+                "peerClientId": PEER_IOS_CLIENT,
+                "distinctDeviceIds": True,
+                "primaryRemainedAuthenticated": True,
+                "peerRemainedAuthenticated": True,
+                "bindingProof": peer_primary.binding_proofs[
+                    PRIMARY_BINDING
+                ].to_dict(),
+            },
+        }
+        return result
+
+    def _launch(
+        self,
+        binding: MobileSimulatorRuntimeBinding,
+        client_id: str,
+    ) -> MobileSimulatorBindingActivation:
+        activation = binding.create_bound_session(client_id)
+        if client_id not in self._activated_clients:
+            self._activated_clients.append(client_id)
+        self._record(
+            "client-launched",
+            client_id,
+            launchGeneration=activation.launch_generation,
+            lifecycleGeneration=int(activation.scope["generation"]),
+            activeBindingRole=activation.active_binding_role,
+            bindingProofs={
+                role: proof.to_dict()
+                for role, proof in activation.binding_proofs.items()
+            },
+        )
+        return activation
+
+    def _select(
+        self,
+        binding: MobileSimulatorRuntimeBinding,
+        client_id: str,
+        binding_role: str,
+    ) -> MobileSimulatorBindingSelection:
+        selection = binding.select_binding(client_id, binding_role)
+        self._record(
+            "binding-selected",
+            client_id,
+            bindingRole=binding_role,
+            launchGeneration=selection.launch_generation,
+            lifecycleGeneration=int(selection.scope["generation"]),
+            bindingProof=selection.binding_proof.to_dict(),
+            remoteRevocation=selection.remote_revocation,
+        )
+        return selection
+
+    @staticmethod
+    def _require_launch_bindings(
+        activation: MobileSimulatorBindingActivation,
+        *,
+        active_binding_role: str,
+        required_binding_roles: set[str],
+    ) -> None:
+        if (
+            activation.active_binding_role != active_binding_role
+            or set(activation.binding_proofs) != required_binding_roles
+        ):
+            raise GateError(
+                "Mobile Runtime Binding launch proof closure is incomplete"
+            )
+
+    def _authenticate(
+        self,
+        binding: MobileSimulatorRuntimeBinding,
+        client_id: str,
+        *,
+        expected_station_peer_id: str,
+        expected_actor_ptid: str | None = None,
+    ) -> str:
+        fixture_authentication = _mapping(
+            binding.authenticate_fixture_actor(client_id),
+            f"{client_id} Fixture authentication",
+        )
+        gate_scope = _mapping(
+            fixture_authentication.get("preAuthenticationScope"),
+            f"{client_id} pre-authentication scope",
+        )
+        self._assert_cleared_scope(
+            gate_scope,
+            expected_station_peer_id=expected_station_peer_id,
+            require_access_gate=True,
+        )
+        authenticated = _mapping(
+            fixture_authentication.get("login"),
+            f"{client_id} login",
+        )
+        session = _mapping(
+            authenticated.get("session"),
+            f"{client_id} login session",
+        )
+        actor_ptid = session.get("actorPtid")
+        station_peer_id = session.get("stationPeerId")
+        if (
+            not isinstance(actor_ptid, str)
+            or not actor_ptid.startswith("ptid:")
+            or station_peer_id != expected_station_peer_id
+        ):
+            raise GateError(
+                f"{client_id} login returned the wrong actor or Station scope"
+            )
+        if expected_actor_ptid is not None and actor_ptid != expected_actor_ptid:
+            raise GateError(
+                f"{client_id} login did not preserve Alice identity"
+            )
+        self._wait_for_runtime_readiness(binding, client_id)
+        self._record(
+            "authenticated",
+            client_id,
+            actorIdentityMatched=True,
+        )
+        return actor_ptid
+
+    @staticmethod
+    def _wait_for_runtime_readiness(
+        binding: MobileSimulatorRuntimeBinding,
+        client_id: str,
+    ) -> None:
+        readiness = _mapping(
+            binding.call_action(
+                client_id,
+                "lifecycle.waitReady",
+                {"includeDiagnostics": True},
+            ),
+            f"{client_id} lifecycle readiness",
+        )
+        runtimes = readiness.get("runtimes")
+        if (
+            readiness.get("phase") != "ACTIVE"
+            or not isinstance(runtimes, list)
+            or not all(
+                isinstance(runtime, Mapping)
+                and runtime.get("status") == "ready"
+                for runtime in runtimes
+            )
+        ):
+            raise GateError(f"{client_id} runtime graph is not ready")
+
+    def _wait_for_scope(
+        self,
+        binding: MobileSimulatorRuntimeBinding,
+        client_id: str,
+        predicate: Callable[[Mapping[str, Any]], bool],
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        latest: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            value = binding.call_action(
+                client_id,
+                "lifecycle.scope.read",
+            )
+            if not isinstance(value, dict):
+                raise GateError(
+                    f"{client_id} lifecycle scope response is invalid"
+                )
+            latest = value
+            if predicate(value):
+                return value
+            time.sleep(0.25)
+        raise GateError(
+            f"{client_id} lifecycle scope did not converge: "
+            f"launchState={latest.get('launchState') if latest else None!r}"
+        )
+
+    def _wait_for_authenticated_scope(
+        self,
+        binding: MobileSimulatorRuntimeBinding,
+        client_id: str,
+        *,
+        expected_station_peer_id: str,
+        expected_actor_ptid: str,
+        minimum_generation: int | None = None,
+    ) -> dict[str, Any]:
+        scope = self._wait_for_scope(
+            binding,
+            client_id,
+            lambda value: (
+                self._scope_is_authenticated(
+                    value,
+                    expected_station_peer_id=expected_station_peer_id,
+                    expected_actor_ptid=expected_actor_ptid,
+                )
+                and (
+                    minimum_generation is None
+                    or int(value["generation"]) > minimum_generation
+                )
+            ),
+        )
+        self._assert_authenticated_scope(
+            scope,
+            expected_station_peer_id=expected_station_peer_id,
+            expected_actor_ptid=expected_actor_ptid,
+        )
+        return scope
+
+    @staticmethod
+    def _assert_authenticated_scope(
+        scope: Mapping[str, Any],
+        *,
+        expected_station_peer_id: str,
+        expected_actor_ptid: str,
+    ) -> None:
+        if not SimulatorStationLifecycleGate._scope_is_authenticated(
+            scope,
+            expected_station_peer_id=expected_station_peer_id,
+            expected_actor_ptid=expected_actor_ptid,
+        ):
+            raise GateError(
+                "Mobile authenticated lifecycle scope is inconsistent"
+            )
+
+    @staticmethod
+    def _scope_is_authenticated(
+        scope: Mapping[str, Any],
+        *,
+        expected_station_peer_id: str,
+        expected_actor_ptid: str,
+    ) -> bool:
+        return (
+            scope.get("launchState") == "shell"
+            and scope.get("activeStationPeerId") == expected_station_peer_id
+            and scope.get("runtimeStationPeerId")
+            == expected_station_peer_id
+            and scope.get("activeActorPtid") == expected_actor_ptid
+        )
+
+    @classmethod
+    def _assert_cleared_scope(
+        cls,
+        scope: Mapping[str, Any],
+        *,
+        expected_station_peer_id: str,
+        require_access_gate: bool = False,
+    ) -> None:
+        if scope.get("activeStationPeerId") != expected_station_peer_id:
+            raise GateError("Mobile cleared scope changed Station identity")
+        if require_access_gate and scope.get("launchState") != (
+            "access-gate-chain"
+        ):
+            raise GateError("Mobile cleared scope did not expose Access Gate")
+        if not cls._scope_is_cleared(scope):
+            raise GateError("Mobile old actor scope remains visible")
+
+    @staticmethod
+    def _scope_is_cleared(scope: Mapping[str, Any]) -> bool:
+        social = scope.get("social")
+        group = scope.get("group")
+        navigation = scope.get("navigation")
+        return (
+            scope.get("activeActorPtid") is None
+            and scope.get("runtimeStationPeerId") is None
+            and isinstance(social, Mapping)
+            and social.get("stationPeerId") is None
+            and social.get("actorPtid") is None
+            and social.get("sessionCount") == 0
+            and social.get("requestCount") == 0
+            and social.get("messageThreadCount") == 0
+            and isinstance(group, Mapping)
+            and group.get("stationPeerId") is None
+            and group.get("actorPtid") is None
+            and group.get("groupCount") == 0
+            and group.get("messageThreadCount") == 0
+            and isinstance(navigation, Mapping)
+            and navigation.get("detailKeys") == []
+            and navigation.get("overlayRouteId") is None
+        )
+
+    def _cleanup(
+        self,
+        binding: MobileSimulatorRuntimeBinding | None,
+    ) -> str | None:
+        if binding is None:
+            return None
+        failures: list[str] = []
+        for client_id in reversed(tuple(self._activated_clients)):
+            if client_id in self._product_cleaned:
+                continue
+            try:
+                result = binding.call_action(client_id, "cleanup")
+                if not isinstance(result, Mapping):
+                    raise GateError("cleanup response is invalid")
+            except Exception as error:
+                failures.append(
+                    f"{client_id} product cleanup: {type(error).__name__}"
+                )
+                self.cleanup.append(
+                    {
+                        "clientId": client_id,
+                        "resource": "product-harness",
+                        "status": "failed",
+                        "errorType": type(error).__name__,
+                    }
+                )
+            else:
+                self.cleanup.append(
+                    {
+                        "clientId": client_id,
+                        "resource": "product-harness",
+                        "status": "passed",
+                    }
+                )
+        try:
+            stopped = binding.close()
+        except Exception as error:
+            failures.append(
+                f"Runtime Binding cleanup: {type(error).__name__}"
+            )
+            self.cleanup.append(
+                {
+                    "resource": "runtime-binding",
+                    "status": "failed",
+                    "errorType": type(error).__name__,
+                }
+            )
+        else:
+            self.cleanup.append(
+                {
+                    "resource": "runtime-binding",
+                    "status": "passed",
+                    "stoppedClients": list(stopped),
+                }
+            )
+        return "; ".join(failures) if failures else None
+
+    def _assertions_from_lifecycle_evidence(
+        self,
+        journey: Mapping[str, Any],
+        report_base: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Build explicit, evidence-derived assertions for the proof contract.
+
+        Each predicate restates an observation already enforced while the
+        lifecycle journey ran (valid-session restore, SAL-D12 multi-device
+        coexistence on distinct device ids, resume revalidation preserving the
+        primary, confirmed device-scoped revocation on every Station switch with
+        monotonic generations, logout teardown, closed binding proofs). Core
+        proof never accepts the PASS label alone, so a missing observation
+        surfaces as ``passed: False`` and the caller fails closed before sealing
+        the report.
+        """
+        events_by_name: dict[str, list[dict[str, Any]]] = {}
+        for event in self.events:
+            events_by_name.setdefault(
+                str(event.get("event")),
+                [],
+            ).append(event)
+
+        def has_event(name: str) -> bool:
+            return bool(events_by_name.get(name))
+
+        coexistence_events = events_by_name.get(
+            "same-account-multi-device-coexistence",
+            [],
+        )
+        coexistence = (
+            coexistence_events[0] if coexistence_events else {}
+        )
+        distinct_device_ids = (
+            isinstance(coexistence.get("primaryDeviceId"), str)
+            and isinstance(coexistence.get("peerDeviceId"), str)
+            and bool(coexistence.get("primaryDeviceId"))
+            and coexistence.get("primaryDeviceId")
+            != coexistence.get("peerDeviceId")
+        )
+
+        switch_events = events_by_name.get("binding-selected", [])[
+            -SWITCH_COUNT:
+        ]
+        switch_generations = [
+            int(event["lifecycleGeneration"])
+            for event in switch_events
+            if isinstance(event.get("lifecycleGeneration"), int)
+        ]
+        monotonic_generations = (
+            len(switch_generations) == SWITCH_COUNT
+            and all(
+                later > earlier
+                for earlier, later in zip(
+                    switch_generations,
+                    switch_generations[1:],
+                )
+            )
+        )
+        switches = journey.get("switches")
+        binding_proofs_closed = (
+            isinstance(switches, list)
+            and len(switches) == SWITCH_COUNT
+            and all(
+                isinstance(item, Mapping)
+                and isinstance(item.get("bindingProof"), Mapping)
+                and bool(item.get("bindingProof"))
+                and item.get("remoteRevocation") == "confirmed"
+                for item in switches
+            )
+        )
+
+        assertions: list[dict[str, Any]] = [
+            {
+                "name": "lifecycle:valid-session-restored-after-restart",
+                "passed": has_event("valid-session-restored"),
+            },
+            {
+                "name": (
+                    "lifecycle:same-account-multi-device-coexistence-"
+                    "distinct-device-ids"
+                ),
+                "passed": has_event(
+                    "same-account-multi-device-coexistence"
+                )
+                and distinct_device_ids,
+            },
+            {
+                "name": (
+                    "lifecycle:primary-session-preserved-through-resume-"
+                    "revalidation"
+                ),
+                "passed": has_event(
+                    "same-account-session-preserved-after-resume"
+                ),
+            },
+            {
+                "name": (
+                    "lifecycle:station-switch-remote-revocation-confirmed"
+                ),
+                "passed": len(switch_events) == SWITCH_COUNT
+                and all(
+                    event.get("remoteRevocation") == "confirmed"
+                    for event in switch_events
+                ),
+            },
+            {
+                "name": "lifecycle:switch-generations-strictly-monotonic",
+                "passed": monotonic_generations,
+            },
+            {
+                "name": "lifecycle:binding-proof-closure-on-every-switch",
+                "passed": binding_proofs_closed,
+            },
+            {
+                "name": "lifecycle:logout-cleared-session-and-scope",
+                "passed": has_event("logout-cleared"),
+            },
+            {
+                "name": "lifecycle:production-actions-without-station-mocks",
+                "passed": report_base.get("stationMocksUsed") is False,
+            },
+            {
+                "name": "lifecycle:simulator-does-not-claim-physical-device",
+                "passed": report_base.get("physicalDeviceClaimed") is False,
+            },
+        ]
+        if self.route_expiry_wait_seconds:
+            assertions.append(
+                {
+                    "name": (
+                        "lifecycle:expired-route-same-session-resumed"
+                    ),
+                    "passed": has_event(
+                        "expired-route-resumed-with-same-session"
+                    ),
+                }
+            )
+        return assertions
+
+    def _result_base(self, status: str) -> dict[str, Any]:
+        observed_scope = list(PROVEN_SCOPE)
+        unproven_scope = list(UNPROVEN_SCOPE)
+        if self.route_expiry_wait_seconds:
+            observed_scope.append(ROUTE_EXPIRY_PROVEN_SCOPE)
+        else:
+            unproven_scope.append(ROUTE_EXPIRY_PROVEN_SCOPE)
+        return {
+            "artifactKind": "acceptance-gate-evidence-report",
+            "gateId": self.gate_id,
+            "gate": self.gate_id,
+            "environment": ENVIRONMENT_ID,
+            "runtimeCell": "dual-ios-simulator",
+            "status": status,
+            "completionStatus": "PARTIAL",
+            "proofStatus": "UNPROVEN",
+            "phase": "W3 Station Lifecycle",
+            "bom": ["W3", "W6D", "W9-C"],
+            "spec": ["AS-04", "AS-10", "MS-AG02", "MS-AG05"],
+            "observedScope": observed_scope if status == "PASS" else [],
+            "unprovenScope": unproven_scope,
+            "physicalDeviceClaimed": False,
+            "stationMocksUsed": False,
+            "switchCount": SWITCH_COUNT,
+            "routeExpiryWaitSeconds": self.route_expiry_wait_seconds,
+            "sampleEmissionAllowed": status == "PASS",
+        }
+
+    def _record(
+        self,
+        event: str,
+        client_id: str,
+        **detail: Any,
+    ) -> None:
+        self.events.append(
+            {
+                "event": event,
+                "clientId": client_id,
+                "atUnixMs": int(time.time() * 1000),
+                **detail,
+            }
+        )
+
+
+def _mapping(value: object, label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise GateError(f"{label} response is invalid")
+    return dict(value)
+
+
+def _parse_route_expiry_wait_seconds(value: str) -> int:
+    try:
+        wait_seconds = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "route expiry wait must be an integer"
+        ) from error
+    if wait_seconds == 0 or (
+        MIN_ROUTE_EXPIRY_WAIT_SECONDS
+        <= wait_seconds
+        <= MAX_ROUTE_EXPIRY_WAIT_SECONDS
+    ):
+        return wait_seconds
+    raise argparse.ArgumentTypeError(
+        "route expiry wait must be 0 or 310-360 seconds"
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--route-expiry-wait-seconds",
+        type=_parse_route_expiry_wait_seconds,
+        default=0,
+        help=(
+            "wait 310-360 seconds before resume and secondary Station "
+            "selection; 0 skips the expiry observation"
+        ),
+    )
+    args = parser.parse_args(argv)
+    return SimulatorStationLifecycleGate(
+        route_expiry_wait_seconds=args.route_expiry_wait_seconds,
+    ).execute()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,414 @@
+import { identityRuntime } from '../../kernel/identityRuntime';
+import { invoke } from '@tauri-apps/api/core';
+import { runIdentityPipeline } from '../../services/identityPipeline';
+import { sessionIdentityScope } from '../../kernel/sessionIdentity';
+import { markLocalIdentityAction } from '../../services/identity_event';
+import {
+  api,
+  type AuthSessionResponse,
+  type MessagingAcceptanceInteractionSnapshot,
+  type MessagingAcceptancePreparedCommand,
+  type MessagingAcceptanceRestorableCommand,
+  type RustCommandResult,
+} from '../../services/desktop_api';
+import {
+  type MemberSettingsResult,
+  type MessagingConversationProjection,
+  type MessagingProjection,
+} from '../../services/im-service-contract';
+import { imServiceV1 } from '../../services/im-service';
+import { useSessionStore } from '../../store/session';
+import type { DesktopServiceMessage } from '../../store/socialProjection';
+import { requireCanonicalAcceptancePtid } from './identity';
+
+export type { MessagingAcceptanceInteractionSnapshot } from '../../services/desktop_api';
+
+async function readNativeAttachmentEvidence(attachmentId: string): Promise<string> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const result = await invoke<RustCommandResult<{ state: string; localPath: string }>>(
+      'messaging_acceptance_attachment_readback',
+      { input: { attachment_id: attachmentId } },
+    );
+    if (!result.ok) throw new Error('acceptance.chat.attachmentReadbackFailed');
+    if (result.data?.state === 'ready' && result.data.localPath) return result.data.localPath;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error('acceptance.chat.attachmentReadbackTimeout');
+}
+
+export interface NativeAcceptanceActorInput {
+  actorPtid: string;
+}
+
+export interface NativeAcceptanceInteractionSnapshotInput
+  extends NativeAcceptanceActorInput {
+  conversationId: string;
+  messageId: string;
+  commandId?: string;
+}
+
+export interface NativeAcceptanceConversationInput
+  extends NativeAcceptanceActorInput {
+  conversationId: string;
+}
+
+export interface NativeAcceptanceSubmittedCommandInput
+  extends NativeAcceptanceActorInput {
+  conversationId: string;
+  messageId: string;
+  commandId: string;
+}
+
+export interface NativeAcceptanceRestorableCommandInput
+  extends NativeAcceptanceActorInput {
+  conversationId: string;
+  plaintext: string;
+}
+
+export interface NativeAcceptanceStorageSeedInput
+  extends NativeAcceptanceActorInput {
+  stationPeerId: string;
+  plaintextBytes: number;
+}
+
+export interface NativeAcceptanceAttachmentInput
+  extends NativeAcceptanceActorInput {
+  attachmentId: string;
+}
+
+export interface NativeAcceptanceIdentityState {
+  phase: string;
+  reason: string;
+  authenticated: boolean;
+  actorPtid: string;
+}
+
+export interface NativeAcceptanceLogoutResult {
+  actorPtid: string;
+  status: string;
+}
+
+interface NativeAcceptanceBridgeDependencies {
+  activeActorPtid(): string | null;
+  markLocalIdentityAction(): void;
+  logoutWindowSession(actorPtid: string): Promise<AuthSessionResponse>;
+  completeLogoutLifecycle(): Promise<void>;
+  readInteractionSnapshot(
+    input: NativeAcceptanceInteractionSnapshotInput,
+  ): Promise<MessagingAcceptanceInteractionSnapshot>;
+  prepareSubmittedCommand(
+    input: NativeAcceptanceSubmittedCommandInput,
+  ): Promise<MessagingAcceptancePreparedCommand>;
+  createRestorableCommand(
+    input: NativeAcceptanceRestorableCommandInput,
+  ): Promise<MessagingAcceptanceRestorableCommand>;
+  seedConversationClear?(
+    input: NativeAcceptanceStorageSeedInput,
+  ): Promise<{
+    actorPtid: string;
+    conversationId: string;
+    messageId: string;
+  }>;
+  resumeMessagingLifecycle(actorPtid: string): Promise<{
+    actorPtid: string;
+    activated: boolean;
+  }>;
+  readMessages(conversationId: string): Promise<MessagingProjection[]>;
+  readServiceMessages(conversationId: string): Promise<DesktopServiceMessage[]>;
+  readConversations(): Promise<MessagingConversationProjection[]>;
+  readMemberSettings(conversationId: string): Promise<MemberSettingsResult>;
+  openAttachment(attachmentId: string): Promise<string>;
+  identityState(): NativeAcceptanceIdentityState;
+}
+
+export interface NativeAcceptanceBridge {
+  logout(
+    input: NativeAcceptanceActorInput,
+  ): Promise<NativeAcceptanceLogoutResult>;
+  engineInteractionSnapshot(
+    input: NativeAcceptanceInteractionSnapshotInput,
+  ): Promise<MessagingAcceptanceInteractionSnapshot>;
+  prepareSubmittedCommand(
+    input: NativeAcceptanceSubmittedCommandInput,
+  ): Promise<MessagingAcceptancePreparedCommand>;
+  createRestorableCommand(
+    input: NativeAcceptanceRestorableCommandInput,
+  ): Promise<MessagingAcceptanceRestorableCommand>;
+  seedConversationClear(
+    input: NativeAcceptanceStorageSeedInput,
+  ): Promise<{
+    actorPtid: string;
+    conversationId: string;
+    messageId: string;
+  }>;
+  resumeMessagingLifecycle(
+    input: NativeAcceptanceActorInput,
+  ): Promise<{ actorPtid: string; activated: boolean }>;
+  engineMessages(
+    input: NativeAcceptanceConversationInput,
+  ): Promise<{ messages: MessagingProjection[] }>;
+  engineServiceMessages(
+    input: NativeAcceptanceConversationInput,
+  ): Promise<{ messages: DesktopServiceMessage[] }>;
+  engineConversations(
+    input: NativeAcceptanceActorInput,
+  ): Promise<{ conversations: MessagingConversationProjection[] }>;
+  conversationMemberSettings(
+    input: NativeAcceptanceConversationInput,
+  ): Promise<{ settings: MemberSettingsResult }>;
+  openAttachment(
+    input: NativeAcceptanceAttachmentInput,
+  ): Promise<{ localPath: string }>;
+  identityState(): Promise<NativeAcceptanceIdentityState>;
+}
+
+function requireMatchingActor(
+  expectedActorPtid: string,
+  activeActorPtid: string | null,
+): string {
+  const expected = requireCanonicalAcceptancePtid(expectedActorPtid);
+  const active = requireCanonicalAcceptancePtid(activeActorPtid);
+  if (expected !== active) {
+    throw new Error('acceptance.chat.actorPtidMismatch');
+  }
+  return expected;
+}
+
+function requireEvidenceIdentity(value: string, errorKey: string): string {
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new Error(errorKey);
+  }
+  return normalized;
+}
+
+export function createNativeAcceptanceBridge(
+  dependencies: NativeAcceptanceBridgeDependencies,
+): NativeAcceptanceBridge {
+  return {
+    async logout(input) {
+      const actorPtid = requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      dependencies.markLocalIdentityAction();
+      const response = await dependencies.logoutWindowSession(actorPtid);
+      if (response.actor_ptid !== null) {
+        throw new Error('acceptance.chat.logoutRetainedActor');
+      }
+      await dependencies.completeLogoutLifecycle();
+      return {
+        actorPtid,
+        status: response.status,
+      };
+    },
+
+    async engineInteractionSnapshot(input) {
+      const actorPtid = requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      return dependencies.readInteractionSnapshot({
+        actorPtid,
+        conversationId: requireEvidenceIdentity(
+          input.conversationId,
+          'acceptance.chat.conversationIdRequired',
+        ),
+        messageId: requireEvidenceIdentity(
+          input.messageId,
+          'acceptance.chat.messageIdRequired',
+        ),
+        commandId: input.commandId?.trim() ?? '',
+      });
+    },
+
+    async prepareSubmittedCommand(input) {
+      const actorPtid = requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      return dependencies.prepareSubmittedCommand({
+        actorPtid,
+        conversationId: requireEvidenceIdentity(
+          input.conversationId,
+          'acceptance.chat.conversationIdRequired',
+        ),
+        messageId: requireEvidenceIdentity(
+          input.messageId,
+          'acceptance.chat.messageIdRequired',
+        ),
+        commandId: requireEvidenceIdentity(
+          input.commandId,
+          'acceptance.chat.commandIdRequired',
+        ),
+      });
+    },
+
+    async createRestorableCommand(input) {
+      const actorPtid = requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      return dependencies.createRestorableCommand({
+        actorPtid,
+        conversationId: requireEvidenceIdentity(
+          input.conversationId,
+          'acceptance.chat.conversationIdRequired',
+        ),
+        plaintext: requireEvidenceIdentity(
+          input.plaintext,
+          'acceptance.chat.plaintextRequired',
+        ),
+      });
+    },
+
+    async seedConversationClear(input) {
+      const actorPtid = requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      const stationPeerId = requireEvidenceIdentity(
+        input.stationPeerId,
+        'acceptance.chat.stationPeerIdRequired',
+      );
+      if (
+        !Number.isSafeInteger(input.plaintextBytes)
+        || input.plaintextBytes < 64 * 1024
+        || input.plaintextBytes > 8 * 1024 * 1024
+      ) {
+        throw new Error('acceptance.chat.plaintextBytesInvalid');
+      }
+      if (!dependencies.seedConversationClear) {
+        throw new Error('acceptance.chat.storageFixtureUnavailable');
+      }
+      return dependencies.seedConversationClear({
+        actorPtid,
+        stationPeerId,
+        plaintextBytes: input.plaintextBytes,
+      });
+    },
+
+    async resumeMessagingLifecycle(input) {
+      const actorPtid = requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      return dependencies.resumeMessagingLifecycle(actorPtid);
+    },
+
+    async engineMessages(input) {
+      requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      const conversationId = requireEvidenceIdentity(
+        input.conversationId,
+        'acceptance.chat.conversationIdRequired',
+      );
+      return {
+        messages: await dependencies.readMessages(conversationId),
+      };
+    },
+
+    async engineServiceMessages(input) {
+      requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      const conversationId = requireEvidenceIdentity(
+        input.conversationId,
+        'acceptance.chat.conversationIdRequired',
+      );
+      return {
+        messages: await dependencies.readServiceMessages(conversationId),
+      };
+    },
+
+    async engineConversations(input) {
+      requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      return {
+        conversations: await dependencies.readConversations(),
+      };
+    },
+
+    async conversationMemberSettings(input) {
+      requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      const conversationId = requireEvidenceIdentity(
+        input.conversationId,
+        'acceptance.chat.conversationIdRequired',
+      );
+      return {
+        settings: await dependencies.readMemberSettings(conversationId),
+      };
+    },
+
+    async openAttachment(input) {
+      requireMatchingActor(
+        input.actorPtid,
+        dependencies.activeActorPtid(),
+      );
+      const attachmentId = requireEvidenceIdentity(
+        input.attachmentId,
+        'acceptance.chat.attachmentIdRequired',
+      );
+      return {
+        localPath: await dependencies.openAttachment(attachmentId),
+      };
+    },
+
+    async identityState() {
+      return dependencies.identityState();
+    },
+  };
+}
+
+export const nativeAcceptanceBridge = createNativeAcceptanceBridge({
+  activeActorPtid: () =>
+    useSessionStore.getState().currentUser?.actorPtid ?? null,
+  markLocalIdentityAction,
+  logoutWindowSession: (actorPtid) =>
+    api.acceptanceLogoutWindowSession(actorPtid),
+  completeLogoutLifecycle: async () => {
+    await runIdentityPipeline({
+      reason: 'logout',
+      actorPtid: null,
+      loginMethod: null,
+    }, sessionIdentityScope(useSessionStore.getState()));
+  },
+  readInteractionSnapshot: (input) =>
+    api.messagingAcceptanceInteractionSnapshot(input),
+  prepareSubmittedCommand: (input) =>
+    api.messagingAcceptancePrepareSubmittedCommand(input),
+  createRestorableCommand: (input) =>
+    api.messagingAcceptanceCreateRestorableCommand(input),
+  seedConversationClear: (input) =>
+    api.chatStorageAcceptanceSeedConversationClear(input),
+  resumeMessagingLifecycle: (actorPtid) =>
+    api.messagingAcceptanceResumeLifecycle(actorPtid),
+  readMessages: (conversationId) =>
+    imServiceV1.messaging.listMessages(conversationId).then(page => page.messages),
+  readServiceMessages: (conversationId) =>
+    imServiceV1.messaging.listServiceMessages(conversationId),
+  readConversations: () =>
+    imServiceV1.messaging.listConversations(),
+  readMemberSettings: (conversationId) =>
+    imServiceV1.messaging.getMemberSettings(conversationId),
+  openAttachment: readNativeAttachmentEvidence,
+  identityState: () => {
+    const snapshot = identityRuntime.getSnapshot();
+    const phase = snapshot.phase;
+    return {
+      phase: phase.kind,
+      reason: 'reason' in phase ? phase.reason : '',
+      authenticated: snapshot.lifecycle.authenticated,
+      actorPtid: useSessionStore.getState().currentUser?.actorPtid ?? '',
+    };
+  },
+});

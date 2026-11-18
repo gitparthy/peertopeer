@@ -1,0 +1,803 @@
+---
+name: pt-github-review
+description: >
+  Use when the user asks to review a pull request, audit a diff, provide code
+  review feedback, or decide whether a Peers-Touch change is safe to merge.
+  The agent is the primary reviewer; scripts, CI, pt-quality-check, and acceptance
+  reports provide evidence, not a replacement for code reading and architectural
+  judgment.
+stage: "DELIVER"
+requires: ["open PR"]
+produces: ["review feedback or merge decision"]
+---
+
+# GitHub Review
+
+Run an agent-led Peers-Touch code review. The goal is a risk-focused merge
+recommendation with concrete findings. Repository instruction files are
+constraints only; do not answer by saying they were read.
+
+## Review Philosophy
+
+1. **Agent-led judgment** - the agent owns the review decision; automation owns
+   evidence.
+2. **Evidence over confidence** - CI, hard rules, pt-quality-check, acceptance, and
+   knowledge matching are inputs to judgment, not the judgment itself.
+3. **Findings first** - defects, missing evidence, and unresolved questions lead
+   the response.
+4. **Fail closed on missing evidence** - invalid diff ranges, unavailable CI,
+   failed knowledge matching, or missing acceptance plans are review findings.
+5. **Escalate precisely** - humans handle only owner intent, product/security/
+   privacy/compatibility/rollout tradeoffs that accepted sources cannot resolve,
+   destructive/irreversible authorization, and hard-rule waivers.
+
+## Review Workflow
+
+### 1. Establish The Target
+
+Accept a PR number, PR URL, commit, explicit git range, or supplied diff.
+
+For a local target, first verify the persisted Worktree Binding under
+`AGENTS.md §13.5.1` from the bound root. Review must stop on
+`WORKTREE_IDENTITY_UNAVAILABLE` or `WORKTREE_IDENTITY_MISMATCH`; it must not
+repair identity by switching branches or creating/selecting another worktree.
+
+For a PR:
+
+```bash
+gh pr view <pr-number> --json number,title,body,baseRefName,headRefName,mergeStateStatus,reviewDecision,files,commits
+gh pr diff <pr-number> --name-only
+gh pr diff <pr-number>
+gh pr checks <pr-number>
+```
+
+For a local range:
+
+```bash
+git diff --name-only <base>...<head>
+git diff --stat <base>...<head>
+git diff <base>...<head>
+```
+
+Verify range endpoints before trusting any report derived from them.
+
+### 1.1 Cross-Branch Preservation Review
+
+For every integration, review the prospective merge tree
+rather than treating the PR's three-dot diff as the final product:
+
+```bash
+base_sha="$(gh pr view <pr-number> --json baseRefOid --jq .baseRefOid)"
+head_sha="$(gh pr view <pr-number> --json headRefOid --jq .headRefOid)"
+merge_base="$(git merge-base "$base_sha" "$head_sha")"
+git merge-tree "$merge_base" "$base_sha" "$head_sha"
+git diff --name-status "$merge_base..$base_sha"
+git diff --name-status "$merge_base..$head_sha"
+```
+
+For every overlapping behavior, owner, contract, test, Gate, registry entry, or
+generated source, classify the prospective result as exactly one of:
+
+- `PRESERVED`: the target behavior and its proof remain intact;
+- `INTENTIONALLY_SUPERSEDED`: an accepted higher-level source explicitly
+  replaces it, with complete consumer migration, deletion and regression proof;
+- `UNPROVEN`: preservation or supersession cannot be established from current
+  source and evidence.
+
+The review must detect both directions of integration damage:
+
+- **coverage loss**: a previously landed owner, consumer, failure path, test,
+  Gate, documentation contract, or generated projection is missing from the
+  merged result;
+- **false kill**: code, tests, Gates, registrations, or evidence are deleted,
+  weakened, bypassed, or reverted without an accepted supersession contract.
+
+A clean textual merge is not preservation evidence. Passing checks obtained by
+deleting or weakening the check are blocking findings. Generated artifacts are
+judged from their authoritative source and regenerated result, never by keeping
+both generated variants.
+
+After an actual rebase or cherry-pick, compare the old and rewritten series:
+
+```bash
+git range-diff <old-base>..<old-head> <new-base>..<new-head>
+```
+
+Invoke `pt-branch-conflict-guardian` when the merge map contains semantic
+conflicts or the rewritten series cannot be explained mechanically. Any
+`UNPROVEN` overlap prevents approval. This review applies to tracked and
+standalone PRs; it is review judgment over the final merged source and does not
+create a Plan, infer a global worktree order, or become a scheduler.
+
+Prepare `integration_review.py`'s complete bilateral inventory before selecting
+checks. Cover automatic merges and non-overlapping files, follow architecture
+dependencies, and investigate historical merge regressions. Record both
+branch intents and one outcome per path. Required/conditional/advisory checks
+are classified before execution; affected product compilation, behavior and
+actual UI interaction cannot be replaced by source-string checks.
+
+The separate reviewer inspects original runner output, original assertions,
+all affected owners and the final candidate and records executable
+counterexamples. Do not echo the executor's summary as independent judgment.
+Missing/failed/skipped/zero-case evidence or unresolved findings block
+approval. Either HEAD, merge base, tree, policy or manifest change invalidates
+old evidence. Run the shared `integration_review.py verify` before approval;
+release entrypoints use `integration_gate.py`, never separate pass rules.
+Schema fixtures prove admission rules; new isolated Agent cases prove only
+the observed calibration sample. See the owning contract:
+`docs/architecture/engineering/quality/integration-review.md`.
+
+### 2. Collect Quality Evidence
+
+Run the review route first. When it includes `code-structure`, invoke
+`pt-code-structure-review` and record its source-bound decision before quality
+aggregation. Then use `pt-quality-check` before making the final review
+judgment. For local ranges, the preferred executable sequence is:
+
+```bash
+tooling/scripts/review/route-change.sh --range <base>...<head>
+python3 tooling/scripts/review/code_structure_decision.py prepare --range <base>...<head>
+# Review the prepared files, then record a findings-only payload.
+make quality-evidence REVIEW_RANGE=<base>...<head>
+```
+
+At minimum, or when reconstructing manually, collect:
+
+```bash
+tooling/scripts/review/route-change.sh --range <base>...<head>
+tooling/scripts/review/knowledge-match.sh --range <base>...<head> --strict
+tooling/scripts/review/hard-rules.sh --range <base>...<head>
+python3 tooling/scripts/review/code_structure_decision.py prepare --range <base>...<head>
+python3 tooling/scripts/review/code_structure_decision.py verify --range <base>...<head>
+python3 tooling/scripts/execution-plan.py --plan <explicit-plan> --require-complete
+python3 tooling/scripts/acceptance-plan.py --execution-plan <explicit-plan> --completion
+```
+
+For explicit standalone no-Plan work, replace the tracked Plan commands with:
+
+```bash
+python3 tooling/scripts/execution-plan.py --require-complete --allow-untracked
+node tooling/scripts/local-dev/completion-review.mjs standalone \
+  --repo-root "$PWD" \
+  --obligations '<json-array>' \
+  --evidence '<json-array>'
+```
+
+Do not manufacture a Plan, task record, host authority, or review receipt for
+standalone review. Formal Acceptance remains `NOT RUN/UNPROVEN` unless its
+normal owner produced exact proof.
+
+CI has no machine workspace binding. The PR body must declare every owned Plan
+under `## Execution Plans / 执行计划`; CI passes each path through `--plan` and
+must not infer a Plan from the PR branch.
+Reject Plan Packages that retain mutable `expectedHead`; current source
+identity comes directly from the selected Git worktree and current evidence,
+not tracked Plan content.
+
+If the PR touches review or skill infrastructure, also run:
+
+```bash
+tooling/scripts/review/skill-check.sh
+```
+
+If the PR touches acceptance infrastructure, also run:
+
+```bash
+make acceptance-validate
+make acceptance-coverage-report
+make acceptance-plan
+```
+
+For selected acceptance gates, record which were run, which were not run, and
+why. Unrun gates are unproven, never passed.
+
+Before a ready/approve/merge decision, invoke `pt-acceptance-gap-detector` for
+the PR's exact completion claim. A blocking detector gap prevents approval.
+
+### 3. Read By Risk
+
+Review in this order:
+
+1. code that owns truth sources, security, privacy, persistence, protocol,
+   runtime freshness, or CI gates;
+2. files matched by `docs/knowledge` or a registered architecture module;
+3. acceptance feature/capability contracts selected by the diff;
+4. public APIs and generated contract changes;
+5. tests, fixtures, and reports that claim coverage;
+6. documentation and PR template claims.
+
+When the route includes `code-structure`, require the recorded
+`pt-code-structure-review` decision to match the current source and rubric.
+`REFACTOR_REQUIRED` blocks approval; `PASS_WITH_SUGGESTIONS` does not. Advisory
+structure signals never decide the verdict by themselves.
+
+Every current advisory signal (`<code>@<path>` from `structure-signals.mjs`)
+must have exactly one `signalDispositions` entry. Resolution `finding` links to
+a recorded finding whose location owns the signalled path and leaves the
+rationale to that finding record; `accepted-advisory` carries a non-empty
+rationale and references no findingId. A signal enumerated in
+`signalsReviewed` without a disposition invalidates the decision, and a
+disposition for a non-current or duplicate signal is rejected. Decisions
+stored under the older schema are stale and must be re-recorded. The knip
+dead-code report is contextual review input, not a recorded signal: it supports
+findings and judgment, has no disposition requirement, and never blocks.
+
+For Goal, execution-skill, or tracked-work workflow changes, additionally
+verify:
+
+- status, handoff, worker result, and review verdict use current Git/runtime
+  facts, explicit obligations, an explicit optional task ID, and fresh
+  evidence rather than host identity or historical workflow stores;
+- optional task state is event-first, task-local, revisioned, corruption
+  isolated, and never used as write/runtime/review authority;
+- TRAE integration changes only the explicitly selected root; Skills and Hook
+  health are separate, Hook failure is advisory, and stored commands use an
+  absolute interpreter with correct quoting;
+- execution mode is justified by dependencies, write sets, generated outputs,
+  shared runtime resources, verification isolation, and integration order;
+- parallel lanes reserve non-overlapping write sets and keep shared files under
+  one integrator;
+- only live, backend-addressable agents with the same Goal identity block new
+  work;
+- stale agent metadata is not converted into a persistent no-subagent rule;
+- Context Anchors name the selected worktree, branch/HEAD, optional task,
+  evidence, blockers, unverified scope, and next action without inventing a
+  lifecycle or completion percentage;
+- resume-time Anchor synchronization does not pause already-authorized
+  execution.
+- Goal Slice completion returns a legal successor frontier to Dev Workflow
+  instead of asking the user whether to continue.
+- routine stage/code review findings are remediated and re-reviewed inside the
+  Plan Run.
+- Development close affects one explicit task only, requires its evidence and
+  resource disposition, and does not hide environment unregister or seal the
+  worktree.
+
+### 4. Decide
+
+Use the evidence, but decide from code and project contracts:
+
+- Does the implementation preserve the correct source of truth?
+- Does it violate a matched invariant or repeat a pitfall?
+- Does acceptance evidence actually prove the claimed product scope?
+- Is the code-structure decision source-bound and fresh, and does it contain
+  any unresolved blocking primary rule IDs?
+- Are unproven scopes acceptable for this PR, or must they block?
+- Does one precise DWF-D20 hard-boundary decision require human owner approval,
+  or can accepted sources and project Review Skills decide it?
+
+When this review runs inside an authorized Plan Run, return actionable findings
+to `pt-dev-workflow`. The workflow fixes source-backed findings, reruns affected
+checks, and invokes this review again. `hold` is not automatically a user
+handoff.
+
+### 5. Run Review Learning Check
+
+For every finding and evidence gap, decide whether the lesson should improve the
+repository review system. The agent must not end with "remember this next time";
+growth must map to repository assets or be explicitly waived as one-off.
+
+Allowed growth decisions:
+
+| Decision | Use when |
+|---|---|
+| `knowledge_invariant` | the review exposed a stable rule future changes must preserve |
+| `knowledge_pitfall` | the review exposed a repeatable bug root cause or escaped defect |
+| `knowledge_playbook` | the review exposed a recurring task procedure |
+| `hard_rule` | the review exposed a deterministic pattern scripts can catch |
+| `review_fixture` | the review exposed a behavior that needs regression coverage |
+| `acceptance_contract` | the review exposed missing or stale product capability scope |
+| `acceptance_gate` | the review exposed missing executable product evidence |
+| `skill_update` | the review exposed a repeatable agent judgment gap |
+| `ci_tooling_update` | the review exposed missing or unreliable CI/tooling evidence |
+| `no_growth_needed` | the lesson is genuinely one-off and the reason is recorded |
+
+If a reusable lesson is found, name the target file or directory. If no growth is
+needed, explain why the finding is not reusable.
+
+## Review Profiles
+
+| Profile | Focus |
+|---|---|
+| `proto` | Model source of truth, compatibility, generated artifact consistency |
+| `station` | Station business truth, DDD subservers, typed errors, persistence |
+| `desktop` | Tauri command path, runtime projection freshness, i18n, logger |
+| `mobile` | Tauri Mobile mainline, native plugin boundaries, no Flutter expansion |
+| `packages` | shared API compatibility and hidden platform dependency |
+| `locales` | locale coverage and no raw user-facing strings |
+| `knowledge` | frontmatter, owns, lifecycle, semantic delta |
+| `acceptance` | capability/domain/feature/gate/report consistency and evidence honesty |
+| `skill` | skill safety, freshness, self-growth, CODEOWNERS |
+| `review-system` | fail-closed scripts, fixtures, CI portability |
+| `ci` | GitHub Actions reliability, permissions, fork/range behavior |
+| `code-structure` | `pt-code-structure-review` rules `STRUCT-01` through `STRUCT-09`; stable ownership, dependency, lifecycle, cutover, locality, proportionality, and testability verdict |
+
+## Script vs Skill Boundary
+
+Scripts are evidence producers:
+
+- `quality-evidence.py` aggregates review route, knowledge matching, acceptance
+  plan, gate tiers, and capability proven/unproven scope.
+- `route-change.sh` identifies review profiles.
+- `hard-rules.sh` catches simple blocking patterns.
+- `structure-signals.mjs` reports non-blocking size, fan-out, and nesting
+  signals that require `pt-code-structure-review` judgment.
+- `dead-code-advisory.mjs` runs knip over the workspace configuration
+  (`knip.json`) and reports unused files, exports, types, and dependencies as
+  a non-blocking advisory; when knip or its install is unavailable it SKIPs
+  instead of failing local or CI review.
+- `knowledge-match.sh` finds knowledge entries that must be read and delegates
+  changed-path architecture validation to the shared module-governance parser.
+- The formal execution plan schedules Acceptance Gates.
+- `acceptance-plan.py --active-plan` validates actual diff impact and projects
+  the current or completion Gate set without becoming a second plan.
+- `acceptance-validate.py` validates acceptance structure and, with
+  `--require-proven`, latest gate evidence.
+- `skill-check.sh` proves review skill structure and fixtures.
+
+This skill owns the judgment scripts cannot make:
+
+- architecture ownership and source-of-truth correctness;
+- runtime projection completeness vs page refresh hacks;
+- Station `app` / `frame` boundary correctness;
+- proto compatibility and staged rollout safety;
+- whether tests and acceptance gates prove the actual risk;
+- whether structural evidence requires `PASS`, `PASS_WITH_SUGGESTIONS`, or
+  `REFACTOR_REQUIRED`;
+- whether knowledge or acceptance contracts are stale;
+- whether a finding should become a fixture, invariant, pitfall, playbook, gate,
+  skill update, or CI/tooling update.
+
+## Hard Rules
+
+Treat these as blocking unless the user explicitly asks for exploratory review:
+
+| Code | Rule |
+|---|---|
+| `debug-statement` | raw `console.log`, `print`, `println!`, `fmt.Println`, `debugPrint`, or equivalent debug output |
+| `secret-exposure` | hardcoded secrets, tokens, passwords, private keys, or credentials |
+| `generated-file-edit` | manual edits to generated `.pb.go`, `.pb.dart`, prost `.rs`, or proto outputs |
+| `proto-first` | shared model or inter-app contract defined outside `model/domain/*.proto` |
+| `mock-api` | No mock frontend-backend collaborative APIs unless explicitly approved |
+| `hardcoded-ui-string` | user-facing text literal outside i18n |
+| `silent-error` | swallowed errors, ignored errors, empty catches, or missing context |
+| `logging-security` | logs tokens, passwords, secrets, or PII |
+| `architecture-boundary` | lower layer redefines architecture or platform ownership |
+| `architecture-viewpoint` | an architecture diagram mixes module, runtime, reuse, authority, deployment, or generation semantics, depicts Model as a runtime hop solely because contracts are proto-first, or changes a canonical Diagram spec without refreshing its SVG, index, and reverse references |
+| `architecture-module-governance` | a changed active architecture module is unregistered, incomplete, overlaps another module, or references undeclared capabilities |
+| `duplicate-side-effect-import` | same dynamic import path appears 2+ times in a single file |
+| `user-home-absolute-path` | committed documentation-like text contains a developer or CI user-home absolute path instead of a repo-relative path or portable placeholder |
+| `retired-product-reference` | tracked content or a tracked path reintroduces a retired external product identifier |
+| `repository-debug-artifact` | repository-root `debug-*`, `.dbg/`, ad-hoc prompt, runtime log, trace, screenshot, DOM dump, or temporary report |
+| `station-profile-bypass` | Station start, deployment, restart, or direct execution bypasses canonical Machine Dev Profile resolution, capability admission, source synchronization, lease ownership, or deployment readback |
+| `unreviewed-environment-topology` | runtime code invents a remote host, credential, dirty/untracked deploy definition, or bypasses canonical Profile creation and binding |
+
+Keywords intentionally present for freshness checks: hardcoded secrets, No mock,
+hardcoded-ui-string, silent error, generated, runtime projection, CODEOWNERS,
+user-home-absolute-path, retired-product-reference, repository-debug-artifact, station-profile-bypass,
+unreviewed-environment-topology.
+
+### Retired Reference Registry
+
+Retired identifiers are registry-driven rather than hard-coded as individual
+branches in the scanner. `tooling/scripts/review/retired-refs.json` holds one
+entry per retired identifier with a stable blocking `code`, a case-insensitive
+ERE `pattern`, a `message`, `paths`/`content` booleans selecting the scanned
+surfaces, and an `ignore` array of ERE allowlists. `retired-refs.mjs` validates
+the registry and renders it for `hard-rules.sh`; a malformed registry fails the
+hard-rule run. Retiring another product, API, or protocol identifier means
+adding one registry entry plus fixture coverage for its surfaces, never another
+special case in the shell scanner.
+
+## Operational Knowledge
+
+Run knowledge matching for changed paths and then do semantic review.
+
+Path matching means a knowledge file must enter review context. It does not prove
+the code complies.
+
+For a changed path owned by
+`docs/architecture/engineering/architecture-governance/architecture-modules.json`,
+review the registered module documents, accepted decisions, positive
+capabilities, consumers, dependencies, and evidence Gates. Reject undocumented
+or overlapping ownership and any attempt to preserve removed names as a
+blacklist.
+
+Knowledge Delta Review:
+
+- matched invariant violated by code -> block;
+- matched pitfall root cause reintroduced -> block or require evidence;
+- matched playbook skipped -> block unless the PR explains why it does not apply;
+- code changes the truth behind a knowledge entry -> require knowledge update or
+  owner-reviewed supersession;
+- bug fix discovers reusable root cause -> require pitfall or explicit waiver;
+- repeated procedure appears again -> propose playbook.
+
+Knowledge Coverage Review (the reverse direction — required knowledge that is
+missing, not just stale knowledge):
+
+- If the diff introduces a new cross-layer contract, a new proto section with
+  client/runtime semantics, a new registered architecture module/path, or a
+  paid-for failure mode, and `knowledge-match.sh` reports `Matched operational
+  knowledge: none` for the changed implementation paths, record a finding:
+  either the PR adds the governing invariant/pitfall/playbook/term (with
+  `owns:` and README index) or states an explicit `no_growth_needed` reason.
+  This is normally P2 for additive, well-documented work; raise to P1 when the
+  change adds a trust, persistence, or protocol boundary whose violation
+  future edits could silently repeat.
+- Review documentation diffs for duplicated truth: a knowledge entry must
+  reference, not restate, an architecture decision; a data/state model must
+  not document persisted objects that the code only derives or holds in
+  memory. Require the single source to be linked and the redundant copy
+  removed.
+
+## Acceptance Evidence
+
+Acceptance Framework proves product capability scope. It does not approve PRs.
+
+For Acceptance Infra PRs, judge merge readiness from
+`acceptance_core_self_validation` and framework evidence. Treat
+`product_domain_validates_acceptance` and business injection gaps as
+informational unless the generic injection mechanism itself is defective.
+Never require an Infra author to create or weaken business-owned injection.
+
+For impacted acceptance features:
+
+1. Read selected feature contracts under `tooling/acceptance/features/`.
+2. Read capability evidence under `tooling/acceptance/capabilities/`.
+3. Compare selected gates with gates run.
+4. Copy proven and unproven scope into the review evidence.
+5. Challenge over-claims: typecheck is not DOM E2E; gateway smoke is not full UI
+   behavior; Station SSE proof is not Desktop live DOM consumption.
+
+Block or hold when:
+
+- a product capability changed but feature/capability contracts did not;
+- a required gate is marked proven without run evidence;
+- an environment gate was skipped and the missing scope is central to the PR;
+- acceptance YAML says a truth source changed but code moved truth elsewhere;
+- reports claim more than the gates actually prove.
+
+## Platform Review Playbooks
+
+### Outcome Comparison Review
+
+For a complex Plan with an outcome comparison, or a change that updates its
+results, check:
+
+- the report covers user experience, product capability, architecture,
+  technology, and quality/operations in language a product or engineering
+  owner can understand;
+- baseline claims distinguish source facts, runtime observations, audits,
+  inferences, and unverified assumptions;
+- each outcome criterion maps to real Tasks and declared Gates, and all
+  Tasks/Gates are covered;
+- user-facing criteria describe concrete Journeys, feedback, recovery, and
+  platform differences rather than generic "experience improvement";
+- architecture criteria name old/new owners, sources of truth, dependency
+  direction, deleted paths, and explicit non-goals;
+- technology criteria name contract, state, storage, build, security,
+  performance, observability, migration, and rollback effects that materially
+  change;
+- the digest-bound planned section is unchanged during execution;
+- `PASS/PARTIAL` actual results bind current source and concrete evidence, and
+  no Task/Gate status is promoted automatically into an outcome claim;
+- the final completion or aggregate evidence binds the exact full report
+  digest.
+
+### Cross-Client Reuse Review
+
+For Desktop/Mobile/Android/iOS architecture changes, check:
+
+- classify contract, portable mechanism, renderer-neutral logic,
+  policy-neutral entity UI, product-form behavior, and OS capability as
+  independent placement axes rather than an ordered runtime stack;
+- select the narrowest canonical semantic owner whose lifecycle and variation
+  axis match the behavior;
+- query the architecture capability registry and workspace manifests before
+  accepting a new local package, crate, component, codec, cache, selector,
+  state machine, persistence owner, or DTO;
+- require the second semantic consumer to reuse or extract the canonical asset
+  before merge; known cross-client contract/security/protocol/persistence/
+  identity semantics are shared from the first implementation;
+- keep Android and iOS on one Mobile product/runtime/component tree;
+- keep Desktop/Mobile layout, navigation, gesture, focus, safe-area, keyboard,
+  and window behavior in Presentation Policy rather than a condition-heavy
+  universal component;
+- treat ordinary shells and typed OS/runtime-port adapters as specialization,
+  not semantic divergence;
+- require every parallel semantic implementation outside the shared
+  policy/port contract to have a current `reuseDivergences` record bound to an
+  accepted decision, canonical capability, dependent implementation
+  capabilities/roots, consumers, evidence Gates, and review trigger;
+- reject unregistered Desktop/Mobile shared direct workspace dependencies;
+- keep platform runtime evidence independent: shared tests, Android, iOS, and
+  Desktop cells do not prove one another.
+- require each architecture diagram to declare exactly one supported
+  viewpoint: `System Context`, `Logical Layer`, `Module Map`, `Runtime
+  Topology`, `Reuse Topology`, `Authority Map`, `Deployment Topology`,
+  `Dynamic Flow`, or `Control Plane`, with one stated arrow meaning;
+- require canonical project diagrams and new or redrawn module diagrams to use
+  a module-local `*.diagram.json` and the shared SVG renderer; Markdown must
+  embed the generated SVG without exposing renderer syntax or machine metadata;
+- run `node tooling/scripts/architecture/diagram-render.mjs --check` when a
+  canonical Diagram spec or SVG changes;
+- run `node tooling/scripts/architecture/document-index.mjs --check` when a
+  canonical SVG, architecture module registry, architecture index, or
+  diagram reference changes;
+- require generated SVGs to be rasterized and visually reviewed for hierarchy,
+  text fit, coherent connector routing, and accidental overlap; schema and XML
+  validity alone are insufficient;
+- reject contract authoring or reuse-classification sequences presented as
+  runtime or authority hierarchy. In runtime views, Client talks to Station
+  directly; Model stays outside the live node path as their shared contract
+  substrate.
+
+### Proto Review
+
+Check:
+
+- shared concepts live in `model/domain/*.proto`;
+- proto-first is a contract authoring constraint, not evidence that Model is a
+  runtime tier, request intermediary, or visually dominant module;
+- field numbers are stable and removed fields are reserved;
+- generated files are not manually edited;
+- Station, Desktop, and Mobile contract consumers are updated or staged safely.
+
+### Station Review
+
+Check:
+
+- Station remains shared business truth;
+- `apps/station/app` may depend on `frame`, not the reverse;
+- business capability code follows subserver boundaries;
+- handlers do not own domain decisions;
+- errors use typed codes and include context;
+- persistence changes include migration or compatibility reasoning.
+
+### Node Connectivity And Relay Review
+
+Check:
+
+- `station_peer_id` remains logical Station identity; Node PeerID, URL, Direct,
+  and Circuit endpoints remain transport routes;
+- one process owns one libp2p Host and Frame adapts standard Direct/Circuit v2
+  streams into the canonical HTTP/protobuf/SSE router;
+- Relay owns bounded admission and control only, never Station credentials,
+  Session, Federation membership, business APIs, or a custom payload data plane;
+- Desktop `AppState` owns one `StationRuntime`; Station Access alone selects
+  routes and publishes immutable `RouteLease` values to transport;
+- same-Station route changes preserve Session scope, advance route revision,
+  cancel the old lease, and never blindly replay an ambiguous mutation;
+- private Relay TLS health uses the reviewed trust anchor and rejects insecure
+  verification bypass, endpoint drift, and substituted Relay identity;
+- cutovers delete old WSS/mount framing, duplicate route owners, stale runtime
+  docs, registrations, and compatibility fallbacks in the same change;
+- runtime claims use exact-source NCP Gates and preserve explicit unproven
+  cluster or Mobile cells instead of generalizing from source checks.
+
+### Desktop Review
+
+Check:
+
+- `native Tauri embedded renderer -> desktop-rust -> station` remains the business path;
+- pages are pure renderers and do not own long-lived freshness;
+- runtime-backed features have event consumption and reconciliation;
+- user-facing strings use locale keys;
+- logging uses project loggers.
+
+### Mobile Review
+
+Check:
+
+- Mobile remains Tauri v2 Mobile + Web UI + Rust capability kernel + native plugins;
+- native plugins provide device capability, not business truth;
+- Flutter paths remain deprecated;
+- Mobile does not create private protocols bypassing Station or proto.
+
+### Knowledge Review
+
+Check frontmatter, `owns:`, lifecycle, recurrence detection, append-only
+supersession, and semantic consistency with the code diff.
+
+### Review-System Review
+
+Check scripts fail closed, fixtures cover positive and negative cases, workflow
+permissions are minimal, CODEOWNERS are real, and review skill freshness remains
+meaningful. Goal and execution workflow changes must also preserve explicit
+concurrency decisions, identity-based live-agent conflict detection, reserved
+write sets, integrator-owned reconciliation, and non-blocking Context Anchor
+projection.
+
+For Agent integration controls, reject ordinary projection that requires
+unrelated worktrees to be idle, writes a descriptor or global configuration,
+or deletes workflow state. Skill projection must remain usable when optional
+Hook installation fails.
+
+For Local Dev Profile changes, reject any stored reset-policy field or
+compatibility reader. The verified canonical Profile ID is the sole policy
+source: a case-insensitive terminal `stable` suffix means reset-protected; all other reviewed
+Profiles are Agent-resettable only inside the exact binding capability,
+scope, topology/source identity, and OS-lease guards. Missing
+capability or scope must remain a typed control-plane failure, not a request for
+human authorization.
+
+Reviewed non-stable Profiles authorize routine environment selection,
+registration, provisioning, deploy, restart, and reset. Local Profile creation
+through `make profile-init` and coherent local checkpoint commits are not review
+violations; checkpoint commits may precede runtime proof and never imply
+delivery. Reject local Profile readers that accept symlinks, non-private or
+foreign-owned files, escaped paths, or shell-active values. Stable selection
+must remain connect-only by default; explicit capability binding is required
+for stable deploy, and stable reset remains forbidden. Namespaced internal
+deployment transport ref updates are not collaboration pushes. Push, PR,
+merge, release, history rewrite, and stable mutation remain separately
+governed.
+
+For machine workspace registration changes, reject persisted Git HEAD,
+command-specific HEAD reconciliation, or another mutable source cache in the
+binding. The registration owns canonical root, workspace ID, registered branch,
+Profile, slot, capabilities, and Owner metadata. Current HEAD comes from Git;
+operation admission and runtime build readback fence source-sensitive mutation.
+
+For Development close changes, require an explicit task ID, revision/CAS,
+current evidence, and a settled disposition for resources owned by that task.
+Environment unregister remains a separate explicit operation.
+
+### Acceptance Review
+
+Check domain, capability, feature, gate, report, and onboarding consistency.
+Gate scripts must prove real product behavior or honestly report unproven scope.
+Durable evidence must come from the current workspace's canonical latest
+manifest, carry `DONE` / `PROVEN` result semantics, and pass artifact identity
+and digest verification. Native Desktop claims must bind the requested runtime
+cell, candidate commit, actual workspace digest, canonical worktree identity,
+Station commit, binary digest, platform probes, and reverse-order cleanup.
+Local builds may use a fenced `sha256:<digest>` snapshot; remote
+`git-object-sync` still requires a clean checkout and independent deployment
+attestation. Reject relabelling a local snapshot as clean or using it to prove
+undeployed service changes. Evidence from one platform cannot prove another.
+Local Native binding construction must validate and retain the parent Cell's
+executable credentials before identity readback or client launch. Both paths
+must revalidate that frozen identity; neither may build or infer a replacement
+executable. Reject launch-time credential consumption that makes prelaunch
+identity unavailable despite a successfully equipped parent Cell.
+
+Semantic Native Cell qualification must freeze the operator before launch and
+compare that same baseline across launch, actions, and owned stop. Reject the
+target client as operator, launch-time focus stealing, repeated show calls that
+activate semantic windows, and resampling that hides an earlier mismatch.
+Desktop build stage reuse requires the same complete candidate identity, a
+nonempty closed output inventory with verified hashes, and the original
+successful producer's cost and logs. A failed later stage may retain that
+checkpoint; it may not publish a binary or proof. Reject unverified stage skips,
+output drift, symlink outputs, or budget increases disguised as stage recovery.
+
+Profile Station equipment must use the canonical target operation without
+rewriting the active binding or slot. Equip before retaining the remote source
+lease, then re-attest health, source, and protocol under that lease.
+Negative port fixtures must claim and retain the actual listening socket
+through the product assertion and owned cleanup. Reject fixed replacement
+ports, probe-and-release allocation, skipped assertions, or stopping unrelated
+listeners as ownership evidence.
+
+Bounded requests retain the complete authorized Gate set. Reused proof must
+reference the original DURABLE producer, complete inventory, current authority,
+matching source and closed inputs, exact prerequisite references, and successful
+cleanup. Sealed request history supplies ordering and candidate references;
+unvisited or unvalidated results remain UNPROVEN.
+
+Input owners must bind the actual executable delegates, installed dependency
+bytes, effective configuration, and material runtime/provider/oracle/fixture
+inputs consumed by their reviewed command. Reject wrapper hashes, version-only
+checks, empty declarations hiding external state, or source owners applied to
+live or ephemeral resources. Equipment observations retain the same original
+run references before command, after cleanup, and on resume; an old READY
+record cannot establish current runtime identity.
+The architecture pnpm/Cargo metadata closure covers only its registry command
+and temporary fixture configuration. It does not qualify compilation, other
+package-manager commands, Profiles, or product state. Probe diagnostics remain
+supporting-only; a successful replay cannot supply an unobserved failure cause,
+renew a deadline, or erase failed process cleanup.
+
+## Severity Levels
+
+| Severity | Blocks merge? | Use when |
+|---|---:|---|
+| `critical` | yes | security/privacy leak, data loss, auth bypass, broken migration, unsafe CI fail-open |
+| `bug` | yes | correctness regression, user-visible wrong behavior, runtime freshness failure |
+| `convention` | yes | project iron-law or source-of-truth violation |
+| `suggestion` | no | maintainability, performance, or test improvement without correctness risk |
+| `question` | maybe | intent unclear; blocks only if answer exposes a blocker |
+
+## Review Output Format
+
+Use Markdown. Findings lead the response, ordered by severity:
+
+```markdown
+Overall: merge | hold | reject
+
+### Findings
+
+#### critical
+
+1. <title>
+   - File:
+   - Problem:
+   - Impact:
+   - Suggested fix:
+   - Confidence:
+
+### Evidence
+
+- Range:
+- Review profiles:
+- Code structure verdict / rule IDs:
+- Quality evidence:
+- Acceptance evidence:
+- Matched knowledge:
+- Tests/CI:
+
+### Merge Guidance
+
+- Must fix before merge:
+- Can follow up:
+- Human owner hard-boundary decision needed:
+
+### Framework Growth Opportunities
+
+- `knowledge_invariant`:
+- `knowledge_pitfall`:
+- `knowledge_playbook`:
+- `hard_rule`:
+- `review_fixture`:
+- `acceptance_contract`:
+- `acceptance_gate`:
+- `skill_update`:
+- `ci_tooling_update`:
+- `no_growth_needed`:
+```
+
+If no findings exist, say so and still list residual risk and checks not run.
+The `Framework Growth Opportunities` section is required even when every item is
+empty except `no_growth_needed`.
+
+## Skill Freshness
+
+This skill is fresh only if:
+
+```bash
+tooling/scripts/review/skill-check.sh
+```
+
+passes, and any upstream quality, review, knowledge, or acceptance rule change is
+reflected here or explicitly waived in the PR.
+
+## Self-Growth
+
+After accepted findings or escaped defects:
+
+1. classify each finding or evidence gap using the Review Learning Check
+   decisions;
+2. add or update review fixtures for deterministic hard-rule gaps;
+3. update `docs/knowledge/**` for operational knowledge;
+4. update acceptance contracts/gates when product evidence was missing;
+5. update this skill when review behavior changes;
+6. update CI/tooling when evidence generation or portability failed;
+7. require CODEOWNERS review before merge.
+
+Growth changes are reviewable product assets. They must be submitted through the
+normal PR path and pass `skill-check.sh`; the agent must not silently weaken a
+rule, refresh a hash, or delete a fixture without explaining the behavior change.
+
+## Anti-Patterns
+
+- Approving because CI is green.
+- Treating `make review` or `make acceptance-run` as the review itself.
+- Reporting script output without reading risky code.
+- Marking unrun acceptance gates as proven.
+- Refreshing hashes or fixtures as bookkeeping without explaining behavior.
+- Asking humans to re-review everything instead of escalating precise decisions.
+- Blocking on cosmetic style (naming, spacing, import order) while ignoring structural violations (mixed responsibility, duplicate logic, inline definitions).
+- Ignoring missing evidence such as invalid range, unavailable CI, or failed
+  knowledge/acceptance planning.

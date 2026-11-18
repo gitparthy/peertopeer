@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "station-access-session-class",
+  "domain": "station-access",
+  "status": "active",
+  "owners": [
+    "apps/station/frame/core/facility/session/**",
+    "apps/desktop/src-tauri/src/application/auth/**",
+    "apps/desktop/src-tauri/src/messaging/**",
+    "apps/mobile/src-tauri/src/runtime/oauth/**",
+    "apps/mobile/src-tauri/src/messaging/**",
+    "tooling/acceptance/gates/station_access/session_class_suite_e2e.py"
+  ],
+  "truth_sources": [
+    "Station and Actor installation-scoped Session bindings",
+    "Desktop and Mobile installation-scoped device identities",
+    "current-source native receiver proof"
+  ],
+  "visible_surfaces": [
+    {"type": "native-desktop", "route": "authenticated-shell"},
+    {"type": "native-mobile", "route": "shell"}
+  ],
+  "required_gates": [
+    "station-access-session-class-suite-e2e"
+  ],
+  "acceptance": {
+    "service": [
+      "multiple Desktop and Mobile installations for the same actor remain valid together",
+      "a newer Session replaces only the same Station, actor and device binding",
+      "device revocation invalidates only that device's Sessions",
+      "each installation retains its own device and storage identity while sharing Station and actor truth"
+    ],
+    "surface": [
+      "both Desktop installations and both Mobile installations receive the same actor's new messages",
+      "each installation remains authenticated while another installation of the same class is active"
+    ]
+  },
+  "negative": [
+    "client class, window labels, runtime labels and OS models must not define Session uniqueness",
+    "one simulator or one storage root must not represent two same-class Mobile installations",
+    "independent regression Gates must not replace the one reusable Suite Runtime or its native receiver proof",
+    "aggregate evidence must not replace any native receiver proof",
+    "stale or dirty-source proof must not satisfy SAL-G08"
+  ]
+}

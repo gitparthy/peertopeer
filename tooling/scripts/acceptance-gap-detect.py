@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""Fail-closed read-only detector for Acceptance evidence gaps.
+
+Validates two layers:
+  1. Plan↔run consistency: changed paths match plan, required gates ran
+     and produced DONE/PROVEN evidence.
+  2. Closure contract deliverables: when a --contract YAML is supplied,
+     every declared deliverable must have corresponding mechanical
+     evidence (scan reports or gate results). This eliminates AI
+     discretion over what counts as 'done'.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tooling.acceptance.core.errors import EvidenceError  # noqa: E402
+from tooling.acceptance.core.proof import read_gate_proof  # noqa: E402
+from tooling.acceptance.core.execution_plan import (  # noqa: E402
+    ExecutionPlanError,
+    changed_paths_for_plan,
+    load_formal_plan,
+)
+
+SCAN_TYPE_TO_GATE = {
+    "path-absent": "chat-w11-forbidden-scan",
+    "source-scan": "chat-w11-forbidden-scan",
+    "http-route-absent": "chat-w11-forbidden-scan",
+    "tauri-command-absent": "chat-w11-forbidden-scan",
+    "no-duplicate-symbol": "chat-w11-duplicate-scan",
+}
+
+
+class DetectorError(RuntimeError):
+    pass
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise DetectorError(f"cannot load {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise DetectorError(f"{path} must contain a JSON object")
+    return value
+
+
+def changed_paths(diff_range: str) -> list[str]:
+    completed = subprocess.run(
+        ["git", "diff", "--name-only", diff_range],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise DetectorError(
+            f"cannot inspect git range {diff_range!r}: {completed.stderr.strip()}"
+        )
+    paths = {
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    }
+    if diff_range == "HEAD":
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        paths.update(
+            line.strip()
+            for line in untracked.stdout.splitlines()
+            if line.strip()
+        )
+    return sorted(paths)
+
+
+def resolve_changed_paths(
+    diff_range: str,
+    explicit_paths: list[str],
+    expected_paths: list[str] | None = None,
+) -> list[str]:
+    if explicit_paths:
+        resolved: set[str] = set()
+        for supplied_path in explicit_paths:
+            path = supplied_path.strip()
+            if not path:
+                continue
+            canonical = PurePosixPath(path)
+            if (
+                canonical.is_absolute()
+                or canonical.as_posix() != path
+                or ".." in canonical.parts
+                or "\\" in path
+            ):
+                raise DetectorError(
+                    "--changed-file must be a canonical repository-relative path: "
+                    f"{path!r}"
+                )
+            resolved.add(path)
+        if not resolved:
+            raise DetectorError(
+                "--changed-file requires at least one non-empty "
+                "repository-relative path"
+            )
+        actual = set(
+            expected_paths
+            if expected_paths is not None
+            else changed_paths(diff_range)
+        )
+        if resolved != actual:
+            missing = sorted(actual - resolved)
+            extra = sorted(resolved - actual)
+            raise DetectorError(
+                "--changed-file must exactly match the selected git range: "
+                f"missing={missing}, extra={extra}"
+            )
+        return sorted(resolved)
+    return (
+        sorted(set(expected_paths))
+        if expected_paths is not None
+        else changed_paths(diff_range)
+    )
+
+
+def formal_closure_paths(plan: dict[str, Any]) -> list[str] | None:
+    execution = plan.get("execution")
+    if not isinstance(execution, dict) or execution.get("mode") != "closure":
+        return None
+    formal_plan_ref = execution.get("formalPlan")
+    if not isinstance(formal_plan_ref, str) or not formal_plan_ref:
+        raise DetectorError(
+            "formal closure Acceptance plan is missing execution.formalPlan"
+        )
+    canonical = PurePosixPath(formal_plan_ref)
+    if (
+        canonical.is_absolute()
+        or canonical.as_posix() != formal_plan_ref
+        or ".." in canonical.parts
+        or "\\" in formal_plan_ref
+    ):
+        raise DetectorError(
+            "execution.formalPlan must be a canonical repository-relative path"
+        )
+    formal_plan_path = (REPO_ROOT / formal_plan_ref).resolve()
+    try:
+        formal_plan_path.relative_to(REPO_ROOT.resolve())
+        formal_plan = load_formal_plan(formal_plan_path)
+    except (ExecutionPlanError, OSError, ValueError) as error:
+        raise DetectorError(
+            f"cannot load formal closure plan {formal_plan_ref!r}: {error}"
+        ) from error
+
+    expected_identity = {
+        "planId": formal_plan.plan_id,
+        "currentTaskId": formal_plan.current_task_id,
+        "closure": formal_plan.current_closure,
+        "workspaceId": formal_plan.workspace_id,
+    }
+    mismatches = {
+        field: {
+            "planned": execution.get(field),
+            "formal": expected,
+        }
+        for field, expected in expected_identity.items()
+        if execution.get(field) != expected
+    }
+    if mismatches:
+        raise DetectorError(
+            "formal closure Acceptance plan identity mismatch: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return changed_paths_for_plan(REPO_ROOT, formal_plan, "closure")
+
+
+def current_source_identity() -> tuple[str, str]:
+    from tooling.acceptance.core.attestation import source_workspace_digest
+
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return commit, source_workspace_digest(REPO_ROOT)
+
+
+def gate_entries(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in plan.get("selected_gates", []):
+        if isinstance(entry, str):
+            entries[entry] = {"id": entry}
+        elif isinstance(entry, dict) and entry.get("id"):
+            entries[str(entry["id"])] = entry
+    return entries
+
+
+def canonical_plan_for_paths(paths: list[str]) -> dict[str, Any]:
+    planner_path = Path(__file__).with_name("acceptance-plan.py")
+    spec = importlib.util.spec_from_file_location(
+        "acceptance_plan_for_gap_detector",
+        planner_path,
+    )
+    if spec is None or spec.loader is None:
+        raise DetectorError(f"cannot load canonical planner at {planner_path}")
+    planner = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(planner)
+        canonical = planner.plan(
+            REPO_ROOT / "tooling" / "acceptance",
+            paths,
+        )
+    except (Exception, SystemExit) as error:
+        raise DetectorError(
+            f"cannot generate canonical Acceptance plan: {error}"
+        ) from error
+    if not isinstance(canonical, dict):
+        raise DetectorError("canonical Acceptance planner returned a non-object")
+    return canonical
+
+
+def result_entries(run: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    entries = {}
+    for result in run.get("results", []):
+        if (
+            not isinstance(result, dict) or not isinstance(result.get("id"), str)
+            or not result["id"] or result["id"] in entries
+        ):
+            raise DetectorError("run contains invalid or duplicate Gate identities")
+        entries[result["id"]] = result
+    return entries
+
+
+def gap(
+    *,
+    gap_type: str,
+    claim: str,
+    owner_stage: str,
+    required_closure: str,
+    evidence: list[dict[str, Any]],
+    status: str = "BLOCKING",
+) -> dict[str, Any]:
+    from tooling.acceptance.core import GapArtifact
+
+    return GapArtifact(
+        claim=claim,
+        gap_type=gap_type,
+        owner_stage=owner_stage,
+        required_closure=required_closure,
+        evidence=tuple(evidence),
+        status=status,
+    ).to_dict()
+
+
+def _load_contract(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except ImportError:
+        pass
+    sys.path.insert(0, str(REPO_ROOT / "tooling" / "scripts"))
+    from importlib import import_module
+    gen = import_module("acceptance-closure-gen".replace("-", "_"))
+    return gen.load_yaml(path)
+
+
+def validate_contract_deliverables(
+    contract: dict[str, Any],
+    results: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    gaps: list[dict[str, Any]] = []
+    deliverables = contract.get("deliverables", [])
+    if not isinstance(deliverables, list):
+        return gaps
+
+    for d in deliverables:
+        if not isinstance(d, dict):
+            continue
+        did = str(d.get("id", "?"))
+        verify = d.get("verify", {})
+        if not isinstance(verify, dict):
+            continue
+        vtype = verify.get("type", "")
+
+        if vtype in SCAN_TYPE_TO_GATE:
+            gate_id = SCAN_TYPE_TO_GATE[vtype]
+            result = results.get(gate_id)
+            if result is None:
+                gaps.append(
+                    gap(
+                        gap_type="CONTRACT_SCAN_GATE_NOT_RUN",
+                        claim=f"contract deliverable {did}",
+                        owner_stage="EXECUTE",
+                        required_closure=f"Run {gate_id} to verify {did}",
+                        evidence=[{
+                            "deliverableId": did,
+                            "verifyType": vtype,
+                            "requiredGate": gate_id,
+                        }],
+                    )
+                )
+            elif str(result.get("status") or "") != "passed":
+                gaps.append(
+                    gap(
+                        gap_type="CONTRACT_SCAN_GATE_FAILED",
+                        claim=f"contract deliverable {did}",
+                        owner_stage="EXECUTE",
+                        required_closure=f"Fix violations found by {gate_id}",
+                        evidence=[{
+                            "deliverableId": did,
+                            "verifyType": vtype,
+                            "gateId": gate_id,
+                            "gateStatus": result.get("status"),
+                        }],
+                    )
+                )
+
+        elif vtype == "gates-passed":
+            for gid in verify.get("gates", []):
+                result = results.get(gid)
+                if result is None:
+                    gaps.append(
+                        gap(
+                            gap_type="CONTRACT_GATE_NOT_RUN",
+                            claim=f"contract deliverable {did}",
+                            owner_stage="EXECUTE",
+                            required_closure=f"Run gate {gid}",
+                            evidence=[{"deliverableId": did, "gateId": gid}],
+                        )
+                    )
+                elif str(result.get("status") or "") != "passed":
+                    gaps.append(
+                        gap(
+                            gap_type="CONTRACT_GATE_FAILED",
+                            claim=f"contract deliverable {did}",
+                            owner_stage="EXECUTE",
+                            required_closure=f"Gate {gid} must pass",
+                            evidence=[{
+                                "deliverableId": did,
+                                "gateId": gid,
+                                "gateStatus": result.get("status"),
+                            }],
+                        )
+                    )
+
+        elif vtype == "gate-passed":
+            gid = verify.get("gate", "")
+            if not gid:
+                continue
+            result = results.get(gid)
+            if result is None:
+                gaps.append(
+                    gap(
+                        gap_type="CONTRACT_GATE_NOT_RUN",
+                        claim=f"contract deliverable {did}",
+                        owner_stage="EXECUTE",
+                        required_closure=f"Run gate {gid}",
+                        evidence=[{"deliverableId": did, "gateId": gid}],
+                    )
+                )
+            elif str(result.get("status") or "") != "passed":
+                gaps.append(
+                    gap(
+                        gap_type="CONTRACT_GATE_FAILED",
+                        claim=f"contract deliverable {did}",
+                        owner_stage="EXECUTE",
+                        required_closure=f"Gate {gid} must pass",
+                        evidence=[{
+                            "deliverableId": did,
+                            "gateId": gid,
+                            "gateStatus": result.get("status"),
+                        }],
+                    )
+                )
+
+    return gaps
+
+
+def detect(
+    *,
+    claim: str,
+    paths: list[str],
+    plan: dict[str, Any],
+    run: dict[str, Any],
+    required_gates: list[str],
+    source_commit: str = "",
+    workspace_digest: str = "",
+    contract: dict[str, Any] | None = None,
+    canonical_plan: dict[str, Any] | None = None,
+    store: Any = None,
+) -> dict[str, Any]:
+    from tooling.acceptance.core import EvidenceStore, source_identity
+
+    source = dict(source_identity(REPO_ROOT))
+    if source_commit:
+        source["commit"] = source_commit
+    if workspace_digest:
+        source["workspaceDigest"] = workspace_digest
+    gaps: list[dict[str, Any]] = []
+    selected = gate_entries(plan)
+    results = result_entries(run)
+    obligations = set(required_gates)
+
+    if contract:
+        deliverables = contract.get("deliverables", [])
+        if not isinstance(deliverables, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("verify", {}), dict)
+            for item in deliverables
+        ):
+            raise DetectorError("contract deliverables are invalid")
+        gaps.extend(validate_contract_deliverables(contract, results))
+        for deliverable in deliverables:
+            verify = deliverable.get("verify", {})
+            kind = verify.get("type")
+            if kind in SCAN_TYPE_TO_GATE:
+                obligations.add(SCAN_TYPE_TO_GATE[kind])
+            elif kind == "gates-passed":
+                obligations.update(verify.get("gates", []))
+            elif kind == "gate-passed" and verify.get("gate"):
+                obligations.add(verify["gate"])
+
+    if canonical_plan is not None:
+        canonical_selected = set(gate_entries(canonical_plan))
+        projected_candidates = plan.get("candidate_gates")
+        supplied_selected = (
+            {
+                str(gate_id)
+                for gate_id in projected_candidates
+                if isinstance(gate_id, str) and gate_id
+            }
+            if isinstance(projected_candidates, list)
+            else set(selected)
+        )
+        missing_canonical_gates = sorted(
+            canonical_selected - supplied_selected
+        )
+        if missing_canonical_gates:
+            gaps.append(
+                gap(
+                    gap_type="ACCEPTANCE_GAP_DETECTOR_INPUT_INVALID",
+                    claim=claim,
+                    owner_stage="PLAN",
+                    required_closure=(
+                        "Use an Acceptance plan containing every Gate selected "
+                        "by the canonical planner for the detector's exact git "
+                        "range"
+                    ),
+                    evidence=[
+                        {
+                            "reason": (
+                                "Supplied Acceptance plan filters canonical "
+                                "exact-range Gates"
+                            ),
+                            "missingCanonicalGates": missing_canonical_gates,
+                            "canonicalSelectedGates": sorted(
+                                canonical_selected
+                            ),
+                            "suppliedSelectedGates": sorted(
+                                supplied_selected
+                            ),
+                        }
+                    ],
+                )
+            )
+
+    planned_paths = plan.get("changed_paths")
+    if isinstance(planned_paths, list):
+        normalized_planned_paths = {
+            str(path) for path in planned_paths if str(path)
+        }
+        actual_paths = set(paths)
+        if normalized_planned_paths != actual_paths:
+            gaps.append(
+                gap(
+                    gap_type="ACCEPTANCE_GAP_DETECTOR_INPUT_INVALID",
+                    claim=claim,
+                    owner_stage="PLAN",
+                    required_closure=(
+                        "Regenerate the Acceptance plan for the detector's "
+                        "exact git range"
+                    ),
+                    evidence=[
+                        {
+                            "reason": "Acceptance plan paths do not match detector range",
+                            "missingFromPlan": sorted(
+                                actual_paths - normalized_planned_paths
+                            ),
+                            "notInRange": sorted(
+                                normalized_planned_paths - actual_paths
+                            ),
+                        }
+                    ],
+                )
+            )
+
+    obligations.update(selected)
+    for gate_id in sorted(obligations):
+        result = results.get(gate_id)
+        gate = selected.get(gate_id, {})
+        if result is None:
+            gaps.append(
+                gap(
+                    gap_type="REQUIRED_GATE_NOT_RUN",
+                    claim=claim,
+                    owner_stage="EXECUTE",
+                    required_closure=f"Run required Gate {gate_id}",
+                    evidence=[
+                        {
+                            "gateId": gate_id,
+                            "environment": gate.get("environment", "unknown"),
+                            "tier": gate.get("tier", "unknown"),
+                        }
+                    ],
+                )
+            )
+            continue
+
+        status = str(result.get("status") or "")
+        completion = str(result.get("completionStatus") or "")
+        proof = str(result.get("proofStatus") or "")
+        tier = str(gate.get("tier") or "")
+        if status == "blocked":
+            gaps.append(
+                gap(
+                    gap_type="GATE_BLOCKED_BY_ENVIRONMENT",
+                    claim=claim,
+                    owner_stage="EXECUTE",
+                    required_closure=str(
+                        result.get("blockedReason")
+                        or f"Resolve the provisioning blocker for {gate_id}"
+                    ),
+                    evidence=[
+                        {
+                            "gateId": gate_id,
+                            "blockedResource": result.get("blockedResource"),
+                            "sourceArtifact": result.get("sourceArtifact"),
+                        }
+                    ],
+                )
+            )
+            continue
+        try:
+            store = store or EvidenceStore.from_environment(repo_root=REPO_ROOT)
+            read_gate_proof(store, gate_id, source, result=result, gate_definition=gate)
+        except (EvidenceError, KeyError, OSError, TypeError, ValueError):
+            gaps.append(
+                gap(
+                    gap_type="GATE_EVIDENCE_UNPROVEN",
+                    claim=claim,
+                    owner_stage="EXECUTE",
+                    required_closure=(
+                        f"Produce DONE/PROVEN evidence for Gate {gate_id}"
+                    ),
+                    evidence=[
+                        {
+                            "gateId": gate_id,
+                            "status": status,
+                            "completionStatus": completion,
+                            "proofStatus": proof,
+                            "sourceArtifact": result.get("sourceArtifact"),
+                        }
+                    ],
+                )
+            )
+            continue
+
+    proof_state = "PROVEN" if not gaps else "UNPROVEN"
+    return {
+        "artifactKind": "acceptance-gap-report",
+        "claim": claim,
+        "proofState": proof_state,
+        "changedPaths": paths,
+        "selectedGates": sorted(selected),
+        "requiredGates": sorted(obligations),
+        "gaps": gaps,
+    }
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--claim", default="Current change is acceptance-ready")
+    parser.add_argument("--range", dest="diff_range", default="HEAD")
+    parser.add_argument("--changed-file", action="append", default=[])
+    parser.add_argument("--plan")
+    parser.add_argument("--run")
+    parser.add_argument("--require-gate", action="append", default=[])
+    parser.add_argument(
+        "--contract",
+        help="Path to closure contract YAML for deliverable validation",
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    from tooling.acceptance.core import (
+        RUN_GATE_ENV,
+        ArtifactSession,
+        EvidenceStore,
+    )
+
+    args = parse_arguments()
+
+    try:
+        store = EvidenceStore.from_environment(
+            repo_root=REPO_ROOT,
+            worktree=REPO_ROOT,
+        )
+        plan = (
+            load_json(Path(args.plan))
+            if args.plan
+            else store.read_json(
+                store.latest_artifact_ref("acceptance-plan", "plan")
+            )
+        )
+        run = (
+            load_json(Path(args.run))
+            if args.run
+            else store.read_json(
+                store.latest_artifact_ref("acceptance-run", "run")
+            )
+        )
+        contract = None
+        if args.contract:
+            contract_path = Path(args.contract)
+            if not contract_path.is_absolute():
+                contract_path = REPO_ROOT / contract_path
+            if contract_path.exists():
+                contract = _load_contract(contract_path)
+        source_commit, workspace_digest = current_source_identity()
+        paths = resolve_changed_paths(
+            args.diff_range,
+            args.changed_file,
+            formal_closure_paths(plan),
+        )
+        report = detect(
+            claim=args.claim,
+            paths=paths,
+            plan=plan,
+            run=run,
+            required_gates=args.require_gate,
+            source_commit=source_commit,
+            workspace_digest=workspace_digest,
+            contract=contract,
+            canonical_plan=(
+                canonical_plan_for_paths(paths)
+                if args.plan
+                else None
+            ),
+        )
+    except (DetectorError, EvidenceError) as error:
+        sys.stderr.write(f"acceptance gap detector failed closed: {error}\n")
+        return 2
+
+    serialized = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    gate_id = os.environ.get(RUN_GATE_ENV) or "acceptance-gap-detect"
+    with ArtifactSession(repo_root=REPO_ROOT, gate_id=gate_id) as session:
+        session.write_bytes(
+            "reports/gap-report.json",
+            serialized.encode("utf-8"),
+            media_type="application/json",
+            role="gap-report",
+        )
+        proven = report["proofState"] == "PROVEN"
+        session.complete(
+            status="passed" if proven else "failed",
+            completion_status="DONE" if proven else "PARTIAL",
+            proof_status=report["proofState"],
+        )
+    sys.stdout.write(serialized)
+    return 0 if report["proofState"] == "PROVEN" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

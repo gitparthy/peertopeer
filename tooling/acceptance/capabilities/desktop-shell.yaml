@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "capabilities": [
+    {
+      "id": "desktop-shell-tray-residency",
+      "domain": "desktop-shell",
+      "direction": "acceptance_validates_product",
+      "features": [
+        "desktop-shell-tray"
+      ],
+      "required_gates": [
+        "desktop-shell-tray-e2e"
+      ],
+      "synthetic_paths": [
+        "apps/desktop/src-tauri/src/application/tray/mod.rs",
+        "apps/desktop/src-tauri/src/application/window_lifecycle.rs",
+        "apps/desktop/src-tauri/icons/tray-icon-macos.png"
+      ],
+      "evidence": {
+        "truth_sources": [
+          "Desktop Rust tray/window lifecycle",
+          "packaged macOS application binary",
+          "macOS Accessibility status-item and window state"
+        ],
+        "surfaces": [
+          "macOS menu-bar status item",
+          "Native Desktop main window"
+        ],
+        "proven_by": [
+          "desktop-shell-tray-e2e"
+        ],
+        "proven_scope": [
+          "DSTR-A01 through DSTR-A06 on desktop-macos-native"
+        ],
+        "unproven_scope": [
+          "Linux tray appearance and lifecycle",
+          "Windows tray appearance and lifecycle",
+          "macOS signing and notarization",
+          "Template rendering across every macOS theme and display arrangement"
+        ]
+      }
+    },
+    {
+      "id": "desktop-linux-install-lifecycle",
+      "domain": "desktop-shell",
+      "direction": "acceptance_validates_product",
+      "features": [
+        "desktop-linux-install"
+      ],
+      "required_gates": [
+        "desktop-linux-install-native-e2e"
+      ],
+      "synthetic_paths": [
+        "tooling/devctl/desktop-install.mjs",
+        "tooling/devctl/desktop.mjs",
+        "tooling/devctl/test/desktop.test.mjs"
+      ],
+      "evidence": {
+        "truth_sources": [
+          "devctl Desktop install orchestrator and platform adapter",
+          "installed AppImage source receipt",
+          "Linux XDG desktop entry and protocol association",
+          "running installed Native Desktop process"
+        ],
+        "surfaces": [
+          "Linux application launcher",
+          "peers-touch-dev protocol handler",
+          "Native Desktop window"
+        ],
+        "proven_by": [
+          "desktop-linux-install-native-e2e"
+        ],
+        "proven_scope": [
+          "exact-source Linux AppImage build and user-scoped XDG installation",
+          "atomic AppImage replacement while the prior process remains alive",
+          "launcher, icon, desktop entry and peers-touch-dev handler readback",
+          "installed process launch, deep-link dispatch and reverse cleanup"
+        ],
+        "unproven_scope": [
+          "Linux distribution families outside the declared Tauri prerequisites",
+          "system-wide or root-owned installation",
+          "package-manager publication",
+          "Windows persistent installation"
+        ]
+      }
+    }
+  ]
+}

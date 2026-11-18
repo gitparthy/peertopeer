@@ -1,0 +1,1170 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+from collections.abc import Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from tooling.acceptance.core._paths import REPO_ROOT
+from tooling.acceptance.core.attestation import (
+    commits_match,
+    produce_station_attestation,
+    source_proto_digest,
+)
+from tooling.acceptance.core.errors import BlockedError
+from tooling.acceptance.core.launch_context import EphemeralGateLaunchContext
+from tooling.acceptance.core.evidence_store import (
+    ArtifactRef,
+    current_artifact_ref,
+    write_current_artifact,
+)
+from tooling.acceptance.core.provisioner import (
+    load_env_file,
+    resolve_deployment_environment_path,
+    resolve_reviewed_profile_environment,
+)
+from tooling.acceptance.core.provisioning import (
+    ActorManifest,
+    ClientRuntime,
+    EnvironmentContract,
+    EnvironmentClient,
+    ProvisioningState,
+    RuntimeManifest,
+    ServiceAttestation,
+)
+from tooling.acceptance.core.resource_diagnostic import ResourceDiagnostic
+from tooling.acceptance.core.profile_bindings import resolve_service_profiles
+from tooling.acceptance.fixtures.chat_native_actors import (
+    fixture_password,
+    produce_bound_actor_manifest,
+)
+from tooling.acceptance.fixtures.chat_reset_targets import (
+    PROFILE_BINDINGS_ENV,
+    bound_reset_profiles,
+    reviewed_profile_bindings,
+)
+
+from .home_station import HomeStationProvisioner
+from .remote_source_identity import resolve_remote_source_identity
+from .station_equipment import equip_station_profile
+
+if TYPE_CHECKING:
+    from .social_relay import SocialRelayFixture
+
+
+_CROSS_STATION_SOCIAL_GATE_ROLES = {
+    "social-public-feed-native-e2e": ("alice", "bob"),
+    "federation-two-station-lifecycle-e2e": (
+        "alice",
+        "federation_secondary_owner",
+    ),
+    "social-cross-station-native-e2e": ("alice", "bob", "eve"),
+}
+_CROSS_STATION_SOCIAL_GATE_CLIENTS = {
+    "social-public-feed-native-e2e": ("alice", "bob", "bob2"),
+    "federation-two-station-lifecycle-e2e": (
+        "alice",
+        "federation-secondary-owner",
+    ),
+    "social-cross-station-native-e2e": ("alice", "bob", "eve", "bob2"),
+}
+# Outsider fixture roles receive an account and federation routing but must
+# never be seeded into the mutual-friendship graph. They authenticate over
+# HTTP without enrolling a device identity, so a FRIENDS private audience that
+# targeted them could never resolve content prekeys. The private Social Suite
+# relies on "eve" staying an outsider for its uniform-denial scenario.
+_CROSS_STATION_SOCIAL_FRIENDSHIP_OUTSIDERS = {
+    "social-cross-station-native-e2e": ("eve",),
+}
+PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class NativeTauriEmbeddedWebDriverProvisioner(HomeStationProvisioner):
+    environment_id = "native-tauri-embedded-webdriver"
+    fixture_id = "chat-native-actors"
+    product_label = "Native Chat"
+
+    def __init__(
+        self,
+        contract: EnvironmentContract,
+        *,
+        station_profiles: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(contract)
+        self._station_profiles = dict(station_profiles or {})
+
+    def prepare_fixture_authority(self, *, budget_seconds: float) -> dict[str, str]:
+        environment = super().prepare_fixture_authority(budget_seconds=budget_seconds)
+        environment[PROFILE_BINDINGS_ENV] = json.dumps(
+            reviewed_profile_bindings(self._required_station_profiles().values()),
+        )
+        return environment
+
+    def _required_station_profiles(self) -> dict[str, str]:
+        self._station_profiles = resolve_service_profiles(
+            self.contract, self._station_profiles,
+            kinds=frozenset({"station"}), repo_root=REPO_ROOT,
+        )
+        expected = {
+            service_id
+            for service_id, service in self.contract.services.items()
+            if service.kind == "station"
+        }
+        provided = set(self._station_profiles)
+        missing = sorted(expected - provided)
+        unexpected = sorted(provided - expected)
+        if missing or unexpected:
+            detail = []
+            if missing:
+                detail.append(f"missing={','.join(missing)}")
+            if unexpected:
+                detail.append(f"unexpected={','.join(unexpected)}")
+            raise BlockedError(
+                reason=(
+                    f"{self.product_label} Station profiles must be specified "
+                    "at run time "
+                    "with --station-profile SERVICE_ID=PROFILE "
+                    f"({'; '.join(detail)})"
+                ),
+                resource="station-profile-bindings",
+            )
+        invalid = sorted(
+            profile_name
+            for profile_name in self._station_profiles.values()
+            if not PROFILE_NAME_PATTERN.fullmatch(profile_name)
+        )
+        if invalid:
+            raise BlockedError(
+                reason=f"Invalid Station profile name: {invalid[0]!r}",
+                resource="station-profile-bindings",
+            )
+        duplicates = sorted(
+            profile_name
+            for profile_name in set(self._station_profiles.values())
+            if list(self._station_profiles.values()).count(profile_name) > 1
+        )
+        if duplicates:
+            raise BlockedError(
+                reason=(
+                    "Distinct Station services require distinct runtime profiles; "
+                    f"duplicate={duplicates[0]!r}"
+                ),
+                resource="station-profile-bindings",
+            )
+        return dict(self._station_profiles)
+
+    def _resolve_credentials(self) -> tuple[tuple[str, ...], dict[str, str]]:
+        return self._remember_resolved_credentials(
+            ("fixture:apps/station/app/conf/actor.yml#preset_users",),
+            {"chat-password": fixture_password()},
+            sensitive=False,
+        )
+
+    def _run_preflight_command(
+        self,
+        command: tuple[str, ...],
+        *,
+        timeout: int,
+        resource: str,
+    ) -> None:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return
+        detail = (
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or f"exit code {completed.returncode}"
+        )
+        raise BlockedError(
+            reason=f"{' '.join(command)} failed: {detail[-4000:]}",
+            resource=resource,
+        )
+
+    def _station_health_failure(
+        self,
+        manifest: RuntimeManifest,
+        service_id: str,
+        profile_name: str,
+        deployment_environment: str,
+        observation: dict[str, object],
+    ) -> BlockedError:
+        resource = f"service-health:{service_id}"
+        return BlockedError(
+            reason=(
+                f"{self.product_label} service {service_id!r} is not healthy "
+                f"at {observation['endpoint']}: {json.dumps(observation, sort_keys=True)}"
+            ),
+            resource=resource,
+            diagnostic=ResourceDiagnostic(
+                owner="native-tauri-embedded-webdriver-provisioner",
+                recovery_action=(
+                    f"Inspect the recorded health probe for Profile {profile_name} "
+                    f"(deployment {deployment_environment}); restore that reviewed "
+                    f"Station through make station, then repeat its health probe "
+                    f"and source attestation for {manifest.source_commit}."
+                ),
+                resource_checks=[
+                    {
+                        "resource": resource,
+                        "expected": {
+                            "serviceId": service_id,
+                            "profile": profile_name,
+                            "deployment": deployment_environment,
+                            "endpoint": observation["endpoint"],
+                            "statusCode": "200..299",
+                        },
+                        "state": "OBSERVED",
+                        "observed": observation,
+                    },
+                    {
+                        "resource": f"source-identity:{service_id}",
+                        "expected": {"commit": manifest.source_commit},
+                        "state": "NOT_EVALUATED",
+                        "reason": "Health preparation failed before Station source attestation.",
+                    },
+                ],
+            ),
+        )
+
+    def _station_equipment_options(
+        self, manifest: RuntimeManifest, service_id: str, profile_name: str,
+    ) -> dict[str, object]:
+        return {}
+
+    def _provision_station_services(
+        self,
+        manifest: RuntimeManifest,
+    ) -> dict[str, ServiceAttestation]:
+        services: dict[str, ServiceAttestation] = {}
+        local_proto_digest = source_proto_digest(REPO_ROOT)
+        profiles = {
+            service_id: (profile, resolve_reviewed_profile_environment(
+                profile, repo_root=REPO_ROOT,
+            )[1])
+            for service_id, profile in self._required_station_profiles().items()
+        }
+        for service_id, (profile_name, profile_env) in profiles.items():
+            if profile_env.get("PT_STATION_MODE", "").strip() == "remote":
+                equip_station_profile(
+                    profile_name, manifest.source_commit, repo_root=REPO_ROOT,
+                    **self._station_equipment_options(manifest, service_id, profile_name),
+                )
+        for service_id, (profile_name, profile_env) in profiles.items():
+            mode = (
+                profile_env.get("PT_STATION_MODE", "local").strip() or "local"
+            )
+            deployment_environment = profile_env.get(
+                "PT_STATION_DEPLOY_ENV",
+                "",
+            ).strip() or profile_name
+            deployment_env: dict[str, str] = {}
+            if mode == "remote":
+                deployment_path = resolve_deployment_environment_path(
+                    deployment_environment,
+                    repo_root=REPO_ROOT,
+                )
+                deployment_env = load_env_file(deployment_path)
+            station_url = profile_env.get("PT_STATION_URL", "").rstrip("/")
+            health_url = (
+                profile_env.get("PT_STATION_HEALTH_URL", "").strip()
+                or deployment_env.get("PT_DEPLOY_HEALTH_URL", "").strip()
+            )
+            if not station_url:
+                raise BlockedError(
+                    reason=f"Station profile {profile_name!r} has no endpoint",
+                    resource=f"service-profile:{service_id}",
+                )
+            owner = f"acceptance:{manifest.gate_id}:{manifest.run_id}"
+            self.acquire_profile_lease(deployment_environment, owner)
+            if mode == "remote":
+                self.acquire_remote_git_source_lease(
+                    deployment_environment,
+                    owner,
+                )
+            health = self._station_health(station_url, health_url)
+            if not health["ready"]:
+                if mode == "remote":
+                    raise self._station_health_failure(
+                        manifest, service_id, profile_name,
+                        deployment_environment, health,
+                    )
+                station_environment = {
+                    **os.environ,
+                    "PT_DEV_TARGET_PROFILE": profile_name,
+                }
+                for field in (
+                    "PT_DEV_PROFILE_FILE", "PT_DEV_PROFILE_FILE_AUTHORITY",
+                    "PT_ACCEPTANCE_RUNTIME_PROFILE_ROOT",
+                ):
+                    station_environment.pop(field, None)
+                equip_station_profile(
+                    profile_name, manifest.source_commit, repo_root=REPO_ROOT,
+                )
+                def stop_local_station(
+                    environment: dict[str, str] = station_environment,
+                    target_profile: str = profile_name,
+                ) -> None:
+                    stopped = subprocess.run(
+                        [
+                            "node", str(REPO_ROOT / "tooling/devctl/index.mjs"),
+                            "station", "stop", "--target-profile", target_profile,
+                        ],
+                        cwd=REPO_ROOT,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                    if stopped.returncode != 0:
+                        detail = (
+                            stopped.stderr.strip()
+                            or stopped.stdout.strip()
+                            or "unknown station-stop failure"
+                        )
+                        raise RuntimeError(detail)
+
+                self.register_cleanup(
+                    f"local-station:{service_id}",
+                    stop_local_station,
+                )
+                health = self._station_health(station_url, health_url)
+                if not health["ready"]:
+                    raise self._station_health_failure(
+                        manifest, service_id, profile_name,
+                        deployment_environment, health,
+                    )
+            attestation = produce_station_attestation(
+                environment_id=self.environment_id,
+                run_id=manifest.run_id,
+                service_id=service_id,
+                station_url=station_url,
+                profile_env=profile_env,
+                require_runtime_identity=True,
+                remote_source_identity_provider=(
+                    resolve_remote_source_identity
+                    if mode == "remote"
+                    else None
+                ),
+            )
+            if not commits_match(
+                attestation.live_commit,
+                manifest.source_commit,
+            ):
+                raise BlockedError(
+                    reason=(
+                        f"{service_id} commit {attestation.live_commit} does "
+                        f"not match client source {manifest.source_commit}"
+                    ),
+                    resource=f"source-identity:{service_id}:commit",
+                    diagnostic=ResourceDiagnostic.observed(
+                        owner="native-tauri-embedded-webdriver-provisioner",
+                        recovery_action=(
+                            f"Deploy checked source {manifest.source_commit} through "
+                            f"make station for Profile {profile_name} "
+                            f"(deployment {deployment_environment}), then verify "
+                            f"{station_url}/app-meta/version."
+                        ),
+                        resource=f"source-identity:{service_id}:commit",
+                        expected={
+                            "commit": manifest.source_commit,
+                            "serviceId": service_id,
+                            "profile": profile_name,
+                            "deployment": deployment_environment,
+                        },
+                        observed={
+                            "commit": attestation.live_commit,
+                            "stationUrl": station_url,
+                            "runtimeIdentity": attestation.runtime_identity,
+                        },
+                    ),
+                )
+            if attestation.protocol_digest != local_proto_digest:
+                raise BlockedError(
+                    reason=(
+                        f"{service_id} protocol digest does not match the "
+                        "client source"
+                    ),
+                    resource=f"source-identity:{service_id}:proto",
+                    diagnostic=ResourceDiagnostic.observed(
+                        owner="native-tauri-embedded-webdriver-provisioner",
+                        recovery_action=(
+                            f"Deploy checked source {manifest.source_commit} through "
+                            f"make station for Profile {profile_name} "
+                            f"(deployment {deployment_environment}), then verify "
+                            f"{station_url}/app-meta/version and protocol digest."
+                        ),
+                        resource=f"source-identity:{service_id}:proto",
+                        expected={
+                            "protocolDigest": local_proto_digest,
+                            "serviceId": service_id,
+                            "profile": profile_name,
+                            "deployment": deployment_environment,
+                        },
+                        observed={
+                            "protocolDigest": attestation.protocol_digest,
+                            "stationUrl": station_url,
+                            "runtimeIdentity": attestation.runtime_identity,
+                        },
+                    ),
+                )
+            services[service_id] = attestation
+        return services
+
+    @staticmethod
+    def _actor_role_targets(
+        roles: tuple[str, ...],
+        clients: tuple[ClientRuntime, ...],
+        declared_clients: tuple[EnvironmentClient, ...],
+        services: dict[str, ServiceAttestation],
+    ) -> dict[str, tuple[str, str]]:
+        targets: dict[str, tuple[str, str]] = {}
+        for role in roles:
+            service_ids = {
+                binding.service_id
+                for client in clients
+                if client.actor == role
+                for binding_role, binding in client.service_bindings.items()
+                if binding_role == "station"
+            }
+            service_ids.update(
+                binding.service_id
+                for client in declared_clients
+                if client.actor == role
+                for binding_role, binding in client.service_bindings.items()
+                if binding_role == "station"
+            )
+            if len(service_ids) != 1:
+                raise BlockedError(
+                    reason=(
+                        f"{self.product_label} actor role {role!r} must bind to exactly "
+                        "one fixture Station"
+                    ),
+                    resource=f"fixture-binding:{role}",
+                )
+            service_id = service_ids.pop()
+            service = services.get(service_id)
+            if service is None:
+                raise BlockedError(
+                    reason=(
+                        f"{self.product_label} actor role {role!r} binds unknown "
+                        f"service {service_id!r}"
+                    ),
+                    resource=f"fixture-binding:{role}",
+                )
+            targets[role] = (
+                service.endpoint,
+                service.deployment_environment,
+            )
+        return targets
+
+    @staticmethod
+    def _persist_station_keyed_actor_manifest(
+        *,
+        manifest: ActorManifest,
+        role_targets: Mapping[str, tuple[str, str]],
+        services: Mapping[str, ServiceAttestation],
+    ) -> dict[str, str]:
+        actors_by_role = {actor.role: actor for actor in manifest.actors}
+        stations: dict[str, dict[str, object]] = {}
+        for role, (endpoint, deployment_environment) in role_targets.items():
+            service_match = next(
+                (
+                    (service_id, service)
+                    for service_id, service in services.items()
+                    if service.endpoint == endpoint
+                    and service.deployment_environment
+                    == deployment_environment
+                ),
+                None,
+            )
+            actor = actors_by_role.get(role)
+            if service_match is None or actor is None:
+                raise BlockedError(
+                    reason=(
+                        f"Federation actor role {role!r} has no exact "
+                        "Station service binding"
+                    ),
+                    resource=f"fixture-binding:{role}",
+                )
+            service_id, service = service_match
+            if (
+                not actor.home_station_peer_id
+                or actor.home_station_peer_id != service.runtime_identity
+            ):
+                raise BlockedError(
+                    reason=(
+                        f"Federation actor role {role!r} Home Station "
+                        "identity does not match its bound service"
+                    ),
+                    resource=f"fixture-binding:{role}",
+                )
+            station = stations.setdefault(
+                service_id,
+                {
+                    "stationPeerId": service.runtime_identity,
+                    "actors": [],
+                },
+            )
+            station_actors = station["actors"]
+            if not isinstance(station_actors, list):
+                raise BlockedError(
+                    reason="Federation actor manifest Station actors invalid",
+                    resource=f"fixture-binding:{service_id}",
+                )
+            station_actors.append(
+                {
+                    "role": actor.role,
+                    "accountRef": actor.account_ref,
+                    "ptid": actor.ptid,
+                    "devicePolicy": actor.device_policy,
+                    "homeStationPeerId": actor.home_station_peer_id,
+                }
+            )
+        payload = {
+            "artifactKind": "cross-station-federation-actor-manifest",
+            "fixtureId": manifest.fixture_id,
+            "environmentId": manifest.environment_id,
+            "runId": manifest.run_id,
+            "createdAt": manifest.created_at,
+            "initialState": manifest.initial_state,
+            "stations": stations,
+            "credentialRefs": list(manifest.credential_refs),
+            "reset": {
+                "authorized": manifest.reset_authorized,
+                "targetVerified": manifest.target_verified,
+            },
+        }
+        relative_path = "runtime/federation-actor-manifest.json"
+        write_current_artifact(
+            relative_path,
+            (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+            repo_root=REPO_ROOT,
+        )
+        return current_artifact_ref(
+            relative_path,
+            repo_root=REPO_ROOT,
+            media_type="application/json",
+        ).to_dict()
+
+    def provision(self, gate_id: str) -> RuntimeManifest:
+        self._manifest = self._new_base_manifest(gate_id)
+        try:
+            profile_name, _, slot, _ = self._resolve_active_profile()
+            manifest = self._preflighted(
+                self._manifest,
+                profile_name=profile_name,
+                slot=slot,
+            )
+            services = self._provision_station_services(manifest)
+            manifest = dataclasses.replace(
+                manifest,
+                state=ProvisioningState.PROVISIONED,
+                services=services,
+            )
+            self._manifest = manifest
+
+            credential_refs, _ = self._resolve_credentials()
+            fixture = next(
+                (
+                    item
+                    for item in self.contract.fixtures
+                    if item.id == self.fixture_id
+                ),
+                None,
+            )
+            if fixture is None:
+                raise BlockedError(
+                    reason=(
+                        f"{self.product_label} contract is missing its "
+                        f"{self.fixture_id} fixture"
+                    ),
+                    resource=f"fixture:{self.fixture_id}",
+                )
+            roles = self._actor_roles(gate_id)
+            clients = self._clients(gate_id, manifest.run_id, slot)
+            role_targets = self._actor_role_targets(
+                roles,
+                clients,
+                self.contract.clients,
+                services,
+            )
+            with bound_reset_profiles(self._required_station_profiles().values()):
+                actor_manifest, _, actor_ref = produce_bound_actor_manifest(
+                    environment_id=self.environment_id,
+                    run_id=manifest.run_id,
+                    role_targets=role_targets,
+                    credential_ref=credential_refs[0] if credential_refs else "",
+                    reset_authorized=None,
+                    fixture_id=self.fixture_id,
+                    friendship_roles=self._friendship_roles(gate_id, roles),
+                )
+                if gate_id == "social-cross-station-native-e2e":
+                    from tooling.acceptance.fixtures.chat_native_reset import (
+                        reset_fixture_follow_edges,
+                    )
+
+                    follow_targets: dict[tuple[str, str], list[str]] = {}
+                    for actor in actor_manifest.actors:
+                        follow_targets.setdefault(
+                            role_targets[actor.role], [],
+                        ).append(actor.ptid)
+                    for (station_url, environment), ptids in follow_targets.items():
+                        reset_fixture_follow_edges(station_url, environment, ptids)
+            if gate_id == "federation-two-station-lifecycle-e2e":
+                actor_ref = self._persist_station_keyed_actor_manifest(
+                    manifest=actor_manifest,
+                    role_targets=role_targets,
+                    services=services,
+                )
+            manifest = dataclasses.replace(
+                manifest,
+                actor_manifest_ref=actor_ref,
+                credential_refs=credential_refs,
+                clients=clients,
+                cleanup_resources=self.contract.cleanup.resources,
+            )
+            manifest = self._ready(manifest)
+        except BlockedError as error:
+            return self._blocked(
+                self._manifest,
+                reason=error.reason,
+                resource=error.resource,
+                diagnostic=error.diagnostic,
+            )
+
+        runtime_cell = os.environ.get(
+            "PT_ACCEPTANCE_RUNTIME_CELL",
+            "",
+        ).strip()
+        if runtime_cell:
+            return manifest
+        try:
+            self._run_preflight_command(
+                ("make", "acceptance-driver-build"),
+                timeout=1200,
+                resource="desktop-acceptance-binary:build",
+            )
+            self._run_preflight_command(
+                ("make", "acceptance-driver-smoke"),
+                timeout=120,
+                resource="desktop-acceptance-binary:smoke",
+            )
+            return manifest
+        except (BlockedError, subprocess.TimeoutExpired) as error:
+            if isinstance(error, BlockedError):
+                blocked = error
+            else:
+                blocked = BlockedError(
+                    reason=f"{' '.join(error.cmd)} timed out after {error.timeout}s",
+                    resource="desktop-acceptance-binary:preflight",
+                )
+            return self._blocked(
+                manifest,
+                reason=blocked.reason,
+                resource=blocked.resource,
+                diagnostic=blocked.diagnostic,
+            )
+
+    @staticmethod
+    def _actor_roles(gate_id: str) -> tuple[str, ...]:
+        from .home_station import GATE_ROLES
+
+        roles = GATE_ROLES.get(gate_id)
+        if roles is None:
+            raise BlockedError(
+                reason=f"Native Chat has no actor allocation for {gate_id}",
+                resource=f"gate-environment:{gate_id}",
+            )
+        return roles
+
+    def _friendship_roles(
+        self, gate_id: str, roles: tuple[str, ...]
+    ) -> tuple[str, ...] | None:
+        """Restrict the seeded mutual-friendship mesh.
+
+        Returning ``None`` keeps the full mesh over every bound role, which is
+        the Chat contract where every actor enrolls a device and exchanges
+        messages. Cross-Station Social overrides this to keep token-only
+        outsider actors out of the friendship graph.
+        """
+        return None
+
+
+class NativeTauriSingleStationWebDriverProvisioner(
+    NativeTauriEmbeddedWebDriverProvisioner
+):
+    """Single-Station embedded-WebDriver provisioner for same-Station Direct.
+
+    Both actors bind the one Station service declared by the environment
+    contract. The Station derives the Direct Local scope from the matching
+    Home Stations; the run-time ``--station-profile`` binding retargets the
+    single ``station-four`` service to the reviewed disposable profile.
+    """
+
+    environment_id = "native-tauri-single-station-webdriver"
+
+
+class CrossStationSocialNativeProvisioner(
+    NativeTauriEmbeddedWebDriverProvisioner
+):
+    environment_id = "cross-station-social-native"
+    fixture_id = "cross-station-social-actors"
+    product_label = "Cross-Station Social"
+
+    def __init__(
+        self,
+        contract: EnvironmentContract,
+        *,
+        station_profiles: Mapping[str, str] | None = None,
+    ) -> None:
+        supplied = dict(station_profiles or {})
+        relay_roles = {key for key, service in contract.services.items() if service.kind == "relay"}
+        self._relay_profiles = {key: supplied.pop(key) for key in relay_roles if key in supplied}
+        self._social_relay_fixture = None
+        super().__init__(
+            contract,
+            station_profiles=supplied,
+        )
+
+    def _station_equipment_options(
+        self, manifest: RuntimeManifest, service_id: str, profile_name: str,
+    ) -> dict[str, object]:
+        if manifest.gate_id not in {
+            "social-public-feed-native-e2e", "social-cross-station-native-e2e",
+        }:
+            return {}
+        receiver = next(client for client in self.contract.clients if client.id == "bob")
+        if service_id != receiver.service_bindings["station"].service_id:
+            return {}
+        # Register before deploying: partial preparation must also restore.
+        # Reverse cleanup releases retained source/service leases first.
+        def restore() -> None:
+            if self._social_relay_fixture is not None:
+                self._social_relay_fixture.attachments.assert_attachments_retired()
+            equip_station_profile(
+                profile_name, manifest.source_commit, repo_root=REPO_ROOT,
+                recreate_runtime=True,
+            )
+
+        self.register_cleanup(
+            f"social-notification-runtime:{profile_name}",
+            restore,
+        )
+        return {"social_notification_run_id": manifest.run_id}
+
+    def create_gate_launch_context(
+        self, *, gate_id: str, evidence_run_id: str, provisioning_run_id: str,
+        required_capabilities: tuple[str, ...],
+    ) -> EphemeralGateLaunchContext | None:
+        from tooling.acceptance.fixtures.social_feed_notification import (
+            CAPABILITY_ID, SocialFeedNotificationHandler,
+        )
+        from tooling.acceptance.fixtures.social_relay_capture import CAPABILITY_ID as CAPTURE_ID
+        if gate_id == "social-cross-station-native-e2e":
+            return self._private_station_outage_context(
+                gate_id=gate_id, evidence_run_id=evidence_run_id,
+                provisioning_run_id=provisioning_run_id,
+                required_capabilities=required_capabilities,
+            )
+        if gate_id != "social-public-feed-native-e2e":
+            return super().create_gate_launch_context(
+                gate_id=gate_id, evidence_run_id=evidence_run_id,
+                provisioning_run_id=provisioning_run_id,
+                required_capabilities=required_capabilities,
+            )
+        if (required_capabilities != (CAPABILITY_ID, CAPTURE_ID) or self._manifest is None
+                or not self._manifest.is_ready()
+                or evidence_run_id != self.evidence_run.run_id
+                or provisioning_run_id != self._manifest.run_id
+                or evidence_run_id == provisioning_run_id):
+            raise BlockedError(
+                reason="Social notification fixture requires the current prepared source and run",
+                resource=f"ephemeral-capabilities:{gate_id}",
+            )
+        clients = {client.id: client for client in self._manifest.clients}
+        receiver_id = clients["bob"].service_bindings["station"].service_id
+        sender_id = clients["alice"].service_bindings["station"].service_id
+        receiver, sender = (
+            self._manifest.services[receiver_id], self._manifest.services[sender_id],
+        )
+        if receiver_id == sender_id or receiver.live_commit != self._manifest.source_commit:
+            raise BlockedError(
+                reason="Social notification fixture requires distinct current-source Stations",
+                resource=CAPABILITY_ID,
+            )
+        deployment = load_env_file(resolve_deployment_environment_path(
+            receiver.deployment_environment, repo_root=REPO_ROOT,
+        ))
+        context = EphemeralGateLaunchContext(required_capabilities=required_capabilities)
+        context.register_capability(CAPABILITY_ID, SocialFeedNotificationHandler(
+            deployment=deployment, run_id=provisioning_run_id,
+            profile=self._required_station_profiles()[receiver_id],
+            commit=self._manifest.source_commit, station=receiver.runtime_identity,
+            source_station=sender.runtime_identity,
+        ))
+        if self._social_relay_fixture is None:
+            raise BlockedError(reason="Public Social has no prepared Relay capture owner",
+                               resource=CAPTURE_ID)
+        context.register_capability(CAPTURE_ID, self._social_relay_fixture.capture_handler(
+            evidence_environment=self.evidence_run.subprocess_environment({}),
+        ))
+        return context
+
+    def _private_station_outage_context(
+        self, *, gate_id: str, evidence_run_id: str, provisioning_run_id: str,
+        required_capabilities: tuple[str, ...],
+    ) -> EphemeralGateLaunchContext:
+        from tooling.acceptance.provisioners.mobile_simulator import (
+            MOBILE_STATION_OUTAGE_CAPABILITY_ID,
+            MOBILE_STATION_OUTAGE_CHANNEL_TIMEOUT_SECONDS,
+            MobileStationOutageCapabilityHandler,
+        )
+        from tooling.acceptance.fixtures.social_private_delivery import (
+            CAPABILITY_ID as DELIVERY_CAPABILITY, SocialPrivateDeliveryHandler,
+        )
+        if (
+            required_capabilities != (MOBILE_STATION_OUTAGE_CAPABILITY_ID, DELIVERY_CAPABILITY)
+            or self._manifest is None or not self._manifest.is_ready()
+            or self._manifest.gate_id != gate_id
+            or evidence_run_id != self.evidence_run.run_id
+            or provisioning_run_id != self._manifest.run_id
+            or evidence_run_id == provisioning_run_id
+        ):
+            raise BlockedError(
+                reason="Private Social outage requires its prepared parent and exact run",
+                resource=f"ephemeral-capabilities:{gate_id}",
+            )
+        clients = {client.id: client for client in self._manifest.clients}
+        receiver_id = clients["bob"].service_bindings["station"].service_id
+        sender_id = clients["alice"].service_bindings["station"].service_id
+        receiver = self._manifest.services[receiver_id]
+        if (
+            receiver_id == sender_id or receiver.service_kind != "station"
+            or receiver.live_commit != self._manifest.source_commit
+            or receiver.workspace_digest != "clean"
+            or not receiver.deployment_environment
+        ):
+            raise BlockedError(
+                reason="Private Social outage target is not its source-attested receiver",
+                resource=MOBILE_STATION_OUTAGE_CAPABILITY_ID,
+            )
+        if not isinstance(self._manifest.actor_manifest_ref, dict):
+            raise BlockedError(
+                reason="Private Social delivery requires its prepared Actor manifest",
+                resource=DELIVERY_CAPABILITY,
+            )
+        actor_ref = ArtifactRef.from_dict(self._manifest.actor_manifest_ref)
+        if actor_ref.gate_id != gate_id or actor_ref.run_id != evidence_run_id:
+            raise BlockedError(
+                reason="Private Social delivery Actor reference belongs to another run",
+                resource=DELIVERY_CAPABILITY,
+            )
+        actor_manifest = self.evidence_run.store.read_json(actor_ref)
+        if (
+            actor_manifest.get("artifactKind") != "acceptance-actor-manifest"
+            or actor_manifest.get("environmentId") != self._manifest.environment_id
+            or actor_manifest.get("runId") != provisioning_run_id
+        ):
+            raise BlockedError(
+                reason="Private Social delivery Actor manifest belongs to another run",
+                resource=DELIVERY_CAPABILITY,
+            )
+        actors = {actor["role"]: actor for actor in actor_manifest["actors"]}
+        # Reuse the original exact-container stop/start owner. Its name does
+        # not allocate a Mobile client or simulator.
+        handler = MobileStationOutageCapabilityHandler(
+            deployment_environment=receiver.deployment_environment,
+            expected_commit=self._manifest.source_commit,
+        )
+        context = EphemeralGateLaunchContext(
+            required_capabilities=required_capabilities,
+            request_timeout_seconds=MOBILE_STATION_OUTAGE_CHANNEL_TIMEOUT_SECONDS,
+        )
+        context.register_capability(MOBILE_STATION_OUTAGE_CAPABILITY_ID, handler)
+
+        def restore() -> None:
+            result = handler.close()
+            if not result.closed or not result.secrets_zeroized:
+                raise BlockedError(
+                    reason="Private Social outage cleanup did not restore its receiver",
+                    resource=MOBILE_STATION_OUTAGE_CAPABILITY_ID,
+                )
+
+        self.register_cleanup("private-social-station-outage", restore)
+        source = self._manifest.services[sender_id]
+        delivery_handler = SocialPrivateDeliveryHandler(
+            repo_root=REPO_ROOT, source_commit=self._manifest.source_commit,
+            run_id=provisioning_run_id,
+            source_deployment=load_env_file(resolve_deployment_environment_path(
+                source.deployment_environment, repo_root=REPO_ROOT,
+            )),
+            receiver_deployment=load_env_file(resolve_deployment_environment_path(
+                receiver.deployment_environment, repo_root=REPO_ROOT,
+            )),
+            source_station=source.runtime_identity, receiver_station=receiver.runtime_identity,
+            receiver_origin=receiver.endpoint,
+            receiver_actor=actors["bob"]["ptid"], outsider_actor=actors["eve"]["ptid"],
+            receiver_profile=self._required_station_profiles()[receiver_id],
+        )
+
+        def clear_delivery() -> None:
+            # The control file belongs to the original receiver container.
+            # Restore an interrupted outage before attempting its removal.
+            restore()
+            result = delivery_handler.close()
+            if not result.closed or not result.secrets_zeroized:
+                raise BlockedError(
+                    reason="Private Social delivery fixture cleanup failed",
+                    resource=DELIVERY_CAPABILITY,
+                )
+
+        self.register_cleanup("private-social-delivery-probe", clear_delivery)
+        delivery_handler.prepare()
+        context.register_capability(DELIVERY_CAPABILITY, delivery_handler)
+        return context
+
+    def _equip_social_relay(self, manifest: RuntimeManifest) -> SocialRelayFixture:
+        from .social_relay import SocialRelayFixture
+        profiles = resolve_service_profiles(
+            self.contract, self._relay_profiles, kinds=frozenset({"relay"}), repo_root=REPO_ROOT,
+        )
+        if set(profiles) != {"relay"}:
+            raise BlockedError(reason="Cross-Station Social requires the declared Relay service",
+                               resource="social-relay-binding")
+        relay = SocialRelayFixture(
+            profile=profiles["relay"], repo_root=REPO_ROOT,
+            register_cleanup=self.register_cleanup,
+            acquire_profile_lease=self.acquire_profile_lease,
+            acquire_source_lease=self.acquire_remote_git_source_lease,
+        )
+        self._social_relay_fixture = relay
+        relay.equip(manifest)
+        return relay
+
+    def _attach_social_relay(
+        self, manifest: RuntimeManifest, relay: SocialRelayFixture,
+        stations: dict[str, ServiceAttestation],
+    ) -> dict[str, ServiceAttestation]:
+        services = {**stations, "relay": relay.attach(manifest, stations)}
+        if manifest.gate_id == "social-public-feed-native-e2e":
+            relay.prepare_capture_probe()
+        self.evidence_run.write_json(
+            "runtime/social-relay-preparation.json", relay.inventory,
+            role="social-relay-preparation",
+        )
+        return services
+
+    def _provision_station_services(
+        self, manifest: RuntimeManifest,
+    ) -> dict[str, ServiceAttestation]:
+        if manifest.gate_id == "social-public-feed-native-e2e":
+            # Both deployment owners finish before retained service/source leases.
+            relay = self._equip_social_relay(manifest)
+            services = super()._provision_station_services(manifest)
+            return self._attach_social_relay(manifest, relay, services)
+        if manifest.gate_id != "social-cross-station-native-e2e":
+            return super()._provision_station_services(manifest)
+        from tooling.acceptance.core import workspace_id
+        from tooling.development.secure_content import runtime_manifest
+        from tooling.development.secure_content.prepared_native import SCHEMA_INVENTORY_PATH
+        from tooling.development.secure_content.runtime_owner import (
+            _publish_canonical_private_schema_attestation,
+            _verify_live_canonical_private_schema_attestation,
+        )
+        from tooling.development.secure_content.runtime_schema import (
+            RUNTIME_TARGETS, prepare_private_social_runtime,
+        )
+
+        profiles = self._required_station_profiles()
+        targets = {}
+        for role, profile in profiles.items():
+            target = RUNTIME_TARGETS.get(profile)
+            if target is None:
+                raise BlockedError(
+                    reason="private Social Station is outside the physical schema reset allowlist",
+                    resource=f"service-profile:{role}",
+                )
+            targets[role] = target
+        # DHT locators alone cannot supply the profile/content Circuit route.
+        # Reuse Public Social's owner rather than relying on ambient attachments.
+        relay = self._equip_social_relay(manifest)
+        # Deploy/reset owns its leases. Prepare both targets before retaining
+        # the Suite's source/service leases; then attest again under those locks.
+        paths = {
+            role: prepare_private_social_runtime(
+                REPO_ROOT, task_id=manifest.gate_id, target_profile=profile,
+                source_commit=manifest.source_commit,
+            )
+            for role, profile in profiles.items()
+        }
+        services = super()._provision_station_services(manifest)
+        inventory = {
+            "artifactKind": "private-social-schema-inventory",
+            "runId": manifest.run_id,
+            "workspaceId": workspace_id(REPO_ROOT),
+            "sourceCommit": manifest.source_commit,
+            "services": {},
+        }
+        for role, service in services.items():
+            target = targets[role]
+            binding = runtime_manifest.load_canonical_private_schema_attestation(
+                paths[role], repo_root=REPO_ROOT,
+                source_commit=manifest.source_commit,
+                workspace_id=inventory["workspaceId"],
+                service_id=target.service_id, profile_id=target.profile_id,
+                deployment_environment=target.deployment_environment,
+                station_runtime_identity=service.runtime_identity,
+                service_attestation_digest=runtime_manifest.schema_service_attestation_binding_digest(
+                    target.service_id, {
+                        "kind": service.service_kind,
+                        "deployment_environment": service.deployment_environment,
+                        "schema_attestation_endpoint": service.endpoint,
+                        "live_commit": service.live_commit,
+                        "protocol_digest": service.protocol_digest,
+                        "runtime_identity": service.runtime_identity,
+                    },
+                ),
+            )
+            _verify_live_canonical_private_schema_attestation(binding, repo_root=REPO_ROOT)
+            reference = _publish_canonical_private_schema_attestation(
+                self.evidence_run.run_dir, target.service_id, binding,
+            )
+            inventory["services"][role] = {
+                "profileId": target.profile_id,
+                "physicalServiceId": target.service_id,
+                "deploymentEnvironment": target.deployment_environment,
+                "attestationRef": reference,
+                "serviceAttestationRef": service.artifact_ref,
+            }
+        self.evidence_run.write_json(
+            SCHEMA_INVENTORY_PATH, inventory, role="private-social-schema-inventory",
+        )
+        return self._attach_social_relay(manifest, relay, services)
+
+    def _resolve_active_profile(self) -> tuple[str, Path, int, dict[str, str]]:
+        profile, profile_path, slot, environment = (
+            super()._resolve_active_profile()
+        )
+        required_profile = self._required_station_profiles()["station-four"]
+        if profile != required_profile:
+            raise BlockedError(
+                reason=(
+                    "Cross-Station Social requires active profile "
+                    f"{required_profile}; observed {profile}"
+                ),
+                resource=f"profile:{required_profile}",
+            )
+        # Machine Dev owns workspace slots. The Environment contract binds
+        # Station roles, while client ports derive from that verified slot.
+        return profile, profile_path, slot, environment
+
+    def _clients(
+        self,
+        gate_id: str,
+        run_id: str,
+        slot: int,
+    ) -> tuple[ClientRuntime, ...]:
+        roles = _CROSS_STATION_SOCIAL_GATE_CLIENTS.get(gate_id)
+        if roles is None:
+            raise BlockedError(
+                reason=(
+                    "Cross-Station Social has no client allocation for gate "
+                    f"{gate_id}"
+                ),
+                resource=f"gate-environment:{gate_id}",
+            )
+        contract_clients = {client.id: client for client in self.contract.clients}
+        missing_clients = sorted(set(roles) - set(contract_clients))
+        if missing_clients:
+            raise BlockedError(
+                reason=(
+                    "Environment contract has no allocation for clients: "
+                    f"{', '.join(missing_clients)}"
+                ),
+                resource=f"gate-environment:{gate_id}",
+            )
+
+        gateway_base = 3330 + slot * 100
+        renderer_base = 3510 + slot * 100
+        webdriver_base = 4445 + slot * 10
+        run_root = (
+            Path(tempfile.gettempdir())
+            / f"pt-social-cross-station-{run_id}-{gate_id}"
+        )
+        clients = tuple(
+            ClientRuntime(
+                actor=contract_clients[role].actor,
+                runtime="native-tauri",
+                worktree=str(REPO_ROOT),
+                gateway_port=gateway_base + index,
+                renderer_port=renderer_base + index,
+                webdriver_port=webdriver_base + index,
+                profile=f"social-cross-station-{role}",
+                storage_root=str(run_root / role / "storage"),
+                id=role,
+                required_service_roles=(
+                    contract_clients[role].required_service_roles
+                ),
+                service_bindings=contract_clients[role].service_bindings,
+            )
+            for index, role in enumerate(roles)
+        )
+        for client in clients:
+            for label, port in (
+                ("gateway", client.gateway_port),
+                ("renderer", client.renderer_port),
+                ("webdriver", client.webdriver_port),
+            ):
+                with socket.socket() as probe:
+                    if probe.connect_ex(("127.0.0.1", port)) == 0:
+                        raise BlockedError(
+                            reason=(
+                                f"{client.id} {label} port {port} is "
+                                "already in use"
+                            ),
+                            resource=f"client-isolation:{label}-port:{port}",
+                        )
+        self.register_cleanup(
+            f"client-storage:{run_root}",
+            lambda: shutil.rmtree(run_root, ignore_errors=True),
+        )
+        return clients
+
+    @staticmethod
+    def _actor_roles(gate_id: str) -> tuple[str, ...]:
+        roles = _CROSS_STATION_SOCIAL_GATE_ROLES.get(gate_id)
+        if roles is None:
+            raise BlockedError(
+                reason=(
+                    "Cross-Station Social has no actor allocation for gate "
+                    f"{gate_id}"
+                ),
+                resource=f"gate-environment:{gate_id}",
+            )
+        return roles
+
+    def _friendship_roles(
+        self, gate_id: str, roles: tuple[str, ...]
+    ) -> tuple[str, ...] | None:
+        outsiders = _CROSS_STATION_SOCIAL_FRIENDSHIP_OUTSIDERS.get(gate_id)
+        if not outsiders:
+            return None
+        outsider_set = set(outsiders)
+        return tuple(role for role in roles if role not in outsider_set)

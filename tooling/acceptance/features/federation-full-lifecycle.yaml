@@ -1,0 +1,94 @@
+{
+  "id": "federation-full-lifecycle",
+  "status": "active",
+  "product_area": "federation",
+  "owners": [
+    "model/domain/federation/**",
+    "apps/station/app/subserver/federation/**",
+    "apps/station/app/subserver/dashboard/handler_federation.go",
+    "apps/station/app/subserver/dashboard/web/src/pages/FederationPage.tsx",
+    "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+    "apps/desktop/src/store/federation.ts",
+    "apps/desktop/src/runtimes/federationRuntime.ts",
+    "apps/desktop/src/acceptance/moments/harness.ts",
+    "apps/desktop/src-tauri/src/acceptance/federation_fixture.rs",
+    "tooling/acceptance/environments/cross-station-social-native.yaml",
+    "tooling/acceptance/fixtures/chat_native_actors.py",
+    "tooling/acceptance/gates/chat/mixed_native_runtime.py",
+    "tooling/acceptance/provisioners/native_tauri_embedded_webdriver.py",
+    "tooling/acceptance/gates/federation/**"
+  ],
+  "truth_sources": [
+    "federation_ledger_events",
+    "federation_station_membership",
+    "federation_actor_role",
+    "station_role_assignment"
+  ],
+  "required_gates": [
+    "station-federation-unit",
+    "station-access-federation-boundary-e2e",
+    "federation-two-station-lifecycle-e2e"
+  ],
+  "profiles": {
+    "station-primary": {
+      "profile": "four",
+      "service_id": "station-four"
+    },
+    "station-secondary": {
+      "profile": "fiveArm",
+      "service_id": "station-five-arm"
+    }
+  },
+  "preconditions": [
+    "profiles four and fiveArm attest distinct Station identities at the candidate source",
+    "the sequencer genesis Station signing key matches the challenge-signed Station identity statement",
+    "the suite does not rotate the Station Federation signing key",
+    "the initial Station owner fixture is bound independently to station-four and station-five-arm",
+    "the reusable Suite Runtime owns both Native Desktop clients and the reset fixture",
+    "fixture mutations authenticate with independent live Dashboard administrator sessions"
+  ],
+  "acceptance": {
+    "create-and-validate": [
+      "the Station administrator creates one single_admin Federation through the Dashboard management port",
+      "the resulting owner projection is active and exposes can_archive",
+      "invalid Federation identity and endpoint inputs fail with a typed result"
+    ],
+    "invite-and-cross-station-join": [
+      "station-five-arm submits a join proposal to the station-four sequencer",
+      "the accepted bootstrap ledger materializes the same Federation identity on both Stations",
+      "a repeated active join is idempotent and does not advance the ledger head"
+    ],
+    "member-and-role-projection": [
+      "both Stations converge the active station-four and station-five-arm member set",
+      "the owner and member projections preserve their distinct roles and capabilities",
+      "both Native Desktop clients render the same active Federation context in Find People"
+    ],
+    "non-owner-leave": [
+      "a non-owner Station submits leave through the sequencer governance path",
+      "the sequencer appends STATION_LEFT and both membership projections converge to left",
+      "the leaving client no longer renders the Federation as an active context"
+    ],
+    "rejoin-and-restart": [
+      "the left Station can rejoin from the authoritative ledger without replacing local history",
+      "both Stations converge the new head and active member set",
+      "a Native process restart restores the same active Federation context"
+    ],
+    "owner-delete": [
+      "a non-owner cannot archive the Federation",
+      "the active sequencer cannot leave without a handover",
+      "only the creator on the sequencer Station archives the Federation",
+      "both Stations converge archived status and ordinary clients remove the active context"
+    ],
+    "cleanup": [
+      "the lifecycle finishes archived with no reusable active membership",
+      "both clients, ports, storage roots, profile leases, and deployment leases are released"
+    ]
+  },
+  "negative": [
+    "Relay reachability is not accepted as Federation membership",
+    "ordinary-client command and route inventories expose no create, join, leave, archive, or member-administration capability",
+    "a follower Station never appends a formal governance event directly",
+    "a stale or divergent bootstrap chain is rejected instead of overwriting local ledger history",
+    "an archived Federation never remains in the ordinary-client active context list"
+  ]
+}

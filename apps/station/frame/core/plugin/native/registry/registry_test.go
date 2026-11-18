@@ -1,0 +1,237 @@
+package native
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"github.com/peers-labs/peers-touch/station/frame/core/registry"
+	"github.com/peers-labs/peers-touch/station/frame/core/store"
+	"github.com/stretchr/testify/assert"
+	"gorm.io/gorm"
+)
+
+// mockStore implements store.Store interface for testing
+type mockStore struct{}
+
+func (m *mockStore) Init(ctx context.Context, opts ...option.Option) error { return nil }
+func (m *mockStore) RDS(ctx context.Context, opts ...store.RDSDMLOption) (*gorm.DB, error) {
+	// Return a mock GORM DB that won't cause panics
+	// In a real test, you might use an in-memory SQLite database
+	// For now, we'll return an error to avoid the migration step
+	return nil, errors.New("mock store - migration not supported")
+}
+func (m *mockStore) Name() string { return "mock" }
+
+func TestNativeRegistry_NewRegistry(t *testing.T) {
+	ctx := context.Background()
+	// Create registry with proper options initialization
+	opts := []option.Option{
+		option.WithRootCtx(ctx),
+		registry.WithStore(&mockStore{}),
+		registry.WithPrivateKey("test-private-key"),
+	}
+	reg := NewRegistry(opts...)
+	assert.NotNil(t, reg)
+	assert.IsType(t, &nativeRegistry{}, reg)
+}
+
+func TestNativeRegistry_Init_WithMDNS(t *testing.T) {
+	ctx := context.Background()
+	reg := NewRegistry(option.WithRootCtx(ctx), registry.WithStore(&mockStore{}), registry.WithPrivateKey("test-private-key")).(*nativeRegistry)
+
+	// Create test options with mDNS enabled
+	opts := []option.Option{
+		option.WithRootCtx(ctx),
+		registry.WithStore(&mockStore{}),
+		registry.WithPrivateKey("test-private-key"),
+		WithMDNSEnable(true),
+		WithLibp2pIdentityKeyFile("test.key"),
+	}
+
+	err := reg.Init(ctx, opts...)
+	// We expect this to fail due to missing key file, but we can verify the options are set
+	assert.Error(t, err) // Expected due to missing key file
+	assert.True(t, reg.extOpts.mdnsEnable)
+}
+
+// Removed: bootstrap enable/listen addrs are no longer part of registry options
+
+func TestNativeRegistry_Init_WithTURN(t *testing.T) {
+	ctx := context.Background()
+	reg := NewRegistry(option.WithRootCtx(ctx), registry.WithStore(&mockStore{}), registry.WithPrivateKey("test-private-key")).(*nativeRegistry)
+
+	// Create test options with TURN enabled
+	turnConfig := registry.TURNAuthConfig{
+		Enabled:         true,
+		ServerAddresses: []string{"stun.l.google.com:19302"},
+		Method:          "short-term",
+		ShortTerm: registry.ShortTermAuth{
+			Username: "test",
+			Password: "test",
+		},
+	}
+
+	opts := []option.Option{
+		option.WithRootCtx(ctx),
+		registry.WithStore(&mockStore{}),
+		registry.WithPrivateKey("test-private-key"),
+		registry.WithTurnConfig(turnConfig),
+		WithMDNSEnable(false),
+		WithLibp2pIdentityKeyFile("test.key"),
+	}
+
+	err := reg.Init(ctx, opts...)
+	// We expect this to fail due to missing key file, but we can verify the options are set
+	assert.Error(t, err) // Expected due to missing key file
+	assert.True(t, reg.options.TurnConfig.Enabled)
+	assert.Equal(t, "stun.l.google.com:19302", reg.options.TurnConfig.ServerAddresses[0])
+}
+
+func TestNativeRegistry_AllDiscoveryMechanisms(t *testing.T) {
+	ctx := context.Background()
+	reg := NewRegistry(option.WithRootCtx(ctx), registry.WithStore(&mockStore{}), registry.WithPrivateKey("test-private-key")).(*nativeRegistry)
+
+	// Create test options with all discovery mechanisms enabled
+	turnConfig := registry.TURNAuthConfig{
+		Enabled:         true,
+		ServerAddresses: []string{"stun.l.google.com:19302"},
+		Method:          "short-term",
+		ShortTerm: registry.ShortTermAuth{
+			Username: "test",
+			Password: "test",
+		},
+	}
+
+	opts := []option.Option{
+		option.WithRootCtx(ctx),
+		registry.WithStore(&mockStore{}),
+		registry.WithPrivateKey("test-private-key"),
+		registry.WithTurnConfig(turnConfig),
+		WithMDNSEnable(true),
+		WithLibp2pIdentityKeyFile("test.key"),
+		WithBootstrapNodes([]string{"/ip4/127.0.0.1/tcp/5001/p2p/12D3KooWR1QjveRKiKMQYQHHbzykFmLRrqHrcrWpBwro8t7mSKwg"}),
+	}
+
+	err := reg.Init(ctx, opts...)
+	// We expect this to fail due to missing key file, but we can verify all options are set correctly
+	assert.Error(t, err) // Expected due to missing key file
+
+	// Verify all discovery mechanisms are configured
+	assert.True(t, reg.extOpts.mdnsEnable, "mDNS should be enabled")
+	assert.True(t, reg.options.TurnConfig.Enabled, "TURN should be enabled")
+
+	// Verify configuration details
+	assert.Len(t, reg.extOpts.bootstrapNodes, 1)
+	assert.Equal(t, "stun.l.google.com:19302", reg.options.TurnConfig.ServerAddresses[0])
+}
+
+func TestNativeRegistry_BootstrapStatusTracking(t *testing.T) {
+	reg := NewRegistry().(*nativeRegistry)
+
+	// Test that registry can be created without errors
+	assert.NotNil(t, reg)
+
+	// Test mDNS stats initialization
+	stats := reg.getMDNSStats()
+	assert.Equal(t, 0, stats.TotalDiscovered)
+	assert.Equal(t, 0, stats.BootstrapDiscovered)
+	assert.Equal(t, 0, stats.ConnectedBootstrap)
+
+	// Test mDNS stats update
+	reg.updateMDNSStats(5, 2, 1, []string{"peer1", "peer2"})
+	stats = reg.getMDNSStats()
+	assert.Equal(t, 5, stats.TotalDiscovered)
+	assert.Equal(t, 2, stats.BootstrapDiscovered)
+	assert.Equal(t, 1, stats.ConnectedBootstrap)
+	assert.Equal(t, 2, len(stats.ActivePeers))
+}
+
+func TestNativeRegistry_DiscoveryMechanismOptions(t *testing.T) {
+	tests := []struct {
+		name         string
+		mdnsEnable   bool
+		turnEnabled  bool
+		expectedMDNS bool
+		expectedTURN bool
+	}{
+		{
+			name:         "All disabled",
+			mdnsEnable:   false,
+			turnEnabled:  false,
+			expectedMDNS: false,
+			expectedTURN: false,
+		},
+		{
+			name:         "Only mDNS enabled",
+			mdnsEnable:   true,
+			turnEnabled:  false,
+			expectedMDNS: true,
+			expectedTURN: false,
+		},
+		{
+			name:         "Only TURN enabled",
+			mdnsEnable:   false,
+			turnEnabled:  true,
+			expectedMDNS: false,
+			expectedTURN: true,
+		},
+		{
+			name:         "Both enabled",
+			mdnsEnable:   true,
+			turnEnabled:  true,
+			expectedMDNS: true,
+			expectedTURN: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			reg := NewRegistry(option.WithRootCtx(ctx)).(*nativeRegistry)
+
+			turnConfig := registry.TURNAuthConfig{
+				Enabled:         tt.turnEnabled,
+				ServerAddresses: []string{"stun.l.google.com:19302"},
+				Method:          "short-term",
+				ShortTerm: registry.ShortTermAuth{
+					Username: "test",
+					Password: "test",
+				},
+			}
+
+			opts := []option.Option{
+				option.WithRootCtx(ctx),
+				registry.WithStore(&mockStore{}),
+				registry.WithPrivateKey("test-private-key"),
+				registry.WithTurnConfig(turnConfig),
+				WithMDNSEnable(tt.mdnsEnable),
+				WithLibp2pIdentityKeyFile("test.key"),
+			}
+
+			// Apply options to verify they are set correctly
+			reg.options = registry.GetOptions(opts...)
+
+			// Get extended options safely
+			if reg.options.ExtOptions != nil {
+				if extOpts, ok := reg.options.ExtOptions.(*options); ok {
+					reg.extOpts = extOpts
+				} else {
+					// Initialize default options if not properly set
+					reg.extOpts = &options{
+						Options: reg.options,
+					}
+				}
+			} else {
+				// Initialize default options if ExtOptions is nil
+				reg.extOpts = &options{
+					Options: reg.options,
+				}
+			}
+
+			assert.Equal(t, tt.expectedMDNS, reg.extOpts.mdnsEnable)
+			assert.Equal(t, tt.expectedTURN, reg.options.TurnConfig.Enabled)
+		})
+	}
+}

@@ -1,0 +1,11 @@
+peers:
+  node:
+    server:
+      subserver:
+        relay:
+          enabled: true
+          max-stations: 100
+          operator-key-file: ""
+          operator-issuer: ""
+          operator-audience: ""
+          operator-scope: ""

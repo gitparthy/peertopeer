@@ -1,0 +1,1040 @@
+from __future__ import annotations
+
+from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+
+from tooling.acceptance.core import (
+    ArtifactRef,
+    DriverError,
+    EvidenceStore,
+    GateError,
+    ProvisioningError,
+    REPO_ROOT,
+    call_async_harness,
+    require_runtime_client_service,
+)
+from tooling.acceptance.core.provisioning import load_runtime_manifest
+from tooling.acceptance.core.runtime_cell import runtime_source_matches
+from tooling.acceptance.drivers.native import (
+    NativeDesktopRuntimeBinding,
+    resolve_native_desktop_runtime,
+)
+from tooling.acceptance.drivers.tauri import TauriSession
+from tooling.acceptance.fixtures.chat_native_reset import (
+    LOCAL_SOURCE_RUNTIME,
+    acceptance_station_environment,
+)
+from tooling.acceptance.station_registry_native_support import (
+    station_registry_snapshot,
+)
+from tooling.acceptance.transports import SshTarget, SshTransport
+
+
+DEV_ACCOUNT_PASSWORD = "1"
+ACCOUNTS = {
+    "alice": "alice@p.t",
+    "bob": "bob@p.t",
+    "charlie": "carol@p.t",
+}
+CHAT_FIXTURE_FEDERATION_NAME = "chat-native-acceptance"
+NATIVE_DEV_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def media_harness(
+    client: TauriSession,
+    runtime_binding: NativeDesktopRuntimeBinding,
+    method: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 45.0,
+) -> Any:
+    """Run a native media action while its owning process awaits permission."""
+    if client.process_id is None:
+        raise GateError(f"{method} has no owning Native process")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(async_harness, client, method, payload, timeout)
+        while True:
+            try:
+                return future.result(timeout=0.1)
+            except FutureTimeoutError:
+                try:
+                    runtime_binding.native_adapter.accept_media_capture_permission_to_process(client.process_id)
+                except DriverError as permission_error:
+                    try:
+                        return future.result(timeout=2)
+                    except FutureTimeoutError:
+                        raise permission_error
+
+
+def is_native_tauri_url(value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    native_dev = os.environ.get("PT_ACCEPTANCE_NATIVE_DEV", "") == "1"
+    return (
+        parsed.username is None
+        and parsed.password is None
+        and (
+            (
+                port is None
+                and parsed.scheme == "tauri"
+                and parsed.hostname == "localhost"
+            )
+            or (
+                port is None
+                and parsed.scheme == "http"
+                and parsed.hostname == "tauri.localhost"
+            )
+            or (
+                native_dev
+                and parsed.scheme == "http"
+                and parsed.hostname in NATIVE_DEV_LOOPBACK_HOSTS
+                and port is not None
+            )
+        )
+    )
+
+
+def runtime_station_service(
+    manifest: dict[str, Any],
+    client_id: str,
+) -> dict[str, Any]:
+    try:
+        _, service = require_runtime_client_service(
+            manifest,
+            client_id,
+            "station",
+        )
+        return service
+    except ProvisioningError as error:
+        raise GateError(str(error)) from error
+
+
+def active_direct_route_multiaddr(client: TauriSession) -> str:
+    snapshot = station_registry_snapshot(client)
+    route = snapshot.get("route")
+    if not isinstance(route, dict) or route.get("route_type") != "direct":
+        raise GateError("Native Chat requires an active signed Direct route")
+    addresses = [
+        str(address)
+        for address in route.get("addresses", [])
+        if isinstance(address, str)
+        and "/p2p-circuit/" not in address
+    ]
+    if len(addresses) != 1:
+        raise GateError(
+            "Native Chat requires exactly one signed Direct multiaddr"
+        )
+    return addresses[0]
+
+
+@dataclass(frozen=True)
+class SelectedNativeRuntime:
+    manifest: dict[str, Any]
+    actor_manifest: dict[str, Any]
+    binding: NativeDesktopRuntimeBinding
+
+
+NativeProcessState = Literal[
+    "starting",
+    "live",
+    "stopped_preserved",
+    "stopped",
+]
+NativeAuthState = Literal[
+    "none",
+    "restoring",
+    "authenticated",
+    "revoked",
+    "logged_out",
+]
+NativeDeviceState = Literal["active", "revoked"]
+
+
+@dataclass
+class NativeClientLifecycle:
+    client: TauriSession
+    expected_actor_ptid: str
+    process_state: NativeProcessState = "starting"
+    auth_state: NativeAuthState = "none"
+    device_state: NativeDeviceState = "active"
+    successor_client_id: int | None = None
+    release_errors: tuple[dict[str, str], ...] = ()
+
+
+class NativeClientLifecycleLedger:
+    def __init__(self) -> None:
+        self.records: list[NativeClientLifecycle] = []
+        self._by_client_id: dict[int, NativeClientLifecycle] = {}
+
+    def register(
+        self,
+        client: TauriSession,
+        expected_actor_ptid: str,
+    ) -> NativeClientLifecycle:
+        if not expected_actor_ptid.startswith("ptid:"):
+            raise GateError(
+                "native client lifecycle requires canonical actor PTID"
+            )
+        record = NativeClientLifecycle(client, expected_actor_ptid)
+        self.records.append(record)
+        self._by_client_id[id(client)] = record
+        return record
+
+    def _record(self, client: TauriSession) -> NativeClientLifecycle:
+        record = self._by_client_id.get(id(client))
+        if record is None:
+            raise GateError(
+                f"native client lifecycle is unregistered: {client.profile}"
+            )
+        return record
+
+    def mark_live(self, client: TauriSession) -> None:
+        self._record(client).process_state = "live"
+
+    def mark_restoring(self, client: TauriSession) -> None:
+        self._record(client).auth_state = "restoring"
+
+    def mark_authenticated(self, client: TauriSession) -> None:
+        self._record(client).auth_state = "authenticated"
+
+    def mark_auth_revoked(self, client: TauriSession) -> None:
+        self._record(client).auth_state = "revoked"
+
+    def mark_device_revoked(self, client: TauriSession) -> None:
+        self._record(client).device_state = "revoked"
+
+    def transfer_preserved_session(
+        self,
+        predecessor: TauriSession,
+        successor: TauriSession,
+    ) -> None:
+        predecessor_record = self._record(predecessor)
+        successor_record = self._record(successor)
+        if predecessor_record.process_state != "stopped_preserved":
+            raise GateError(
+                "native session transfer requires a preserved predecessor"
+            )
+        if (
+            predecessor_record.expected_actor_ptid
+            != successor_record.expected_actor_ptid
+        ):
+            raise GateError(
+                "native session transfer actor PTID mismatch"
+            )
+        predecessor_record.successor_client_id = id(successor)
+        successor_record.auth_state = "restoring"
+
+    def stop_preserving_session(self, client: TauriSession) -> None:
+        record = self._record(client)
+        client.stop(preserve_state=True)
+        record.process_state = "stopped_preserved"
+
+    def release(self, client: TauriSession) -> list[dict[str, str]]:
+        record = self._record(client)
+        if record.process_state == "stopped":
+            return list(record.release_errors)
+        errors: list[dict[str, str]] = []
+        if record.process_state == "stopped_preserved":
+            successor = self._by_client_id.get(
+                record.successor_client_id or -1
+            )
+            if successor is None or successor.auth_state not in {
+                "authenticated",
+                "revoked",
+                "logged_out",
+            }:
+                errors.append(
+                    {
+                        "resource": f"session:{client.profile}",
+                        "error": (
+                            "preserved native session has no verified "
+                            "successor"
+                        ),
+                    }
+                )
+            else:
+                return []
+
+        elif record.auth_state in {"authenticated", "restoring"}:
+            try:
+                process_alive = client.is_alive()
+            except Exception as error:
+                process_alive = False
+                errors.append(
+                    {
+                        "resource": f"session:{client.profile}",
+                        "error": (
+                            "failed to inspect authenticated native window: "
+                            f"{error}"
+                        ),
+                    }
+                )
+            if not process_alive:
+                if not errors:
+                    errors.append(
+                        {
+                            "resource": f"session:{client.profile}",
+                            "error": (
+                                "authenticated native window terminated before "
+                                "logout"
+                            ),
+                        }
+                    )
+            else:
+                try:
+                    logout_native_client(
+                        client,
+                        record.expected_actor_ptid,
+                    )
+                    record.auth_state = "logged_out"
+                except Exception as error:
+                    errors.append(
+                        {
+                            "resource": f"session:{client.profile}",
+                            "error": str(error),
+                        }
+                    )
+
+        try:
+            client.stop()
+            record.process_state = "stopped"
+        except Exception as error:
+            errors.append(
+                {
+                    "resource": f"client:{client.profile}",
+                    "error": str(error),
+                }
+            )
+        record.release_errors = tuple(errors)
+        return errors
+
+    def release_all(self) -> list[dict[str, str]]:
+        errors: list[dict[str, str]] = []
+        for record in reversed(self.records):
+            errors.extend(self.release(record.client))
+        return errors
+
+
+def selected_native_runtime(gate_id: str) -> SelectedNativeRuntime | None:
+    from tooling.acceptance.core.e2e_preflight import preflight_gate_entry
+
+    preflight_gate_entry(gate_id, repo_root=REPO_ROOT)
+    cell_id = os.environ.get("PT_ACCEPTANCE_RUNTIME_CELL", "").strip()
+    if not cell_id:
+        raise GateError(
+            "PT_ACCEPTANCE_RUNTIME_CELL is required for Native Chat Gates"
+        )
+    raw_path = os.environ.get("PT_ACCEPTANCE_RUNTIME_MANIFEST", "").strip()
+    if not raw_path:
+        raise GateError(
+            "PT_ACCEPTANCE_RUNTIME_MANIFEST is required when "
+            "PT_ACCEPTANCE_RUNTIME_CELL is selected"
+        )
+    manifest = load_runtime_manifest(Path(raw_path), gate_id)
+    actor_ref = manifest.get("actorManifest")
+    if not isinstance(actor_ref, dict):
+        raise GateError("runtime manifest actorManifest is required")
+    actors = EvidenceStore.from_environment(
+        repo_root=REPO_ROOT,
+        worktree=REPO_ROOT,
+    ).read_json(ArtifactRef.from_dict(actor_ref))
+    if actors.get("artifactKind") != "acceptance-actor-manifest":
+        raise GateError("runtime actor manifest has invalid artifact kind")
+    source = manifest.get("source")
+    source_commit = str(
+        source.get("commit") if isinstance(source, dict) else ""
+    )
+    if not source_commit:
+        raise GateError("runtime manifest source commit is required")
+    binding = resolve_native_desktop_runtime(
+        cell_id,
+        gate_id=gate_id,
+        source_commit=source_commit,
+    )
+    binding.set_runtime_manifest(manifest)
+    return SelectedNativeRuntime(
+        manifest=manifest,
+        actor_manifest=actors,
+        binding=binding,
+    )
+
+
+def verify_runtime_fixture_ready(
+    manifest: dict[str, Any],
+    actor_manifest: dict[str, Any],
+    *,
+    allow_existing_fixture: bool = False,
+) -> None:
+    reset = actor_manifest.get("reset")
+    if (
+        manifest.get("state") != "FIXTURE_READY"
+        or not isinstance(reset, dict)
+        or reset.get("targetVerified") is not True
+    ):
+        raise GateError("runtime manifest fixture is not ready for the selected mode")
+    if allow_existing_fixture:
+        valid_authority = (
+            reset.get("authorized") is False
+            and actor_manifest.get("initialState") == "existing"
+        )
+    else:
+        valid_authority = reset.get("authorized") is True
+    if not valid_authority:
+        raise GateError("runtime manifest fixture is not ready for the selected mode")
+
+
+def cleanup_preserving_primary_failure(
+    cleanup: Callable[[], dict[str, Any]],
+    report: Any,
+    context: str,
+) -> dict[str, Any]:
+    primary_error = sys.exc_info()[1]
+    try:
+        return cleanup()
+    except Exception as cleanup_error:
+        if primary_error is None:
+            raise
+        failure = {
+            "resource": "cleanup",
+            "error": str(cleanup_error),
+        }
+        report.runtime["cleanupFailure"] = failure
+        if hasattr(primary_error, "add_note"):
+            primary_error.add_note(
+                f"{context} cleanup also failed: {cleanup_error}"
+            )
+        cleanup_evidence = report.runtime.get("cleanup")
+        return (
+            cleanup_evidence
+            if isinstance(cleanup_evidence, dict)
+            else {"cleanupErrors": [failure]}
+        )
+
+
+def native_runtime_source_identity(
+    *,
+    gate_id: str,
+    manifest: dict[str, Any],
+    runtime_binding: NativeDesktopRuntimeBinding,
+    station_live: dict[str, Any],
+    client_id: str = "alice",
+) -> dict[str, Any]:
+    source = manifest.get("source")
+    station = runtime_station_service(manifest, client_id)
+    runtime_cell = runtime_binding.runtime_identity()
+    binary = runtime_binding.binary_identity()
+    cell_source = (
+        runtime_cell.get("source")
+        if isinstance(runtime_cell, dict)
+        else None
+    )
+    platform = (
+        runtime_cell.get("platform")
+        if isinstance(runtime_cell, dict)
+        else None
+    )
+    transport = (
+        runtime_cell.get("transport")
+        if isinstance(runtime_cell, dict)
+        else None
+    )
+    source_commit = str(
+        source.get("commit") if isinstance(source, dict) else ""
+    )
+    station_commit = str(
+        station.get("liveCommit") if isinstance(station, dict) else ""
+    )
+    binary_sha256 = str(binary.get("sha256") or "")
+    linux_runtime_valid = (
+        runtime_binding.cell_id != "desktop-linux-native"
+        or (
+            isinstance(cell_source, dict)
+            and cell_source.get("remoteCheckoutClean") is True
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(cell_source.get("remoteSourceDigest") or ""),
+            )
+            is not None
+            and isinstance(platform, dict)
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(platform.get("imageDigest") or ""),
+            )
+            is not None
+            and isinstance(transport, dict)
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(transport.get("hostIdentitySha256") or ""),
+            )
+            is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(transport.get("hostKeySha256") or ""),
+            )
+            is not None
+        )
+    )
+    identity = {
+        "orchestrator": source,
+        "station": station,
+        "stationLive": station_live,
+        "runtimeCell": runtime_cell,
+        "binary": binary,
+    }
+    if isinstance(source, dict) and source.get("workspaceDigest") != "clean":
+        # Remote Station attestation proves its deployed commit. A local client
+        # snapshot may differ only in inputs outside that service build.
+        changed = subprocess.run(
+            (
+                "git", "status", "--porcelain", "--untracked-files=all", "--",
+                "apps/station", "apps/applets/note/service", "model",
+                "packages/sdk/go", "go.work", "go.work.sum",
+            ),
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True, timeout=3,
+        ).stdout.strip()
+        if changed:
+            raise GateError("Local Station build inputs are not covered by deployed attestation")
+    valid = (
+        runtime_source_matches(
+            source, cell_source,
+            remote=runtime_binding.cell_id != "desktop-macos-native",
+        )
+        and isinstance(station, dict)
+        and station.get("workspaceDigest") == "clean"
+        and station_commit == source_commit
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(station.get("protocolDigest") or ""),
+        )
+        is not None
+        and commits_match(
+            str(station_live.get("build_commit") or ""),
+            source_commit,
+        )
+        and isinstance(runtime_cell, dict)
+        and runtime_cell.get("artifactKind")
+        == "acceptance-runtime-cell-manifest"
+        and runtime_cell.get("cellId") == runtime_binding.cell_id
+        and runtime_cell.get("gateId") == gate_id
+        and bool(runtime_cell.get("runId"))
+        and runtime_cell.get("state") == "LEASED"
+        and isinstance(cell_source, dict)
+        and linux_runtime_valid
+        and binary.get("sourceCommit") == source_commit
+        and re.fullmatch(r"[0-9a-f]{64}", binary_sha256) is not None
+        and cell_source.get("binarySha256") == binary_sha256
+    )
+    if not valid:
+        raise GateError(
+            "source_build_runtime_identity: runtime source identity mismatch: "
+            f"{json.dumps(identity, sort_keys=True)}"
+        )
+    return identity
+
+
+def async_harness(
+    driver: Any,
+    method: str,
+    payload: dict[str, Any],
+    timeout: float = 45.0,
+) -> Any:
+    return call_async_harness(
+        driver,
+        method,
+        payload,
+        namespace="chat",
+        script_timeout=timeout,
+    )
+
+
+def shared_federation_id(
+    clients: dict[str, TauriSession],
+    actors: tuple[str, ...],
+) -> str:
+    if len(actors) < 2 or any(actor not in clients for actor in actors):
+        raise GateError("shared Federation lookup requires known Native actors")
+    contexts = {
+        actor: async_harness(
+            clients[actor],
+            "federationContext",
+            {},
+        )
+        for actor in actors
+    }
+    projected = {
+        actor: {
+            str(item.get("federationId") or ""): str(item.get("name") or "")
+            for item in (contexts[actor] or {}).get("federations", [])
+            if isinstance(item, dict) and item.get("federationId")
+        }
+        for actor in actors
+    }
+    shared_fixture_ids = [
+        federation_id
+        for federation_id, name in projected[actors[0]].items()
+        if name == CHAT_FIXTURE_FEDERATION_NAME
+        and all(
+            values.get(federation_id) == CHAT_FIXTURE_FEDERATION_NAME
+            for values in (
+                projected[actor]
+                for actor in actors[1:]
+            )
+        )
+    ]
+    if len(shared_fixture_ids) != 1:
+        raise GateError(
+            "Native actors do not have exactly one shared Chat Fixture "
+            f"Federation: {', '.join(actors)}"
+        )
+    return shared_fixture_ids[0]
+
+
+def wait_for_peer_key_bundle(
+    client: TauriSession,
+    peer_ptid: str,
+    home_station_peer_id: str,
+    *,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    if not home_station_peer_id:
+        raise GateError("peer key readiness requires a Home Station peer ID")
+
+    def ready() -> dict[str, Any] | None:
+        state = async_harness(
+            client,
+            "peerKeyBundleState",
+            {
+                "peerPtid": peer_ptid,
+                "homeStationPeerId": home_station_peer_id,
+            },
+            timeout=10,
+        )
+        return (
+            state
+            if isinstance(state, dict)
+            and int(state.get("bundleCount") or 0) > 0
+            else None
+        )
+
+    return wait_until(
+        ready,
+        f"peer key bundle for {peer_ptid}",
+        timeout=timeout,
+    )
+
+
+def is_station_authorization_rejection(error: BaseException | str) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "endpoint is not active",
+            "sender unauthorized",
+            "forbidden",
+            "status 403",
+            "station returned 403",
+        )
+    )
+
+
+def logout_native_client(
+    client: TauriSession,
+    actor_ptid: str,
+) -> dict[str, Any]:
+    result = async_harness(
+        client,
+        "logout",
+        {"actorPtid": actor_ptid},
+        timeout=30,
+    )
+    if (
+        not isinstance(result, dict)
+        or result.get("actorPtid") != actor_ptid
+        or result.get("status") != "logged_out"
+    ):
+        raise GateError(
+            "native window logout returned invalid lifecycle evidence: "
+            f"{result}"
+        )
+    return result
+
+
+def enter_chat_page(client: TauriSession) -> None:
+    def chat_surface_ready(driver: Any) -> bool:
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    return location.href.endsWith('#/chat')
+                      && Boolean(document.querySelector('[data-social-chat-layout]'));
+                    """
+                )
+            )
+        except WebDriverException:
+            return False
+
+    def click_chat_navigation(driver: Any) -> bool:
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    const target = document.querySelector(
+                      '[data-pt-primary-nav="chat"] button, '
+                      + '[data-pt-primary-nav="chat"] [role="button"]'
+                    );
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                    """
+                )
+            )
+        except WebDriverException:
+            return False
+
+    if chat_surface_ready(client.driver):
+        return
+    WebDriverWait(client.driver, 20).until(click_chat_navigation)
+    WebDriverWait(client.driver, 20).until(chat_surface_ready)
+
+
+def stop_client(client: TauriSession) -> None:
+    try:
+        client.invoke_app_result("auth_logout")
+    finally:
+        client.stop()
+
+
+def current_commit() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+
+def current_workspace_digest() -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        subprocess.run(
+            ["git", "diff", "--binary", "HEAD"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    for raw_path in sorted(path for path in untracked if path):
+        digest.update(raw_path)
+        digest.update(b"\0")
+        digest.update((REPO_ROOT / raw_path.decode("utf-8")).read_bytes())
+    return digest.hexdigest()
+
+
+def commits_match(live_commit: str, expected_commit: str) -> bool:
+    return (
+        len(live_commit) >= 7
+        and len(expected_commit) >= 7
+        and (
+            live_commit.startswith(expected_commit)
+            or expected_commit.startswith(live_commit)
+        )
+    )
+
+
+def read_station_version(station_url: str) -> dict[str, Any]:
+    with urllib.request.urlopen(
+        f"{station_url.rstrip('/')}/app-meta/version",
+        timeout=10,
+    ) as response:
+        value = json.loads(response.read().decode("utf-8"))
+    if not isinstance(value, dict):
+        raise GateError("Station version response must be an object")
+    return value
+
+
+def wait_until(
+    predicate: Callable[[], Any],
+    description: str,
+    timeout: float = 120,
+    interval: float = 0.25,
+) -> Any:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            value = predicate()
+            if value:
+                return value
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+        time.sleep(interval)
+    suffix = f"; last error: {last_error}" if last_error else ""
+    raise GateError(f"timed out waiting for {description}{suffix}")
+
+
+def send_text(client: TauriSession, text: str) -> dict[str, Any]:
+    composer = client.find_element('[data-pt-text-input="chat-composer"]', 30)
+    client.execute_script(
+        """
+        const element = arguments[0];
+        const value = arguments[1];
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          'value',
+        )?.set;
+        if (!setter) throw new Error('textarea setter missing');
+        setter.call(element, value);
+        element.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          data: value,
+          inputType: 'insertText',
+        }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        """,
+        composer,
+        text,
+    )
+    client.find_element("[data-chat-send]", 10).click()
+    return wait_until(
+        lambda: message_snapshot(client, text),
+        "sender optimistic message",
+    )
+
+
+def message_snapshot(client: TauriSession, text: str) -> dict[str, Any] | None:
+    value = client.execute_script(
+        """
+        const text = arguments[0];
+        const row = Array.from(document.querySelectorAll('[data-message-ulid]'))
+          .find((item) => (item.innerText || '').includes(text));
+        if (!row) return null;
+        return {
+          messageUlid: row.getAttribute('data-message-ulid') || '',
+          text: row.innerText || '',
+          receipt: row.querySelector('[data-message-receipt]')
+            ?.getAttribute('data-message-receipt') || '',
+        };
+        """,
+        text,
+    )
+    return value if isinstance(value, dict) else None
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def station_readback(
+    conversation_id: str,
+    message_id: str,
+    *,
+    station_url: str = "",
+    deployment_environment: str = "",
+) -> dict[str, Any]:
+    if not station_url:
+        raise GateError("Station readback requires an explicit bound service URL")
+    environment = acceptance_station_environment(
+        station_url,
+        deployment_environment or None,
+    )
+    if environment.get("PT_ACCEPTANCE_RUNTIME_KIND") == LOCAL_SOURCE_RUNTIME:
+        database = environment.get("PT_ACCEPTANCE_LOCAL_DATABASE", "").strip()
+        if not database:
+            raise GateError("Local source Station database is unavailable")
+        with closing(sqlite3.connect(database, timeout=10)) as connection:
+            connection.row_factory = sqlite3.Row
+            events = connection.execute(
+                """
+SELECT event_id, sequence, command_id, message_id, event_hash
+FROM conversation_events
+WHERE conversation_id = ? AND message_id = ?
+ORDER BY sequence
+""",
+                (conversation_id, message_id),
+            ).fetchall()
+            authority_events = connection.execute(
+                """
+SELECT event_id, sequence, command_id
+FROM conversation_events
+WHERE conversation_id = ?
+ORDER BY sequence
+""",
+                (conversation_id,),
+            ).fetchall()
+            queue = connection.execute(
+                """
+SELECT item_id, event_id, recipient_ptid, recipient_device_id,
+       lane_sequence, state, attempt_count, payload_sha256
+FROM device_queue_items
+WHERE conversation_id = ?
+ORDER BY recipient_ptid, recipient_device_id, lane_sequence
+""",
+                (conversation_id,),
+            ).fetchall()
+            read_cursors = connection.execute(
+                """
+SELECT ptid AS reader_ptid, last_read_sequence
+FROM conversation_read_cursors
+WHERE conversation_id = ?
+ORDER BY ptid
+""",
+                (conversation_id,),
+            ).fetchall()
+        return {
+            "events": [
+                {
+                    "eventId": row["event_id"],
+                    "sequence": row["sequence"],
+                    "commandId": row["command_id"],
+                    "messageId": row["message_id"],
+                    "hashBytes": len(row["event_hash"] or b""),
+                }
+                for row in events
+            ],
+            "authorityEvents": [
+                {
+                    "eventId": row["event_id"],
+                    "sequence": row["sequence"],
+                    "commandId": row["command_id"],
+                }
+                for row in authority_events
+            ],
+            "queue": [
+                {
+                    "itemId": row["item_id"],
+                    "eventId": row["event_id"],
+                    "recipientPtid": row["recipient_ptid"],
+                    "recipientDeviceId": row["recipient_device_id"],
+                    "laneSequence": row["lane_sequence"],
+                    "state": row["state"],
+                    "attemptCount": row["attempt_count"],
+                    "payloadSha256": bytes(
+                        row["payload_sha256"] or b""
+                    ).hex(),
+                }
+                for row in queue
+            ],
+            "readCursors": [
+                {
+                    "readerPtid": row["reader_ptid"],
+                    "lastReadSequence": row["last_read_sequence"],
+                }
+                for row in read_cursors
+            ],
+        }
+    host = environment.get("PT_DEPLOY_HOST", "").strip()
+    user = environment.get("PT_DEPLOY_USER", "").strip()
+    if not host or not user:
+        raise GateError(
+            "Chat Acceptance Station deployment host identity is unavailable"
+        )
+    container = environment["PT_ACCEPTANCE_POSTGRES_CONTAINER"]
+    conversation = sql_literal(conversation_id)
+    message = sql_literal(message_id)
+    query = f"""
+SELECT json_build_object(
+  'events', COALESCE((
+    SELECT json_agg(json_build_object(
+      'eventId', event_id,
+      'sequence', sequence,
+      'commandId', command_id,
+      'messageId', message_id,
+      'hashBytes', octet_length(event_hash)
+    ) ORDER BY sequence)
+    FROM conversation_events
+    WHERE conversation_id = {conversation} AND message_id = {message}
+  ), '[]'::json),
+  'authorityEvents', COALESCE((
+    SELECT json_agg(json_build_object(
+      'eventId', event_id,
+      'sequence', sequence,
+      'commandId', command_id
+    ) ORDER BY sequence)
+    FROM conversation_events
+    WHERE conversation_id = {conversation}
+  ), '[]'::json),
+  'queue', COALESCE((
+    SELECT json_agg(json_build_object(
+      'itemId', item_id,
+      'eventId', event_id,
+      'recipientPtid', recipient_ptid,
+      'recipientDeviceId', recipient_device_id,
+      'laneSequence', lane_sequence,
+      'state', state,
+      'attemptCount', attempt_count,
+      'payloadSha256', encode(payload_sha256, 'hex')
+    ) ORDER BY recipient_ptid, recipient_device_id, lane_sequence)
+    FROM device_queue_items
+    WHERE conversation_id = {conversation}
+  ), '[]'::json),
+  'readCursors', COALESCE((
+    SELECT json_agg(json_build_object(
+      'readerPtid', ptid,
+      'lastReadSequence', last_read_sequence
+    ) ORDER BY ptid)
+    FROM conversation_read_cursors
+    WHERE conversation_id = {conversation}
+  ), '[]'::json)
+);
+"""
+    remote = (
+        f"docker exec -i {container} sh -lc "
+        "'psql -At -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"'"
+    )
+    try:
+        port = int(
+            environment.get(
+                "PT_DEPLOY_SSH_PORT",
+                environment.get("PT_DEPLOY_PORT", "22"),
+            )
+        )
+    except ValueError as error:
+        raise GateError(
+            "Chat Acceptance deployment SSH port is invalid"
+        ) from error
+    result = SshTransport(
+        SshTarget(
+            host=host,
+            user=user,
+            port=port,
+            known_hosts_file=environment.get(
+                "PT_DEPLOY_KNOWN_HOSTS_FILE",
+                "",
+            ).strip(),
+        )
+    ).run_argv(
+        ["sh", "-lc", remote],
+        input_text=query,
+        timeout=30,
+        check=True,
+    )
+    value = json.loads(result.stdout.strip())
+    if not isinstance(value, dict):
+        raise GateError("Station interaction readback is invalid")
+    return value

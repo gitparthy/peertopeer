@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: hard-rules.sh [--range <git-range>] [--fixture-dir <dir>]
+
+Runs blocking Peers-Touch hard-rule checks against changed files.
+Use --fixture-dir to scan a fixture tree instead of git diff files.
+USAGE
+}
+
+diff_range="HEAD"
+fixture_dir=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --range)
+      diff_range="${2:?missing --range value}"
+      shift 2
+      ;;
+    --fixture-dir)
+      fixture_dir="${2:?missing --fixture-dir value}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "hard-rules: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+tmp_files="$(mktemp)"
+retired_match_file="$(mktemp)"
+generated_verify_root=""
+trap 'rm -f "$tmp_files" "$retired_match_file"; [[ -z "$generated_verify_root" ]] || rm -rf "$generated_verify_root"' EXIT
+
+if [[ -n "$fixture_dir" ]]; then
+  find "$fixture_dir" -type f | sed "s#^\./##" > "$tmp_files"
+else
+  if ! git diff --name-only "$diff_range" -- > "$tmp_files"; then
+    echo "hard-rules: invalid or unreadable git range: $diff_range" >&2
+    exit 1
+  fi
+  if [[ ! -s "$tmp_files" && "$diff_range" == "HEAD" ]]; then
+    git diff --name-only --cached -- > "$tmp_files"
+  fi
+  if [[ "$diff_range" == "HEAD" ]]; then
+    git ls-files --others --exclude-standard >> "$tmp_files"
+  fi
+  sort -u "$tmp_files" -o "$tmp_files"
+fi
+
+has_proto_source_change=0
+if [[ -z "$fixture_dir" ]]; then
+  while IFS= read -r changed_file; do
+    case "$changed_file" in
+      model/**/*.proto|*/model/**/*.proto)
+        has_proto_source_change=1
+        break
+        ;;
+    esac
+  done < "$tmp_files"
+fi
+
+canonical_mobile_web_output=""
+prepare_canonical_mobile_web_output() {
+  if [[ -n "$canonical_mobile_web_output" ]]; then
+    return 0
+  fi
+  generated_verify_root="$(mktemp -d)"
+  canonical_mobile_web_output="$generated_verify_root/proto"
+  if ! PT_MOBILE_WEB_PROTO_OUT="$canonical_mobile_web_output" \
+    tooling/scripts/proto-gen-mobile.sh web >/dev/null 2>&1; then
+    return 1
+  fi
+}
+
+failures=0
+
+report_failure() {
+  local code="$1"
+  local message="$2"
+  failures=$((failures + 1))
+  printf '[%s] %s\n' "$code" "$message"
+}
+
+# Tests $1 against the unit-separator joined ERE allowlist in $2.
+retired_is_ignored() {
+  local target="$1"
+  local ignore_list="$2"
+  local saved_ifs="$IFS"
+  local ignore_pattern
+  IFS=$'\x1f'
+  for ignore_pattern in $ignore_list; do
+    [[ -n "$ignore_pattern" ]] || continue
+    if [[ "$target" =~ $ignore_pattern ]]; then
+      IFS="$saved_ifs"
+      return 0
+    fi
+  done
+  IFS="$saved_ifs"
+  return 1
+}
+
+scan_retired_product_references() {
+  local scan_status=0
+  local had_nocasematch=0
+
+  : > "$retired_match_file"
+  if [[ -n "$fixture_dir" ]]; then
+    if ! find "$fixture_dir" -type f -print0 > "$retired_match_file"; then
+      report_failure "retired-reference-registry" "unable to enumerate fixture paths"
+      return
+    fi
+  elif ! git ls-files -z > "$retired_match_file"; then
+    report_failure "retired-reference-registry" "unable to enumerate tracked paths"
+    return
+  fi
+  local candidate_files
+  candidate_files="$(cat "$retired_match_file" | tr '\0' '\n')"
+
+  if shopt -q nocasematch; then
+    had_nocasematch=1
+  else
+    shopt -s nocasematch
+  fi
+
+  # Registry rows are emitted by retired-refs.mjs as five TSV columns; the
+  # trailing column is the unit-separator joined per-entry ignore allowlist.
+  while IFS=$'\t' read -r retired_code retired_pattern retired_message retired_scopes retired_ignores; do
+    [[ -n "$retired_code" ]] || continue
+
+    case ",$retired_scopes," in
+      *,paths,*)
+        while IFS= read -r candidate; do
+          [[ -n "$candidate" ]] || continue
+          if [[ "$candidate" =~ $retired_pattern ]] \
+            && ! retired_is_ignored "$candidate" "$retired_ignores"; then
+            report_failure "$retired_code" "$candidate $retired_message"
+          fi
+        done <<< "$candidate_files"
+        ;;
+    esac
+
+    case ",$retired_scopes," in
+      *,content,*)
+        if [[ -n "$fixture_dir" ]]; then
+          if rg -I -n -i -e "$retired_pattern" "$fixture_dir" > "$retired_match_file" 2>/dev/null; then
+            scan_status=0
+          else
+            scan_status=$?
+          fi
+        elif git grep -I -n -i -E "$retired_pattern" -- . > "$retired_match_file" 2>/dev/null; then
+          scan_status=0
+        else
+          scan_status=$?
+        fi
+
+        if [[ "$scan_status" -gt 1 ]]; then
+          report_failure "$retired_code" "unable to scan tracked content"
+          continue
+        fi
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          if ! retired_is_ignored "$line" "$retired_ignores"; then
+            report_failure "$retired_code" "$line"
+          fi
+        done < "$retired_match_file"
+        ;;
+    esac
+  done < <(node "$script_dir/retired-refs.mjs")
+
+  if [[ "$had_nocasematch" -eq 0 ]]; then
+    shopt -u nocasematch
+  fi
+}
+
+scan_retired_product_references
+
+# Generated outputs are declared in .gitignore. Force-adding them re-tracks
+# large build artifacts (recurrence: vendored Archify HTML readers re-entered
+# history despite an existing ignore rule); .gitignore never blocks files
+# already in the index, so this invariant needs an executable check.
+if [[ -z "$fixture_dir" ]]; then
+  tracked_ignored_outputs="$(git ls-files --cached --ignored --exclude-standard || true)"
+  if [[ -n "$tracked_ignored_outputs" ]]; then
+    while IFS= read -r tracked_ignored_output; do
+      [[ -n "$tracked_ignored_output" ]] || continue
+      report_failure "ignored-output-tracked" "$tracked_ignored_output is tracked despite a .gitignore rule; generated output is rebuilt at build time and must not be committed (untrack with: git rm --cached <path>)"
+    done <<< "$tracked_ignored_outputs"
+  fi
+fi
+
+is_source_file() {
+  case "$1" in
+    *.go|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.rs|*.kt|*.kts|*.swift|*.java|*.sh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_ui_file() {
+  case "$1" in
+    # Rendered test fixtures have fixed labels, not product localization copy.
+    # Source checks above still inspect their secrets, errors and debug output.
+    *.test.tsx|*.spec.tsx) return 1 ;;
+    apps/desktop/src/*.tsx|apps/desktop/src/**/*.tsx|apps/mobile/src/*.tsx|apps/mobile/src/**/*.tsx|packages/ui/**/*.tsx|*/apps/desktop/src/*.tsx|*/apps/desktop/src/**/*.tsx|*/apps/mobile/src/*.tsx|*/apps/mobile/src/**/*.tsx|*/packages/ui/**/*.tsx) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_documentation_file() {
+  case "$1" in
+    *.md|*.mdx|*.txt|*.yaml|*.yml|*.json|*.jsonl|*.toml) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  [[ ! -f "$file" ]] && continue
+  if [[ -z "$fixture_dir" ]]; then
+    case "$file" in
+      tooling/review-fixtures/*) continue ;;
+    esac
+  fi
+
+  if is_documentation_file "$file"; then
+    # Home anchors require at least two path segments so ordinary repository
+    # paths containing a route or directory named "home" (e.g.
+    # "src/routes/(main)/home/index.tsx") are not mistaken for a home dir.
+    if rg --pcre2 -n '(/Users/(?!Shared(?:/|$))[^/[:space:]`]+/[^/[:space:]`]+|/home/[^/[:space:]`]+/[^/[:space:]`]+|[A-Za-z]:\\Users\\[^\\[:space:]`]+\\[^\\[:space:]`]+)' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+      while IFS= read -r line; do
+        report_failure "user-home-absolute-path" "$file:$line"
+      done < /tmp/pt-review-match.$$
+      rm -f /tmp/pt-review-match.$$
+    fi
+  fi
+
+  if [[ -z "$fixture_dir" ]]; then
+    case "$file" in
+      tooling/scripts/review/*|tooling/skills/*) continue ;;
+    esac
+  fi
+
+  case "$file" in
+    *.pb.go|*.pb.dart|*.pb.rs|*/gen/proto/*|*/src/gen/proto/*)
+      if [[ "$has_proto_source_change" -ne 1 ]]; then
+        case "$file" in
+          apps/mobile/src/gen/proto/*)
+            generated_relative="${file#apps/mobile/src/gen/proto/}"
+            if ! prepare_canonical_mobile_web_output \
+              || [[ ! -f "$canonical_mobile_web_output/$generated_relative" ]] \
+              || ! cmp -s "$file" "$canonical_mobile_web_output/$generated_relative"; then
+              report_failure "generated-file-edit" "$file does not match verifiable canonical regeneration"
+            fi
+            ;;
+          *)
+            report_failure "generated-file-edit" "$file appears to be generated; update proto source and regenerate instead"
+            ;;
+        esac
+      fi
+      ;;
+  esac
+
+  if is_documentation_file "$file"; then
+    # Home anchors require at least two path segments so ordinary repository
+    # paths containing a route or directory named "home" (e.g.
+    # "src/routes/(main)/home/index.tsx") are not mistaken for a home dir.
+    if rg --pcre2 -n '(/Users/(?!Shared(?:/|$))[^/[:space:]`]+/[^/[:space:]`]+|/home/[^/[:space:]`]+/[^/[:space:]`]+|[A-Za-z]:\\Users\\[^\\[:space:]`]+\\[^\\[:space:]`]+)' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+      while IFS= read -r line; do
+        report_failure "user-home-absolute-path" "$file:$line"
+      done < /tmp/pt-review-match.$$
+      rm -f /tmp/pt-review-match.$$
+    fi
+  fi
+
+  if is_source_file "$file"; then
+    if rg --pcre2 -n 'console\.log[[:space:]]*\(|fmt\.Println[[:space:]]*\(|println![[:space:]]*\((?![[:space:]]*"cargo:)|debugPrint[[:space:]]*\(|(^|[^[:alnum:]_])print\(' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+      while IFS= read -r line; do
+        report_failure "debug-statement" "$file:$line"
+      done < /tmp/pt-review-match.$$
+      rm -f /tmp/pt-review-match.$$
+    fi
+
+    if rg -n 'catch\s*\([^)]*\)\s*\{\s*\}|if\s+err\s*!=\s*nil\s*\{\s*return\s*\}|_\s*=\s*err' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+      while IFS= read -r line; do
+        report_failure "silent-error" "$file:$line"
+      done < /tmp/pt-review-match.$$
+      rm -f /tmp/pt-review-match.$$
+    fi
+
+    if rg -n '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{32,}|api[_-]?key\s*[:=]\s*["'\''][^"'\'']+|secret\s*[:=]\s*["'\''][^"'\'']+|password\s*[:=]\s*["'\''][^"'\'']+)' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+      while IFS= read -r line; do
+        report_failure "secret-exposure" "$file:$line"
+      done < /tmp/pt-review-match.$$
+      rm -f /tmp/pt-review-match.$$
+    fi
+  fi
+
+  case "$file" in
+    apps/desktop/src/**|apps/mobile/src/**|packages/**|*/apps/desktop/src/**|*/apps/mobile/src/**|*/packages/**)
+      if rg -n '(mock[A-Z_]|Mock[A-Z_]|mockData|fake[A-Z_]|fixture[A-Z_]).*(api|Api|station|Station|backend|Backend)' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+        while IFS= read -r line; do
+          report_failure "mock-api" "$file:$line"
+        done < /tmp/pt-review-match.$$
+        rm -f /tmp/pt-review-match.$$
+      fi
+      ;;
+  esac
+
+  if is_ui_file "$file"; then
+    # Text-node detection must not let inline arrows ("=>") split a tag:
+    # the visible body cannot contain "<", ">", or braces (JSX expressions),
+    # and the closing token must be a real named tag.
+    if rg -n '<[^>]*>[[:space:]]*[A-Za-z\u4e00-\u9fff][^<>{}]*[[:space:]]*</[A-Za-z]|title=["'\''][A-Za-z\u4e00-\u9fff]|placeholder=["'\''][A-Za-z\u4e00-\u9fff]' "$file" >/tmp/pt-review-match.$$ 2>/dev/null; then
+      while IFS= read -r line; do
+        report_failure "hardcoded-ui-string" "$file:$line"
+      done < /tmp/pt-review-match.$$
+      rm -f /tmp/pt-review-match.$$
+    fi
+  fi
+done < "$tmp_files"
+
+rm -f /tmp/pt-review-match.$$
+
+if [[ "$failures" -gt 0 ]]; then
+  echo "hard-rules: $failures blocking finding(s)" >&2
+  exit 1
+fi
+
+echo "hard-rules: pass"

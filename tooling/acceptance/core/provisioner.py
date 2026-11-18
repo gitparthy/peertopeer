@@ -1,0 +1,941 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import subprocess
+import urllib.error
+import urllib.request
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
+
+from ._paths import REPO_ROOT
+from .attestation import source_workspace_digest
+from .errors import BlockedError, ProvisioningError
+from .evidence_store import RunHandle, write_current_artifact
+from .launch_context import EphemeralGateLaunchContext
+from .lease import (
+    ProfileLease,
+    ProfileLeaseUnavailable,
+    RemoteGitSourceLease,
+    RemoteGitSourceLeaseUnavailable,
+    normalize_lease_resource,
+)
+from .provisioning import (
+    EnvironmentContract,
+    ProvisioningState,
+    RuntimeManifest,
+    blocked_manifest,
+    new_manifest,
+)
+from .resource_diagnostic import ResourceDiagnostic
+from .reset_authority import (
+    STATION_RESET_AUTHORITY_PREFIX,
+    acquire_station_reset_authority,
+    require_station_reset_authority,
+)
+
+PROFILE_ENV_OVERRIDES = (
+    "PT_AGENT_PROVIDER_ID",
+    "PT_AGENT_PROVIDER_API_KEY",
+    "PT_AGENT_DEFAULT_MODEL_ID",
+    "PT_AGENT_PROVIDER_BASE_URL",
+)
+REVIEWED_PROFILE_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def resolve_machine_profile_environment(
+    repo_root: Path | None = None,
+    *,
+    require_identity_match: bool = True,
+) -> tuple[str, Path, int, dict[str, str]]:
+    root = (repo_root or REPO_ROOT).resolve()
+    configured_env_repo = os.environ.get("PT_ENV_REPO", "").strip()
+    env_repo = (
+        Path(configured_env_repo).expanduser().resolve()
+        if configured_env_repo
+        else root.parent / "env"
+    )
+    machine_dev = (
+        root
+        / "tooling"
+        / "scripts"
+        / "local-dev"
+        / "machine-dev.mjs"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "node",
+                str(machine_dev),
+                "check",
+                "--workspace-root",
+                str(root),
+                "--env-repo",
+                str(env_repo),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise BlockedError(
+            reason=f"Machine Dev profile binding is unavailable: {error}",
+            resource="profile:machine-control-plane",
+            diagnostic=ResourceDiagnostic.observed(
+                owner="machine-profile-binding",
+                recovery_action=f"Restore the Machine Dev executable for {root} and repeat profile resolution.",
+                resource="profile:machine-control-plane",
+                expected={"command": "machine-dev check", "exitCode": 0},
+                observed={"errorType": type(error).__name__},
+            ),
+        ) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise BlockedError(
+            reason=(
+                "Machine Dev profile binding is unavailable: "
+                f"{detail or 'machine-dev check returned no output'}"
+            ),
+            resource="profile:machine-control-plane",
+            diagnostic=ResourceDiagnostic.observed(
+                owner="machine-profile-binding",
+                recovery_action=f"Resolve the workspace Profile capability with make profile in {root}, then repeat machine-dev check.",
+                resource="profile:machine-control-plane",
+                expected={"command": "machine-dev check", "exitCode": 0},
+                observed={"exitCode": completed.returncode},
+            ),
+        )
+    try:
+        resolved = json.loads(completed.stdout)
+        binding = resolved["binding"]
+        profile = resolved["profile"]
+        ports = resolved["ports"]
+        profile_name = binding["profile"]
+        slot = binding["slot"]
+        profile_file = Path(profile["profileFile"]).resolve(strict=True)
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+    ) as error:
+        raise BlockedError(
+            reason=f"Machine Dev profile binding is invalid: {error}",
+            resource="profile:machine-control-plane",
+        ) from error
+
+    values = load_env_file(profile_file)
+    for field in PROFILE_ENV_OVERRIDES:
+        injected = os.environ.get(field, "")
+        if injected:
+            values[field] = injected
+    if (
+        not isinstance(profile_name, str)
+        or not profile_name
+        or not isinstance(slot, int)
+        or isinstance(slot, bool)
+        or slot < 0
+    ):
+        raise BlockedError(
+            reason="Machine Dev profile binding has invalid identity or slot",
+            resource="profile:machine-control-plane",
+        )
+    if (
+        resolved.get("authority") != "machine-control-plane"
+        or profile.get("sourceState") != "tracked-clean"
+    ):
+        raise BlockedError(
+            reason="Machine Dev profile binding is not authoritative",
+            resource="profile:machine-control-plane",
+            diagnostic=ResourceDiagnostic.observed(
+                owner="machine-profile-binding",
+                recovery_action=f"Reconcile the reviewed Profile binding for {root} through Machine Dev.",
+                resource="profile:machine-control-plane",
+                expected={"authority": "machine-control-plane", "sourceState": "tracked-clean"},
+                observed={"authority": resolved.get("authority"), "sourceState": profile.get("sourceState")},
+            ),
+        )
+    declared_profile = values.get("PT_DEV_PROFILE", "")
+    expected_profile = os.environ.get("PT_ACCEPTANCE_PROFILE", "").strip()
+    if expected_profile and expected_profile != profile_name:
+        raise BlockedError(
+            reason=f"Acceptance Profile {expected_profile!r} differs from active {profile_name!r}",
+            resource="profile:identity",
+        )
+    if require_identity_match and declared_profile != profile_name:
+        raise BlockedError(
+            reason=(
+                f"Profile identity mismatch: PT_DEV_PROFILE={declared_profile} "
+                f"but machine binding is {profile_name}"
+            ),
+            resource=f"profile:identity:{profile_name}",
+            diagnostic=ResourceDiagnostic.observed(
+                owner="machine-profile-binding",
+                recovery_action=f"Align the reviewed {profile_name} Profile ID and Machine Dev binding; repeat profile selection.",
+                resource=f"profile:identity:{profile_name}",
+                expected={"profile": profile_name},
+                observed={"profile": declared_profile},
+            ),
+        )
+    port_fields = {
+        "desktopAppGateway": "PT_DESKTOP_APP_GATEWAY_PORT",
+        "desktopAppWeb": "PT_DESKTOP_APP_WEB_PORT",
+        "mobileWeb": "PT_MOBILE_WEB_PORT",
+    }
+    values["PT_DEV_SLOT"] = str(slot)
+    for machine_field, environment_field in port_fields.items():
+        port = ports.get(machine_field)
+        if not isinstance(port, int) or isinstance(port, bool) or port <= 0:
+            raise BlockedError(
+                reason=(
+                    "Machine Dev profile binding has an invalid "
+                    f"{machine_field} port"
+                ),
+                resource="profile:machine-control-plane",
+            )
+        values[environment_field] = str(port)
+    return profile_name, profile_file, slot, values
+
+
+def resolve_reviewed_profile_environment(
+    profile_name: str,
+    *,
+    repo_root: Path | None = None,
+) -> tuple[Path, dict[str, str]]:
+    if not REVIEWED_PROFILE_NAME_PATTERN.fullmatch(profile_name):
+        raise BlockedError(
+            reason=f"Invalid reviewed profile name: {profile_name!r}",
+            resource="service-profile-bindings",
+        )
+    root = (repo_root or REPO_ROOT).resolve()
+    configured_env_repo = os.environ.get("PT_ENV_REPO", "").strip()
+    env_repo = (
+        Path(configured_env_repo).expanduser().resolve()
+        if configured_env_repo
+        else root.parent / "env"
+    )
+    relative_directory = Path("peers-touch") / profile_name
+    relative_profile = relative_directory / "profile.env.example"
+    resource = f"service-profile:{profile_name}"
+    try:
+        worktree = subprocess.run(
+            ["git", "-C", str(env_repo), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        tracked = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(env_repo),
+                "ls-files",
+                "--error-unmatch",
+                relative_profile.as_posix(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        source_state = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(env_repo),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                relative_directory.as_posix(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BlockedError(
+            reason=(
+                f"Reviewed profile {profile_name!r} authority is unavailable: "
+                f"{error}"
+            ),
+            resource=resource,
+        ) from error
+    if (
+        worktree.returncode != 0
+        or worktree.stdout.strip() != "true"
+        or tracked.returncode != 0
+        or source_state.returncode != 0
+    ):
+        raise BlockedError(
+            reason=(
+                f"Reviewed profile {profile_name!r} is not a tracked "
+                "environment-repository definition"
+            ),
+            resource=resource,
+        )
+    if source_state.stdout.strip():
+        raise BlockedError(
+            reason=(
+                f"Reviewed profile {profile_name!r} has dirty or untracked "
+                "environment definitions"
+            ),
+            resource=resource,
+        )
+    try:
+        profile_path = (env_repo / relative_profile).resolve(strict=True)
+        profile_path.relative_to(env_repo.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise BlockedError(
+            reason=f"Reviewed profile {profile_name!r} path is unavailable",
+            resource=resource,
+        ) from error
+    values = load_env_file(profile_path)
+    declared_profile = values.get("PT_DEV_PROFILE", "").strip()
+    if declared_profile != profile_name:
+        raise BlockedError(
+            reason=(
+                f"Reviewed profile {profile_name!r} declares "
+                f"PT_DEV_PROFILE={declared_profile!r}"
+            ),
+            resource=resource,
+        )
+    return profile_path, values
+
+
+def resolve_deployment_environment_path(
+    environment_name: str,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    root = REPO_ROOT if repo_root is None else repo_root
+    resolver = root / "tooling" / "scripts" / "deploy" / "deploy.sh"
+    resource = f"deployment-environment:{environment_name}"
+    try:
+        completed = subprocess.run(
+            ["/bin/bash", str(resolver), "resolve", environment_name],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BlockedError(
+            reason=(
+                f"Deployment environment {environment_name!r} could not be "
+                f"resolved: {error}"
+            ),
+            resource=resource,
+        ) from error
+
+    if completed.returncode != 0:
+        detail = (
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or f"resolver exited with status {completed.returncode}"
+        )
+        raise BlockedError(
+            reason=(
+                f"Deployment environment {environment_name!r} could not be "
+                f"resolved: {detail}"
+            ),
+            resource=resource,
+        )
+
+    candidates = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+    if len(candidates) != 1:
+        raise BlockedError(
+            reason=(
+                f"Deployment environment {environment_name!r} resolver "
+                f"returned {len(candidates)} paths; expected exactly one"
+            ),
+            resource=resource,
+        )
+    candidate = Path(candidates[0])
+    if not candidate.is_absolute():
+        raise BlockedError(
+            reason=(
+                f"Deployment environment {environment_name!r} resolver "
+                f"returned a non-absolute path: {candidate}"
+            ),
+            resource=resource,
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise BlockedError(
+            reason=(
+                f"Deployment environment {environment_name!r} path cannot be "
+                f"resolved: {candidate}: {error}"
+            ),
+            resource=resource,
+        ) from error
+    if not resolved.is_file():
+        raise BlockedError(
+            reason=(
+                f"Deployment environment {environment_name!r} is not a file: "
+                f"{resolved}"
+            ),
+            resource=resource,
+        )
+    return resolved
+
+
+class EnvironmentProvisioner(ABC):
+    environment_id = ""
+
+    def __init__(self, contract: EnvironmentContract) -> None:
+        if not self.environment_id:
+            raise ProvisioningError(
+                f"Provisioner subclass {type(self).__name__} must define environment_id"
+            )
+        if contract.id != self.environment_id:
+            raise ProvisioningError(
+                f"contract id {contract.id!r} does not match provisioner "
+                f"{self.environment_id!r}"
+            )
+        self.contract = contract
+        self._manifest: RuntimeManifest | None = None
+        self._cleanup_handlers: list[tuple[str, Callable[[], None]]] = []
+        self._resolved_credential_values: tuple[str, ...] = ()
+        self._prepared_credentials: (
+            tuple[tuple[str, ...], dict[str, str]] | None
+        ) = None
+        self._credential_preparation_error: Exception | None = None
+        self._evidence_run: RunHandle | None = None
+        self._source_leases: list[RemoteGitSourceLease] = []
+        self._remote_source_context_depth = 0
+
+    @property
+    def remote_source_environment(self) -> dict[str, str]:
+        from tooling.acceptance.transports.ssh import SSH_CONNECTIONS_ENV
+
+        descriptors = [
+            descriptor for lease in self._source_leases
+            if (descriptor := lease.connection_descriptor) is not None
+        ]
+        return (
+            {SSH_CONNECTIONS_ENV: json.dumps(descriptors, separators=(",", ":"))}
+            if descriptors else {}
+        )
+
+    def _refresh_remote_source_context(self) -> None:
+        from tooling.acceptance.transports.ssh import SSH_CONNECTIONS_ENV
+
+        environment = self.remote_source_environment
+        if SSH_CONNECTIONS_ENV in environment:
+            os.environ[SSH_CONNECTIONS_ENV] = environment[SSH_CONNECTIONS_ENV]
+        else:
+            os.environ.pop(SSH_CONNECTIONS_ENV, None)
+
+    @contextmanager
+    def remote_source_context(self):
+        """Project only this owner's live connections for synchronous operations."""
+        from tooling.acceptance.transports.ssh import SSH_CONNECTIONS_ENV
+
+        previous = os.environ.get(SSH_CONNECTIONS_ENV)
+        self._remote_source_context_depth += 1
+        try:
+            self._refresh_remote_source_context()
+            yield
+        finally:
+            self._remote_source_context_depth -= 1
+            if previous is None:
+                os.environ.pop(SSH_CONNECTIONS_ENV, None)
+            else:
+                os.environ[SSH_CONNECTIONS_ENV] = previous
+
+    def bind_evidence_run(self, run: RunHandle) -> None:
+        if self._manifest is not None:
+            raise ProvisioningError(
+                "evidence run must be bound before provisioning starts"
+            )
+        if self._evidence_run is not None and self._evidence_run is not run:
+            raise ProvisioningError(
+                "provisioner is already bound to another evidence run"
+            )
+        self._evidence_run = run
+
+    @property
+    def evidence_run(self) -> RunHandle:
+        if self._evidence_run is None:
+            raise ProvisioningError(
+                "provisioner requires an explicitly bound evidence run"
+            )
+        return self._evidence_run
+
+    @abstractmethod
+    def provision(self, gate_id: str) -> RuntimeManifest:
+        ...
+
+    def create_gate_launch_context(
+        self,
+        *,
+        gate_id: str,
+        evidence_run_id: str,
+        provisioning_run_id: str,
+        required_capabilities: tuple[str, ...],
+    ) -> EphemeralGateLaunchContext | None:
+        if required_capabilities:
+            raise BlockedError(
+                reason=(
+                    f"Environment {self.environment_id!r} does not provide "
+                    "the Gate's required ephemeral capabilities"
+                ),
+                resource=f"ephemeral-capabilities:{gate_id}",
+            )
+        return None
+
+    def cleanup(self) -> tuple[str, ...]:
+        failures: list[str] = []
+        completed: list[str] = []
+        for name, handler in reversed(self._cleanup_handlers):
+            try:
+                # Earlier handlers may have released a source connection.
+                # Each operation borrows only this owner's still-live leases.
+                with self.remote_source_context():
+                    handler()
+                completed.append(name)
+            except Exception as error:
+                failures.append(f"{name}: {error}")
+        self._cleanup_handlers.clear()
+        self._source_leases.clear()
+        if failures:
+            raise ProvisioningError(f"cleanup failed: {'; '.join(failures)}")
+        return tuple(completed)
+
+    def register_cleanup(self, name: str, handler: Callable[[], None]) -> None:
+        self._cleanup_handlers.append((name, handler))
+
+    def prepare_fixture_authority(self, *, budget_seconds: float) -> dict[str, str]:
+        """Hold injected reset authority until reverse resource cleanup ends."""
+        scopes = {
+            fixture.authorization_ref[len(STATION_RESET_AUTHORITY_PREFIX):]
+            for fixture in self.contract.fixtures
+            if fixture.authorization_required
+            and fixture.authorization_ref.startswith(STATION_RESET_AUTHORITY_PREFIX)
+        }
+        if not scopes:
+            return {}
+        if len(scopes) != 1:
+            raise ProvisioningError(
+                "one Environment requires one canonical reset scope; "
+                f"received {sorted(scopes)!r}"
+            )
+        scope = next(iter(scopes))
+        if (
+            os.environ.get("PT_MACHINE_LEASE_KIND") == "station.reset"
+            and os.environ.get("PT_MACHINE_LEASE_RESOURCE_ID") == scope
+        ):
+            require_station_reset_authority(scope)
+            return {}
+        if self._cleanup_handlers:
+            raise ProvisioningError("fixture authority must precede resource acquisition")
+        lease = acquire_station_reset_authority(scope, budget_seconds=budget_seconds)
+        self.register_cleanup(f"station.reset:{scope}", lease.release)
+        return lease.environment
+
+    @property
+    def resolved_credential_values(self) -> tuple[str, ...]:
+        """Return in-memory values resolved by this provisioner instance."""
+        return self._resolved_credential_values
+
+    def prepare_credentials(
+        self,
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        """Resolve credentials once, before any runtime artifact is written."""
+        if self._credential_preparation_error is not None:
+            raise self._credential_preparation_error
+        if self._prepared_credentials is None:
+            try:
+                refs, values = self._resolve_credentials()
+            except Exception as error:
+                self._credential_preparation_error = error
+                raise
+            self._prepared_credentials = (refs, dict(values))
+        refs, values = self._prepared_credentials
+        return refs, dict(values)
+
+    def _remember_resolved_credentials(
+        self,
+        refs: tuple[str, ...],
+        values: dict[str, str],
+        *,
+        sensitive: bool = True,
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        if sensitive:
+            short_ids = sorted(
+                credential_id
+                for credential_id, value in values.items()
+                if len(value) < 4
+            )
+            if short_ids:
+                raise BlockedError(
+                    reason=(
+                        "Resolved credentials are too short for safe evidence "
+                        f"redaction: {', '.join(short_ids)}"
+                    ),
+                    resource="credential-values",
+                )
+            self._resolved_credential_values = tuple(
+                value for value in values.values() if value
+            )
+        else:
+            self._resolved_credential_values = ()
+        return refs, values
+
+    def _resolve_credentials(self) -> tuple[tuple[str, ...], dict[str, str]]:
+        refs: list[str] = []
+        values: dict[str, str] = {}
+        self._resolved_credential_values = ()
+        for credential in self.contract.credentials:
+            try:
+                value = credential.resolve()
+            except Exception as error:
+                raise BlockedError(
+                    reason=(
+                        f"Cannot resolve credential {credential.id} from "
+                        f"{credential.source_ref}: {error}"
+                    ),
+                    resource=f"credential-ref:{credential.source_ref}",
+                    diagnostic=ResourceDiagnostic.observed(
+                        owner=f"environment-provisioner:{self.environment_id}",
+                        recovery_action=f"Prepare the required credential at {credential.source_ref} through its owner, then repeat provisioning.",
+                        resource=f"credential-ref:{credential.source_ref}",
+                        expected={"resolved": True},
+                        observed={
+                            "resolved": False,
+                            "resolverErrorType": type(error).__name__,
+                            "environmentVariablePresent": (
+                                bool(os.environ.get(credential.source_ref[4:], ""))
+                                if credential.source_ref.startswith("env:")
+                                else None
+                            ),
+                        },
+                    ),
+                ) from error
+            if len(value) < 4:
+                raise BlockedError(
+                    reason=(
+                        f"Credential {credential.id} from "
+                        f"{credential.source_ref} is too short for safe "
+                        "evidence redaction"
+                    ),
+                    resource=f"credential-ref:{credential.source_ref}",
+                    diagnostic=ResourceDiagnostic.observed(
+                        owner=f"environment-provisioner:{self.environment_id}",
+                        recovery_action=f"Prepare a credential that satisfies the safe-redaction contract at {credential.source_ref}.",
+                        resource=f"credential-ref:{credential.source_ref}",
+                        expected={"present": True, "safeRedactionLength": True},
+                        observed={"present": bool(value), "safeRedactionLength": False},
+                    ),
+                )
+            refs.append(credential.source_ref)
+            values[credential.id] = value
+            self._resolved_credential_values = tuple(
+                resolved
+                for resolved in values.values()
+                if resolved
+            )
+        return self._remember_resolved_credentials(tuple(refs), values)
+
+    def acquire_profile_lease(self, resource: str, owner: str) -> None:
+        lease = ProfileLease(resource, owner)
+        try:
+            lease.acquire()
+        except ProfileLeaseUnavailable as error:
+            resource = f"profile-lease:{error.resource}"
+            raise BlockedError(
+                reason=str(error),
+                resource=resource,
+                diagnostic=ResourceDiagnostic.observed(
+                    owner=f"environment-provisioner:{self.environment_id}",
+                    recovery_action=(
+                        "Coordinate with the recorded lease holder and retry "
+                        "the same reviewed Profile after its owner releases it."
+                    ),
+                    resource=resource,
+                    expected={"leaseAcquired": True},
+                    observed={"leaseAcquired": False, "holder": error.owner},
+                ),
+            ) from error
+        self.register_cleanup(
+            f"profile-lease:{lease.resource}",
+            lease.release,
+        )
+
+    def acquire_remote_git_source_lease(
+        self,
+        resource: str,
+        owner: str,
+    ) -> None:
+        try:
+            environment_name = normalize_lease_resource(resource)
+        except ValueError as error:
+            raise BlockedError(
+                reason=str(error),
+                resource="source-lease:invalid-resource",
+                diagnostic=ResourceDiagnostic.observed(
+                    owner=f"environment-provisioner:{self.environment_id}",
+                    recovery_action="Use the reviewed canonical deployment environment name.",
+                    resource="source-lease:invalid-resource",
+                    expected="canonical deployment environment name",
+                    observed={"requestedResource": resource, "error": str(error)},
+                ),
+            ) from error
+        if environment_name != resource:
+            raise BlockedError(
+                reason=(
+                    f"Station deployment environment {resource!r} is not a "
+                    "canonical lease resource"
+                ),
+                resource="source-lease:invalid-resource",
+                diagnostic=ResourceDiagnostic.observed(
+                    owner=f"environment-provisioner:{self.environment_id}",
+                    recovery_action="Use the reviewed canonical deployment environment name.",
+                    resource="source-lease:invalid-resource",
+                    expected={"requestedResource": environment_name},
+                    observed={"requestedResource": resource},
+                ),
+            )
+        environment: dict[str, str] = {}
+        try:
+            environment_path = resolve_deployment_environment_path(environment_name)
+            environment = load_env_file(environment_path)
+            lease = RemoteGitSourceLease(
+                environment_name,
+                owner,
+                host=environment.get("PT_DEPLOY_HOST", ""),
+                user=environment.get("PT_DEPLOY_USER", ""),
+                deploy_path=environment.get("PT_DEPLOY_PATH", ""),
+                port=int(environment.get("PT_DEPLOY_SSH_PORT", "22")),
+                known_hosts_file=environment.get(
+                    "PT_DEPLOY_KNOWN_HOSTS_FILE",
+                    "",
+                ),
+                **(
+                    {"reuse_connection": True}
+                    if self._remote_source_context_depth > 0 and os.name == "posix"
+                    else {}
+                ),
+            )
+            lease.acquire()
+        except (
+            ValueError,
+            OSError,
+            ProvisioningError,
+            RemoteGitSourceLeaseUnavailable,
+        ) as error:
+            blocked_resource = f"source-lease:{environment_name}"
+            raise BlockedError(
+                reason=str(error),
+                resource=blocked_resource,
+                diagnostic=ResourceDiagnostic(
+                    owner=f"environment-provisioner:{self.environment_id}",
+                    recovery_action=(
+                        f"Verify deployment environment {environment_name}, "
+                        "its configured SSH endpoint and lease handshake; "
+                        "coordinate any recorded holder's release, then retry "
+                        "the same reviewed Profile. A handshake failure does "
+                        "not establish remote lock ownership or source drift."
+                    ),
+                    resource_checks=[{
+                        "resource": blocked_resource,
+                        "expected": {"leaseAcquired": True},
+                        "state": "OBSERVED",
+                        "observed": {
+                            "leaseAcquired": False,
+                            "environment": environment_name,
+                            "host": environment.get("PT_DEPLOY_HOST", ""),
+                            "port": environment.get("PT_DEPLOY_SSH_PORT", "22"),
+                            "deployPath": environment.get("PT_DEPLOY_PATH", ""),
+                            "errorType": type(error).__name__,
+                            "error": str(error),
+                        },
+                    }, {
+                        "resource": f"deployment-source:{environment_name}",
+                        "expected": "source verification under an acquired lease",
+                        "state": "NOT_EVALUATED",
+                        "reason": "Source lease acquisition failed before source verification.",
+                    }],
+                ),
+            ) from error
+        self.register_cleanup(
+            f"source-lease:{lease.resource}",
+            lease.release,
+        )
+        self._source_leases.append(lease)
+        if self._remote_source_context_depth:
+            self._refresh_remote_source_context()
+
+    def _git_commit(self) -> str:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return (
+            completed.stdout.strip()
+            if completed.returncode == 0
+            else "unknown"
+        )
+
+    def _git_workspace_digest(self) -> str:
+        try:
+            return source_workspace_digest(REPO_ROOT)
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+
+    def _resolve_active_profile(self) -> tuple[str, Path, int, dict[str, str]]:
+        return resolve_machine_profile_environment(
+            REPO_ROOT,
+            require_identity_match=self.contract.profile.identity_match,
+        )
+
+    def _station_health(self, station_url: str, health_url: str = "") -> dict[str, object]:
+        url = health_url or f"{station_url.rstrip('/')}/api/oauth/providers"
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        observation = {"endpoint": url, "timeoutSeconds": 8, "ready": False}
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                observation.update(
+                    statusCode=response.status,
+                    ready=200 <= response.status < 300,
+                )
+        except urllib.error.HTTPError as error:
+            observation.update(statusCode=error.code, errorType=type(error).__name__)
+            error.close()
+        except (urllib.error.URLError, OSError, TimeoutError) as error:
+            cause = error.reason if isinstance(error, urllib.error.URLError) else error
+            observation.update(
+                errorType=type(error).__name__,
+                causeType=type(cause).__name__,
+                errno=getattr(cause, "errno", None),
+            )
+        return observation
+
+    def _station_ready(self, station_url: str, health_url: str = "") -> bool:
+        return bool(self._station_health(station_url, health_url)["ready"])
+
+    def _new_base_manifest(self, gate_id: str) -> RuntimeManifest:
+        return new_manifest(
+            environment_id=self.environment_id,
+            gate_id=gate_id,
+            requested_profile="unknown",
+            resolved_profile="unknown",
+            slot=0,
+            commit=self._git_commit(),
+            worktree=str(REPO_ROOT),
+            workspace_digest=self._git_workspace_digest(),
+        )
+
+    def _preflighted(
+        self,
+        manifest: RuntimeManifest,
+        *,
+        profile_name: str,
+        slot: int,
+    ) -> RuntimeManifest:
+        resolved = dataclasses.replace(
+            manifest,
+            state=ProvisioningState.PREFLIGHTED,
+            profile_requested=profile_name,
+            profile_resolved=profile_name,
+            profile_slot=slot,
+        )
+        self._manifest = resolved
+        return resolved
+
+    def _blocked(
+        self,
+        manifest: RuntimeManifest,
+        *,
+        reason: str,
+        resource: str,
+        diagnostic: ResourceDiagnostic | None = None,
+    ) -> RuntimeManifest:
+        blocked = blocked_manifest(
+            manifest, reason=reason, resource=resource, diagnostic=diagnostic,
+        )
+        self._manifest = blocked
+        return blocked
+
+    def _ready(self, manifest: RuntimeManifest) -> RuntimeManifest:
+        for service_id, requirement in self.contract.services.items():
+            if not requirement.required:
+                continue
+            attestation = manifest.services.get(service_id)
+            if attestation is None:
+                raise BlockedError(
+                    reason=(
+                        f"Required service {service_id!r} has no runtime attestation"
+                    ),
+                    resource=f"service-attestation:{service_id}",
+                )
+            if attestation.service_kind != requirement.kind:
+                raise BlockedError(
+                    reason=(
+                        f"Service {service_id!r} kind {attestation.service_kind!r} "
+                        f"does not match contract kind {requirement.kind!r}"
+                    ),
+                    resource=f"service-attestation:{service_id}",
+                )
+            if (
+                requirement.runtime_identity_required
+                and not attestation.runtime_identity
+            ):
+                raise BlockedError(
+                    reason=(
+                        f"Service {service_id!r} has no stable runtime identity"
+                    ),
+                    resource=f"service-identity:{service_id}",
+                )
+        ready = dataclasses.replace(
+            manifest,
+            state=ProvisioningState.FIXTURE_READY,
+            cleanup_registered=bool(self._cleanup_handlers),
+        )
+        self._manifest = ready
+        return ready
+
+    def write_manifest(self) -> Path:
+        if self._manifest is None:
+            raise ProvisioningError(
+                "cannot write manifest before provision() is called"
+            )
+        return write_current_artifact(
+            "runtime/environment-manifest.json",
+            (
+                json.dumps(self._manifest.to_dict(), indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8"),
+            repo_root=REPO_ROOT,
+        )

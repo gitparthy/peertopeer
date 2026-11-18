@@ -1,0 +1,4067 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "mobile-profile-resource-dependencies",
+      "features": ["mobile-profile-resource-dependencies"],
+      "when": {"paths": [
+        "tooling/scripts/local-dev/machine-dev-resource-*",
+        "tooling/scripts/local-dev/machine-dev-ios-provider.mjs",
+        "tooling/scripts/local-dev/machine-dev-resource*",
+        "tooling/scripts/local-dev/machine-dev-lease.py",
+        "tooling/scripts/local-dev/mobile-ios-sim.sh",
+        "apps/mobile/scripts/ios-dev-sim.sh",
+        "tooling/acceptance/provisioners/mobile_ios_resources.py",
+        "tooling/acceptance/provisioners/profile_ios_fixture.py",
+        "tooling/acceptance/gates/mobile/resource_dependencies*",
+        "docs/architecture/engineering/local-dev/**"
+      ]},
+      "require": ["machine-dev-registry-self", "profile-resource-id-sharing-native-e2e", "profile-resource-overwrite-native-e2e"]
+    },
+    {
+      "id": "social-content-search",
+      "features": ["social-content-search"],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/social/application/public_search*.go",
+          "apps/station/app/subserver/social/application/private_read_policy*.go",
+          "apps/station/app/subserver/social/infrastructure/private_read_policy.go",
+          "apps/station/app/subserver/social/search_handler*.go",
+          "apps/station/app/subserver/social/read_policy_handler.go",
+          "apps/desktop/src-tauri/src/application/search/social.rs",
+          "apps/desktop/src-tauri/src/application/search/private.rs",
+          "apps/desktop/src-tauri/src/secure_content/search*.rs",
+          "apps/desktop/src/runtimes/searchOpeners.ts",
+          "apps/desktop/src/runtimes/searchInvalidations.ts",
+          "apps/desktop/src/services/socialOpenResource.ts",
+          "apps/mobile/src-tauri/src/runtime/search/social.rs",
+          "apps/mobile/src-tauri/src/runtime/search/social/**",
+          "apps/mobile/src-tauri/src/secure_content/store/search*.rs",
+          "apps/mobile/src/features/social/openSearchResource.ts",
+          "apps/mobile/src/runtimes/searchInvalidations.ts",
+          "tooling/acceptance/features/social-content-search.yaml",
+          "tooling/acceptance/gates/social/content_search*"
+        ]
+      },
+      "require": [
+        "social-content-search-contract",
+        "social-content-search-desktop-native-e2e",
+        "social-content-search-mobile-native-e2e"
+      ]
+    },
+    {
+      "id": "chat-device-search",
+      "features": ["chat-device-search"],
+      "when": {
+        "paths": [
+          "packages/search-core/**",
+          "model/domain/search/**",
+          "apps/desktop/src-tauri/src/application/search/**",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/search.rs",
+          "apps/desktop/src/components/search/**",
+          "apps/desktop/src/runtimes/searchRuntime.ts",
+          "apps/desktop/src/runtimes/searchQueries.ts",
+          "docs/client/desktop/search-experience-contract.md",
+          "apps/desktop/src/store/search.ts",
+          "apps/desktop/src/services/search.ts",
+          "apps/desktop/src/messaging/openResource.ts",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src/kernel/identityRuntime.ts",
+          "docs/architecture/domains/search/**",
+          "tooling/acceptance/features/chat-device-search.yaml",
+          "tooling/acceptance/gates/chat/device_search_*.py"
+        ]
+      },
+      "require": ["chat-device-search-contract", "chat-device-search-native-e2e"]
+    },
+    {
+      "id": "chat-mobile-device-search",
+      "features": ["chat-mobile-device-search"],
+      "when": {
+        "paths": [
+          "packages/search-core/**",
+          "model/domain/search/**",
+          "apps/mobile/src-tauri/src/runtime/search.rs",
+          "apps/mobile/src-tauri/src/commands/search.rs",
+          "apps/mobile/src-tauri/src/messaging/adapter/search.rs",
+          "apps/mobile/src/pages/SearchPage*",
+          "apps/mobile/src/runtimes/searchRuntime.ts",
+          "apps/mobile/src/features/search/**",
+          "apps/mobile/src/services/search.ts",
+          "apps/mobile/src/components/SearchEntry*",
+          "apps/mobile/src/acceptance/searchActions.ts",
+          "docs/architecture/domains/search/**",
+          "tooling/acceptance/features/chat-mobile-device-search.yaml",
+          "tooling/acceptance/environments/chat-mobile-search-simulator.yaml",
+          "tooling/acceptance/provisioners/mobile_search.py",
+          "tooling/acceptance/gates/chat/mobile_device_search.py"
+        ]
+      },
+      "require": ["chat-device-search-contract", "chat-mobile-device-search-native-e2e"]
+    },
+    {
+      "id": "x-config-api-closure",
+      "features": ["x-config-api-closure"],
+      "when": {
+        "paths": [
+          "tooling/acceptance/gates/x_config/**",
+          "tooling/acceptance/provisioners/x_config_*.py",
+          "tooling/acceptance/environments/x-config-*-api.yaml",
+          "tooling/acceptance/features/x-config-api-closure.yaml",
+          "packages/x-config-core/examples/verify_production.rs"
+        ]
+      },
+      "require": [
+        "x-config-home-operator-login-e2e",
+        "x-config-home-publication-e2e",
+        "x-config-api-aggregate-e2e",
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "x-config-domain-contract",
+      "features": [
+        "x-config-operator-login",
+        "x-config-snapshot-core",
+        "x-config-publication",
+        "x-config-client-adapters",
+        "x-config-admin-console",
+        "x-config-api-closure"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/capabilities/x-config.yaml",
+          "tooling/acceptance/domains/x-config.yaml"
+        ]
+      },
+      "require": [
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "x-config-operator-login",
+      "features": [
+        "x-config-operator-login"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/oauth/operator_login.proto",
+          "packages/github-repository/**",
+          "apps/oauth2-client/internal/application/oauth/usecase/operator_login*",
+          "apps/oauth2-client/internal/infrastructure/persistence/**",
+          "apps/oauth2-client/internal/interfaces/http/handler/operator_login*",
+          "apps/oauth2-client/api/oauth/operator/**",
+          "apps/x-config/internal/application/operatorauth/**",
+          "apps/x-config/internal/infrastructure/operatorstore/**",
+          "apps/x-config/internal/interfaces/http/auth_handler.go",
+          "tooling/acceptance/features/x-config-operator-login.yaml"
+        ]
+      },
+      "require": [
+        "x-config-operator-login-contract",
+        "x-config-home-operator-login-e2e",
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "x-config-snapshot-core",
+      "features": [
+        "x-config-snapshot-core"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/x_config/**",
+          "packages/x-config-core/**",
+          "apps/station/frame/touch/model/xconfig/**",
+          "apps/desktop/src/gen/proto/domain/x_config/**",
+          "tooling/acceptance/features/x-config-snapshot-core.yaml"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "x-config-snapshot-core-contract",
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "x-config-publication",
+      "features": [
+        "x-config-publication"
+      ],
+      "when": {
+        "paths": [
+          "apps/x-config/internal/application/admin/**",
+          "apps/x-config/internal/infrastructure/catalogrepo/**",
+          "apps/x-config/internal/interfaces/http/public_handler.go",
+          "apps/x-config/internal/publication/**",
+          "tooling/acceptance/features/x-config-publication.yaml"
+        ]
+      },
+      "require": [
+        "x-config-snapshot-publication-contract",
+        "x-config-home-publication-e2e",
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "x-config-client-adapters",
+      "features": [
+        "x-config-client-adapters"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src-tauri/src/application/x_config/**",
+          "apps/desktop/src-tauri/src/infrastructure/station_discovery.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/x_config.rs",
+          "apps/desktop/src/runtimes/xConfigRuntime.ts",
+          "apps/desktop/src/services/xConfig*",
+          "apps/desktop/src/pages/login/StationSetupPanel.tsx",
+          "apps/desktop/src/pages/login/useStationRegistry.ts",
+          "apps/mobile/src-tauri/src/runtime/x_config.rs",
+          "apps/mobile/src-tauri/src/runtime/station_route.rs",
+          "apps/mobile/src/runtimes/runtimeRegistry.ts",
+          "apps/mobile/src/features/station/xConfig*",
+          "apps/mobile/src/features/station/StationSelector*",
+          "tooling/acceptance/features/x-config-client-adapters.yaml"
+        ]
+      },
+      "require": [
+        "x-config-desktop-adapter-contract",
+        "x-config-mobile-adapter-contract",
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "x-config-admin-console",
+      "features": [
+        "x-config-admin-console"
+      ],
+      "when": {
+        "paths": [
+          "apps/x-config/internal/application/admin/**",
+          "apps/x-config/internal/domain/catalog/**",
+          "apps/x-config/internal/infrastructure/catalogrepo/**",
+          "apps/x-config/internal/infrastructure/endpointvalidator/**",
+          "apps/x-config/internal/interfaces/http/admin_handler.go",
+          "apps/x-config/console/**",
+          "tooling/acceptance/features/x-config-admin-console.yaml"
+        ]
+      },
+      "require": [
+        "x-config-admin-api-contract",
+        "x-config-console-admin-e2e",
+        "x-config-domain-validation"
+      ]
+    },
+    {
+      "id": "agent-chat-production",
+      "features": ["agent-chat-production"],
+      "when": {
+        "paths": [
+          "tooling/acceptance/gates/agent/agent_definition_roundtrip*",
+          "tooling/acceptance/gates/agent/chat_*",
+          "tooling/acceptance/features/agent-chat-production.yaml",
+          "model/domain/agent/agent.proto",
+          "model/domain/agent/capability.proto",
+          "apps/desktop/src-tauri/src/application/agents/mod.rs",
+          "apps/desktop/src-tauri/src/application/capability_authority.rs",
+          "apps/desktop/src-tauri/src/application/agent_turn/mod.rs",
+          "apps/desktop/src/pages/AgentProfilePage.tsx",
+          "apps/desktop/src/components/ChatInput.tsx",
+          "apps/desktop/src/components/agent/workbench/**",
+          "apps/desktop/src/components/agent/AgentCommandPalette.tsx",
+          "apps/desktop/src/components/messages/AssistantMessage.tsx",
+          "apps/desktop/src/components/messages/TurnAttribution.tsx",
+          "apps/desktop/src/components/messages/ClarificationQuestion.tsx",
+          "apps/desktop/src/store/agentCapabilities.ts",
+          "apps/desktop/src/store/chat.ts",
+          "apps/station/app/subserver/agent/domain/agent.go",
+          "apps/station/app/subserver/agent/handler/agent_handler.go",
+          "apps/station/app/subserver/agent/handler/capability_authority_handler.go",
+          "apps/station/app/subserver/agent/handler/turn_handler.go",
+          "apps/station/app/subserver/agent/infrastructure/persistence/agent*",
+          "apps/station/app/subserver/agent/infrastructure/persistence/migrations*",
+          "apps/station/app/subserver/agent/service/agent_definition_config.go",
+          "apps/station/app/subserver/agent/service/agent_package_service*",
+          "apps/station/app/subserver/agent/service/agent_service*",
+          "apps/station/app/subserver/agent/service/prompt_assembly_service*",
+          "apps/station/app/subserver/agent/service/skill_service*",
+          "apps/station/app/subserver/agent/service/turn_service.go",
+          "apps/station/app/subserver/agent/service/turn_attribution_service*",
+          "apps/station/app/subserver/agent/service/capability_command_projection_service*",
+          "apps/station/app/subserver/agent/service/clarification*",
+          "apps/station/app/subserver/agent/service/conversation_deletion_service*"
+        ]
+      },
+      "require": [
+        "agent-definition-roundtrip-native-e2e",
+        "agent-slash-command-native-e2e",
+        "agent-context-projection-native-e2e",
+        "agent-depth-linux-native-e2e",
+        "agent-chat-profile-native", "agent-chat-models-native",
+        "agent-chat-topics-native", "agent-chat-conversation-native",
+        "agent-chat-layout-native", "agent-chat-workspace-native"
+      ]
+    },
+    {
+      "id": "oauth2-client-vercel-publication",
+      "features": [
+        "oauth2-client-vercel-publication"
+      ],
+      "when": {
+        "paths": [
+          "apps/oauth2-client/api/oauth/**",
+          "apps/oauth2-client/cmd/verify-record-envelopes/**",
+          "apps/oauth2-client/config/sites*.json",
+          "apps/oauth2-client/internal/bootstrap/config.go",
+          "apps/oauth2-client/internal/domain/oauth/valueobject/provider.go",
+          "apps/oauth2-client/internal/infrastructure/provider/**",
+          "apps/oauth2-client/vercel.json",
+          "tooling/acceptance/features/oauth2-client-vercel-publication.yaml",
+          "tooling/skills/pt-oauth2-client-2-vercel/**"
+        ]
+      },
+      "require": [
+        "oauth2-client-vercel-publication"
+      ]
+    },
+    {
+      "id": "oauth-login-broker-durability",
+      "features": [
+        "oauth2-client-durability"
+      ],
+      "when": {
+        "paths": [
+          "apps/oauth2-client/**",
+          "docs/architecture/domains/identity/oauth-login-broker/**",
+          "tooling/acceptance/capabilities/oauth-login-broker.yaml",
+          "tooling/acceptance/domains/oauth-login-broker.yaml",
+          "tooling/acceptance/environments/oauth2-client-local-*.yaml",
+          "tooling/acceptance/features/oauth2-client-durability.yaml",
+          "tooling/acceptance/gates/oauth2_client/**",
+          "tooling/acceptance/provisioners/oauth2_client_local.py"
+        ]
+      },
+      "require": [
+        "oauth-login-broker-durable-login",
+        "oauth-login-broker-refresh-idempotency",
+        "oauth-login-broker-key-rotation",
+        "oauth-login-broker-operator",
+        "oauth2-client-live-api-repository",
+        "oauth-login-broker-architecture",
+        "oauth-login-broker-contract"
+      ]
+    },
+    {
+      "id": "oauth-login-broker-native-login",
+      "features": [
+        "oauth-live-login"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src-tauri/src/application/oauth2/**",
+          "apps/desktop/src-tauri/src/contracts.rs",
+          "apps/desktop/src-tauri/src/interface/contracts/mod.rs",
+          "apps/desktop/src-tauri/src/interface/http_gateway/mod.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/oauth2.rs",
+          "apps/desktop/src-tauri/src/main.rs",
+          "apps/desktop/src/gen/proto/domain/oauth/**",
+          "apps/mobile/src/gen/proto/domain/oauth/**",
+          "apps/desktop/src/pages/login/**",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src/store/oauth2.ts",
+          "apps/oauth2-client/internal/application/oauth/**",
+          "apps/oauth2-client/internal/infrastructure/provider/**",
+          "apps/oauth2-client/internal/interfaces/http/handler/**",
+          "apps/station/app/subserver/oauth/**",
+          "apps/station/frame/core/auth/oauth2.go",
+          "apps/station/frame/touch/actor_handler.go",
+          "apps/station/frame/touch/actor_router.go",
+          "apps/station/frame/touch/auth/**",
+          "apps/station/frame/touch/model/db/automigrate.go",
+          "apps/station/frame/touch/model/db/oauth2_state.go",
+          "apps/station/frame/touch/oauth_handler.go",
+          "apps/station/frame/touch/model/oauth.pb.go",
+          "model/domain/oauth/**",
+          "tooling/acceptance/capabilities/oauth-login-broker.yaml",
+          "tooling/acceptance/domains/oauth-login-broker.yaml",
+          "tooling/acceptance/features/oauth-live-login.yaml"
+        ]
+      },
+      "require": [
+        "oauth-login-broker-handoff-contract",
+        "oauth-login-broker-provider-identity",
+        "oauth-login-broker-architecture",
+        "oauth-login-broker-contract"
+      ]
+    },
+    {
+      "id": "lark-channel-production-contract",
+      "features": [
+        "lark-channel-production-contract"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/channel/**",
+          "apps/station/app/cmd/lark-channel-plugin/**",
+          "apps/station/app/subserver/channel/**",
+          "apps/station/app/subserver/agent/channel_wire.go",
+          "apps/station/app/subserver/agent/service/channel_turn_executor.go",
+          "apps/station/app/subserver/agent/service/lark_requester_tools.go",
+          "apps/desktop/src/components/settings/channels/**",
+          "apps/desktop/src/gen/proto/domain/channel/**",
+          "apps/desktop/src/runtimes/channelRuntime.ts",
+          "apps/desktop/src/services/channelActions.ts",
+          "apps/desktop/src/store/channel.ts",
+          "apps/desktop/src-tauri/src/application/channels/**",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/channels.rs",
+          "tooling/docker/station.Dockerfile",
+          "tooling/docker/compose.yml",
+          "tooling/docker/entrypoint.sh",
+          "tooling/plugins/build-lark-plugin.sh",
+          "tooling/acceptance/capabilities/channel.yaml",
+          "tooling/acceptance/domains/channel.yaml",
+          "tooling/acceptance/domains/channel/**",
+          "tooling/acceptance/gates/channel/**",
+          "tooling/acceptance/features/lark-channel-production-contract.yaml"
+        ]
+      },
+      "require": [
+        "lark-channel-source",
+        "station-api-ownership",
+        "lark-01-e2e",
+        "lark-02-e2e",
+        "lark-03-e2e",
+        "lark-04-e2e",
+        "lark-05-e2e",
+        "lark-06-e2e",
+        "lark-07-e2e",
+        "lark-08-e2e",
+        "lark-09-e2e",
+        "lark-10-e2e",
+        "lark-11-e2e",
+        "lark-12-e2e",
+        "lark-13-e2e",
+        "lark-14-e2e",
+        "lark-15-e2e",
+        "lark-16-e2e",
+        "lark-17-e2e",
+        "lark-18a-e2e",
+        "lark-18b-e2e",
+        "lark-18c-e2e",
+        "lark-19-e2e",
+        "lark-20-e2e",
+        "channel-domain-validation"
+      ]
+    },
+    {
+      "id": "development-workflow-host-neutral",
+      "features": [
+        "development-workflow-control-plane"
+      ],
+      "when": {
+        "paths": [
+          "tooling/skills/pt-goal-orchestrator/**",
+          "tooling/skills/pt-trae-host-adapter/**",
+          "tooling/skills/pt-cursor-host-adapter/**",
+          "tooling/skills/pt-codex-host-adapter/**",
+          "tooling/plugins/pt-ew-plugin/**",
+          "tooling/scripts/local-dev/workflow-*.mjs",
+          "tooling/scripts/agent-integration-control.py",
+          "tooling/scripts/agent-integration-audit.py",
+          "tooling/scripts/agent-integration-audit-test.py",
+          "tooling/scripts/install-agent-integration.sh",
+          "tooling/make/setup.mk"
+        ]
+      },
+      "require": [
+        "acceptance-workflow-contract"
+      ]
+    },
+    {
+      "id": "station-access-wire-contract",
+      "features": [
+        "station-access-wire-contract"
+      ],
+      "when": {
+        "paths": [
+          "docs/architecture/engineering/api-governance/station-api-capabilities.yaml",
+          "model/domain/access_gate/**",
+          "model/domain/peer/station_identity.proto",
+          "apps/station/frame/core/plugin/native/subserver/bootstrap/station_identity.go",
+          "apps/station/frame/core/plugin/native/subserver/bootstrap/bootstrap.go",
+          "apps/station/frame/touch/accessgate/**",
+          "apps/station/frame/touch/actor_handler.go",
+          "apps/station/frame/touch/actor_router.go",
+          "apps/station/frame/touch/router.go",
+          "apps/station/app/cmd/station_api_ownership/**"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-api-ownership",
+        "station-access-capability-contract"
+      ]
+    },
+    {
+      "id": "station-access-oauth-bridge",
+      "features": [
+        "station-access-authentication"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/touch/actor_handler.go",
+          "apps/station/frame/touch/oauth_handler.go"
+        ]
+      },
+      "require": [
+        "station-access-capability-contract",
+        "station-access-desktop-oauth-native-e2e",
+        "station-access-auth-e2e"
+      ]
+    },
+    {
+      "id": "station-access-desktop-runtime",
+      "features": [
+        "station-access-authentication",
+        "station-access-scope-isolation"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/index.css",
+          "apps/desktop/src/kernel/identityLifecycle.ts",
+          "apps/desktop/src/kernel/identityRuntime.ts",
+          "apps/desktop/src/pages/login/**",
+          "apps/desktop/src/services/accessGate.ts",
+          "apps/desktop/src/store/session.ts",
+          "apps/desktop/src-tauri/src/application/auth/**",
+          "apps/desktop/src-tauri/src/application/oauth2/**",
+          "apps/desktop/src-tauri/src/application/key_exchange/device_install.rs",
+          "apps/desktop/src-tauri/src/application/station_binding/**",
+          "apps/desktop/src-tauri/src/application/station_runtime/**",
+          "apps/desktop/src-tauri/src/infrastructure/station_registry.rs",
+          "apps/desktop/src-tauri/src/interface/http_gateway/mod.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/oauth2.rs"
+        ]
+      },
+      "require": [
+        "station-access-capability-contract",
+        "station-access-desktop-oauth-native-e2e",
+        "station-access-auth-e2e",
+        "station-access-scope-isolation-e2e"
+      ]
+    },
+    {
+      "id": "station-access-mobile-runtime",
+      "features": [
+        "station-access-authentication",
+        "station-access-scope-isolation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/features/auth/**",
+          "apps/mobile/src/features/station/**",
+          "apps/mobile/src/runtimes/accessRuntime.ts",
+          "apps/mobile/src/runtimes/authRuntime.ts",
+          "apps/mobile/src/runtimes/messagingRuntime.ts",
+          "apps/mobile/src/runtimes/sessionRuntime.ts",
+          "apps/mobile/src/runtimes/stationRuntime.ts",
+          "apps/mobile/src/storage/mobileClientStorage.ts",
+          "apps/mobile/src-tauri/src/commands/station.rs",
+          "apps/mobile/src-tauri/src/runtime/oauth/**"
+        ]
+      },
+      "require": [
+        "station-access-capability-contract",
+        "station-access-auth-e2e",
+        "station-access-scope-isolation-e2e"
+      ]
+    },
+    {
+      "id": "station-access-session-class",
+      "features": [
+        "station-access-session-class"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/core/facility/session/**",
+          "apps/desktop/src-tauri/src/application/auth/**",
+          "apps/desktop/src-tauri/src/messaging/**",
+          "apps/mobile/src-tauri/src/runtime/oauth/**",
+          "apps/mobile/src-tauri/src/messaging/**",
+          "tooling/acceptance/gates/station_access/session_class_suite_e2e.py",
+          "tooling/acceptance/gates/station_access/session_class_suite_e2e_test.py"
+        ]
+      },
+      "require": [
+        "station-access-session-class-suite-e2e"
+      ]
+    },
+    {
+      "id": "station-access-federation-boundary",
+      "features": [
+        "station-access-federation-boundary"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/actor/actor.proto",
+          "model/domain/federation/**",
+          "apps/station/frame/touch/actor/**",
+          "apps/station/frame/touch/federation_api_handler.go",
+          "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+          "apps/desktop/src/store/federation.ts",
+          "apps/desktop/src/runtimes/federationRuntime.ts",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src-tauri/src/application/federation/**",
+          "apps/mobile/src/features/social/**",
+          "apps/mobile/src/pages/ContactsPage.tsx",
+          "apps/mobile/src/pages/settings/**",
+          "apps/mobile/src/services/gateways/profileGateway.ts",
+          "apps/mobile/src-tauri/src/runtime/station_transport/**"
+        ]
+      },
+      "require": [
+        "station-federation-unit",
+        "station-api-ownership",
+        "station-access-federation-boundary-e2e"
+      ]
+    },
+    {
+      "id": "station-access-relay-role-security",
+      "features": [
+        "station-access-relay-role-security",
+        "station-access-relay-enrollment"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/conf/sub_relay.yml",
+          "apps/station/app/main.go",
+          "apps/station/app/subserver/events/bus.go",
+          "apps/station/frame/core/federation/transport.go",
+          "apps/station/frame/core/plugin/native/node/**",
+          "apps/station/frame/core/plugin/native/relay/**",
+          "apps/station/frame/core/plugin/native/subserver/relay/**",
+          "apps/station/frame/core/runtime/role/**",
+          "apps/station/frame/peers.go",
+          "tooling/docker/.env.example",
+          "tooling/docker/README.md",
+          "tooling/docker/compose.yml",
+          "tooling/docker/entrypoint.sh",
+          "tooling/acceptance/environments/station-access-relay-role.yaml",
+          "tooling/acceptance/provisioners/station_access_relay_role.py",
+          "tooling/acceptance/tests/test_station_access_relay_role.py",
+          "tooling/scripts/local-dev/relay-check.sh",
+          "tooling/scripts/local-dev/station-dev.sh"
+        ]
+      },
+      "require": [
+        "relay-role-security-contract",
+        "NCP-G07"
+      ]
+    },
+    {
+      "id": "station-access-relay-attachment-lifecycle",
+      "features": [
+        "station-access-relay-attachment-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/core/plugin/native/relay/attachment_controller.go",
+          "apps/station/frame/core/plugin/native/relay/attachment_migration.go",
+          "apps/station/frame/core/plugin/native/relay/reservation.go",
+          "apps/station/frame/core/plugin/native/relay/runtime.go",
+          "apps/station/frame/core/plugin/native/relay/station_control.go",
+          "apps/station/frame/core/plugin/native/subserver/relay/handler_admin.go",
+          "apps/station/frame/core/plugin/native/subserver/relay/infrastructure/repo.go",
+          "apps/station/app/subserver/dashboard/handler.go",
+          "apps/station/app/subserver/dashboard/web/src/api/relayAttachments.ts",
+          "apps/station/app/subserver/dashboard/web/src/pages/RelayAttachmentsPage.tsx",
+          "docs/architecture/platform/runtime/node-connectivity/relay-attachment/**",
+          "tooling/acceptance/environments/station-access-dual-relay.yaml",
+          "tooling/acceptance/features/station-access-relay-attachment-lifecycle.yaml",
+          "tooling/acceptance/gates/station_access/relay_attachment_lifecycle_e2e.py",
+          "tooling/acceptance/provisioners/station_access_dual_relay.py",
+          "tooling/acceptance/runtime/station-access-dual-relay.compose.yml",
+          "tooling/acceptance/station_access_evidence.py",
+          "tooling/acceptance/tests/test_station_access_dual_relay.py"
+        ]
+      },
+      "require": [
+        "RAL-G01",
+        "RAL-G02",
+        "RAL-G03",
+        "RAL-G04",
+        "RAL-G05",
+        "RAL-G06",
+        "RAL-G07",
+        "RAL-G08"
+      ]
+    },
+    {
+      "id": "station-access-endpoint-discovery",
+      "features": [
+        "station-access-endpoint-discovery"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/peer/access_endpoint.proto",
+          "apps/station/app/subserver/dashboard/handler.go",
+          "apps/station/app/subserver/dashboard/handler_middleware.go",
+          "apps/station/app/subserver/dashboard/subserver.go",
+          "apps/station/frame/core/plugin/native/subserver/bootstrap/access_endpoint.go",
+          "apps/station/frame/core/plugin/native/subserver/bootstrap/accessendpoint/**",
+          "apps/station/frame/core/plugin/native/subserver/relay/application/discovery.go",
+          "apps/station/frame/core/plugin/native/subserver/relay/domain/discovery.go",
+          "apps/station/frame/core/plugin/native/relay/connection_material.go",
+          "apps/station/frame/core/plugin/native/relay/station_control.go",
+          "apps/station/frame/core/plugin/native/subserver/relay/handler_discovery.go",
+          "tooling/acceptance/features/station-access-endpoint-discovery.yaml",
+          "tooling/acceptance/gates/station_access/relay_endpoint_discovery_contract.py"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-api-ownership",
+        "NCP-G01",
+        "NCP-G07"
+      ]
+    },
+    {
+      "id": "node-connectivity-standard-stream",
+      "features": [
+        "node-connectivity-standard-stream"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/core/plugin/native/transport/securehttp/**",
+          "apps/station/frame/core/plugin/native/relay/**",
+          "apps/station/frame/core/plugin/server/hertz/secure_stream_test.go",
+          "packages/station-libp2p-http/**",
+          "apps/desktop/src-tauri/src/application/station_runtime/**",
+          "apps/desktop/src-tauri/src/infrastructure/station/**",
+          "apps/mobile/src-tauri/src/runtime/station_route.rs",
+          "model/domain/federation/locator.proto",
+          "apps/station/frame/core/plugin/native/federation/locator/**",
+          "apps/station/frame/touch/federation/resolver/**",
+          "apps/station/app/subserver/events/**",
+          "apps/station/app/subserver/presence/publisher.go",
+          "apps/station/frame/touch/model/peer/station_trust.go",
+          "apps/station/frame/touch/model/peer/station_route_trust.go",
+          "tooling/acceptance/environments/node-connectivity-durable-events.yaml",
+          "tooling/acceptance/gates/station_access/node_connectivity_native_e2e.py",
+          "tooling/acceptance/provisioners/node_connectivity_durable_events.py",
+          "tooling/acceptance/features/node-connectivity-standard-stream.yaml",
+          "tooling/scripts/check-node-connectivity-hard-cut.py",
+          "tooling/scripts/check-node-connectivity-hard-cut-test.py",
+          "tooling/scripts/node-connectivity-journey.py"
+        ]
+      },
+      "require": [
+        "NCP-G01",
+        "NCP-G02",
+        "NCP-G03",
+        "NCP-G04",
+        "NCP-G07",
+        "NCP-G08"
+      ]
+    },
+    {
+      "id": "node-connectivity-shared-access",
+      "features": [
+        "node-connectivity-shared-access"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/core/auth/**",
+          "apps/station/frame/core/facility/session/**",
+          "apps/station/frame/touch/accessgate/**",
+          "apps/station/frame/touch/auth/**",
+          "apps/station/frame/touch/model/db/access_gate.go",
+          "apps/station/app/subserver/oauth/**",
+          "tooling/acceptance/environments/node-connectivity-shared-access.yaml",
+          "tooling/acceptance/provisioners/node_connectivity_postgres.py",
+          "tooling/acceptance/provisioners/node_connectivity_shared_access.py",
+          "tooling/acceptance/features/node-connectivity-shared-access.yaml",
+          "tooling/scripts/node-connectivity-journey.py"
+        ]
+      },
+      "require": [
+        "NCP-G05"
+      ]
+    },
+    {
+      "id": "node-connectivity-agent-fencing",
+      "features": [
+        "node-connectivity-agent-fencing"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/orchestration.proto",
+          "apps/station/frame/core/server/options.go",
+          "apps/station/frame/core/plugin/native/node/native_init_top_comp.go",
+          "apps/station/app/subserver/agent/infrastructure/persistence/executor_lease.go",
+          "apps/station/app/subserver/agent/infrastructure/persistence/migrations.go",
+          "apps/station/app/subserver/agent/service/chat_task_service.go",
+          "apps/station/app/subserver/agent/service/chat_task_fencing_postgres_test.go",
+          "apps/station/app/subserver/agent/service/turn_service.go",
+          "tooling/acceptance/environments/node-connectivity-agent-fencing.yaml",
+          "tooling/acceptance/provisioners/node_connectivity_agent_fencing.py",
+          "tooling/acceptance/features/node-connectivity-agent-fencing.yaml",
+          "tooling/scripts/node-connectivity-journey.py"
+        ]
+      },
+      "require": [
+        "NCP-G06-AGENT"
+      ]
+    },
+    {
+      "id": "node-connectivity-shared-objects",
+      "features": [
+        "node-connectivity-shared-objects"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/oss/**",
+          "apps/station/frame/core/facility/storage/**",
+          "tooling/acceptance/environments/node-connectivity-oss-fencing.yaml",
+          "tooling/acceptance/provisioners/node_connectivity_oss_fencing.py",
+          "tooling/acceptance/features/node-connectivity-shared-objects.yaml",
+          "tooling/scripts/node-connectivity-journey.py"
+        ]
+      },
+      "require": [
+        "NCP-G06-OSS"
+      ]
+    },
+    {
+      "id": "node-connectivity-cluster",
+      "features": [
+        "node-connectivity-cluster"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/core/plugin/native/node/**",
+          "apps/station/frame/core/auth/station_keyring.go",
+          "apps/station/frame/core/facility/storage/**",
+          "apps/station/app/subserver/events/**",
+          "apps/station/app/subserver/agent/**",
+          "apps/station/app/subserver/oss/**",
+          "apps/desktop/src-tauri/src/application/station_binding/**",
+          "apps/desktop/src-tauri/src/application/station_runtime/**",
+          "apps/desktop/src-tauri/src/infrastructure/station_registry.rs",
+          "apps/desktop/src-tauri/src/infrastructure/station/**",
+          "tooling/acceptance/environments/node-connectivity-cluster.yaml",
+          "tooling/acceptance/provisioners/node_connectivity_cluster.py",
+          "tooling/acceptance/features/node-connectivity-cluster.yaml",
+          "tooling/scripts/node-connectivity-journey.py"
+        ]
+      },
+      "require": [
+        "NCP-G04",
+        "NCP-G05",
+        "NCP-G06"
+      ]
+    },
+    {
+      "id": "node-connectivity-architecture",
+      "features": [
+        "node-connectivity-standard-stream"
+      ],
+      "when": {
+        "paths": [
+          "docs/architecture/platform/runtime/node-connectivity/**"
+        ]
+      },
+      "require": [
+        "architecture-module-governance",
+        "NCP-G01",
+        "NCP-G02",
+        "NCP-G03",
+        "NCP-G04",
+        "NCP-G05",
+        "NCP-G06",
+        "NCP-G06-AGENT",
+        "NCP-G06-OSS",
+        "NCP-G07",
+        "NCP-G08"
+      ]
+    },
+    {
+      "id": "station-access-desktop-relay-binding",
+      "features": [
+        "station-access-desktop-relay-binding"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src-tauri/src/application/station_binding/**",
+          "apps/desktop/src-tauri/src/application/station_runtime/**",
+          "apps/desktop/src-tauri/src/infrastructure/station_discovery.rs",
+          "apps/desktop/src-tauri/src/infrastructure/station_registry.rs",
+          "apps/desktop/src-tauri/src/infrastructure/station/**",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/station.rs",
+          "apps/desktop/src/acceptance/stationAccess.ts",
+          "apps/desktop/src/acceptance/station_access/**",
+          "apps/desktop/src/pages/login/StationSetupPanel.tsx",
+          "apps/desktop/src/pages/login/useStationRegistry.ts",
+          "packages/locales/en/common.json",
+          "packages/locales/zh-CN/common.json",
+          "tooling/acceptance/environments/station-access-relay-role.yaml",
+          "tooling/acceptance/features/station-access-desktop-relay-binding.yaml",
+          "tooling/acceptance/gates/station_access/desktop_relay_native_e2e.py",
+          "tooling/acceptance/provisioners/station_access_relay_role.py"
+        ]
+      },
+      "require": [
+        "station-access-desktop-relay-native-e2e",
+        "station-access-desktop-relay-windows-e2e"
+      ]
+    },
+    {
+      "id": "station-access-mobile-relay-binding",
+      "features": [
+        "station-access-mobile-relay-binding"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src-tauri/src/runtime/station_route.rs",
+          "apps/mobile/src-tauri/src/runtime/oauth/**",
+          "apps/mobile/src/features/station/**",
+          "apps/mobile/src/runtimes/stationRuntime.ts",
+          "apps/mobile/src/acceptance/**",
+          "apps/mobile/src/App.tsx",
+          "apps/mobile/src/components/MobileShell.tsx",
+          "apps/mobile/src/pages/SettingsPage.tsx",
+          "apps/mobile/src/pages/settings/SettingsSections.tsx",
+          "packages/locales/en/common.json",
+          "packages/locales/zh-CN/common.json",
+          "tooling/acceptance/environments/mobile-relay-simulator.yaml",
+          "tooling/acceptance/environments/mobile-social-simulator.yaml",
+          "tooling/acceptance/features/station-access-mobile-relay-binding.yaml",
+          "tooling/acceptance/gates/station_access/mobile_relay_native_e2e.py"
+        ]
+      },
+      "require": [
+        "station-access-mobile-relay-native-e2e"
+      ]
+    },
+    {
+      "id": "station-access-acceptance",
+      "features": [
+        "station-access-wire-contract",
+        "station-access-authentication",
+        "station-access-scope-isolation",
+        "station-access-session-class",
+        "station-access-federation-boundary",
+        "station-access-relay-role-security",
+        "station-access-relay-enrollment",
+        "station-access-relay-attachment-lifecycle",
+        "station-access-endpoint-discovery",
+        "node-connectivity-standard-stream",
+        "station-access-desktop-relay-binding",
+        "station-access-mobile-relay-binding",
+        "station-access-interface-contract"
+      ],
+      "when": {
+        "paths": [
+          "docs/architecture/platform/station/access/**",
+          "tooling/acceptance/domains/station-access.yaml",
+          "tooling/acceptance/capabilities/station-access.yaml",
+          "tooling/acceptance/features/station-access-*.yaml",
+          "tooling/acceptance/environments/station-access-desktop-oauth-native.yaml",
+          "tooling/acceptance/environments/station-access-native.yaml",
+          "tooling/acceptance/environments/station-access-dual-relay.yaml",
+          "tooling/acceptance/environments/station-access-relay-role.yaml",
+          "tooling/acceptance/environments/mobile-relay-simulator.yaml",
+          "tooling/acceptance/gates/station_access/**",
+          "tooling/acceptance/provisioners/station_access_desktop_oauth_native.py",
+          "tooling/acceptance/provisioners/station_access_dual_relay.py",
+          "tooling/acceptance/provisioners/station_access_relay_role.py",
+          "tooling/acceptance/station_access_evidence.py"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-api-ownership",
+        "station-access-capability-contract",
+        "station-access-desktop-oauth-native-e2e",
+        "station-access-auth-e2e",
+        "station-access-scope-isolation-e2e",
+        "station-access-session-class-suite-e2e",
+        "station-access-federation-boundary-e2e",
+        "relay-role-security-contract",
+        "NCP-G01",
+        "NCP-G02",
+        "NCP-G03",
+        "NCP-G04",
+        "NCP-G07",
+        "NCP-G08",
+        "RAL-G01",
+        "RAL-G02",
+        "RAL-G03",
+        "RAL-G04",
+        "RAL-G05",
+        "RAL-G06",
+        "RAL-G07",
+        "RAL-G08",
+        "station-access-mobile-relay-native-e2e",
+        "station-access-relay-security-e2e",
+        "desktop-release-build",
+        "mobile-native-build",
+        "station-access-lifecycle-aggregate-e2e",
+        "unified-relay-station-access-aggregate-e2e",
+        "station-access-domain-validation"
+      ]
+    },
+    {
+      "id": "machine-dev-control-plane",
+      "features": [
+        "development-workflow-control-plane"
+      ],
+      "when": {
+        "paths": [
+          "tooling/devctl/desktop.mjs",
+          "tooling/devctl/errors.mjs",
+          "tooling/devctl/process-adapter.mjs",
+          "tooling/devctl/profile.mjs",
+          "tooling/devctl/station.mjs",
+          "tooling/devctl/test/desktop.test.mjs",
+          "tooling/devctl/test/process-adapter.test.mjs",
+          "tooling/devctl/test/profile.test.mjs",
+          "tooling/devctl/test/station.test.mjs",
+          "tooling/scripts/local-dev/machine-dev*",
+          "tooling/make/local-dev.mk",
+          "Makefile"
+        ]
+      },
+      "require": [
+        "machine-dev-registry-self",
+        "acceptance-workflow-contract"
+      ]
+    },
+    {
+      "id": "chat-proto",
+      "features": [
+        "chat-service-contract"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/**"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-api-ownership",
+        "station-messaging-unit",
+        "messaging-platform-contract"
+      ]
+    },
+    {
+      "id": "chat-message-publishing",
+      "features": [
+        "chat-message-publishing"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/publishing.proto",
+          "apps/station/app/subserver/conversation/application/publishing/**",
+          "apps/station/app/subserver/conversation/application/command/system_message*.go",
+          "apps/station/app/subserver/conversation/domain/aggregate/system_service_message*.go",
+          "apps/station/app/subserver/conversation/domain/entity/publishing.go",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/service_plaintext_kind_test.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/publishing_store.go",
+          "apps/station/app/subserver/conversation/interface/http/system_service_message_mapper_test.go",
+          "apps/station/app/subserver/conversation/production_publishing*.go",
+          "apps/station/app/subserver/bot/application/registry/**",
+          "apps/station/app/subserver/bot/infrastructure/publishing_manager.go",
+          "apps/station/app/subserver/bot/handler_management.go",
+          "packages/messaging-core/src/inbox/service_plaintext.rs",
+          "packages/messaging-core/tests/service_plaintext_processor_test.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src/components/chat/message/serviceEventAggregation*.ts",
+          "apps/desktop/src/store/socialChat.conversationProjection.test.ts",
+          "apps/desktop/src/acceptance/message_publishing/**",
+          "tooling/acceptance/features/chat-message-publishing.yaml",
+          "tooling/acceptance/gates/chat/message_publishing_*.py"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-api-ownership",
+        "station-messaging-unit",
+        "messaging-platform-contract",
+        "desktop-check",
+        "chat-message-publishing-native-e2e"
+      ]
+    },
+    {
+      "id": "unified-client-messaging-core",
+      "features": [
+        "unified-client-messaging-core"
+      ],
+      "when": {
+        "paths": [
+          "packages/messaging-core/**",
+          "docs/architecture/domains/chat/messaging/**",
+          "tooling/acceptance/features/unified-client-messaging-core.yaml",
+          "tooling/acceptance/gates/chat/unified_client_core_contract.py",
+          "tooling/acceptance/gates/chat/unified_client_core_contract_test.py",
+          "tooling/acceptance/capabilities/chat.yaml",
+          "tooling/acceptance/domains/chat.yaml"
+        ]
+      },
+      "require": [
+        "unified-client-messaging-core-contract"
+      ]
+    },
+    {
+      "id": "unified-client-messaging-runtime",
+      "features": [
+        "unified-client-messaging-runtime"
+      ],
+      "when": {
+        "paths": [
+          "packages/messaging-core/**",
+          "packages/messaging-native-filesystem/**",
+          "apps/desktop/src-tauri/src/messaging/**",
+          "apps/mobile/src-tauri/src/messaging/**",
+          "tooling/acceptance/features/unified-client-messaging-runtime.yaml",
+          "tooling/acceptance/gates/chat/unified_client_core_suite.py",
+          "tooling/acceptance/gates/chat/unified_client_core_suite_test.py",
+          "tooling/acceptance/gates/unified_client/messaging_owner_zero.py",
+          "tooling/acceptance/gates/unified_client/messaging_owner_zero_test.py",
+          "tooling/acceptance/capabilities/chat.yaml"
+        ]
+      },
+      "require": [
+        "messaging-owner-hard-cut-zero",
+        "unified-client-messaging-e2e"
+      ]
+    },
+    {
+      "id": "unified-client-shared-semantics",
+      "features": [
+        "unified-client-shared-semantics"
+      ],
+      "when": {
+        "paths": [
+          "packages/client-chat-core/**",
+          "packages/client-media-security/**",
+          "packages/client-storage/**",
+          "apps/desktop/src/components/chat/chatPresentationPolicy.ts",
+          "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+          "apps/desktop/src/store/socialNormalizers.ts",
+          "apps/desktop/src/store/socialProjection.ts",
+          "apps/desktop/src/components/moments/MomentComposer.tsx",
+          "apps/mobile/src/pages/chat/chatPresentationPolicy.ts",
+          "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+          "apps/mobile/src/features/social/socialNormalizers.ts",
+          "apps/mobile/src/features/social/socialProjection.ts",
+          "apps/mobile/src/services/gateways/momentMediaGateway.ts",
+          "docs/architecture/platform/client/cross-client-runtime/**",
+          "docs/client/common/**",
+          "tooling/acceptance/features/unified-client-shared-semantics.yaml",
+          "tooling/acceptance/gates/unified_client/shared_semantics.py",
+          "tooling/acceptance/gates/unified_client/shared_semantics_test.py"
+        ]
+      },
+      "require": [
+        "unified-client-shared-semantics"
+      ]
+    },
+    {
+      "id": "chat-client-unification-integrity",
+      "features": [
+        "chat-client-unification-integrity"
+      ],
+      "when": {
+        "paths": [
+          "docs/architecture/domains/chat/lifecycle/**",
+          "apps/desktop/src/acceptance/chat/**",
+          "apps/desktop/src/components/chat/[A-Z]*",
+          "apps/desktop/src/components/chat/chat*",
+          "apps/desktop/src/components/chat/contact*",
+          "apps/desktop/src/components/chat/find*",
+          "apps/desktop/src/components/chat/mentions.ts",
+          "apps/desktop/src/components/chat/use*",
+          "apps/desktop/src/components/chat/composer/**",
+          "apps/desktop/src/components/chat/message/[A-Z]*",
+          "apps/desktop/src/components/chat/message/chatMessage*",
+          "apps/desktop/src/components/chat/message/messageAction*",
+          "apps/desktop/src/components/chat/message/messageReaction*",
+          "apps/desktop/src/pages/SocialChatPage*",
+          "apps/desktop/src/runtimes/chat*",
+          "apps/desktop/src/services/*chat*",
+          "apps/desktop/src/store/*chat*",
+          "apps/desktop/src-tauri/src/messaging/[a-r]*",
+          "apps/desktop/src-tauri/src/messaging/send.rs",
+          "apps/desktop/src-tauri/src/messaging/skipped.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/messaging/transport.rs",
+          "apps/desktop/src-tauri/src/messaging/verification.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs",
+          "apps/mobile/src/acceptance/**",
+          "apps/mobile/src/features/chat/**",
+          "apps/mobile/src/pages/ChatPage.tsx",
+          "apps/mobile/src/runtimes/chat*",
+          "apps/mobile/src-tauri/src/messaging/**",
+          "apps/station/app/subserver/conversation/application/attachment/**",
+          "apps/station/app/subserver/conversation/application/command/projections.go",
+          "apps/station/app/subserver/conversation/application/command/service*.go",
+          "apps/station/app/subserver/conversation/application/command/system_direct.go",
+          "apps/station/app/subserver/conversation/application/delivery/**",
+          "apps/station/app/subserver/conversation/application/interaction/**",
+          "apps/station/app/subserver/conversation/application/ports/**",
+          "apps/station/app/subserver/conversation/application/query/**",
+          "apps/station/app/subserver/conversation/application/reconciliation/**",
+          "apps/station/app/subserver/conversation/domain/aggregate/conversation*.go",
+          "apps/station/app/subserver/conversation/domain/aggregate/system_direct*.go",
+          "apps/station/app/subserver/conversation/domain/entity/entities*.go",
+          "apps/station/app/subserver/conversation/domain/errors.go",
+          "apps/station/app/subserver/conversation/domain/event/**",
+          "apps/station/app/subserver/conversation/domain/repository/**",
+          "apps/station/app/subserver/conversation/domain/service/**",
+          "apps/station/app/subserver/conversation/domain/valueobject/value_objects.go",
+          "apps/station/app/subserver/conversation/infrastructure/attachment/**",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/[a-r]*",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/writer.go",
+          "apps/station/app/subserver/conversation/infrastructure/federation/**",
+          "apps/station/app/subserver/conversation/infrastructure/identity/**",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/canonical_event_reader.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/models.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/repositories*.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/schema*.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/unit_of_work*.go",
+          "apps/station/app/subserver/conversation/infrastructure/reconciliation/**",
+          "apps/station/app/subserver/conversation/interface/http/[a-r]*",
+          "apps/station/app/subserver/conversation/ddd_composition_test.go",
+          "apps/station/app/subserver/conversation/doc.go",
+          "apps/station/app/subserver/conversation/gate_evaluator*.go",
+          "apps/station/app/subserver/conversation/gate_relationship_adapter.go",
+          "apps/station/app/subserver/conversation/group_call_capability*.go",
+          "apps/station/app/subserver/conversation/production_[a-o]*",
+          "apps/station/app/subserver/conversation/production_[q-z]*",
+          "apps/station/app/subserver/conversation/signal_authorizer.go",
+          "apps/station/app/subserver/conversation/sqlite_schema_compatibility_test.go",
+          "apps/station/app/subserver/conversation/subject_identity*.go",
+          "apps/station/app/subserver/conversation/subserver.go",
+          "apps/station/app/subserver/key_exchange/**",
+          "apps/station/app/subserver/recovery/**",
+          "model/domain/chat/[a-o]*",
+          "model/domain/chat/[q-z]*",
+          "packages/messaging-core/Cargo.lock",
+          "packages/messaging-core/Cargo.toml",
+          "packages/messaging-core/build.rs",
+          "packages/messaging-core/src/attachment/**",
+          "packages/messaging-core/src/codec/**",
+          "packages/messaging-core/src/contracts/**",
+          "packages/messaging-core/src/crypto/**",
+          "packages/messaging-core/src/identity/**",
+          "packages/messaging-core/src/inbox/[a-r]*",
+          "packages/messaging-core/src/inbox/skipped.rs",
+          "packages/messaging-core/src/lib.rs",
+          "packages/messaging-core/src/mls/**",
+          "packages/messaging-core/src/outbox/**",
+          "packages/messaging-core/src/ports/**",
+          "packages/messaging-core/src/proto.rs",
+          "packages/messaging-core/src/recovery/**",
+          "packages/messaging-core/src/storage_governance/**",
+          "packages/messaging-core/src/store/**",
+          "packages/messaging-core/tests/direct_processor_test.rs",
+          "packages/messaging-core/tests/fixtures/**",
+          "packages/messaging-core/tests/send_fan_out_test.rs",
+          "tooling/acceptance/gates/chat/chat_*",
+          "tooling/acceptance/gates/chat/contact_*",
+          "tooling/acceptance/gates/chat/lifecycle_*",
+          "tooling/acceptance/gates/chat/messaging_*",
+          "tooling/acceptance/gates/chat/mixed_*",
+          "tooling/acceptance/gates/chat/native_*",
+          "tooling/acceptance/gates/chat/storage_*",
+          "tooling/acceptance/gates/chat/w11_*"
+        ]
+      },
+      "require": [
+        "chat-lifecycle-tree-zero-reference-e2e"
+      ]
+    },
+    {
+      "id": "desktop-linux-install",
+      "features": [
+        "desktop-linux-install"
+      ],
+      "when": {
+        "paths": [
+          "tooling/devctl/desktop-install.mjs",
+          "tooling/devctl/desktop.mjs",
+          "tooling/devctl/test/desktop.test.mjs",
+          "docs/architecture/engineering/local-dev/design.md",
+          "docs/global/local-dev-environment.md"
+        ]
+      },
+      "require": [
+        "desktop-linux-install-native-e2e"
+      ]
+    },
+    {
+      "id": "desktop-shell-tray",
+      "features": [
+        "desktop-shell-tray"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/.gitignore",
+          "apps/desktop/src-tauri/Cargo.lock",
+          "apps/desktop/src-tauri/Cargo.toml",
+          "apps/desktop/src-tauri/icons/tray-icon-macos.*",
+          "apps/desktop/src-tauri/src/application/tray/**",
+          "apps/desktop/src-tauri/src/application/window_lifecycle.rs",
+          "docs/client/desktop/tray-residency.md",
+          "tooling/acceptance/capabilities/desktop-shell.yaml",
+          "tooling/acceptance/domains/desktop-shell.yaml",
+          "tooling/acceptance/environments/desktop-shell-native.yaml",
+          "tooling/acceptance/features/desktop-shell-tray.yaml",
+          "tooling/acceptance/gates/desktop/shell_tray_e2e.py",
+          "tooling/acceptance/gates/desktop/shell_tray_e2e_test.py",
+          "tooling/acceptance/provisioners/desktop_shell_native.py",
+          "tooling/acceptance/provisioners/desktop_shell_native_test.py"
+        ]
+      },
+      "require": [
+        "desktop-shell-tray-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-observability",
+      "features": [
+        "chat-storage-observability"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/storage.proto",
+          "packages/messaging-core/src/storage_governance/**",
+          "apps/desktop/src-tauri/src/messaging/**",
+          "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+          "apps/desktop/src/components/settings/ChatStorageSettings.tsx",
+          "apps/mobile/src-tauri/src/messaging/**",
+          "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+          "apps/mobile/src/pages/settings/SettingsSections.tsx",
+          "tooling/acceptance/environments/chat-storage-native.yaml",
+          "tooling/acceptance/provisioners/chat_storage_native.py",
+          "tooling/acceptance/gates/chat/storage_governance_*.py"
+        ]
+      },
+      "require": [
+        "chat-storage-contract",
+        "chat-storage-accounting-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-cache-cleanup",
+      "features": [
+        "chat-storage-cache-cleanup"
+      ],
+      "when": {
+        "paths": [
+          "packages/messaging-core/src/storage_governance/cache.rs",
+          "packages/messaging-core/src/store/schema.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs",
+          "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+          "apps/desktop/src/components/settings/ChatStorageSettings.tsx",
+          "apps/mobile/src-tauri/src/messaging/engine.rs",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs",
+          "apps/mobile/src-tauri/src/messaging/commands.rs",
+          "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+          "apps/mobile/src/pages/settings/SettingsSections.tsx",
+          "apps/mobile/src/acceptance/**",
+          "tooling/acceptance/features/chat-storage-cache-cleanup.yaml",
+          "tooling/acceptance/gates/mobile/simulator_social_e2e.py"
+        ]
+      },
+      "require": [
+        "chat-storage-cache-clear-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-retention",
+      "features": [
+        "chat-storage-retention"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/storage.proto",
+          "packages/messaging-core/src/storage_governance/retention.rs",
+          "packages/messaging-core/src/store/schema.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs",
+          "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+          "apps/desktop/src/components/settings/ChatStorageSettings.tsx",
+          "apps/mobile/src-tauri/src/messaging/engine.rs",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs",
+          "apps/mobile/src-tauri/src/messaging/commands.rs",
+          "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+          "apps/mobile/src/pages/settings/SettingsSections.tsx",
+          "apps/mobile/src/acceptance/**",
+          "tooling/acceptance/features/chat-storage-retention.yaml",
+          "tooling/acceptance/gates/mobile/simulator_social_e2e.py"
+        ]
+      },
+      "require": [
+        "chat-storage-retention-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-redaction-recovery",
+      "features": [
+        "chat-storage-redaction-recovery"
+      ],
+      "when": {
+        "paths": [
+          "packages/messaging-core/src/storage_governance/redaction.rs",
+          "packages/messaging-core/src/store/schema.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/messaging/recovery.rs",
+          "packages/messaging-core/src/inbox/public_event.rs",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/desktop/src/acceptance/chat/**",
+          "apps/mobile/src-tauri/src/messaging/engine.rs",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs",
+          "tooling/acceptance/features/chat-storage-redaction-recovery.yaml",
+          "tooling/acceptance/environments/chat-storage-native.yaml",
+          "tooling/acceptance/provisioners/chat_storage_native.py",
+          "tooling/acceptance/gates/chat/storage_redaction_recovery_*.py"
+        ]
+      },
+      "require": [
+        "chat-storage-redaction-recovery-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-conversation-clear",
+      "features": [
+        "chat-storage-conversation-clear"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/storage.proto",
+          "packages/messaging-core/src/storage_governance/conversation_clear.rs",
+          "packages/messaging-core/src/store/schema.rs",
+          "apps/station/frame/touch/model/chat/**",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs",
+          "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+          "apps/desktop/src/components/chat/ChatDetailPanel.tsx",
+          "apps/mobile/src-tauri/src/messaging/engine.rs",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs",
+          "apps/mobile/src-tauri/src/messaging/commands.rs",
+          "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+          "apps/mobile/src/pages/ChatPage.tsx",
+          "apps/mobile/src/acceptance/**",
+          "packages/client-chat-core/**",
+          "packages/prototypes/desktop/features/social-chat/**",
+          "docs/architecture/domains/chat/lifecycle/**",
+          "docs/client/chat/**",
+          "tooling/acceptance/features/chat-storage-conversation-clear.yaml",
+          "tooling/acceptance/gates/chat_storage/**",
+          "tooling/acceptance/gates/mobile/simulator_social_e2e.py"
+        ]
+      },
+      "require": [
+        "chat-storage-delete-reclaim-e2e",
+        "chat-storage-dead-contract-zero-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-batch-clear",
+      "features": [
+        "chat-storage-batch-clear"
+      ],
+      "when": {
+        "paths": [
+          "packages/client-chat-core/src/storageBatch.ts",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src/runtimes/chatStorageRuntime.ts",
+          "apps/desktop/src/components/settings/ChatStorageSettings.tsx",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs",
+          "apps/mobile/src/runtimes/chatStorageRuntime.ts",
+          "apps/mobile/src/pages/settings/SettingsSections.tsx",
+          "packages/locales/**",
+          "tooling/acceptance/features/chat-storage-batch-clear.yaml",
+          "tooling/acceptance/gates/chat/storage_batch_desktop_*.py",
+          "tooling/acceptance/gates/mobile/simulator_social_e2e.py"
+        ]
+      },
+      "require": [
+        "chat-storage-zero-legacy-e2e",
+        "chat-storage-desktop-batch-clear-e2e",
+        "chat-storage-mobile-batch-clear-e2e"
+      ]
+    },
+    {
+      "id": "chat-storage-governance-integrity",
+      "features": [
+        "chat-storage-governance-integrity"
+      ],
+      "when": {
+        "paths": [
+          "docs/architecture/domains/chat/storage-governance/legacy-inventory.json",
+          "tooling/acceptance/features/chat-storage-governance-integrity.yaml",
+          "tooling/acceptance/gates/chat_storage/**"
+        ]
+      },
+      "require": [
+        "chat-storage-zero-legacy-e2e",
+        "desktop-release-build",
+        "mobile-native-build",
+        "chat-storage-governance-aggregate-e2e"
+      ]
+    },
+    {
+      "id": "station-messaging",
+      "features": [
+        "chat-service-contract",
+        "chat-realtime-delivery"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/conversation/application/attachment/**",
+          "apps/station/app/subserver/conversation/application/command/projections.go",
+          "apps/station/app/subserver/conversation/application/command/service*.go",
+          "apps/station/app/subserver/conversation/application/command/system_direct.go",
+          "apps/station/app/subserver/conversation/application/delivery/**",
+          "apps/station/app/subserver/conversation/application/interaction/**",
+          "apps/station/app/subserver/conversation/application/ports/**",
+          "apps/station/app/subserver/conversation/application/query/**",
+          "apps/station/app/subserver/conversation/application/reconciliation/**",
+          "apps/station/app/subserver/conversation/domain/aggregate/conversation*.go",
+          "apps/station/app/subserver/conversation/domain/aggregate/system_direct*.go",
+          "apps/station/app/subserver/conversation/domain/entity/entities*.go",
+          "apps/station/app/subserver/conversation/domain/errors.go",
+          "apps/station/app/subserver/conversation/domain/event/**",
+          "apps/station/app/subserver/conversation/domain/repository/**",
+          "apps/station/app/subserver/conversation/domain/service/**",
+          "apps/station/app/subserver/conversation/domain/valueobject/value_objects.go",
+          "apps/station/app/subserver/conversation/infrastructure/attachment/**",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/[a-r]*",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/writer.go",
+          "apps/station/app/subserver/conversation/infrastructure/federation/**",
+          "apps/station/app/subserver/conversation/infrastructure/identity/**",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/canonical_event_reader.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/models.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/repositories*.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/schema*.go",
+          "apps/station/app/subserver/conversation/infrastructure/persistence/unit_of_work*.go",
+          "apps/station/app/subserver/conversation/infrastructure/reconciliation/**",
+          "apps/station/app/subserver/conversation/interface/http/[a-r]*",
+          "apps/station/app/subserver/conversation/ddd_composition_test.go",
+          "apps/station/app/subserver/conversation/doc.go",
+          "apps/station/app/subserver/conversation/gate_evaluator*.go",
+          "apps/station/app/subserver/conversation/gate_relationship_adapter.go",
+          "apps/station/app/subserver/conversation/group_call_capability*.go",
+          "apps/station/app/subserver/conversation/production_[a-o]*",
+          "apps/station/app/subserver/conversation/production_[q-z]*",
+          "apps/station/app/subserver/conversation/signal_authorizer.go",
+          "apps/station/app/subserver/conversation/sqlite_schema_compatibility_test.go",
+          "apps/station/app/subserver/conversation/subject_identity*.go",
+          "apps/station/app/subserver/conversation/subserver.go",
+          "apps/station/app/subserver/actor_identity/**",
+          "apps/station/app/subserver/key_exchange/**",
+          "apps/station/app/subserver/recovery/**",
+          "apps/station/frame/core/federation/**",
+          "model/domain/actor/actor.proto",
+          "model/domain/federation/delivery.proto",
+          "model/domain/key_exchange/key_exchange.proto",
+          "model/domain/recovery/recovery.proto"
+        ]
+      },
+      "require": [
+        "station-api-ownership",
+        "station-messaging-unit",
+        "messaging-platform-contract",
+        "desktop-check",
+        "chat-lifecycle-direct-e2e"
+      ]
+    },
+    {
+      "id": "chat-rich-media-recorded-voice",
+      "features": [
+        "chat-rich-media-recorded-voice"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/attachment.proto",
+          "apps/station/frame/touch/model/chat/attachment.pb.go",
+          "packages/messaging-core/src/codec/private_content.rs",
+          "packages/messaging-core/src/store/schema.rs",
+          "packages/client-chat-core/src/index.ts",
+          "packages/client-chat-core/src/attachmentAccess.ts",
+          "packages/client-chat-core/src/attachmentPreview.ts",
+          "packages/client-chat-core/src/attachmentPreview.css",
+          "packages/client-chat-core/src/attachmentFileType.ts",
+          "packages/client-chat-core/src/pdfPreview.ts",
+          "packages/client-chat-core/src/office*.ts",
+          "packages/client-chat-core/src/attachmentByteReader.ts",
+          "packages/client-chat-core/src/textPreview.ts",
+          "packages/client-chat-core/src/workbookTable.ts",
+          "packages/client-chat-core/src/preview*.ts",
+          "packages/messaging-native-filesystem/src/file_access.rs",
+          "packages/messaging-native-filesystem/src/image_preview.rs",
+          "packages/messaging-core/src/attachment/access.rs",
+          "packages/messaging-core/src/attachment/transfer.rs",
+          "apps/desktop/src/gen/proto/domain/chat/attachment_pb.ts",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/oss.rs",
+          "apps/desktop/src-tauri/src/messaging/attachment_transfer.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/private_content.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src/components/chat/AttachmentItem.tsx",
+          "apps/desktop/src/components/chat/AttachmentDetailHost.tsx",
+          "apps/desktop/src/components/chat/attachmentDetail.css",
+          "apps/desktop/src-tauri/src/infrastructure/window_session_registry/**",
+          "apps/desktop/src/components/chat/useAttachmentAccess.ts",
+          "apps/desktop/src/messaging/attachmentAccess.ts",
+          "apps/desktop/src/acceptance/chat/harness.ts",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging_files.rs",
+          "apps/desktop/src/components/chat/ChatComposer.tsx",
+          "apps/desktop/src/components/chat/composer/useChatAttachmentDrafts.ts",
+          "apps/desktop/src/components/chat/composer/useChatVoiceRecorder.ts",
+          "apps/desktop/src/services/im-service-contract.ts",
+          "apps/desktop/src/services/im-service.ts",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/mobile/src/gen/proto/domain/chat/attachment_pb.ts",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs",
+          "apps/mobile/src-tauri/src/messaging/engine.rs",
+          "apps/mobile/src-tauri/src/messaging/file_access.rs",
+          "apps/mobile/src-tauri/plugins/platform-permissions/**",
+          "apps/mobile/src/features/chat/AttachmentDetailHost.tsx",
+          "apps/mobile/src/features/chat/attachmentDetail.css",
+          "apps/mobile/src/features/chat/MessageAttachment.tsx",
+          "apps/mobile/src/runtimes/attachmentAccess.ts",
+          "packages/locales/en/chat.json",
+          "packages/locales/zh-CN/chat.json",
+          "packages/prototypes/desktop/features/social-chat/**",
+          "packages/prototypes/mobile/chat/src/components/AttachmentCard.tsx",
+          "tooling/acceptance/features/chat-rich-media-recorded-voice.yaml",
+          "tooling/acceptance/fixtures/chat_attachment_fault_proxy.py",
+          "tooling/acceptance/gates/chat/lifecycle_rich_voice.py",
+          "tooling/acceptance/gates/chat/lifecycle_file_viewing.py",
+          "tooling/acceptance/gates/chat/lifecycle_file_fixtures.py",
+          "tooling/acceptance/gates/chat/lifecycle_file_documents.py",
+          "tooling/acceptance/gates/chat/lifecycle_file_pixels.py",
+          "tooling/acceptance/gates/chat/lifecycle_file_pixels.swift",
+          "tooling/acceptance/gates/chat/lifecycle_file_native.py",
+          "tooling/acceptance/gates/chat/lifecycle_rich_voice_contract_test.py"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "messaging-platform-contract",
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-lifecycle-rich-voice-e2e"
+      ]
+    },
+    {
+      "id": "chat-direct-delivered-receipt",
+      "features": [
+        "chat-direct-delivered-receipt"
+      ],
+      "when": {
+        "paths": [
+          "packages/messaging-core/src/crypto/prekeys.rs",
+          "packages/messaging-core/src/engine/reconciliation.rs",
+          "packages/messaging-core/src/inbox/consumer.rs",
+          "packages/messaging-core/src/inbox/direct.rs",
+          "packages/messaging-core/src/inbox/drain.rs",
+          "packages/messaging-core/src/inbox/receipt.rs",
+          "packages/messaging-core/src/outbox/receipt.rs",
+          "packages/messaging-core/src/outbox/send.rs",
+          "packages/messaging-core/src/store/schema.rs",
+          "apps/desktop/src-tauri/src/messaging/prekeys.rs",
+          "apps/desktop/src-tauri/src/messaging/direct_session.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/lifecycle.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/messaging/transport.rs",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/station/app/subserver/conversation/application/interaction/service.go",
+          "apps/station/app/subserver/conversation/application/interaction/service_test.go",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/receipt_recorder.go",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/receipt_recorder_test.go",
+          "apps/station/app/subserver/conversation/interface/http/interaction.go",
+          "apps/station/app/subserver/conversation/interface/http/interaction_test.go",
+          "apps/station/app/subserver/conversation/production_endpoint_manifest_test.go",
+          "apps/station/app/subserver/conversation/production_http.go",
+          "apps/station/app/subserver/conversation/subserver.go",
+          "apps/station/app/subserver/key_exchange/infrastructure/canonical_store.go",
+          "apps/station/app/subserver/key_exchange/infrastructure/canonical_store_test.go",
+          "apps/station/app/subserver/key_exchange/canonical_api_test.go",
+          "tooling/acceptance/core/provisioning.py",
+          "tooling/acceptance/drivers/native/runtime.py",
+          "tooling/acceptance/provisioners/native_tauri_current_profile.py",
+          "tooling/acceptance/environments/native-tauri-current-profile.yaml",
+          "tooling/acceptance/fixtures/chat_native_reset.py",
+          "tooling/acceptance/gates/chat/chat_native_reset_test.py",
+          "tooling/acceptance/gates/chat/native_two_client_runner.py",
+          "tooling/acceptance/gates/chat/native_two_client_e2e.py",
+          "tooling/acceptance/gates/chat/native_current_profile_two_client_e2e.py",
+          "tooling/acceptance/gates/chat/native_submitted_command_recovery_entry.py",
+          "tooling/acceptance/gates/chat/native_submitted_command_recovery_e2e.py"
+        ]
+      },
+      "require": [
+        "station-messaging-unit",
+        "messaging-platform-contract",
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-lifecycle-direct-e2e",
+        "chat-native-current-profile-two-client-e2e",
+        "chat-native-submitted-command-recovery-e2e",
+        "chat-native-two-client-e2e"
+      ]
+    },
+    {
+      "id": "chat-native-friendship-projection",
+      "features": [
+        "chat-native-friendship-projection"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/social/relationship.proto",
+          "apps/station/frame/core/plugin/server/hertz/hertz.go",
+          "apps/station/frame/core/plugin/server/hertz/hertz_test.go",
+          "apps/station/frame/core/server/typed_handler.go",
+          "apps/station/frame/core/server/typed_handler_test.go",
+          "apps/station/frame/touch/federation/cache/doc.go",
+          "apps/station/frame/touch/federation/cache/cache.go",
+          "apps/station/frame/touch/federation/cache/cache_test.go",
+          "apps/station/app/subserver/social/infrastructure/follow_repo.go",
+          "apps/station/app/subserver/social/application/relationship_service.go",
+          "apps/station/app/subserver/social/application/relationship_service_test.go",
+          "apps/station/app/subserver/social/handler.go",
+          "apps/station/app/subserver/social/domain/federated_friend_request.go",
+          "apps/station/app/subserver/social/infrastructure/federated_friend_request_store.go",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/social.rs",
+          "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+          "apps/desktop/src/store/federation.ts",
+          "apps/desktop/src/store/relationships.ts",
+          "apps/desktop/src/store/friendshipProjection.ts",
+          "apps/desktop/src/services/socialRealtime.ts",
+          "apps/desktop/src-tauri/src/application/station_runtime/client.rs",
+          "apps/desktop/src-tauri/src/messaging/group_genesis.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs",
+          "apps/desktop/src/acceptance/chat/harness.ts",
+          "apps/desktop/src/components/chat/useActiveSocialChatStore.ts",
+          "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+          "apps/desktop/src/components/chat/CreateGroupModal.tsx",
+          "apps/desktop/src/components/chat/CreateGroupModal.test.ts",
+          "apps/desktop/src/components/chat/ChatActorIdentityRow.tsx",
+          "apps/desktop/src/components/chat/ChatContactsPanel.tsx",
+          "apps/desktop/src/components/chat/ChatSessionList.tsx",
+          "apps/desktop/src/components/chat/ChatSearchDropdown.tsx",
+          "apps/desktop/src/components/chat/contactSelection.ts",
+          "apps/desktop/src/services/errorMappings/chatErrorMapping.ts",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/desktop/src/components/profile/PublicProfileCard.tsx",
+          "apps/desktop/src/pages/SocialChatPage.tsx",
+          "packages/locales/en/chat.json",
+          "packages/locales/en/errors.json",
+          "packages/locales/zh-CN/chat.json",
+          "packages/locales/zh-CN/errors.json",
+          "packages/prototypes/desktop/features/social-chat/**",
+          "docs/architecture/domains/social/core/prototype/README.md",
+          "tooling/acceptance/gates/chat/native_group_mls_runner.py",
+          "tooling/acceptance/gates/chat/native_group_mls_runner_test.py",
+          "tooling/acceptance/features/chat-native-friendship-projection.yaml"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-lifecycle-onboarding-e2e",
+        "chat-native-group-mls-e2e"
+      ]
+    },
+    {
+      "id": "chat-message-interactions",
+      "features": [
+        "chat-message-interactions"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/command.proto",
+          "model/domain/chat/event.proto",
+          "apps/station/app/subserver/conversation/application/command/service.go",
+          "apps/station/app/subserver/conversation/application/interaction/service.go",
+          "apps/station/app/subserver/conversation/infrastructure/delivery/receipt_recorder.go",
+          "apps/station/app/subserver/conversation/interface/http/interaction.go",
+          "apps/station/app/subserver/conversation/interface/http/mapper.go",
+          "packages/messaging-core/src/inbox/public_event.rs",
+          "packages/messaging-core/src/outbox/interaction.rs",
+          "apps/desktop/src-tauri/src/messaging/engine.rs",
+          "apps/desktop/src-tauri/src/messaging/mls.rs",
+          "apps/desktop/src-tauri/src/messaging/store.rs",
+          "apps/desktop/src-tauri/src/provider_models_lib.rs",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src/services/errorMappings/chatErrorMapping.ts",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/desktop/src/components/chat/ChatMessageArea.tsx",
+          "apps/desktop/src/components/chat/ChatThreadPanel.tsx",
+          "apps/desktop/src/components/chat/message/ChatMessageActionOverlay.tsx",
+          "apps/desktop/src/components/chat/message/ChatMessageContent.tsx",
+          "apps/desktop/src/components/chat/message/ChatMessageRow.tsx",
+          "apps/desktop/src/components/chat/message/ChatMessageTimeline*.ts",
+          "apps/desktop/src/components/chat/message/chatMessageModel.ts",
+          "apps/desktop/src/components/chat/message/chatMessageThreadStats.ts",
+          "apps/desktop/src/components/chat/message/chatMessageTimelinePolicy.ts",
+          "apps/desktop/src/components/chat/message/messageActionGeometry*.ts",
+          "apps/desktop/src/components/chat/message/messageReactionState*.ts",
+          "apps/desktop/src/pages/SettingsPage.tsx",
+          "apps/desktop/src/main.tsx",
+          "apps/desktop/src/acceptance/chat/**",
+          "tooling/acceptance/fixtures/chat_native_reset.py",
+          "tooling/acceptance/node_connectivity_native_support.py",
+          "tooling/acceptance/gates/chat/chat_native_reset_test.py",
+          "tooling/acceptance/gates/station_access/node_connectivity_native_e2e_test.py",
+          "tooling/acceptance/gates/chat/native_interactions_runner.py",
+          "tooling/acceptance/gates/chat/lifecycle_interactions_group.py",
+          "tooling/acceptance/gates/chat/native_interactions_static_test.py",
+          "tooling/acceptance/gates/chat/native_support.py"
+        ]
+      },
+      "require": [
+        "station-messaging-unit",
+        "messaging-platform-contract",
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-native-interactions-e2e",
+        "chat-lifecycle-interactions-group-e2e"
+      ]
+    },
+    {
+      "id": "chat-live-voice-video",
+      "features": [
+        "chat-live-voice-video"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src-tauri/src/interface/tauri_commands/realtime.rs",
+          "apps/desktop/src/modules/p2p/callP2p.ts",
+          "apps/desktop/src/components/chat/CallSurface.tsx",
+          "apps/desktop/src/acceptance/chat/harness.ts",
+          "tooling/acceptance/features/chat-live-voice-video.yaml",
+          "tooling/acceptance/gates/chat/lifecycle_live_voice.py",
+          "tooling/acceptance/gates/chat/lifecycle_live_voice_e2e.py",
+          "tooling/acceptance/gates/chat/lifecycle_live_voice_contract_test.py"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-lifecycle-live-voice-e2e"
+      ]
+    },
+    {
+      "id": "chat-group-live",
+      "features": [
+        "chat-group-live"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/groupcall/**",
+          "apps/station/frame/core/facility/session/media_authorization.go",
+          "apps/station/frame/core/facility/mediaaccess/**",
+          "apps/station/app/subserver/actor_identity/infrastructure/persistence/repository.go",
+          "apps/station/app/subserver/conversation/group_call_capability.go",
+          "packages/client-chat-core/src/group-call/**",
+          "apps/mobile/src/features/call/**",
+          "apps/mobile/src/components/call/MobileGroupCallSurface.tsx",
+          "tooling/docker/livekit*",
+          "tooling/docker/patch-livekit.py",
+          "apps/desktop/src/modules/groupCall/**",
+          "apps/desktop/src/components/chat/GroupCallSurface.tsx",
+          "apps/desktop/src/components/chat/ChatMessageArea.tsx",
+          "apps/desktop/src/pages/SocialChatPage.tsx",
+          "apps/desktop/src/acceptance/chat/harness.ts",
+          "tooling/docker/compose.yml",
+          "tooling/acceptance/features/chat-group-live.yaml",
+          "tooling/acceptance/gates/chat/lifecycle_group_live.py",
+          "tooling/acceptance/gates/chat/lifecycle_group_live_e2e.py",
+          "tooling/acceptance/gates/chat/lifecycle_group_live_test.py"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-lifecycle-group-live-e2e"
+      ]
+    },
+    {
+      "id": "chat-presence-layout-stability",
+      "features": [
+        "chat-presence-layout-stability"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/presence/**",
+          "apps/station/frame/core/federation/presence.go",
+          "apps/station/frame/core/federation/routes.go",
+          "apps/station/frame/core/federation/scope.go",
+          "apps/desktop/src/hooks/usePresence.ts",
+          "apps/desktop/src/services/chatPresence.ts",
+          "apps/desktop/src/services/socialRealtime.ts",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/desktop/src/components/chat/ChatSessionList.tsx",
+          "apps/desktop/src/components/chat/chatGeometry.ts",
+          "apps/desktop/src/components/chat/message/ChatMessageRow.tsx",
+          "apps/desktop/src/components/chat/message/ChatMessageTimeline.tsx",
+          "apps/desktop/src/components/chat/message/chatMessageTimelinePolicy.ts",
+          "apps/desktop/src/acceptance/chat/**",
+          "tooling/acceptance/features/chat-presence-layout-stability.yaml",
+          "tooling/acceptance/fixtures/chat_presence_fault_proxy.py",
+          "tooling/acceptance/gates/chat/chat_presence_fault_proxy_test.py",
+          "tooling/acceptance/gates/chat/lifecycle_presence_layout.py",
+          "tooling/acceptance/gates/chat/lifecycle_presence_layout_e2e.py",
+          "tooling/acceptance/gates/chat/lifecycle_presence_layout_contract_test.py"
+        ]
+      },
+      "require": [
+        "chat-native-visible-static",
+        "chat-presence-layout-e2e"
+      ]
+    },
+    {
+      "id": "chat-typing-presence",
+      "features": [
+        "chat-typing-presence"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/chat/conversation.proto",
+          "apps/station/app/subserver/conversation/application/interaction/pulse_ledger.go",
+          "apps/station/app/subserver/conversation/application/interaction/service.go",
+          "apps/station/app/subserver/conversation/interface/http/interaction.go",
+          "apps/desktop/src/components/chat/ChatMessageArea.tsx",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/desktop/src/services/chatPresence.ts",
+          "apps/desktop/src/services/socialRealtime.ts",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/presence.rs",
+          "apps/desktop/src/acceptance/chat/**",
+          "tooling/acceptance/fixtures/chat_native_reset.py",
+          "tooling/acceptance/gates/chat/chat_native_reset_test.py",
+          "tooling/acceptance/gates/chat/native_support.py",
+          "tooling/acceptance/gates/chat/native_typing_runner.py"
+        ]
+      },
+      "require": [
+        "station-messaging-unit",
+        "messaging-platform-contract",
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-native-typing-e2e",
+        "chat-lifecycle-direct-e2e"
+      ]
+    },
+    {
+      "id": "desktop-chat",
+      "features": [
+        "desktop-chat-surface",
+        "chat-realtime-delivery",
+        "chat-native-visible-clients"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/App.tsx",
+          "apps/desktop/src/vite-env.d.ts",
+          "apps/desktop/src/pages/SocialChatPage.tsx",
+          "apps/desktop/src/pages/SocialChatPage.descriptor.tsx",
+          "apps/desktop/src/components/chat/[A-Z]*",
+          "apps/desktop/src/components/chat/chat*",
+          "apps/desktop/src/components/chat/contact*",
+          "apps/desktop/src/components/chat/find*",
+          "apps/desktop/src/components/chat/mentions.ts",
+          "apps/desktop/src/components/chat/use*",
+          "apps/desktop/src/components/chat/composer/**",
+          "apps/desktop/src/components/chat/message/[A-Z]*",
+          "apps/desktop/src/components/chat/message/chatMessage*",
+          "apps/desktop/src/components/chat/message/messageAction*",
+          "apps/desktop/src/components/chat/message/messageReaction*",
+          "apps/desktop/src/store/socialChat.ts",
+          "apps/desktop/src/services/socialRealtime.ts",
+          "apps/desktop/src/services/socialChatRealtime.ts",
+          "tooling/acceptance/node_connectivity_native_support.py",
+          "tooling/acceptance/gates/station_access/node_connectivity_native_e2e_test.py",
+          "tooling/acceptance/gates/chat/contact_message_resilience_runner.py",
+          "tooling/acceptance/gates/chat/drawer_layout.py"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "chat-native-visible-static",
+        "chat-contact-message-resilience-e2e",
+        "chat-native-current-profile-two-client-e2e",
+        "chat-lifecycle-direct-e2e"
+      ]
+    },
+    {
+      "id": "chat-native-visible-operations",
+      "features": [
+        "chat-native-visible-clients"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/gates/chat/native_multi_device_runner.py",
+          "tooling/acceptance/gates/chat/native_recovery_runner.py",
+          "tooling/acceptance/gates/chat/native_group_mls_runner.py",
+          "tooling/acceptance/gates/chat/lifecycle_onboarding.py",
+          "tooling/acceptance/gates/chat/lifecycle_onboarding_e2e.py",
+          "tooling/acceptance/gates/chat/lifecycle_onboarding_test.py",
+          "tooling/acceptance/gates/chat/lifecycle_direct.py",
+          "tooling/acceptance/gates/chat/native_current_profile_two_client_entry.py",
+          "tooling/acceptance/gates/chat/native_current_profile_two_client_e2e.py",
+          "tooling/acceptance/gates/chat/native_support.py",
+          "tooling/acceptance/fixtures/chat_native_reset.py",
+          "tooling/acceptance/gates/chat/chat_native_reset_test.py",
+          "tooling/acceptance/playbooks/chat-native-visible-clients.md",
+          "tooling/acceptance/environments/native-tauri-current-profile.yaml",
+          "tooling/acceptance/provisioners/native_tauri_current_profile.py",
+          "apps/desktop/src/kernel/identityRuntime.ts",
+          "apps/desktop/src/pages/login/LoginPage.tsx",
+          "apps/desktop/src/pages/login/StationSetupPanel.tsx",
+          "apps/desktop/src/pages/login/useStationRegistry.ts",
+          "apps/desktop/src/pages/login/views/**",
+          "apps/desktop/src/acceptance/chat/**",
+          "apps/desktop/src-tauri/src/application/profile/mod.rs",
+          "apps/desktop/src/components/common/SquareAvatar.tsx",
+          "apps/desktop/src/components/chat/[A-Z]*",
+          "apps/desktop/src/components/chat/chat*",
+          "apps/desktop/src/components/chat/contact*",
+          "apps/desktop/src/components/chat/find*",
+          "apps/desktop/src/components/chat/mentions.ts",
+          "apps/desktop/src/components/chat/use*",
+          "apps/desktop/src/components/chat/composer/**",
+          "apps/desktop/src/components/chat/message/[A-Z]*",
+          "apps/desktop/src/components/chat/message/chatMessage*",
+          "apps/desktop/src/components/chat/message/messageAction*",
+          "apps/desktop/src/components/chat/message/messageReaction*",
+          "apps/desktop/src/components/profile/PublicProfileCard.tsx",
+          "apps/desktop/src/store/federation.ts",
+          "apps/desktop/src/store/friendshipProjection.ts",
+          "apps/desktop/src/store/socialNormalizers.ts",
+          "apps/desktop/src/runtimes/federationRuntime.ts",
+          "packages/locales/en/chat.json",
+          "packages/locales/zh-CN/chat.json",
+          "apps/station/app/conf/actor.yml",
+          "apps/station/frame/touch/actor/seed.go"
+        ]
+      },
+      "require": [
+        "chat-native-visible-static",
+        "chat-lifecycle-onboarding-e2e",
+        "chat-lifecycle-direct-e2e",
+        "chat-native-current-profile-two-client-e2e",
+        "chat-native-two-client-e2e",
+        "chat-native-multi-device-e2e",
+        "chat-native-recovery-e2e",
+        "chat-native-group-mls-e2e"
+      ]
+    },
+    {
+      "id": "federation-two-station-lifecycle",
+      "features": [
+        "federation-full-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/federation/**",
+          "apps/station/app/subserver/federation/**",
+          "apps/desktop/src/store/federation.ts",
+          "apps/desktop/src/runtimes/federationRuntime.ts",
+          "apps/desktop/src/acceptance/moments/harness.ts",
+          "apps/desktop/src-tauri/src/acceptance/federation_fixture.rs",
+          "tooling/acceptance/environments/cross-station-social-native.yaml",
+          "tooling/acceptance/fixtures/chat_native_actors.py",
+          "tooling/acceptance/gates/chat/mixed_native_runtime.py",
+          "tooling/acceptance/gates/federation/**",
+          "tooling/acceptance/provisioners/native_tauri_embedded_webdriver.py",
+          "tooling/acceptance/features/federation-full-lifecycle.yaml"
+        ]
+      },
+      "require": [
+        "station-federation-unit",
+        "station-access-federation-boundary-e2e",
+        "federation-two-station-lifecycle-e2e"
+      ]
+    },
+    {
+      "id": "federation-proto",
+      "features": [
+        "federation-ledger",
+        "federation-governance"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/federation/**"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-federation-unit"
+      ]
+    },
+    {
+      "id": "station-federation",
+      "features": [
+        "federation-ledger",
+        "federation-governance",
+        "federation-discovery-network"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/federation/**"
+        ]
+      },
+      "require": [
+        "station-federation-unit"
+      ]
+    },
+    {
+      "id": "station-federation-discovery",
+      "features": [
+        "federation-discovery-network"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/frame/core/plugin/native/federation/locator/**"
+        ]
+      },
+      "require": [
+        "station-federation-unit"
+      ]
+    },
+    {
+      "id": "station-dashboard",
+      "features": [
+        "station-dashboard-auth",
+        "station-dashboard-operations"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/dashboard/**"
+        ]
+      },
+      "require": [
+        "station-dashboard-unit",
+        "station-dashboard-web-check"
+      ]
+    },
+    {
+      "id": "desktop-federation",
+      "features": [
+        "desktop-federation-surfaces"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/pages/login/StationSetupPanel.tsx",
+          "apps/desktop/src/pages/login/useStationRegistry.ts",
+          "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+          "apps/desktop/src/store/stationRegistry.ts",
+          "apps/desktop/src/runtimes/stationRuntime.ts",
+          "apps/desktop/src-tauri/src/application/federation/mod.rs",
+          "apps/desktop/src-tauri/src/infrastructure/station_registry.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/station.rs"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "station-access-federation-boundary-e2e"
+      ]
+    },
+    {
+      "id": "desktop-applet-lifecycle",
+      "features": [
+        "applet-desktop-lifecycle-smoothness"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/kernel/PageHost.tsx",
+          "apps/desktop/src/kernel/pageRuntimeLease.ts",
+          "apps/desktop/src/kernel/runtime.ts",
+          "apps/desktop/src/pages/AppletRuntimePage.tsx",
+          "apps/desktop/src/pages/AppletRuntimePage.descriptor.tsx",
+          "apps/desktop/src/pages/AppletsPage.tsx",
+          "apps/desktop/src/runtimes/appletsRuntime.ts",
+          "apps/desktop/src/store/applets.ts",
+          "apps/desktop/src/applet/LynxContainer.tsx",
+          "apps/desktop/src/applet/productWindowE2E.ts",
+          "apps/desktop/src/applet/useProductWindowLifecycleE2E.ts",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/applets.rs",
+          "tooling/scripts/applet-desktop-product-window-gate.mjs"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "applet-desktop-lifecycle-smoothness"
+      ]
+    },
+    {
+      "id": "unified-client-secure-content-core",
+      "features": [
+        "unified-client-secure-content-core"
+      ],
+      "when": {
+        "paths": [
+          "packages/secure-content-core/**",
+          "docs/architecture/shared/security/secure-content/**",
+          "tooling/acceptance/features/unified-client-secure-content-core.yaml",
+          "tooling/acceptance/gates/mobile/secure_content_portable_core.py",
+          "tooling/acceptance/gates/mobile/secure_content_portable_core_test.py",
+          "tooling/acceptance/capabilities/mobile.yaml",
+          "tooling/acceptance/domains/mobile.yaml"
+        ]
+      },
+      "require": [
+        "secure-content-portable-core"
+      ]
+    },
+    {
+      "id": "unified-client-secure-content-runtime",
+      "features": [
+        "unified-client-secure-content-runtime"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src-tauri/src/secure_content/**",
+          "apps/desktop/src-tauri/src/social/private_comment.rs",
+          "apps/desktop/src-tauri/src/social/private_moment.rs",
+          "apps/mobile/src-tauri/src/secure_content/**",
+          "apps/mobile/src-tauri/src/social/**",
+          "tooling/acceptance/features/unified-client-secure-content-runtime.yaml",
+          "tooling/acceptance/gates/mobile/unified_secure_content_suite.py",
+          "tooling/acceptance/gates/mobile/unified_secure_content_suite_test.py",
+          "tooling/acceptance/gates/unified_client/secure_content_owner_zero.py",
+          "tooling/acceptance/gates/unified_client/secure_content_owner_zero_test.py",
+          "tooling/acceptance/capabilities/mobile.yaml",
+          "tooling/acceptance/domains/mobile.yaml"
+        ]
+      },
+      "require": [
+        "secure-content-owner-hard-cut-zero",
+        "unified-client-secure-content-e2e"
+      ]
+    },
+    {
+      "id": "mobile-station-access",
+      "features": [
+        "mobile-station-trust",
+        "mobile-access-gate-oauth"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/actor/**",
+          "model/domain/access_gate/**",
+          "model/domain/oauth/**",
+          "apps/mobile/src/features/station/**",
+          "apps/mobile/src/features/auth/**",
+          "apps/mobile/src/components/recovery/RecoveryOverlayHost.tsx",
+          "apps/mobile/src/assets/logo.png",
+          "apps/mobile/src-tauri/src/commands/station.rs",
+          "apps/mobile/scripts/check-mobile-shell-contracts.py",
+          "apps/mobile/scripts/check_mobile_shell_contracts_test.py",
+          "packages/prototypes/mobile/chat/src/pages/AuthGateScreen.tsx",
+          "packages/prototypes/mobile/chat/src/MobilePrototype.tsx",
+          "packages/prototypes/mobile/chat/src/components/ExperienceRecovery.tsx",
+          "packages/prototypes/mobile/chat/src/mobilePrototype.css",
+          "packages/prototypes/mobile/chat/src/assets/logo.png",
+          "packages/prototypes/mobile/chat/scripts/check-layout.mjs",
+          "tooling/scripts/generate-mobile-brand-assets.py",
+          "tooling/acceptance/gates/mobile/contract_static.py"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-identity-contract",
+        "mobile-simulator-access-e2e"
+      ]
+    },
+    {
+      "id": "mobile-access-gate-oauth-runtime",
+      "features": [
+        "mobile-access-gate-oauth",
+        "mobile-session-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/acceptance/**",
+          "apps/mobile/src/runtimes/authRuntime.ts",
+          "apps/mobile/src-tauri/src/runtime/oauth/**",
+          "apps/mobile/src-tauri/src/commands/oauth.rs",
+          "tooling/acceptance/gates/mobile/appium.py",
+          "tooling/acceptance/gates/mobile/native_e2e.py",
+          "tooling/acceptance/gates/mobile/native_e2e_test.py",
+          "tooling/acceptance/provisioners/mobile_native.py",
+          "tooling/acceptance/provisioners/mobile_service_bindings.py",
+          "tooling/acceptance/tests/test_mobile_native_preflight.py",
+          "tooling/acceptance/environments/mobile-native.yaml"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-simulator-access-e2e",
+        "mobile-simulator-station-lifecycle-e2e"
+      ]
+    },
+    {
+      "id": "mobile-simulator-access-runtime",
+      "features": [
+        "mobile-access-gate-oauth",
+        "mobile-session-lifecycle",
+        "mobile-native-accessibility-performance"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/environments/mobile-simulator.yaml",
+          "tooling/acceptance/provisioners/mobile_simulator.py",
+          "tooling/acceptance/provisioners/mobile_service_bindings.py",
+          "tooling/acceptance/tests/test_mobile_simulator_provisioner.py"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-simulator-access-e2e",
+        "mobile-simulator-runtime-lifecycle-e2e",
+        "mobile-simulator-station-lifecycle-e2e",
+        "mobile-ios-simulator-layout-accessibility-e2e"
+      ]
+    },
+    {
+      "id": "mobile-station-lifecycle-simulator-runtime",
+      "features": [
+        "mobile-session-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/environments/mobile-station-lifecycle-simulator.yaml",
+          "tooling/acceptance/gates/mobile/simulator_runtime_binding.py",
+          "tooling/acceptance/gates/mobile/simulator_runtime_binding_test.py",
+          "tooling/acceptance/gates/mobile/simulator_station_lifecycle_e2e.py",
+          "tooling/acceptance/gates/mobile/simulator_station_lifecycle_e2e_test.py"
+        ]
+      },
+      "require": [
+        "mobile-simulator-station-lifecycle-e2e"
+      ]
+    },
+    {
+      "id": "mobile-ios-layout-runtime",
+      "features": [
+        "mobile-native-accessibility-performance"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/environments/mobile-ios-layout-simulator.yaml",
+          "tooling/acceptance/gates/mobile/simulator_layout_accessibility_e2e.py",
+          "tooling/acceptance/gates/mobile/simulator_layout_accessibility_e2e_test.py"
+        ]
+      },
+      "require": [
+        "mobile-ios-simulator-layout-accessibility-e2e"
+      ]
+    },
+    {
+      "id": "mobile-whole-product-usability",
+      "features": [
+        "mobile-native-accessibility-performance"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/gates/mobile/whole_product_surface_inventory.json",
+          "apps/mobile/scripts/review-mobile-surfaces.mjs",
+          "tooling/acceptance/gates/mobile/simulator_whole_product_usability_e2e.py",
+          "tooling/acceptance/gates/mobile/simulator_whole_product_usability_e2e_test.py"
+        ]
+      },
+      "require": [
+        "mobile-simulator-whole-product-usability-e2e"
+      ]
+    },
+    {
+      "id": "mobile-runtime-lifecycle",
+      "features": [
+        "mobile-session-lifecycle",
+        "mobile-recovery-degraded-states"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/App.tsx",
+          "apps/mobile/src/app/**",
+          "apps/mobile/src/components/MobileShell.tsx",
+          "apps/mobile/src/components/MobileRouteBoundary*.tsx",
+          "apps/mobile/src/runtimes/messagingRuntime.ts",
+          "apps/mobile/src/runtimes/runtimeSessionTransition*.ts",
+          "apps/mobile/src/runtimes/runtimeRegistry.ts",
+          "apps/mobile/src/runtimes/stationRuntime.ts"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-simulator-runtime-lifecycle-e2e",
+        "mobile-simulator-station-lifecycle-e2e",
+        "mobile-simulator-recovery-ui-e2e"
+      ]
+    },
+    {
+      "id": "mobile-recovery-surfaces",
+      "features": [
+        "mobile-recovery-degraded-states"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/components/recovery/**",
+          "apps/mobile/src/runtimes/recoveryProjection.ts"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-simulator-recovery-ui-e2e"
+      ]
+    },
+    {
+      "id": "mobile-native-lifecycle-platform",
+      "features": [
+        "mobile-session-lifecycle",
+        "mobile-native-accessibility-performance"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/runtimes/nativeLifecycleBridge.ts",
+          "apps/mobile/src/runtimes/mobileNativeEventBridge.ts",
+          "apps/mobile/src-tauri/src/platform/background_bridge.rs",
+          "apps/mobile/src-tauri/src/platform/lifecycle_bridge.rs",
+          "apps/mobile/src-tauri/src/platform/network_bridge.rs",
+          "apps/mobile/src-tauri/src/platform/permission_bridge.rs"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-simulator-runtime-lifecycle-e2e",
+        "mobile-simulator-platform-e2e",
+        "mobile-hard-cut-static"
+      ]
+    },
+    {
+      "id": "mobile-command-recovery",
+      "features": [
+        "mobile-command-draft-recovery",
+        "mobile-recovery-degraded-states"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/mobile/**",
+          "model/domain/social/relationship.proto",
+          "apps/station/app/subserver/social/application/federated_friend_request.go",
+          "apps/station/app/subserver/social/handler.go",
+          "apps/station/app/subserver/social/infrastructure/federated_friend_request_store.go",
+          "apps/mobile/scripts/check-mobile-shell-contracts.py",
+          "apps/mobile/scripts/check_mobile_shell_contracts_test.py",
+          "apps/mobile/src/acceptance/contracts.ts",
+          "apps/mobile/src/acceptance/projection.ts",
+          "apps/mobile/src/acceptance/registry.test.ts",
+          "apps/mobile/src/runtimes/commandRuntime.ts",
+          "apps/mobile/src/features/chat/chatCommands.ts",
+          "apps/mobile/src/features/social/contactCommands.ts",
+          "apps/mobile/src/pages/moments/MomentCommentsSection.tsx",
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/**",
+          "apps/mobile/src-tauri/src/messaging/engine.rs",
+          "apps/mobile/src-tauri/src/messaging/transport.rs",
+          "apps/mobile/src-tauri/src/runtime/command_ledger/**",
+          "apps/mobile/src-tauri/src/runtime/draft_store/**",
+          "apps/mobile/src-tauri/src/runtime/reliability/**",
+          "apps/mobile/src-tauri/src/messaging/adapter.rs"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-hard-cut-static",
+        "mobile-simulator-recovery-e2e",
+        "mobile-simulator-recovery-ui-e2e"
+      ]
+    },
+    {
+      "id": "mobile-service-bindings",
+      "features": [
+        "mobile-station-trust",
+        "mobile-access-gate-oauth",
+        "mobile-session-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/provisioners/mobile_service_bindings.py"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-simulator-access-e2e",
+        "mobile-simulator-runtime-lifecycle-e2e",
+        "mobile-simulator-station-lifecycle-e2e"
+      ]
+    },
+    {
+      "id": "mobile-social-facade",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/features/social/mobileSocialFacade.ts",
+          "apps/mobile/src/features/social/socialExperienceProjection.ts",
+          "apps/mobile/src/features/social/socialIntents.ts",
+          "apps/mobile/src/features/social/useSocialExperience.ts",
+          "apps/mobile/src/services/socialNativeAdapter.ts",
+          "apps/mobile/src-tauri/src/social/adapter.rs",
+          "tooling/acceptance/gates/mobile/social_facade_contract.py"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract"
+      ]
+    },
+    {
+      "id": "mobile-social-feed",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/features/social/momentsFeedStore.ts",
+          "apps/mobile/src/features/social/privateMomentFeedProjection.ts",
+          "apps/mobile/src/features/social/mobileSocialFacade.ts",
+          "apps/mobile/src/features/social/socialExperienceProjection.ts",
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/MomentFeedItem.tsx",
+          "apps/mobile/src/services/gateways/momentsGateway.ts",
+          "apps/mobile/src/styles.css",
+          "packages/locales/**",
+          "tooling/acceptance/gates/mobile/social_feed_native.py"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract",
+        "mobile-social-feed-native",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-social-search-profile",
+      "features": [
+        "mobile-moments-participation",
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/app/navigation/**",
+          "apps/mobile/src/components/MobileShell.tsx",
+          "apps/mobile/src/features/social/socialProfileCommands.ts",
+          "apps/mobile/src/features/social/socialStore.ts",
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/SocialSearchPage.tsx",
+          "apps/mobile/src/pages/moments/SocialProfilePage.tsx",
+          "apps/mobile/src/services/gateways/momentsGateway.ts",
+          "apps/mobile/src/services/gateways/socialGateway.ts",
+          "packages/locales/**",
+          "tooling/acceptance/gates/mobile/social_search_profile_native.py"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract",
+        "mobile-social-search-profile-native",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-social-circles",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/app/navigation/**",
+          "apps/mobile/src/components/MobileShell.tsx",
+          "apps/mobile/src/features/social/socialCircles.ts",
+          "apps/mobile/src/pages/moments/MomentAudienceTargetPicker.tsx",
+          "apps/mobile/src/pages/moments/SocialCircleDetailPage.tsx",
+          "apps/mobile/src/pages/moments/SocialCircleMemberPickerPage.tsx",
+          "apps/mobile/src/pages/moments/SocialCirclePages.test.ts",
+          "apps/mobile/src/pages/moments/SocialCirclesPage.tsx",
+          "apps/mobile/src/services/socialNativeAdapter.ts",
+          "apps/mobile/src/services/stationTransport.ts",
+          "apps/mobile/src-tauri/src/runtime/station_transport/**",
+          "apps/mobile/src-tauri/src/social/**",
+          "apps/mobile/src/styles.css",
+          "packages/locales/**",
+          "tooling/acceptance/gates/mobile/social_circles_native.py"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract",
+        "mobile-social-circles-native",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-social-audience-composer",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/acceptance/actions.ts",
+          "apps/mobile/src/features/social/mobileSocialFacade.ts",
+          "apps/mobile/src/features/social/socialAudience.ts",
+          "apps/mobile/src/features/social/socialIntents.ts",
+          "apps/mobile/src/features/social/useMomentsDraft.ts",
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/MomentAudienceTargetPicker.tsx",
+          "apps/mobile/src/pages/moments/MomentComposer.css",
+          "apps/mobile/src/pages/moments/MomentComposer.test.ts",
+          "apps/mobile/src/pages/moments/MomentComposer.tsx",
+          "apps/mobile/src/runtimes/privateMomentsRuntime.ts",
+          "apps/mobile/src/services/mobileCommands.ts",
+          "apps/mobile/src-tauri/src/social/**",
+          "packages/locales/**",
+          "tooling/acceptance/gates/mobile/social_audience_composer_native.py"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract",
+        "mobile-social-audience-composer-native",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-social-thread-media",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/components/MobileShell.tsx",
+          "apps/mobile/src/features/social/mobileSocialFacade.ts",
+          "apps/mobile/src/features/social/socialExperienceProjection.ts",
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/MomentCommentsSection.tsx",
+          "apps/mobile/src/pages/moments/MomentFeedItem.tsx",
+          "apps/mobile/src/pages/moments/MomentImage.tsx",
+          "apps/mobile/src/pages/moments/MomentMediaOverlay.tsx",
+          "apps/mobile/src/runtimes/privateMomentsRuntime.ts",
+          "apps/mobile/src/services/gateways/momentMediaGateway.ts",
+          "apps/mobile/src/styles.css",
+          "packages/locales/**",
+          "tooling/acceptance/gates/mobile/social_thread_media_native.py"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract",
+        "mobile-social-thread-media-native",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-social-runtime",
+      "features": [
+        "mobile-chat-contacts-groups",
+        "mobile-moments-participation",
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/social/**",
+          "apps/station/app/subserver/social/**",
+          "apps/mobile/src/features/social/**"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-social-facade-contract",
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-social-projection-runtime",
+      "features": [
+        "mobile-chat-contacts-groups",
+        "mobile-moments-participation",
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/app/lifecycle/**",
+          "apps/mobile/src/components/MobileRouteBoundary*.tsx",
+          "apps/mobile/src/runtimes/messagingRuntime.ts",
+          "apps/mobile/src/runtimes/runtimeSessionTransition*.ts",
+          "apps/mobile/src/runtimes/socialEventIngress.ts",
+          "apps/mobile/src/runtimes/socialProjectionRuntime.ts",
+          "apps/mobile/src/runtimes/runtimeRegistry.ts"
+        ]
+      },
+      "require": [
+        "mobile-social-facade-contract",
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-chat-contacts-e2e",
+        "mobile-simulator-moments-e2e",
+        "mobile-simulator-settings-e2e",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "mobile-moments-projection-runtime",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/runtimes/momentsProjectionDescriptor.ts"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-moments-e2e"
+      ]
+    },
+    {
+      "id": "mobile-profile-projection-runtime",
+      "features": [
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/runtimes/profileProjectionDescriptor.ts"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-settings-e2e"
+      ]
+    },
+    {
+      "id": "mobile-chat-contacts-groups",
+      "features": [
+        "mobile-chat-contacts-groups"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/features/chat/**",
+          "apps/mobile/src/components/BoundedList.tsx",
+          "apps/mobile/src/components/boundedListRange.ts",
+          "apps/mobile/scripts/check-bounded-lists.mjs",
+          "apps/mobile/scripts/fixtures/bounded-list.tsx",
+          "apps/mobile/src/features/social/contactCommands.ts",
+          "apps/mobile/src/runtimes/messagingRuntime.ts",
+          "apps/mobile/src/features/chat/chatCommands.ts",
+          "apps/mobile/src/features/social/contactCommands.ts",
+          "apps/mobile/src/services/gateways/socialGateway.ts",
+          "apps/mobile/src/pages/ChatPage.tsx",
+          "apps/mobile/src/pages/ContactsPage.tsx"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-chat-contacts-e2e"
+      ]
+    },
+    {
+      "id": "mobile-shared-social-projections",
+      "features": [
+        "mobile-chat-contacts-groups",
+        "mobile-moments-participation",
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/runtimes/socialEventIngress.ts",
+          "apps/mobile/src/runtimes/socialProjectionRuntime.ts",
+          "apps/mobile/src/runtimes/runtimeRegistry.ts"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-chat-contacts-e2e",
+        "mobile-simulator-moments-e2e",
+        "mobile-simulator-settings-e2e"
+      ]
+    },
+    {
+      "id": "mobile-moments-projection",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/runtimes/momentsProjectionDescriptor.ts"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-moments-e2e"
+      ]
+    },
+    {
+      "id": "mobile-profile-projection",
+      "features": [
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/runtimes/profileProjectionDescriptor.ts"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-settings-e2e"
+      ]
+    },
+    {
+      "id": "mobile-messaging-acceptance",
+      "features": [
+        "mobile-chat-contacts-groups",
+        "mobile-command-draft-recovery",
+        "mobile-recovery-degraded-states",
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/acceptance/**",
+          "tooling/acceptance/gates/mobile/messaging_journey.py",
+          "tooling/acceptance/gates/mobile/messaging_journey_test.py",
+          "tooling/acceptance/gates/mobile/android_social_e2e.py",
+          "tooling/acceptance/gates/mobile/android_social_e2e_test.py",
+          "tooling/acceptance/gates/mobile/simulator_social_e2e.py",
+          "tooling/acceptance/gates/mobile/simulator_social_e2e_test.py",
+          "tooling/acceptance/environments/mobile-android-physical.yaml",
+          "tooling/acceptance/environments/mobile-android-physical-runtime.yaml",
+          "tooling/acceptance/environments/mobile-direct-simulator.yaml",
+          "tooling/acceptance/environments/mobile-social-ios-simulator.yaml",
+          "tooling/acceptance/environments/mobile-social-simulator.yaml"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-chat-contacts-e2e",
+        "mobile-simulator-recovery-e2e",
+        "mobile-simulator-recovery-ui-e2e",
+        "mobile-simulator-moments-e2e",
+        "mobile-social-ios-native",
+        "mobile-social-android-native"
+      ]
+    },
+    {
+      "id": "social-cross-platform-native",
+      "features": [
+        "social-private-cross-platform-native"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/acceptance/moments/**",
+          "apps/desktop/src/pages/moments/**",
+          "apps/desktop/src/runtimes/momentsRuntime.ts",
+          "apps/desktop/src/store/moments.ts",
+          "apps/mobile/src/acceptance/**",
+          "apps/mobile/src/features/social/**",
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/**",
+          "apps/mobile/src/runtimes/privateMomentsRuntime.ts",
+          "apps/mobile/src-tauri/src/commands/mod.rs",
+          "apps/mobile/src-tauri/src/social/**",
+          "apps/station/app/subserver/key_exchange/**",
+          "apps/station/app/subserver/social/**",
+          "apps/station/frame/core/federation/**",
+          "model/domain/federation/**",
+          "model/domain/key_exchange/**",
+          "model/domain/social/**",
+          "packages/secure-content-core/**",
+          "tooling/acceptance/capabilities/mobile.yaml",
+          "tooling/acceptance/capabilities/social.yaml",
+          "tooling/acceptance/domains/mobile.yaml",
+          "tooling/acceptance/domains/social.yaml",
+          "tooling/acceptance/environments/social-cross-station-mobile-desktop.yaml",
+          "tooling/acceptance/features/social-private-cross-platform-native.yaml",
+          "tooling/acceptance/gates/mobile/simulator_harness_contract.py",
+          "tooling/acceptance/gates/mobile/simulator_runtime_binding.py",
+          "tooling/acceptance/gates/social/cross_station_mobile_desktop_e2e.py",
+          "tooling/acceptance/provisioners/mobile_simulator.py"
+        ]
+      },
+      "require": [
+        "social-cross-station-mobile-desktop-e2e",
+        "social-domain-validation",
+        "mobile-domain-validation"
+      ]
+    },
+    {
+      "id": "mobile-moments",
+      "features": [
+        "mobile-moments-participation"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/pages/MomentsPage.tsx",
+          "apps/mobile/src/pages/moments/MomentCommentsSection.tsx",
+          "apps/mobile/src/pages/moments/**",
+          "apps/mobile/src/services/gateways/momentMediaGateway.ts"
+        ]
+      },
+      "require": [
+        "mobile-contract-static",
+        "mobile-social-facade-contract",
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-moments-e2e"
+      ]
+    },
+    {
+      "id": "mobile-profile-settings",
+      "features": [
+        "mobile-profile-settings"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src/app/mobileI18n.tsx",
+          "apps/mobile/src/pages/SettingsPage.tsx",
+          "apps/mobile/src/pages/settings/**",
+          "apps/mobile/src/runtimes/deviceSettingsRuntime.ts",
+          "apps/mobile/src/runtimes/profileProjectionDescriptor.ts"
+        ]
+      },
+      "require": [
+        "mobile-simulator-social-convergence-e2e",
+        "mobile-simulator-settings-e2e"
+      ]
+    },
+    {
+      "id": "mobile-native-quality",
+      "features": [
+        "mobile-native-accessibility-performance"
+      ],
+      "when": {
+        "paths": [
+          "apps/mobile/src-tauri/src/platform/**",
+          "apps/mobile/src-tauri/gen/apple/**",
+          "apps/mobile/src-tauri/gen/android/**",
+          "apps/mobile/src/styles.css",
+          "apps/mobile/src/components/BoundedList.tsx",
+          "apps/mobile/src/components/boundedListRange.ts",
+          "apps/mobile/scripts/check-bounded-lists.mjs",
+          "apps/mobile/scripts/review-mobile-surfaces.mjs",
+          "apps/mobile/scripts/fixtures/bounded-list.tsx",
+          "packages/locales/**"
+        ]
+      },
+      "require": [
+        "mobile-ios-simulator-layout-accessibility-e2e",
+        "mobile-simulator-whole-product-usability-e2e",
+        "mobile-simulator-platform-e2e",
+        "mobile-hard-cut-static"
+      ]
+    },
+    {
+      "id": "release-mobile-ios-desktop-operation-analysis",
+      "features": [
+        "release-mobile-ios-desktop-operation-analysis"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/features/release-mobile-ios-desktop-operation-analysis.yaml",
+          "tooling/acceptance/capabilities/mobile.yaml",
+          "tooling/acceptance/domains/mobile.yaml",
+          "tooling/acceptance/gates/release/evidence.py",
+          "tooling/acceptance/gates/release/operation_analysis.py",
+          "tooling/acceptance/gates/release/operation_analysis_test.py",
+          "docs/architecture/engineering/acceptance/reports/0.0.1-mobile-ios-desktop.md"
+        ]
+      },
+      "require": [
+        "release-0.0.1-operation-analysis"
+      ]
+    },
+    {
+      "id": "release-mobile-ios-desktop-final-aggregate",
+      "features": [
+        "release-mobile-ios-desktop-operation-analysis"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/gates/release/evidence.py",
+          "tooling/acceptance/gates/release/release_aggregate.py",
+          "tooling/acceptance/gates/release/release_aggregate_test.py",
+          "docs/architecture/engineering/acceptance/execution-plans/20261017-release-0.0.1-mobile-ios-desktop/**"
+        ]
+      },
+      "require": [
+        "release-0.0.1-mobile-ios-desktop-aggregate"
+      ]
+    },
+    {
+      "id": "agent-v2-external-runtime",
+      "features": [
+        "agent-v2-external-runtime"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/agent.proto",
+          "apps/station/app/subserver/agent/service/external_runtime*",
+          "apps/station/app/subserver/agent/service/externalruntime/**",
+          "apps/station/app/subserver/agent/infrastructure/persistence/external_runtime_reset.go",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src/store/chat.ts",
+          "apps/desktop/src/components/messages/AssistantMessage.tsx",
+          "apps/desktop/src/acceptance/agent/harness.ts",
+          "packages/locales/en/agent.json",
+          "packages/locales/zh-CN/agent.json",
+          "tooling/acceptance/gates/agent/external_runtime_*.py",
+          "tooling/docker/compose.yml"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-v2-external-runtime-e2e"
+      ]
+    },
+    {
+      "id": "agent-v2-kernel-foundation",
+      "features": [
+        "agent-v2-kernel-foundation"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/**",
+          "apps/station/app/subserver/agent/**",
+          "apps/desktop/src/acceptance/agent/**",
+          "apps/desktop/src/runtimes/chatRuntime*",
+          "apps/desktop/src/runtimes/agentTopicRuntime.ts",
+          "apps/desktop/src/services/chat-service.ts",
+          "apps/desktop/src/store/streaming/**",
+          "tooling/acceptance/gates/agent/foundation_*.py"
+        ]
+      },
+      "require": [
+        "agent-v2-kernel-foundation-e2e"
+      ]
+    },
+    {
+      "id": "agent-stream-resilience",
+      "features": [
+        "agent-stream-resilience"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/turn_handler*",
+          "apps/station/app/subserver/agent/**/live_resume*",
+          "apps/desktop/src-tauri/src/application/agent_turn/mod.rs",
+          "apps/desktop/src/components/AgentSidebar.tsx",
+          "apps/desktop/src/components/messages/AssistantMessage.tsx",
+          "apps/desktop/src/components/messages/ThinkingBlock.tsx",
+          "apps/desktop/src/kernel/identityRuntime.ts",
+          "apps/desktop/src/runtimes/chatRuntime*",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src/services/eventStream*",
+          "apps/desktop/src/services/identityHandlers.ts",
+          "apps/desktop/src/services/identityPipeline.ts",
+          "apps/desktop/src/store/chat.ts",
+          "apps/desktop/src/store/chatOperationEvent.test.ts",
+          "apps/desktop/src/store/session.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-stream-resilience-e2e"
+      ]
+    },
+    {
+      "id": "development-workflow-control-plane",
+      "features": [
+        "acceptance-framework"
+      ],
+      "when": {
+        "paths": [
+          "AGENTS.md",
+          "docs/global/workflow.md",
+          "docs/architecture/engineering/development-workflow/**",
+          "tooling/scripts/lib/machine-dev-paths.mjs",
+          "tooling/scripts/local-dev/dev-work*.mjs",
+          "tooling/scripts/local-dev/task-progress-store.mjs",
+          "tooling/scripts/local-dev/completion-review*.mjs",
+          "tooling/scripts/local-dev/workflow-*.mjs",
+          "tooling/scripts/plan/**",
+          "tooling/scripts/execution-plan.py",
+          "tooling/acceptance/core/execution_plan.py",
+          "tooling/acceptance/tests/test_execution_plan.py",
+          "tooling/make/local-dev.mk",
+          "tooling/skills/pt-architecture-execution-methodology/**",
+          "tooling/skills/pt-context-anchor/**",
+          "tooling/skills/pt-dev-workflow/**",
+          "tooling/skills/pt-execution-plan-guardian/**",
+          "tooling/skills/pt-god-view/**",
+          "tooling/skills/pt-plan-and-document/**"
+        ]
+      },
+      "require": [
+        "development-workflow-control-plane",
+        "development-flow-tool-e2e"
+      ]
+    },
+    {
+      "id": "chat-mixed-client-convergence",
+      "features": [
+        "chat-mixed-client-convergence"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/environments/chat-mixed-native.yaml",
+          "tooling/acceptance/provisioners/mobile_simulator.py",
+          "tooling/acceptance/gates/mobile/simulator_runtime_binding.py",
+          "tooling/acceptance/gates/chat/mixed_native_runtime.py",
+          "tooling/acceptance/gates/chat/lifecycle_call_resolution.py",
+          "tooling/acceptance/gates/chat/lifecycle_mixed_client_*.py",
+          "tooling/acceptance/tests/test_mobile_simulator_provisioner.py",
+          "tooling/acceptance/features/chat-mixed-client-convergence.yaml"
+        ]
+      },
+      "require": [
+        "chat-lifecycle-mixed-client-same-station-e2e",
+        "chat-lifecycle-mixed-client-cross-station-e2e",
+        "chat-lifecycle-mixed-client-multi-device-e2e",
+        "chat-lifecycle-call-resolution-e2e",
+        "chat-lifecycle-mixed-client-group-mls-e2e"
+      ]
+    },
+    {
+      "id": "acceptance-framework",
+      "features": [
+        "acceptance-framework"
+      ],
+      "when": {
+        "paths": [
+          "tooling/acceptance/**",
+          "tooling/scripts/acceptance-*.py",
+          "tooling/scripts/execution-plan.py",
+          "tooling/scripts/quality-evidence.py",
+          "tooling/make/acceptance.mk",
+          "tooling/scripts/review/route-change.sh",
+          "docs/architecture/engineering/quality/**",
+          "docs/architecture/engineering/acceptance/**",
+          "Makefile"
+        ]
+      },
+      "require": [
+        "acceptance-plan-self",
+        "acceptance-infra-validation",
+        "acceptance-workflow-contract",
+        "acceptance-runtime-provisioning-self"
+      ]
+    },
+    {
+      "id": "desktop-dev-runtime-isolation",
+      "features": [
+        "chat-native-visible-clients"
+      ],
+      "when": {
+        "paths": [
+          "tooling/scripts/_ensure-desktop-rust.sh",
+          "tooling/scripts/_ensure-desktop-vite.sh",
+          "tooling/scripts/local-dev/desktop-dev.sh",
+          "tooling/scripts/local-dev/env.sh",
+          "tooling/scripts/local-dev/profile.sh",
+          "tooling/acceptance/gates/desktop/dev_runtime_multi_instance.py",
+          "tooling/acceptance/gates/desktop/dev_runtime_multi_instance_static_test.py"
+        ]
+      },
+      "require": [
+        "desktop-dev-runtime-isolation-static"
+      ]
+    },
+    {
+      "id": "agent-minimum-usable-chat",
+      "features": [
+        "agent-minimum-usable-chat"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/service/turn_service.go",
+          "apps/station/app/subserver/agent/service/capability_authority_service.go",
+          "apps/desktop/src/acceptance/agent/harness.ts",
+          "tooling/acceptance/features/agent-minimum-usable-chat.yaml",
+          "tooling/acceptance/gates/agent/native_agent_runner.py",
+          "tooling/acceptance/gates/agent/native_agent_runner_test.py"
+        ]
+      },
+      "require": [
+        "agent-minimum-usable-chat-native-e2e"
+      ]
+    },
+    {
+      "id": "agent-core",
+      "features": [
+        "agent-core-chat-loop",
+        "agent-core-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**",
+          "apps/desktop/src/components/agent/workbench/AgentRail.tsx",
+          "apps/desktop/src/components/agent/workbench/TopicRail.tsx",
+          "apps/desktop/src/pages/AgentProfilePage.tsx",
+          "apps/desktop/src/store/agent.ts",
+          "apps/desktop/src/store/provider.ts",
+          "apps/desktop/src/services/eventStream.ts",
+          "tooling/acceptance/features/agent-core-lifecycle.yaml",
+          "tooling/acceptance/gates/agent/native_agent_runner.py",
+          "tooling/acceptance/gates/agent/native_agent_runner_test.py",
+          "tooling/acceptance/matrices/agent-core-lifecycle-native.yaml"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "station-agent-unit",
+        "agent-core-lifecycle-native-e2e"
+      ]
+    },
+    {
+      "id": "agent-cli-provider-primary",
+      "features": [
+        "agent-cli-provider-primary"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/catalog/providers.default.yaml",
+          "apps/station/app/subserver/agent/service/cli/**",
+          "apps/station/app/subserver/agent/service/provider_config_service.go",
+          "apps/station/app/subserver/agent/service/provider_service.go",
+          "apps/station/app/subserver/agent/service/runtime_admission_service.go",
+          "apps/station/app/subserver/agent/service/turn_service.go",
+          "apps/desktop/src/acceptance/agent/harness.ts",
+          "tooling/acceptance/features/agent-cli-provider-primary.yaml",
+          "tooling/acceptance/gates/agent/native_agent_runner.py",
+          "tooling/acceptance/gates/agent/native_agent_runner_test.py",
+          "tooling/acceptance/matrices/agent-cli-provider-primary-native.yaml",
+          "tooling/scripts/deploy/deploy.sh"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "station-agent-unit",
+        "agent-cli-provider-primary-native-e2e"
+      ]
+    },
+    {
+      "id": "agent-mention-composer",
+      "features": [
+        "agent-mention-composer"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/components/ChatInput.tsx",
+          "apps/desktop/src/components/chat/MentionPopup.tsx",
+          "apps/desktop/src/components/chat/MentionTag.tsx",
+          "apps/desktop/src/store/mentions.ts"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "agent-native-mention-e2e"
+      ]
+    },
+    {
+      "id": "agent-knowledge-binding",
+      "features": [
+        "agent-knowledge-binding"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/pages/AgentProfilePage.tsx",
+          "apps/desktop/src/store/agent.ts",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src-tauri/src/application/agent_turn/mod.rs",
+          "apps/desktop/src-tauri/src/interface/tauri_commands/agent_turn.rs",
+          "apps/station/app/subserver/agent/service/agent_config_service.go",
+          "apps/station/app/subserver/agent/domain/agent_config_service.go",
+          "apps/station/app/subserver/agent/infrastructure/persistence/agent_config.go"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "station-agent-unit",
+        "agent-native-knowledge-binding-e2e"
+      ]
+    },
+    {
+      "id": "agent-connector-lifecycle",
+      "features": [
+        "agent-connector-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/components/agent/AgentConnectorsPanel.tsx",
+          "apps/desktop/src/store/agentConnectors.ts",
+          "apps/desktop/src/store/oauth2.ts",
+          "apps/desktop/src/runtimes/agentCapabilityRuntime.ts"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "agent-native-connector-lifecycle-e2e"
+      ]
+    },
+    {
+      "id": "agent-message-forward",
+      "features": [
+        "agent-message-forward"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/components/messages/ForwardMessageModal.tsx",
+          "apps/desktop/src/components/messages/actions/registry.ts",
+          "apps/desktop/src/utils/forwardContent.ts",
+          "apps/desktop/src/utils/openAgentChatSession.ts",
+          "apps/desktop/src/store/chat.ts"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "agent-native-message-forward-e2e"
+      ]
+    },
+    {
+      "id": "agent-portal-navigation",
+      "features": [
+        "agent-portal-navigation"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/store/portal.ts",
+          "apps/desktop/src/components/portal/**"
+        ]
+      },
+      "require": [
+        "desktop-check",
+        "agent-native-portal-navigation-e2e"
+      ]
+    },
+    {
+      "id": "agent-v2-home-command-center",
+      "features": [
+        "agent-v2-home-command-center"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/home.proto",
+          "apps/station/app/subserver/agent/**/home*",
+          "apps/desktop/src/pages/HomePage.tsx",
+          "apps/desktop/src/runtimes/homeRuntime.ts"
+        ]
+      },
+      "require": [
+        "agent-v2-home-command-center-e2e"
+      ]
+    },
+    {
+      "id": "agent-v2-capability-binding",
+      "features": [
+        "agent-v2-capability-binding"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/capability.proto",
+          "apps/station/app/subserver/agent/**/capability*",
+          "apps/desktop/src/runtimes/agentCapabilityRuntime.ts"
+        ]
+      },
+      "require": [
+        "agent-v2-capability-binding-e2e"
+      ]
+    },
+    {
+      "id": "agent-v2-governed-tool-loop",
+      "features": [
+        "agent-v2-governed-tool-loop"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/turn_stream.proto",
+          "apps/station/app/subserver/agent/**/tool*",
+          "apps/station/app/subserver/agent/service/turn_service.go",
+          "apps/desktop/src-tauri/src/application/agent_turn/**",
+          "apps/desktop/src/components/messages/AssistantMessage.tsx",
+          "apps/desktop/src/components/messages/ToolCallCard.tsx",
+          "apps/desktop/src/components/messages/actions/**",
+          "apps/desktop/src/store/streaming/**",
+          "apps/desktop/src/runtimes/toolRuntime.ts"
+        ]
+      },
+      "require": [
+        "agent-v2-governed-tool-loop-e2e"
+      ]
+    },
+    {
+      "id": "agent-mcp-dual-runtime",
+      "features": [
+        "agent-mcp-dual-runtime"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/capability.proto",
+          "apps/desktop/src/store/mcp.ts",
+          "apps/desktop/src/services/mcp-service.ts",
+          "apps/desktop/src-tauri/src/application/mcp/**",
+          "apps/desktop/src-tauri/src/application/desktop_executor_worker/**",
+          "apps/station/app/subserver/agent/**/mcp*"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-mcp-dual-runtime-source"
+      ]
+    },
+    {
+      "id": "agent-v2-mcp-lifecycle",
+      "features": [
+        "agent-v2-mcp-lifecycle"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/store/mcp.ts",
+          "apps/desktop/src/services/mcp-service.ts",
+          "apps/desktop/src-tauri/src/application/mcp/**",
+          "apps/station/app/subserver/agent/**/capability_operation*"
+        ]
+      },
+      "require": [
+        "agent-v2-mcp-lifecycle-e2e"
+      ]
+    },
+    {
+      "id": "agent-v2-connector-invocation",
+      "features": [
+        "agent-v2-connector-invocation"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/store/agentConnectors.ts",
+          "apps/desktop/src/store/oauth2.ts",
+          "apps/desktop/src/components/agent/AgentConnectorsPanel.tsx",
+          "apps/station/app/subserver/agent/**/connector*"
+        ]
+      },
+      "require": [
+        "agent-v2-connector-invocation-e2e"
+      ]
+    },
+    {
+      "id": "agent-v2-evaluation-lab",
+      "features": [
+        "agent-v2-evaluation-lab"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/evaluation.proto",
+          "apps/station/app/subserver/agent/**/evaluation*",
+          "apps/desktop/src/store/evaluation.ts",
+          "apps/desktop/src/hooks/useNavigation.ts",
+          "apps/desktop/src/pages/EvaluationPage.tsx"
+        ]
+      },
+      "require": [
+        "agent-v2-evaluation-lab-e2e"
+      ]
+    },
+    {
+      "id": "agent-conversation-management",
+      "features": [
+        "agent-conversation-management"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/conversation*",
+          "apps/desktop/src/store/agent.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-conversation-e2e"
+      ]
+    },
+    {
+      "id": "agent-provider-credential",
+      "features": [
+        "agent-provider-credential"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/provider*",
+          "apps/desktop/src/store/provider.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-provider-credential-e2e"
+      ]
+    },
+    {
+      "id": "agent-memory-system",
+      "features": [
+        "agent-memory-system"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/memory*",
+          "apps/desktop/src/modules/memory.ts",
+          "apps/desktop/src/components/settings/MemorySettingsSection.tsx",
+          "apps/desktop/src/components/settings/MemorySettingsTab.tsx"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-memory-e2e"
+      ]
+    },
+    {
+      "id": "agent-skill-management",
+      "features": [
+        "agent-skill-management"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/skill*",
+          "apps/desktop/src/store/skill.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-skill-e2e"
+      ]
+    },
+    {
+      "id": "agent-growth-diagnostics",
+      "features": [
+        "agent-growth-diagnostics"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/growth*",
+          "apps/desktop/src/components/settings/AgentGrowthTab.tsx"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-growth-e2e"
+      ]
+    },
+    {
+      "id": "agent-orchestration-collaboration",
+      "features": [
+        "agent-orchestration-collaboration"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/orchestration*",
+          "apps/desktop/src/store/agentOrchestration.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-orchestration-e2e"
+      ]
+    },
+    {
+      "id": "agent-thread-branching",
+      "features": [
+        "agent-thread-branching"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/thread*",
+          "apps/desktop/src/store/agentThread.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-thread-e2e"
+      ]
+    },
+    {
+      "id": "agent-ecosystem",
+      "features": [
+        "agent-ecosystem"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/ecosystem*",
+          "apps/desktop/src/store/agentEcosystem.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-ecosystem-e2e"
+      ]
+    },
+    {
+      "id": "agent-trusted-package-catalog",
+      "features": [
+        "agent-trusted-package-catalog"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/package_catalog.proto",
+          "packages/agent-catalog/**",
+          "apps/station/app/subserver/agent/catalog/**",
+          "apps/station/app/subserver/agent/handler/package_catalog_handler.go",
+          "apps/station/app/subserver/agent/handler/package_catalog_handler_test.go",
+          "apps/station/app/subserver/agent/model/package_catalog.pb.go",
+          "apps/station/app/subserver/agent/agent.go",
+          "apps/desktop/src-tauri/build.rs",
+          "apps/desktop/src-tauri/src/application/skills_market/**",
+          "apps/desktop/src/components/settings/DiscoverSettings.tsx",
+          "apps/desktop/src/components/settings/discover/**",
+          "apps/desktop/src/modules/discover.ts",
+          "apps/desktop/src/components/SkillsTab.tsx",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src/hooks/useNavigation.ts",
+          "apps/desktop/src/acceptance/agent/harness.ts",
+          "packages/locales/en/agent.json",
+          "packages/locales/zh-CN/agent.json",
+          "packages/locales/en/provider.json",
+          "packages/locales/zh-CN/provider.json",
+          "tooling/acceptance/gates/agent/marketplace_catalog_development.py",
+          "tooling/acceptance/gates/agent/marketplace_catalog_development_test.py",
+          "tooling/acceptance/gates/agent/marketplace_catalog_fault_proxy_test.py",
+          "tooling/acceptance/fixtures/agent_marketplace_catalog_fault_proxy.py",
+          "tooling/acceptance/features/agent-trusted-package-catalog.yaml"
+        ]
+      },
+      "require": [
+        "proto-build",
+        "station-agent-unit",
+        "desktop-check",
+        "agent-marketplace-catalog-e2e"
+      ]
+    },
+    {
+      "id": "agent-task-management",
+      "features": [
+        "agent-task-management"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/task*",
+          "apps/station/app/subserver/agent/service/agent_task_service.go",
+          "apps/desktop/src/store/tasks.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-task-e2e"
+      ]
+    },
+    {
+      "id": "agent-scheduler",
+      "features": [
+        "agent-scheduler"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/scheduler*",
+          "apps/desktop/src/store/agentScheduler.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-scheduler-e2e"
+      ]
+    },
+    {
+      "id": "agent-turn-trace",
+      "features": [
+        "agent-turn-trace"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/turn_trace*",
+          "apps/station/app/subserver/agent/**/turn_evidence*",
+          "apps/station/app/subserver/agent/infrastructure/persistence/turn_attempt.go",
+          "apps/station/app/subserver/agent/infrastructure/persistence/user_feedback.go",
+          "apps/station/app/subserver/agent/service/growth_metrics_service.go",
+          "apps/station/app/subserver/agent/handler/growth_handler.go",
+          "apps/desktop/src/diagnostics/agentTurnDiagnostics.ts",
+          "apps/desktop/src/diagnostics/agentTurnEvidence.ts",
+          "apps/desktop/src-tauri/src/application/agent_turn/**",
+          "apps/desktop/src-tauri/src/application/agent_growth/**"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-v2-kernel-foundation-e2e"
+      ]
+    },
+    {
+      "id": "agent-quick-completion",
+      "features": [
+        "agent-quick-completion"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/quick_completion*",
+          "apps/station/app/subserver/agent/service/agent_service.go",
+          "apps/desktop/src/services/desktop_api.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-quick-completion-e2e"
+      ]
+    },
+    {
+      "id": "agent-event-stream",
+      "features": [
+        "agent-event-stream"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/event_stream*",
+          "apps/desktop/src/services/eventStream.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-event-stream-e2e"
+      ]
+    },
+    {
+      "id": "agent-atelier-workspace",
+      "features": [
+        "agent-atelier-workspace"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/atelier*",
+          "apps/desktop/src/store/agentAtelier.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-atelier-e2e"
+      ]
+    },
+    {
+      "id": "agent-offline-queue-recovery",
+      "features": [
+        "agent-offline-queue-recovery"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/offline_queue*",
+          "apps/desktop/src/services/offlineQueue*"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-offline-queue-e2e"
+      ]
+    },
+    {
+      "id": "agent-revision-retry",
+      "features": [
+        "agent-revision-retry"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/revision*",
+          "apps/desktop/src/store/agentRevision*",
+          "apps/desktop/src/store/messageActions.test.ts",
+          "apps/desktop/src/components/messages/actions/registry.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-message-actions-static",
+        "agent-revision-e2e"
+      ]
+    },
+    {
+      "id": "agent-workspace",
+      "features": [
+        "agent-workspace"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/workspace*",
+          "apps/desktop/src/store/agentWorkspace*"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-workspace-e2e"
+      ]
+    },
+    {
+      "id": "agent-stream-resilience",
+      "features": [
+        "agent-stream-resilience"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/turn_handler*",
+          "apps/station/app/subserver/agent/**/live_resume*",
+          "apps/desktop/src-tauri/src/application/agent_turn/mod.rs",
+          "apps/desktop/src/components/AgentSidebar.tsx",
+          "apps/desktop/src/components/messages/AssistantMessage.tsx",
+          "apps/desktop/src/components/messages/ThinkingBlock.tsx",
+          "apps/desktop/src/kernel/identityRuntime.ts",
+          "apps/desktop/src/services/desktop_api.ts",
+          "apps/desktop/src/services/eventStream*",
+          "apps/desktop/src/services/identityHandlers.ts",
+          "apps/desktop/src/services/identityPipeline.ts",
+          "apps/desktop/src/store/chat.ts",
+          "apps/desktop/src/store/chatOperationEvent.test.ts",
+          "apps/desktop/src/store/session.ts",
+          "tooling/acceptance/gates/agent/native_agent_runner.py"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-stream-resilience-e2e"
+      ]
+    },
+    {
+      "id": "agent-attachment-reference",
+      "features": [
+        "agent-attachment-reference"
+      ],
+      "when": {
+        "paths": [
+          "model/domain/agent/agent.proto",
+          "apps/station/app/subserver/agent/**/attachment_admission*",
+          "apps/station/app/subserver/agent/**/runtime_admission*",
+          "apps/station/app/subserver/agent/**/turn_*",
+          "apps/station/app/subserver/oss/service/file_service.go",
+          "apps/desktop/src/services/agentAttachments.ts",
+          "apps/desktop/src/components/composer/*Attachment*",
+          "apps/desktop/src/components/composer/useAgentAttachmentDrafts.ts",
+          "tooling/acceptance/gates/agent/native_agent_runner.py"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-attachment-e2e"
+      ]
+    },
+    {
+      "id": "agent-capability-transparency",
+      "features": [
+        "agent-capability-transparency"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/capability_authority*",
+          "apps/station/app/subserver/agent/**/capability_readiness_authority*",
+          "apps/desktop/src/store/agentCapabilities.ts",
+          "apps/desktop/src/runtimes/agentCapabilityRuntime.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-capability-transparency-e2e"
+      ]
+    },
+    {
+      "id": "agent-dogfood-selftest",
+      "features": [
+        "agent-dogfood-selftest"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/dogfood*"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "agent-dogfood-e2e"
+      ]
+    },
+    {
+      "id": "agent-message-translation",
+      "features": [
+        "agent-message-translation"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/conversation*",
+          "apps/desktop/src/store/chat.ts"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-translation-e2e"
+      ]
+    },
+    {
+      "id": "agent-follow-up-suggestions",
+      "features": [
+        "agent-follow-up-suggestions"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/turn_service*",
+          "apps/desktop/src/store/streaming/*"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-follow-up-e2e"
+      ]
+    },
+    {
+      "id": "agent-topic-comments",
+      "features": [
+        "agent-topic-comments"
+      ],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/agent/**/ecosystem*",
+          "apps/desktop/src/store/topicComments*"
+        ]
+      },
+      "require": [
+        "station-agent-unit",
+        "desktop-check",
+        "agent-topic-comments-e2e"
+      ]
+    },
+    {
+      "id": "social-public-signed-feed",
+      "features": ["social-public-signed-feed"],
+      "when": {
+        "paths": [
+          "apps/station/app/subserver/social/**/feed_*",
+          "apps/station/app/subserver/social/feed_*",
+          "apps/desktop/src-tauri/src/social/public_feed*",
+          "apps/desktop/src/services/publicFeed*",
+          "apps/desktop/src/services/social_api.ts",
+          "tooling/acceptance/gates/social/public_feed*",
+          "packages/station-trust/src/feed_log.rs",
+          "model/domain/social/feed_log.proto",
+          "apps/station/frame/core/signedlog/**",
+          "docs/architecture/domains/social/federation/actor-*"
+        ]
+      },
+      "require": ["social-public-feed-source", "station-api-ownership", "social-public-feed-native-e2e"]
+    },
+    {
+      "id": "social-cross-station-private",
+      "features": [
+        "social-private-cross-station-desktop"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/kernel/**",
+          "apps/desktop/src/pages/moments/**",
+          "apps/desktop/src/runtimes/momentsRuntime*",
+          "apps/desktop/src/services/privateMomentsNative*",
+          "apps/desktop/src/store/moments*",
+          "apps/station/app/subserver/conversation/application/ports/ports.go",
+          "apps/station/app/subserver/conversation/group_call_capability.go",
+          "apps/station/app/subserver/conversation/group_call_capability_test.go",
+          "apps/station/app/subserver/key_exchange/**",
+          "apps/station/app/subserver/social/**",
+          "apps/station/frame/core/federation/**",
+          "docs/architecture/domains/social/cross-station/**",
+          "model/domain/federation/**",
+          "model/domain/key_exchange/**",
+          "model/domain/social/**",
+          "packages/locales/en/errors.json",
+          "packages/locales/en/moments.json",
+          "packages/locales/zh-CN/errors.json",
+          "packages/locales/zh-CN/moments.json",
+          "tooling/scripts/check-social-cross-station-operability.mjs"
+        ]
+      },
+      "require": [
+        "station-api-ownership",
+        "social-cross-station-contract",
+        "social-cross-station-eventbus-contract",
+        "social-cross-station-prekey",
+        "social-cross-station-delivery",
+        "social-cross-station-interaction",
+        "social-cross-station-revocation-recovery",
+        "social-cross-station-desktop-functional",
+        "social-private-desktop-e2e",
+        "social-cross-station-native-e2e",
+        "browser-social-zero-registration",
+        "social-domain-validation"
+      ]
+    },
+    {
+      "id": "social-private-moments-desktop",
+      "features": [
+        "social-private-moments-desktop"
+      ],
+      "when": {
+        "paths": [
+          "apps/desktop/src/acceptance/moments/**",
+          "apps/desktop/src/pages/MomentsPage.tsx",
+          "apps/desktop/src/store/moments.ts",
+          "apps/station/app/subserver/social/**",
+          "docs/architecture/domains/social/core/**",
+          "model/domain/social/**",
+          "tooling/acceptance/capabilities/social.yaml",
+          "tooling/acceptance/domains/social.yaml",
+          "tooling/acceptance/features/social-private-moments-desktop.yaml",
+          "tooling/acceptance/gates/social/**",
+          "tooling/development/secure_content/**"
+        ]
+      },
+      "require": [
+        "social-private-desktop-e2e"
+      ]
+    }
+  ]
+}

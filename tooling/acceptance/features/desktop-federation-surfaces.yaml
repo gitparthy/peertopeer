@@ -1,0 +1,46 @@
+{
+  "id": "desktop-federation-surfaces",
+  "status": "active",
+  "product_area": "federation",
+  "owners": [
+    "apps/desktop/src/store/federation.ts",
+    "apps/desktop/src/runtimes/federationRuntime.ts",
+    "apps/desktop/src/pages/login/StationSetupPanel.tsx",
+    "apps/desktop/src/pages/login/useStationRegistry.ts",
+    "apps/desktop/src/components/chat/FindPeopleModal.tsx",
+    "apps/desktop/src/store/stationRegistry.ts",
+    "apps/desktop/src-tauri/src/application/federation/mod.rs",
+    "apps/desktop/src-tauri/src/infrastructure/station_registry.rs"
+  ],
+  "truth_sources": [
+    "StationRegistry",
+    "Federation Plaza projection",
+    "Federation catalog projection"
+  ],
+  "visible_surfaces": [
+    {"type": "desktop", "route": "onboarding station picker"},
+    {"type": "desktop", "route": "find people modal"}
+  ],
+  "required_gates": [
+    "desktop-check",
+    "station-access-federation-boundary-e2e"
+  ],
+  "acceptance": {
+    "native": [
+      "the native Desktop client consumes one explicit Federation context",
+      "scoped search and resolve preserve Federation and Home Station identity",
+      "Direct and Group creation use the selected Federation context",
+      "Federation Catalog decodes the direct typed protobuf response"
+    ],
+    "visible": [
+      "Station configuration gate exposes the selected station",
+      "Find People explains local and federation search context"
+    ]
+  },
+  "negative": [
+    "Desktop must not silently select a different Federation or Station",
+    "ordinary Desktop Settings exposes no Federation management section",
+    "Federation Catalog must not decode a direct typed response as a PeersResponse envelope",
+    "UI labels must not hide Station Federation or Actor identity context"
+  ]
+}

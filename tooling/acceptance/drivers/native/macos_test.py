@@ -1,0 +1,812 @@
+from __future__ import annotations
+
+import ast
+import json
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from tooling.acceptance.core.errors import BlockedError, DriverError, NativeInputBlocked
+from tooling.acceptance.drivers.native.base import (
+    NativeControlSnapshot,
+    NativeInputMode,
+)
+from tooling.acceptance.drivers.native.macos import (
+    MacOSNativeDesktopAdapter,
+    MacOSStatusItemSnapshot,
+    _ACCESSIBILITY_PROBE,
+    _FILE_CHOOSER_SELECTION_PROBE,
+    _NATIVE_AX_SUPPORT,
+)
+
+
+_BUSY_ACCESSIBILITY_OWNER = r"""
+import json
+import sys
+import time
+from pathlib import Path
+
+import AppKit
+import Foundation
+
+root = Path(sys.argv[1])
+delay = float(sys.argv[2])
+
+class BusyOwner(Foundation.NSObject):
+    def tick_(self, timer):
+        (root / "ready").touch()
+        if (root / "arm").exists():
+            timer.invalidate()
+            (root / "busy").touch()
+            time.sleep(delay)
+
+app = AppKit.NSApplication.sharedApplication()
+app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    ((150, 150), (400, 200)),
+    AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable,
+    AppKit.NSBackingStoreBuffered, False,
+)
+window.setTitle_("AX responsiveness fixture")
+window.orderBack_(None)
+if sys.argv[3] in ("panel", "sheet"):
+    panel = AppKit.NSOpenPanel.openPanel()
+    def selected(response):
+        url = panel.URL()
+        (root / "selection.json").write_text(json.dumps({
+            "response": int(response), "path": str(url.path()) if url else "",
+        }))
+    if sys.argv[3] == "sheet":
+        panel.beginSheetModalForWindow_completionHandler_(window, selected)
+    else:
+        panel.beginWithCompletionHandler_(selected)
+owner = BusyOwner.alloc().init()
+timer = Foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+    0.02, owner, "tick:", None, True,
+)
+app.run()
+"""
+
+_OBJECT_IDENTITY_OWNER = r"""
+import sys
+from pathlib import Path
+import AppKit
+import Foundation
+
+root = Path(sys.argv[1])
+app = AppKit.NSApplication.sharedApplication()
+app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+windows, fields = [], []
+for index in range(2):
+    window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        ((180 + index * 30, 180 + index * 30), (320, 160)),
+        AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable,
+        AppKit.NSBackingStoreBuffered, False,
+    )
+    window.setTitle_("Identical fixture title")
+    for column in range(2):
+        field = AppKit.NSTextField.alloc().initWithFrame_(((20, 30 + column * 50), (260, 30)))
+        field.setStringValue_("Identical fixture text")
+        field.setAccessibilityIdentifier_("first" if column == 0 else "second")
+        window.contentView().addSubview_(field)
+        fields.append(field)
+    window.orderBack_(None)
+    windows.append(window)
+
+class Owner(Foundation.NSObject):
+    def tick_(self, timer):
+        (root / "ready").touch()
+        if (root / "change").exists() and not (root / "changed").exists():
+            for window in windows:
+                window.setTitle_("Changed fixture title")
+            for field in fields:
+                field.setStringValue_("Changed fixture text")
+            (root / "changed").touch()
+
+owner = Owner.alloc().init()
+timer = Foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+    0.02, owner, "tick:", None, True,
+)
+app.run()
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin", "requires real macOS Accessibility")
+class MacOSAccessibilityResponsivenessTests(unittest.TestCase):
+    def test_real_cf_equal_distinguishes_same_title_windows_and_same_role_controls(self):
+        probe = _NATIVE_AX_SUPPORT + r"""
+core_foundation.CFEqual.argtypes = [CFRef, CFRef]
+core_foundation.CFEqual.restype = ctypes.c_bool
+reads = AXReadSession(application_services, core_foundation, deadline=time.monotonic() + 2.5)
+root = Path(sys.argv[2])
+application = application_services.AXUIElementCreateApplication(int(sys.argv[1]))
+before = after = None
+paths = []
+try:
+    before = copy_attribute(application, "AXWindows", required=True)
+    windows = array_items(before)
+    assert len(windows) == 2
+    titles = [copied_text(window, "AXTitle") for window in windows]
+    assert titles[0] == titles[1]
+    assert not core_foundation.CFEqual(windows[0], windows[1])
+    for name in ("first", "second"):
+        path = find_path(windows[0], lambda element, _: copied_text(element, "AXIdentifier") == name)
+        assert path
+        paths.append(path)
+    first, second = paths[0][-1], paths[1][-1]
+    assert copied_text(first, "AXRole") == copied_text(second, "AXRole")
+    assert copied_text(first, "AXValue") == copied_text(second, "AXValue")
+    assert not core_foundation.CFEqual(first, second)
+    (root / "change").touch()
+    end = time.monotonic() + 1
+    while not (root / "changed").exists():
+        assert time.monotonic() < end
+        time.sleep(0.01)
+    after = copy_attribute(application, "AXWindows", required=True)
+    new_windows = array_items(after)
+    assert all(any(core_foundation.CFEqual(old, new) for new in new_windows) for old in windows)
+    assert copied_text(windows[0], "AXTitle") != titles[0]
+    new_path = find_path(windows[0], lambda element, _: copied_text(element, "AXIdentifier") == "first")
+    assert new_path
+    paths.append(new_path)
+    assert core_foundation.CFEqual(first, new_path[-1])
+    assert copied_text(first, "AXValue") == "Changed fixture text"
+    print(json.dumps({"distinctWindows": True, "distinctControls": True, "stableAfterContentChange": True}))
+finally:
+    for path in paths:
+        release_path(path)
+    for ref in (before, after, application):
+        if ref:
+            core_foundation.CFRelease(ref)
+"""
+        with tempfile.TemporaryDirectory(prefix="pt-ax-identity-") as directory:
+            root = Path(directory)
+            child = subprocess.Popen(
+                (sys.executable, "-c", _OBJECT_IDENTITY_OWNER, str(root)),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                end = time.monotonic() + 5
+                while not (root / "ready").exists():
+                    self.assertIsNone(child.poll())
+                    self.assertLess(time.monotonic(), end)
+                    time.sleep(0.01)
+                result = subprocess.run(
+                    (sys.executable, "-c", probe, str(child.pid), str(root)),
+                    capture_output=True, text=True, timeout=3,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {
+                    "distinctWindows": True, "distinctControls": True,
+                    "stableAfterContentChange": True,
+                })
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=3)
+
+    def _probe_busy_owner(
+        self, probe: str, busy_seconds: float, *, panel: bool = False, sheet: bool = False,
+        arguments: tuple[str, ...] = (),
+        probe_timeout: float = 2,
+        expected_selection: Path | None = None,
+    ) -> tuple[
+        subprocess.CompletedProcess[str], float
+    ]:
+        with tempfile.TemporaryDirectory(prefix="pt-ax-responsiveness-") as directory:
+            root = Path(directory)
+            with (root / "owner.log").open("w+") as log:
+                child = subprocess.Popen(
+                    (sys.executable, "-c", _BUSY_ACCESSIBILITY_OWNER,
+                     str(root), str(busy_seconds), "sheet" if sheet else "panel" if panel else "window"),
+                    stdout=log, stderr=log,
+                )
+                try:
+                    for marker, timeout in (("ready", 5), ("busy", 2)):
+                        deadline = time.monotonic() + timeout
+                        while not (root / marker).exists():
+                            if child.poll() is not None:
+                                log.seek(0)
+                                self.fail(f"AppKit fixture exited: {log.read()}")
+                            if time.monotonic() >= deadline:
+                                self.fail(f"AppKit fixture never became {marker}")
+                            time.sleep(0.01)
+                        if marker == "ready":
+                            (root / "arm").touch()
+                    began = time.monotonic()
+                    result = subprocess.run(
+                        (sys.executable, "-c", probe, str(child.pid), *arguments),
+                        capture_output=True, text=True, timeout=probe_timeout,
+                    )
+                    if expected_selection is not None:
+                        deadline = time.monotonic() + 1
+                        while not (root / "selection.json").exists():
+                            if child.poll() is not None or time.monotonic() >= deadline:
+                                self.fail("AppKit panel did not complete its native selection")
+                            time.sleep(0.01)
+                        selection = json.loads((root / "selection.json").read_text())
+                        self.assertEqual(selection, {
+                            "response": 1, "path": str(expected_selection),
+                        })
+                    return result, time.monotonic() - began
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                    child.wait(timeout=3)
+
+    def test_busy_application_recovers_within_the_existing_rpc_bound(self) -> None:
+        result, elapsed = self._probe_busy_owner(_ACCESSIBILITY_PROBE, 1.1)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["windowCount"], 1)
+        self.assertLess(elapsed, 2)
+
+    def test_unresponsive_application_preserves_the_terminal_ax_error(self) -> None:
+        result, elapsed = self._probe_busy_owner(_ACCESSIBILITY_PROBE, 4)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("AXWindows inspection failed: AX error -25204", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 2)
+
+    def _observe_panel(self, busy_seconds: float) -> tuple[
+        subprocess.CompletedProcess[str], float
+    ]:
+        probe = _FILE_CHOOSER_SELECTION_PROBE.split("try:\n    home_path =")[0]
+        probe += """
+panel = open_panel(application)
+sys.stdout.write(json.dumps({"panelFound": bool(panel)}))
+if panel:
+    core_foundation.CFRelease(panel)
+core_foundation.CFRelease(application)
+"""
+        with tempfile.NamedTemporaryFile(dir=Path.home(), suffix=".txt") as target:
+            return self._probe_busy_owner(
+                probe, busy_seconds, panel=True, arguments=(target.name,),
+            )
+
+    def test_busy_file_panel_is_observed_after_ax_recovery(self) -> None:
+        result, elapsed = self._observe_panel(1.1)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["panelFound"])
+        self.assertLess(elapsed, 2)
+
+    def test_unresponsive_file_panel_cannot_be_reported_as_closed(self) -> None:
+        result, elapsed = self._observe_panel(4)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("AXWindows inspection failed: AX error -25204", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 2)
+
+    def test_fresh_file_selection_commits_through_the_real_panel(self) -> None:
+        self._assert_fresh_file_selection()
+
+    def test_fresh_file_selection_commits_through_the_real_attached_sheet(self) -> None:
+        self._assert_fresh_file_selection(sheet=True)
+
+    def _assert_fresh_file_selection(self, *, sheet: bool = False) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="PeersTouchSelectionRegression-", dir=Path.home(),
+        ) as raw:
+            target = Path(raw).resolve() / "fresh-proof.bin"
+            target.write_bytes(b"fresh native selection proof")
+            result, elapsed = self._probe_busy_owner(
+                _FILE_CHOOSER_SELECTION_PROBE, 0, panel=True, sheet=sheet,
+                arguments=(str(target),), probe_timeout=30,
+                expected_selection=target,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            selection = json.loads(result.stdout)
+            self.assertTrue(selection["selected"], selection.get("reason"))
+            self.assertEqual(selection["path"], str(target))
+            self.assertEqual(target.read_bytes(), b"fresh native selection proof")
+            self.assertLess(elapsed, 30)
+
+    def _cancel_panel(self, busy_seconds: float, *, panel: bool = True) -> tuple[
+        subprocess.CompletedProcess[str], float
+    ]:
+        probe = """
+import json
+import sys
+from tooling.acceptance.drivers.native.macos_panels import press_panel_button
+sys.stdout.write(json.dumps(press_panel_button(
+    int(sys.argv[1]), "Cancel", ("Open",), timeout_seconds=1.5,
+)))
+"""
+        return self._probe_busy_owner(probe, busy_seconds, panel=panel)
+
+    def test_busy_panel_button_is_pressed_once_after_read_recovery(self) -> None:
+        result, elapsed = self._cancel_panel(1.1)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["pressed"])
+        self.assertLess(elapsed, 2)
+
+    def test_unresponsive_panel_preserves_failure_before_any_press(self) -> None:
+        result, elapsed = self._cancel_panel(4)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("AXWindows inspection failed: AX error -25204", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 2)
+
+    def test_successfully_observed_absent_panel_returns_no_press(self) -> None:
+        result, elapsed = self._cancel_panel(0, panel=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["pressed"])
+        self.assertLess(elapsed, 2)
+
+
+class MacOSStatusItemAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = MacOSNativeDesktopAdapter()
+        self.process_patch = mock.patch.object(
+            self.adapter,
+            "_validated_process_id",
+            return_value=123,
+        )
+        self.process_patch.start()
+        self.addCleanup(self.process_patch.stop)
+
+    def test_status_item_snapshot_parses_accessibility_contract(self) -> None:
+        with mock.patch.object(
+            self.adapter,
+            "_run_osascript",
+            return_value=(
+                "AXMenuBarItem\tAXMenuExtra\t\tPeers Touch\t"
+                "831\t4.5\t62\t24\tShow Peers Touch|Quit"
+            ),
+        ):
+            snapshot = self.adapter.status_item_snapshot(
+                123,
+                expected_help="Peers Touch",
+            )
+
+        self.assertEqual(
+            snapshot,
+            MacOSStatusItemSnapshot(
+                role="AXMenuBarItem",
+                subrole="AXMenuExtra",
+                title="",
+                help="Peers Touch",
+                position=(831.0, 4.5),
+                size=(62.0, 24.0),
+                menu_items=("Show Peers Touch", "Quit"),
+            ),
+        )
+
+    def test_position_main_window_targets_exact_process(self) -> None:
+        with mock.patch.object(
+            self.adapter,
+            "_accessibility",
+            return_value={"operation": "position"},
+        ) as run:
+            self.adapter.position_main_window(123, (0.0, 32.0))
+
+        process_id, operation, position = run.call_args.args
+        self.assertEqual(process_id, 123)
+        self.assertEqual(operation, "position")
+        self.assertEqual(json.loads(position), [0.0, 32.0])
+
+    def test_window_state_parses_hidden_and_visible_states(self) -> None:
+        with mock.patch.object(
+            self.adapter,
+            "_accessibility",
+            side_effect=(
+                {
+                    "windowCount": 0, "frontmost": False,
+                    "mainWindow": False, "focusedWindow": False,
+                },
+                {
+                    "windowCount": 1, "frontmost": True,
+                    "mainWindow": True, "focusedWindow": True,
+                },
+            ),
+        ):
+            self.assertEqual(
+                self.adapter.window_state(123),
+                {
+                    "windowCount": 0,
+                    "frontmost": False,
+                    "mainWindow": False,
+                    "focusedWindow": False,
+                },
+            )
+            self.assertEqual(
+                self.adapter.window_state(123),
+                {
+                    "windowCount": 1,
+                    "frontmost": True,
+                    "mainWindow": True,
+                    "focusedWindow": True,
+                },
+            )
+
+    def test_show_uses_status_item_menu_and_waits_for_focus(self) -> None:
+        with (
+            mock.patch.object(
+                self.adapter,
+                "_run_osascript",
+                return_value="",
+            ) as run,
+            mock.patch.object(
+                self.adapter,
+                "_wait_for_window_count",
+                return_value={"windowCount": 1, "frontmost": True},
+            ) as wait,
+        ):
+            result = self.adapter.show_main_window_from_status_item(
+                123,
+                expected_help="Peers Touch",
+                menu_item_title="Show Peers Touch",
+            )
+
+        self.assertEqual(result["windowCount"], 1)
+        self.assertIn("click targetItem", run.call_args.args[0])
+        self.assertIn("Show Peers Touch", run.call_args.args[0])
+        wait.assert_called_once_with(
+            123,
+            expected_visible=True,
+            timeout_seconds=10.0,
+        )
+
+    def test_hide_uses_native_close_button(self) -> None:
+        with (
+            mock.patch.object(
+                self.adapter,
+                "_accessibility",
+                return_value={"operation": "close"},
+            ) as run,
+            mock.patch.object(
+                self.adapter,
+                "_wait_for_window_count",
+                return_value={"windowCount": 0},
+            ) as wait,
+        ):
+            result = self.adapter.hide_main_window(123)
+
+        self.assertEqual(result["windowCount"], 0)
+        run.assert_called_once_with(123, "close")
+        wait.assert_called_once_with(
+            123,
+            expected_visible=False,
+            timeout_seconds=10.0,
+        )
+
+    def test_window_inspection_failures_do_not_mean_hidden(self) -> None:
+        for result in (
+            subprocess.CompletedProcess([], 1, "", "AXWindows error -25202"),
+            subprocess.CompletedProcess([], 0, "{}\n", ""),
+            subprocess.CompletedProcess([], 0, "invalid JSON\n", ""),
+        ):
+            with (
+                self.subTest(result=result),
+                mock.patch(
+                    "tooling.acceptance.drivers.native.macos.subprocess.run",
+                    return_value=result,
+                ) as run,
+            ):
+                with self.assertRaises(DriverError):
+                    self.adapter.window_state(123)
+                self.assertEqual(run.call_args.kwargs["timeout"], 2)
+                self.assertEqual(run.call_args.args[0][-2:], ("123", "inspect"))
+
+    def test_accessibility_timeout_is_bounded_and_preserves_failure(self) -> None:
+        with mock.patch(
+            "tooling.acceptance.drivers.native.macos.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("AX probe", 2),
+        ):
+            with self.assertRaisesRegex(DriverError, "timed out"):
+                self.adapter.window_state(123)
+            self.assertIn("timed out", self.adapter.focused_control(123).error)
+
+    def test_activation_rejects_a_sibling_frontmost_process(self) -> None:
+        adapter = MacOSNativeDesktopAdapter(NativeInputMode.EXCLUSIVE_NATIVE_INPUT)
+        with (
+            mock.patch.object(adapter, "_validated_process_id", return_value=123),
+            mock.patch(
+                "tooling.acceptance.drivers.native.macos.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, "{}", ""),
+            ),
+            mock.patch.object(
+                adapter, "_accessibility",
+                side_effect=(
+                    {"operation": "activate"},
+                    {"frontmost": True, "actualFrontmostPid": 456},
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(DriverError, "did not become frontmost"):
+                adapter.activate_process(123)
+
+    def test_semantic_input_rejects_activation_before_os_mutation(self) -> None:
+        with mock.patch.object(self.adapter, "_accessibility") as run:
+            with self.assertRaises(NativeInputBlocked):
+                self.adapter.activate_process(123)
+            run.assert_not_called()
+
+    def test_nonfinite_position_is_rejected_before_os_mutation(self) -> None:
+        with mock.patch.object(self.adapter, "_accessibility") as run:
+            with self.assertRaisesRegex(DriverError, "position is invalid"):
+                self.adapter.position_main_window(123, (float("nan"), 32.0))
+            run.assert_not_called()
+
+    def test_unsupported_ax_list_selection_falls_back_without_faking_success(self) -> None:
+        adapter = MacOSNativeDesktopAdapter(NativeInputMode.EXCLUSIVE_NATIVE_INPUT)
+        owner = NativeControlSnapshot(frontmost=True, actual_frontmost_pid=123)
+        with tempfile.NamedTemporaryFile(dir=Path.home(), suffix=".txt") as target:
+            with (
+                mock.patch.object(adapter, "_validated_process_id", return_value=123),
+                mock.patch.object(adapter, "focused_control", return_value=owner),
+                mock.patch(
+                    "tooling.acceptance.drivers.native.macos.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        [],
+                        0,
+                        json.dumps({
+                            "selected": False,
+                            "reason": "list-selection-unsupported",
+                            "path": target.name,
+                        }),
+                        "",
+                    ),
+                ) as run,
+            ):
+                self.assertIsNone(
+                    adapter.select_file_chooser_path_to_process(123, target.name)
+                )
+            self.assertIn("-c", run.call_args.args[0])
+
+    def test_unknown_chooser_result_is_still_a_failure(self) -> None:
+        adapter = MacOSNativeDesktopAdapter(NativeInputMode.EXCLUSIVE_NATIVE_INPUT)
+        owner = NativeControlSnapshot(frontmost=True, actual_frontmost_pid=123)
+        with tempfile.NamedTemporaryFile(dir=Path.home(), suffix=".txt") as target:
+            with (
+                mock.patch.object(adapter, "_validated_process_id", return_value=123),
+                mock.patch.object(adapter, "focused_control", return_value=owner),
+                mock.patch(
+                    "tooling.acceptance.drivers.native.macos.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        [],
+                        0,
+                        json.dumps({"selected": False, "reason": "unexpected"}),
+                        "",
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(DriverError, "did not select"):
+                    adapter.select_file_chooser_path_to_process(123, target.name)
+
+    def test_chooser_probe_falls_back_to_exact_pid_search_commit(self) -> None:
+        probe = _FILE_CHOOSER_SELECTION_PROBE
+        self.assertIn("class ListSelectionUnsupported", probe)
+        self.assertIn("def select_file_via_search(", probe)
+        # The semantic fallback commits through the Search field and rows.
+        self.assertIn('"AXIdentifier") == "Search"', probe)
+        self.assertIn('perform_action(search_element, "AXConfirm")', probe)
+        self.assertIn('"AXSelectedRows"', probe)
+        # Ambiguous search results remain unsupported, never arbitrary.
+        self.assertIn('"search-multiple-matches"', probe)
+        compile(probe, "_FILE_CHOOSER_SELECTION_PROBE", "exec")
+
+    def test_chooser_search_confirmation_never_replays_unknown_action(self) -> None:
+        function = next(
+            node for node in ast.parse(_FILE_CHOOSER_SELECTION_PROBE).body
+            if isinstance(node, ast.FunctionDef) and node.name == "commit_search_field"
+        )
+        code = compile(
+            ast.Module(body=[function], type_ignores=[]), "native-search-confirmation", "exec",
+        )
+        search_element = object()
+        for status in (-25204, -25200, -25205):
+            with self.subTest(status=status):
+                failure = RuntimeError(f"AXConfirm action failed: AX error {status}")
+                action = mock.Mock(side_effect=failure)
+                namespace = {"perform_action": action}
+                exec(code, namespace)
+                with self.assertRaises(RuntimeError) as raised:
+                    namespace["commit_search_field"](search_element)
+                self.assertIs(raised.exception, failure)
+                action.assert_called_once_with(search_element, "AXConfirm")
+        self.assertNotIn("CGEventPost", _FILE_CHOOSER_SELECTION_PROBE)
+
+    def test_search_unavailability_sentinels_fall_back_without_faking(self) -> None:
+        adapter = MacOSNativeDesktopAdapter(NativeInputMode.EXCLUSIVE_NATIVE_INPUT)
+        owner = NativeControlSnapshot(frontmost=True, actual_frontmost_pid=123)
+        with tempfile.NamedTemporaryFile(dir=Path.home(), suffix=".txt") as target:
+            for reason in (
+                "search-field-unavailable",
+                "search-no-match",
+                "search-multiple-matches",
+                "search-selection-unsupported",
+                "search-confirm-unavailable",
+                "search-panel-remained-open",
+            ):
+                with (
+                    mock.patch.object(adapter, "_validated_process_id", return_value=123),
+                    mock.patch.object(adapter, "focused_control", return_value=owner),
+                    mock.patch(
+                        "tooling.acceptance.drivers.native.macos.subprocess.run",
+                        return_value=subprocess.CompletedProcess(
+                            [],
+                            0,
+                            json.dumps({
+                                "selected": False,
+                                "reason": reason,
+                                "path": target.name,
+                            }),
+                            "",
+                        ),
+                    ),
+                ):
+                    self.assertIsNone(
+                        adapter.select_file_chooser_path_to_process(
+                            123, target.name
+                        ),
+                        reason,
+                    )
+
+    def test_semantic_selection_preserves_unavailable_reason_without_fallback(self) -> None:
+        adapter = MacOSNativeDesktopAdapter(NativeInputMode.SEMANTIC_NON_INTRUSIVE)
+        with tempfile.NamedTemporaryFile(dir=Path.home(), suffix=".txt") as target:
+            for reason in (
+                "search-field-unavailable", "search-no-match", "search-multiple-matches",
+                "search-selection-unsupported", "search-confirm-unavailable",
+                "search-panel-remained-open", "list-selection-unsupported",
+            ):
+                with (
+                    self.subTest(reason=reason),
+                    mock.patch.object(adapter, "_validated_process_id", return_value=123),
+                    mock.patch(
+                        "tooling.acceptance.drivers.native.macos.subprocess.run",
+                        return_value=subprocess.CompletedProcess(
+                            [], 0, json.dumps({
+                                "selected": False, "reason": reason, "path": target.name,
+                            }), "",
+                        ),
+                    ) as run,
+                    self.assertRaises(BlockedError) as failure,
+                ):
+                    adapter.select_file_chooser_path_to_process(123, target.name)
+                run.assert_called_once()
+                diagnostic = failure.exception.diagnostic.to_dict()
+                self.assertEqual(
+                    diagnostic["resourceChecks"][0]["observed"],
+                    {"selected": False, "selectionReason": reason, "targetProcessId": 123,
+                     "inputMode": "semantic-nonintrusive"},
+                )
+                self.assertNotIn(target.name, json.dumps(diagnostic))
+
+    def test_unavailable_selection_must_still_bind_the_requested_path(self) -> None:
+        for mode in NativeInputMode:
+            adapter = MacOSNativeDesktopAdapter(mode)
+            with (
+                self.subTest(mode=mode),
+                tempfile.NamedTemporaryFile(dir=Path.home(), suffix=".txt") as target,
+                mock.patch(
+                    "tooling.acceptance.drivers.native.macos.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps({
+                            "selected": False, "reason": "search-no-match", "path": "/foreign",
+                        }), "",
+                    ),
+                ),
+                self.assertRaisesRegex(DriverError, "did not select"),
+            ):
+                adapter.select_file_chooser_path_to_process(123, target.name)
+
+
+class AXTransientReadRetryTest(unittest.TestCase):
+    def _session(self):
+        from tooling.acceptance.drivers.native.macos_ax import AXReadSession
+
+        session = object.__new__(AXReadSession)
+        session.read_deadline = __import__("time").monotonic() + 1.5
+
+        class AX:
+            def AXUIElementSetMessagingTimeout(self, *_):
+                return 0
+
+        session.ax = AX()
+        session._check = lambda error, operation: None
+        return session
+
+    def test_cannot_complete_is_retried_like_notification_timeout(self):
+        session = self._session()
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            return -25200 if calls == 1 else 0
+
+        self.assertEqual(session.read(object(), "AXChildren", operation), 0)
+        self.assertEqual(calls, 2)
+
+    def test_persistent_cannot_complete_returns_error_within_budget(self):
+        session = self._session()
+        self.assertEqual(session.read(object(), "AXChildren", lambda: -25200), -25200)
+
+
+class AXOneShotActionTest(unittest.TestCase):
+    def _session(self):
+        from tooling.acceptance.drivers.native.macos_ax import AXReadSession
+
+        session = object.__new__(AXReadSession)
+        session.deadline = 29.0
+        session.read_deadline = 1.5
+        session.ax = mock.Mock()
+        session.ax.AXUIElementSetMessagingTimeout.return_value = 0
+        return session
+
+    def test_action_uses_remaining_operation_budget_not_read_budget(self):
+        session = self._session()
+        action = mock.Mock(return_value=0)
+        with mock.patch(
+            "tooling.acceptance.drivers.native.macos_ax.time.monotonic",
+            side_effect=(5.0, 5.0, 5.9, 5.9),
+        ):
+            session._one_shot("element", "AXConfirm action", action)
+        session.ax.AXUIElementSetMessagingTimeout.assert_called_once_with("element", 24.0)
+        action.assert_called_once_with()
+
+    def test_failed_mutation_is_never_replayed(self):
+        from tooling.acceptance.drivers.native.macos_ax import NativeAXActionUnavailable
+
+        for status in (-25204, -25200, -25205):
+            session = self._session()
+            action = mock.Mock(return_value=status)
+            with (
+                self.subTest(status=status),
+                mock.patch(
+                    "tooling.acceptance.drivers.native.macos_ax.time.monotonic",
+                    side_effect=(5.0, 5.0, 5.9, 5.9),
+                ),
+                self.assertRaises(NativeAXActionUnavailable) as failure,
+            ):
+                session._one_shot("element", "AXConfirm action", action)
+            action.assert_called_once_with()
+            self.assertEqual(failure.exception.observed["axStatus"], status)
+
+    def test_expired_operation_cannot_invoke_action(self):
+        from tooling.acceptance.drivers.native.macos_ax import NativeAXActionUnavailable
+
+        session = self._session()
+        action = mock.Mock()
+        with (
+            mock.patch(
+                "tooling.acceptance.drivers.native.macos_ax.time.monotonic",
+                return_value=30.0,
+            ),
+            self.assertRaises(NativeAXActionUnavailable),
+        ):
+            session._one_shot("element", "AXConfirm action", action)
+        action.assert_not_called()
+        session.ax.AXUIElementSetMessagingTimeout.assert_not_called()
+
+    def test_late_success_is_not_admitted(self):
+        from tooling.acceptance.drivers.native.macos_ax import NativeAXActionUnavailable
+
+        session = self._session()
+        action = mock.Mock(return_value=0)
+        with (
+            mock.patch(
+                "tooling.acceptance.drivers.native.macos_ax.time.monotonic",
+                side_effect=(28.0, 28.0, 29.1, 29.1),
+            ),
+            self.assertRaises(NativeAXActionUnavailable) as failure,
+        ):
+            session._one_shot("element", "AXConfirm action", action)
+        action.assert_called_once_with()
+        self.assertTrue(failure.exception.observed["actionDeadlineExceeded"])
+
+
+if __name__ == "__main__":
+    unittest.main()

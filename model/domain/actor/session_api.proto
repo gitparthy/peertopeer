@@ -1,0 +1,19 @@
+syntax = "proto3";
+package peers.actor;
+
+import "google/protobuf/timestamp.proto";
+import "domain/actor/actor.proto";
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model/actor;actor";
+
+message VerifySessionRequest {
+  // Empty request - token is in Authorization header
+}
+
+message VerifySessionResponse {
+  bool valid = 1;
+  reserved 2;
+  reserved "subject_id";
+  map<string, string> attributes = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  peers_touch.model.actor.v1.ActorRef actor_ref = 5 [json_name = "actor_ref"];
+}

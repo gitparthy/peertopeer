@@ -1,0 +1,2157 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, call, patch
+
+from tooling.acceptance.core import (
+    AppLaunchMetadata,
+    BindingProofRecord,
+    ClientRuntimeIdentity,
+)
+from tooling.acceptance.core.evidence_store import workspace_id
+from tooling.acceptance.core.errors import ClientBindingError, DriverError
+from tooling.acceptance.drivers.native.base import (
+    MouseAction,
+    NativeDesktopAdapter,
+    NativeInputMode,
+    NativeKey,
+    admit_local_native_input_mode,
+    resolve_native_input_mode,
+)
+from tooling.acceptance.drivers.native.runtime import (
+    CloneStorageEntry,
+    CloneStorageRoots,
+    LinuxNativeDesktopRuntimeBinding,
+    LocalMacOSRuntimeBinding,
+    NativeLaunchOptions,
+    NativeStorageFixture,
+    WindowsNativeDesktopRuntimeBinding,
+    _route_matches_bound_service,
+    normalize_clone_paths,
+    resolve_native_desktop_runtime,
+)
+from tooling.acceptance.drivers.tauri import (
+    MakeDesktopLauncher,
+    ProvisionedTauriLauncher,
+    TauriSession,
+)
+
+
+class SyntheticRemoteNativeLifecycle:
+    def __init__(self, staged_path: str) -> None:
+        self.staged_path = staged_path
+        self.calls: list[tuple[str, object]] = []
+        self.released_endpoints: list[str] = []
+
+    def validate_binding(self, gate_id: str, source_commit: str) -> None:
+        self.calls.append(("validate_binding", (gate_id, source_commit)))
+
+    def launch_actor(
+        self,
+        actor: str,
+        client_spec: dict[str, object],
+        environment: dict[str, str],
+    ) -> ProvisionedTauriLauncher:
+        self.calls.append(
+            ("launch_actor", (actor, client_spec, environment))
+        )
+        return ProvisionedTauriLauncher(
+            AppLaunchMetadata(
+                webdriver_host="127.0.0.1",
+                webdriver_port=int(client_spec["webdriver_port"]),
+                gateway_port=int(client_spec["gateway_port"]),
+                profile=str(client_spec["profile"]),
+                storage_root=str(client_spec["storage_root"]),
+                process_id=712,
+            )
+        )
+
+    def expose_orchestrator_endpoint(
+        self,
+        endpoint_id: str,
+        url: str,
+    ) -> dict[str, object]:
+        self.calls.append(("expose_orchestrator_endpoint", (endpoint_id, url)))
+        if url.startswith("/"):
+            peer_id = url.rsplit("/p2p/", 1)[1]
+            exposed = f"/ip4/127.0.0.1/tcp/40123/p2p/{peer_id}"
+        else:
+            exposed = "http://127.0.0.1:40123/proxy"
+        return {
+            "endpointId": endpoint_id,
+            "url": exposed,
+        }
+
+    def release_endpoint(self, endpoint_id: str) -> dict[str, object]:
+        self.released_endpoints.append(endpoint_id)
+        return {"endpointId": endpoint_id, "released": True}
+
+    def endpoint_cleanup_audit(self) -> dict[str, object]:
+        return {"endpointsReleased": True}
+
+    def binary_identity(self) -> dict[str, str]:
+        return {
+            "path": "runtime-cell:synthetic:desktop.exe",
+            "sha256": "a" * 64,
+            "sourceCommit": "source-commit",
+        }
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {"artifactKind": "acceptance-runtime-cell-manifest"}
+
+    def stage_actor_file(self, actor: str, source: Path) -> str:
+        self.calls.append(("stage_actor_file", (actor, source)))
+        return self.staged_path
+
+    def import_actor_storage_file(
+        self, actor: str, source: Path, relative_path: str, sha256: str,
+    ) -> None:
+        self.calls.append(("import_actor_storage_file", (actor, source, relative_path, sha256)))
+
+    def actor_file_sha256(self, actor: str, path: str) -> str:
+        self.calls.append(("actor_file_sha256", (actor, path)))
+        return "b" * 64
+
+    def clone_actor_storage(
+        self,
+        source_actor: str,
+        target_actor: str,
+        relative_path: CloneStorageRoots,
+    ) -> None:
+        self.calls.append(
+            (
+                "clone_actor_storage",
+                (source_actor, target_actor, relative_path),
+            )
+        )
+
+    def execute_adapter(
+        self,
+        operation: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        self.calls.append(("execute_adapter", (operation, payload)))
+        if operation == "capture_screenshot":
+            return {
+                "content": base64.b64encode(b"bitmap").decode("ascii"),
+            }
+        if operation == "read_clipboard":
+            return {
+                "content": base64.b64encode(b"clipboard").decode("ascii"),
+            }
+        if operation == "verify_focused_text":
+            return {
+                "verified": payload["expected"] == self.staged_path,
+            }
+        if operation in {
+            "activate_process",
+            "focused_control",
+            "reveal_file_chooser_location_to_process",
+            "select_file_chooser_path_to_process",
+        }:
+            return {
+                "kind": (
+                    "text-field"
+                    if operation in {
+                        "reveal_file_chooser_location_to_process",
+                        "select_file_chooser_path_to_process",
+                    }
+                    else "window"
+                ),
+                "actualFrontmostPid": payload["processId"],
+                "frontmost": True,
+            }
+        return {}
+
+    def actor_cleanup_audit(self) -> dict[str, object]:
+        return {
+            "processesReleased": True,
+            "storageReleased": True,
+        }
+
+
+class NativeDesktopAdapterInputTest(unittest.TestCase):
+    def test_native_input_mode_defaults_to_non_intrusive(self) -> None:
+        self.assertEqual(
+            resolve_native_input_mode(None),
+            NativeInputMode.SEMANTIC_NON_INTRUSIVE,
+        )
+        self.assertEqual(
+            resolve_native_input_mode("exclusive-native-input"),
+            NativeInputMode.EXCLUSIVE_NATIVE_INPUT,
+        )
+
+    def test_local_macos_binding_uses_declared_input_mode(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PT_ACCEPTANCE_NATIVE_DEV": "1",
+                "PT_ACCEPTANCE_DESKTOP_INPUT_MODE": "semantic-nonintrusive",
+            },
+        ):
+            binding = LocalMacOSRuntimeBinding()
+
+        self.assertEqual(
+            binding.input_mode,
+            NativeInputMode.SEMANTIC_NON_INTRUSIVE,
+        )
+
+    def test_local_macos_acceptance_binding_defaults_to_semantic_input(
+        self,
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "tooling.acceptance.drivers.native.runtime.sys.platform",
+            "darwin",
+        ), patch.object(
+            LocalMacOSRuntimeBinding, "_consume_prepared_binary",
+        ):
+            binding = LocalMacOSRuntimeBinding()
+
+        self.assertEqual(
+            binding.input_mode,
+            NativeInputMode.SEMANTIC_NON_INTRUSIVE,
+        )
+
+    def test_local_exclusive_input_requires_isolated_gui_session(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "NATIVE_INPUT_ISOLATION_REQUIRED",
+        ):
+            admit_local_native_input_mode(
+                "exclusive-native-input",
+                "shared-user-session",
+            )
+
+        self.assertEqual(
+            admit_local_native_input_mode(
+                "exclusive-native-input",
+                "isolated-gui-session",
+            ),
+            NativeInputMode.EXCLUSIVE_NATIVE_INPUT,
+        )
+
+    def test_drag_mouse_posts_interpolated_drag_events_with_timing(self) -> None:
+        adapter = Mock(spec=NativeDesktopAdapter)
+
+        with patch(
+            "tooling.acceptance.drivers.native.base.time.sleep"
+        ) as sleep:
+            NativeDesktopAdapter.drag_mouse(
+                adapter,
+                (10.0, 20.0),
+                (40.0, 80.0),
+                duration_seconds=0.3,
+                steps=3,
+            )
+
+        self.assertEqual(
+            adapter.post_mouse.call_args_list,
+            [
+                call((MouseAction.MOVE,), (10.0, 20.0)),
+                call((MouseAction.LEFT_DOWN,), (10.0, 20.0)),
+                call((MouseAction.LEFT_DRAG,), (20.0, 40.0)),
+                call((MouseAction.LEFT_DRAG,), (30.0, 60.0)),
+                call((MouseAction.LEFT_DRAG,), (40.0, 80.0)),
+                call((MouseAction.LEFT_UP,), (40.0, 80.0)),
+            ],
+        )
+        self.assertEqual(sleep.call_args_list, [call(0.075)] * 4)
+
+    def test_drag_mouse_rejects_non_positive_timing(self) -> None:
+        adapter = Mock(spec=NativeDesktopAdapter)
+
+        with self.assertRaisesRegex(ValueError, "duration must be positive"):
+            NativeDesktopAdapter.drag_mouse(
+                adapter,
+                (0.0, 0.0),
+                (1.0, 1.0),
+                duration_seconds=0,
+            )
+        with self.assertRaisesRegex(ValueError, "steps must be positive"):
+            NativeDesktopAdapter.drag_mouse(
+                adapter,
+                (0.0, 0.0),
+                (1.0, 1.0),
+                steps=0,
+            )
+
+
+class RemoteNativeDesktopRuntimeBindingTest(unittest.TestCase):
+    def test_storage_fixture_rejects_escape_and_changed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fixture"
+            source.write_bytes(b"synthetic")
+            digest = hashlib.sha256(b"synthetic").hexdigest()
+            for destination in ("../escape", "/absolute", "a/../b", "a//b", "a\\b"):
+                with self.subTest(destination=destination), self.assertRaises(DriverError):
+                    NativeStorageFixture(source, destination, digest).validate()
+            fixture = NativeStorageFixture(source, "data/fixture", digest)
+            fixture.validate()
+            source.write_bytes(b"changed")
+            with self.assertRaises(DriverError):
+                fixture.validate()
+
+    def test_remote_storage_fixture_delegates_to_cell_owner(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/fixtures/example")
+        binding = LinuxNativeDesktopRuntimeBinding("chat-native", "source-commit", lifecycle)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fixture"
+            source.write_bytes(b"synthetic")
+            fixture = NativeStorageFixture(
+                source, "data/fixture", hashlib.sha256(b"synthetic").hexdigest(),
+            )
+            binding._import_storage_fixture("alice", {}, fixture)
+            self.assertEqual(
+                lifecycle.calls[-1],
+                ("import_actor_storage_file", ("alice", source, "data/fixture", fixture.sha256)),
+            )
+
+    def test_storage_fixture_import_precedes_launch_and_restore_rejects_import(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/fixtures/example")
+        binding = LinuxNativeDesktopRuntimeBinding("chat-native", "source-commit", lifecycle)
+        binding.set_runtime_manifest(self.runtime_manifest())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fixture"
+            source.write_bytes(b"synthetic")
+            fixture = NativeStorageFixture(
+                source, "data/fixture", hashlib.sha256(b"synthetic").hexdigest(),
+            )
+            with self.assertRaises(DriverError):
+                binding.create_bound_session(
+                    "alice", NativeLaunchOptions(restore_session=True, storage_fixtures=(fixture,)),
+                )
+            self.assertFalse(any(name == "launch_actor" for name, _ in lifecycle.calls))
+            with (
+                patch.object(TauriSession, "start"),
+                patch.object(TauriSession, "wait_for_acceptance_harness"),
+                patch.object(binding, "_configure_session_station"),
+                patch.object(binding, "_observe_live_service_identity", return_value="station-peer-four"),
+                patch(
+                    "tooling.acceptance.drivers.native.runtime.persist_client_binding_observation",
+                    return_value=(object(), {}),
+                ),
+            ):
+                binding.create_bound_session("alice", NativeLaunchOptions(storage_fixtures=(fixture,)))
+            operations = [name for name, _ in lifecycle.calls]
+            self.assertLess(operations.index("import_actor_storage_file"), operations.index("launch_actor"))
+
+    @staticmethod
+    def runtime_manifest() -> dict[str, object]:
+        return {
+            "environmentId": "native-tauri-embedded-webdriver",
+            "gateId": "chat-native",
+            "runId": "provisioning-run",
+            "services": {
+                "station-four": {
+                    "kind": "station",
+                    "endpoint": "http://station.example",
+                    "runtimeIdentity": "station-peer-four",
+                    "attestationArtifact": {
+                        "artifactKind": "acceptance-artifact-ref",
+                        "workspaceId": "workspace",
+                        "gateId": "chat-native",
+                        "runId": "evidence-run",
+                        "path": "runtime/services/station-four/attestation.json",
+                        "sha256": "a" * 64,
+                        "mediaType": "application/json",
+                    },
+                }
+            },
+            "clients": [
+                {
+                    "id": "alice",
+                    "actor": "alice",
+                    "runtime": "native-tauri",
+                    "webdriver_port": 4445,
+                    "gateway_port": 18081,
+                    "profile": "alice",
+                    "storage_root": "/workspace/run/actors/alice/storage",
+                    "required_service_roles": ["station"],
+                    "service_bindings": {
+                        "station": {
+                            "service_id": "station-four",
+                            "required_kind": "station",
+                        }
+                    },
+                }
+            ],
+        }
+
+    def test_station_configuration_uses_tauri_input_envelope(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "station_peer_id": "station-peer-four",
+                                "routes": [
+                                    {
+                                        "route_id": "direct-primary",
+                                        "route_type": "direct",
+                                        "endpoint_origin": (
+                                            "http://station.example"
+                                        ),
+                                        "attestation_expires_at_unix_ms": 10,
+                                        "route_generation": 1,
+                                    },
+                                    {
+                                        "route_id": "relay-newer",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "http://station.example"
+                                        ),
+                                        "attestation_expires_at_unix_ms": 20,
+                                        "route_generation": 2,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+            }
+        }
+
+        binding._configure_session_station(
+            session,
+            "http://station.example",
+            "station-four",
+            "station-peer-four",
+        )
+
+        self.assertEqual(
+            session.invoke_app_result.call_args_list,
+            [
+                call(
+                    "station_add",
+                    {"input": {"input": "http://station.example"}},
+                ),
+                call(
+                    "station_set_active",
+                    {
+                        "input": {
+                            "station_peer_id": "station-peer-four",
+                            "route_id": "direct-primary",
+                        }
+                    },
+                ),
+            ],
+        )
+
+    def test_station_configuration_selects_refreshed_direct_candidate(
+        self,
+    ) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "station_peer_id": "station-peer-four",
+                                "routes": [
+                                    {
+                                        "route_id": "direct-primary",
+                                        "route_type": "direct",
+                                        "endpoint_origin": (
+                                            "https://old-proxy.example:18443"
+                                        ),
+                                        "health": "available",
+                                    }
+                                ],
+                                "candidate_route_refreshes": [
+                                    {
+                                        "route_id": "direct-primary",
+                                        "route_type": "direct",
+                                        "endpoint_origin": (
+                                            "https://new-proxy.example:19443"
+                                        ),
+                                        "health": "available",
+                                        "attestation_expires_at_unix_ms": 20,
+                                        "route_generation": 1,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+            }
+        }
+
+        binding._configure_session_station(
+            session,
+            "https://new-proxy.example:19443",
+            "station-four",
+            "station-peer-four",
+        )
+
+        self.assertEqual(
+            session.invoke_app_result.call_args_list[-1],
+            call(
+                "station_set_active",
+                {
+                    "input": {
+                        "station_peer_id": "station-peer-four",
+                        "route_id": "direct-primary",
+                    }
+                },
+            ),
+        )
+
+    def test_station_configuration_prefers_fresh_available_route(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "station_peer_id": "station-peer-foreign",
+                                "routes": [
+                                    {
+                                        "route_id": "relay-foreign-newer",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "https://relay.example:18443"
+                                        ),
+                                        "health": "available",
+                                        "attestation_expires_at_unix_ms": 100,
+                                        "last_verified_at": (
+                                            "2026-10-14T10:00:00Z"
+                                        ),
+                                    }
+                                ],
+                            },
+                            {
+                                "station_peer_id": "station-peer-four",
+                                "routes": [
+                                    {
+                                        "route_id": "relay-expired",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "https://relay.example:18443"
+                                        ),
+                                        "health": "available",
+                                        "attestation_expires_at_unix_ms": 10,
+                                        "last_verified_at": (
+                                            "2026-10-11T10:00:00Z"
+                                        ),
+                                    },
+                                    {
+                                        "route_id": "relay-unavailable",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "https://relay.example:18443"
+                                        ),
+                                        "health": "unavailable",
+                                        "attestation_expires_at_unix_ms": 30,
+                                        "last_verified_at": (
+                                            "2026-10-13T10:00:00Z"
+                                        ),
+                                    },
+                                    {
+                                        "route_id": "relay-current",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "https://relay.example:18443"
+                                        ),
+                                        "health": "available",
+                                        "attestation_expires_at_unix_ms": 20,
+                                        "last_verified_at": (
+                                            "2026-10-12T10:00:00Z"
+                                        ),
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                )
+            }
+        }
+
+        binding._configure_session_station(
+            session,
+            "https://relay.example:18443",
+            "station-via-relay",
+            "station-peer-four",
+        )
+
+        self.assertEqual(
+            session.invoke_app_result.call_args_list[-1],
+            call(
+                "station_set_active",
+                {
+                    "input": {
+                        "station_peer_id": "station-peer-four",
+                        "route_id": "relay-current",
+                    }
+                },
+            ),
+        )
+
+    def test_station_configuration_selects_single_relay_transport_route(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "station_peer_id": "station-peer-four",
+                                "routes": [
+                                    {
+                                        "route_id": "relay-primary",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "https://relay.example:18443"
+                                        ),
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+            }
+        }
+
+        binding._configure_session_station(
+            session,
+            "http://relay.example:18081",
+            "station-via-relay",
+            "station-peer-four",
+        )
+
+        self.assertEqual(
+            session.invoke_app_result.call_args_list,
+            [
+                call(
+                    "station_add",
+                    {"input": {"input": "http://relay.example:18081"}},
+                ),
+                call(
+                    "station_set_active",
+                    {
+                        "input": {
+                            "station_peer_id": "station-peer-four",
+                            "route_id": "relay-primary",
+                        }
+                    },
+                ),
+            ],
+        )
+
+    def test_observation_requires_active_station_and_bound_route(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "active_station_peer_id": "station-peer-four",
+                        "entries": [
+                            {
+                                "station_peer_id": "station-peer-four",
+                                "active_route_id": "relay-primary",
+                                "routes": [
+                                    {
+                                        "route_id": "relay-primary",
+                                        "route_type": "direct",
+                                        "endpoint_origin": (
+                                            "http://station.example"
+                                        ),
+                                        "health": "available",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            }
+        }
+
+        observed = binding._observe_live_service_identity(
+            session,
+            client_id="alice",
+            binding_role="station",
+        )
+
+        self.assertEqual(observed, "station-peer-four")
+
+    def test_relay_observation_accepts_discovered_tls_transport(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        manifest = self.runtime_manifest()
+        manifest["services"] = {
+            "station-via-relay": {
+                "kind": "station",
+                "endpoint": "http://relay.example:18081",
+                "runtimeIdentity": "station-peer-four",
+            }
+        }
+        clients = manifest["clients"]
+        assert isinstance(clients, list)
+        client = clients[0]
+        assert isinstance(client, dict)
+        client["service_bindings"] = {
+            "station": {
+                "service_id": "station-via-relay",
+                "required_kind": "station",
+            }
+        }
+        binding.set_runtime_manifest(manifest)
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "active_station_peer_id": "station-peer-four",
+                        "entries": [
+                            {
+                                "station_peer_id": "station-peer-four",
+                                "active_route_id": "relay-primary",
+                                "routes": [
+                                    {
+                                        "route_id": "relay-primary",
+                                        "route_type": "relay",
+                                        "endpoint_origin": (
+                                            "https://relay.example:18443"
+                                        ),
+                                        "health": "available",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            }
+        }
+
+        observed = binding._observe_live_service_identity(
+            session,
+            client_id="alice",
+            binding_role="station",
+        )
+
+        self.assertEqual(observed, "station-peer-four")
+
+    def test_relay_route_match_rejects_non_relay_or_foreign_transport(
+        self,
+    ) -> None:
+        locator = "http://relay.example:18081"
+        self.assertFalse(
+            _route_matches_bound_service(
+                "station-via-relay",
+                locator,
+                {
+                    "route_type": "direct",
+                    "endpoint_origin": "https://relay.example:18443",
+                },
+            )
+        )
+        self.assertFalse(
+            _route_matches_bound_service(
+                "station-via-relay",
+                locator,
+                {
+                    "route_type": "relay",
+                    "endpoint_origin": "https://other.example:18443",
+                },
+            )
+        )
+        self.assertFalse(
+            _route_matches_bound_service(
+                "station-via-relay",
+                locator,
+                {
+                    "route_type": "relay",
+                    "endpoint_origin": "http://relay.example:18443",
+                },
+            )
+        )
+
+    def test_observation_rejects_route_for_different_station(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+        session = Mock(spec=TauriSession)
+        session.invoke_app_result.return_value = {
+            "data": {
+                "status": json.dumps(
+                    {
+                        "active_station_peer_id": "other-station",
+                        "entries": [],
+                    }
+                )
+            }
+        }
+
+        with (
+            patch(
+                "tooling.acceptance.drivers.native.runtime.time.monotonic",
+                side_effect=[0.0, 31.0],
+            ),
+            self.assertRaises(ClientBindingError),
+        ):
+            binding._observe_live_service_identity(
+                session,
+                client_id="alice",
+                binding_role="station",
+            )
+
+    def test_windows_binding_delegates_to_platform_neutral_lifecycle(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            r"C:\acceptance\actors\alice\fixture.png"
+        )
+        binding = WindowsNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+
+        self.assertEqual(binding.cell_id, "desktop-windows-native")
+        self.assertEqual(binding.native_adapter.platform, "win32")
+        self.assertEqual(
+            lifecycle.calls[0],
+            ("validate_binding", ("chat-native", "source-commit")),
+        )
+
+        binding.native_adapter.activate_process(712)
+        binding.native_adapter.post_mouse(
+            (MouseAction.MOVE,),
+            (14.5, 28.0),
+        )
+        binding.native_adapter.post_mouse_to_process(
+            712,
+            (MouseAction.MOVE, MouseAction.LEFT_DOWN, MouseAction.LEFT_UP),
+            (18.0, 32.5),
+        )
+        binding.native_adapter.post_key(NativeKey.ENTER, text="value")
+        binding.native_adapter.post_key_to_process(
+            712,
+            NativeKey.ENTER,
+            private_source=True,
+        )
+        binding.native_adapter.post_key_sequence_to_process(
+            712,
+            (NativeKey.ENTER, NativeKey.TAB, NativeKey.ENTER),
+            interval_seconds=0.2,
+            private_source=True,
+        )
+        revealed_control = (
+            binding.native_adapter.reveal_file_chooser_location_to_process(712)
+        )
+        path_control = binding.native_adapter.select_file_chooser_path_to_process(
+            712,
+            r"C:\acceptance\fixture.png",
+        )
+        activated_control = binding.native_adapter.activate_and_focused_control(712)
+        control = binding.native_adapter.focused_control(712)
+        self.assertIsNotNone(revealed_control)
+        self.assertEqual(revealed_control.kind, "text-field")
+        self.assertIsNotNone(path_control)
+        self.assertEqual(path_control.kind, "text-field")
+        self.assertTrue(activated_control.frontmost)
+        self.assertTrue(control.frontmost)
+        self.assertEqual(control.actual_frontmost_pid, 712)
+        self.assertIn(
+            (
+                "execute_adapter",
+                (
+                    "post_key_to_process",
+                    {
+                        "processId": 712,
+                        "key": "enter",
+                        "modifiers": [],
+                        "text": "",
+                        "privateSource": True,
+                    },
+                ),
+            ),
+            lifecycle.calls,
+        )
+        self.assertIn(
+            (
+                "execute_adapter",
+                (
+                    "post_mouse_to_process",
+                    {
+                        "processId": 712,
+                        "actions": ["move", "left-down", "left-up"],
+                        "point": [18.0, 32.5],
+                    },
+                ),
+            ),
+            lifecycle.calls,
+        )
+        self.assertIn(
+            (
+                "execute_adapter",
+                (
+                    "reveal_file_chooser_location_to_process",
+                    {"processId": 712},
+                ),
+            ),
+            lifecycle.calls,
+        )
+        self.assertIn(
+            (
+                "execute_adapter",
+                (
+                    "select_file_chooser_path_to_process",
+                    {
+                        "processId": 712,
+                        "path": r"C:\acceptance\fixture.png",
+                    },
+                ),
+            ),
+            lifecycle.calls,
+        )
+        self.assertIn(
+            (
+                "execute_adapter",
+                (
+                    "post_key_sequence_to_process",
+                    {
+                        "processId": 712,
+                        "keys": ["enter", "tab", "enter"],
+                        "intervalSeconds": 0.2,
+                        "privateSource": True,
+                    },
+                ),
+            ),
+            lifecycle.calls,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = Path(directory) / "native.bmp"
+            binding.native_adapter.capture_screenshot(screenshot)
+            self.assertEqual(screenshot.read_bytes(), b"bitmap")
+        self.assertEqual(binding.native_adapter.read_clipboard(), b"clipboard")
+
+    def test_linux_binding_delegates_focused_text_verification(self) -> None:
+        staged_path = "/workspace/run/actors/alice/fixture.png"
+        lifecycle = SyntheticRemoteNativeLifecycle(staged_path)
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+
+        verified = binding.native_adapter.verify_focused_text(
+            staged_path,
+            timeout_seconds=10,
+        )
+
+        self.assertTrue(verified)
+        self.assertEqual(
+            lifecycle.calls[-1],
+            (
+                "execute_adapter",
+                (
+                    "verify_focused_text",
+                    {
+                        "expected": staged_path,
+                        "timeoutSeconds": 10,
+                    },
+                ),
+            ),
+        )
+        remote_control = (
+            Path(__file__).resolve().parents[1]
+            / "images/desktop-linux/remote_control.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"verify_focused_text",',
+            remote_control,
+        )
+        self.assertIn(
+            'elif operation == "verify_focused_text":',
+            remote_control,
+        )
+
+    def test_windows_binding_accepts_drive_absolute_remote_paths(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            r"C:\acceptance\actors\alice\fixture.png"
+        )
+        binding = WindowsNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+
+        staged = binding.stage_native_file("alice", Path("fixture.png"))
+
+        self.assertEqual(
+            str(staged),
+            r"C:\acceptance\actors\alice\fixture.png",
+        )
+        self.assertEqual(
+            binding.native_file_sha256("alice", staged),
+            "b" * 64,
+        )
+
+    def test_windows_clipboard_write_retries_one_broker_failure(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            r"C:\acceptance\actors\alice\fixture.png"
+        )
+        lifecycle.execute_adapter = Mock(
+            side_effect=[DriverError("broker timeout"), {}],
+        )
+        binding = WindowsNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+
+        binding.native_adapter.write_clipboard(b"replacement")
+
+        self.assertEqual(lifecycle.execute_adapter.call_count, 2)
+        lifecycle.execute_adapter.assert_called_with(
+            "write_clipboard",
+            {
+                "content": base64.b64encode(b"replacement").decode("ascii"),
+            },
+        )
+
+    def test_remote_binding_delegates_session_endpoint_and_cleanup(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/fixture.png"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        client_spec = {
+            "webdriver_port": 4445,
+            "gateway_port": 18081,
+            "profile": "alice",
+            "storage_root": "/workspace/run/actors/alice/storage",
+        }
+
+        session = binding._create_session(
+            "alice",
+            client_spec,
+            {"PEERS_STATION_URL": "http://station.example"},
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+        handle = binding.create_transport_override(
+            "alice",
+            "station",
+            "http://127.0.0.1:39000/proxy"
+        )
+        binding.clone_actor_storage(
+            "alice",
+            client_spec,
+            "alice-restarted",
+            client_spec,
+            "profiles/alice",
+        )
+        cleanup = binding.finalize_cleanup([session], {"alice": client_spec})
+
+        self.assertEqual(session.process_id, 712)
+        self.assertFalse(hasattr(handle, "url"))
+        self.assertEqual(
+            lifecycle.released_endpoints,
+            ["orchestrator-endpoint-1"],
+        )
+        self.assertTrue(cleanup["processesReleased"])
+        self.assertTrue(cleanup["endpointsReleased"])
+        self.assertEqual(cleanup["cleanupErrors"], [])
+
+    def test_clone_path_normalization_rejects_unsafe_inputs(self) -> None:
+        self.assertEqual(
+            normalize_clone_paths("peers-touch/desktop/data/meta"),
+            (
+                CloneStorageEntry(
+                    "peers-touch/desktop/data/meta",
+                    "peers-touch/desktop/data/meta",
+                ),
+            ),
+        )
+        self.assertEqual(
+            normalize_clone_paths(
+                [
+                    "peers-touch/desktop/data/secure-store/identity-keys",
+                    CloneStorageEntry(
+                        "peers-touch/chat-native-bob1/data/auth/device_id",
+                        "peers-touch/chat-native-bob2/data/auth/device_id",
+                    ),
+                ]
+            ),
+            (
+                CloneStorageEntry(
+                    "peers-touch/desktop/data/secure-store/identity-keys",
+                    "peers-touch/desktop/data/secure-store/identity-keys",
+                ),
+                CloneStorageEntry(
+                    "peers-touch/chat-native-bob1/data/auth/device_id",
+                    "peers-touch/chat-native-bob2/data/auth/device_id",
+                ),
+            ),
+        )
+        invalid_entries = [
+            "",
+            ".",
+            "..",
+            "/abs/path",
+            "a/../b",
+            "a/./b",
+            r"\abs\path",
+            r"C:\abs\path",
+            r"a\..\b",
+            ["a", "a"],
+            [],
+            CloneStorageEntry("a", "/abs/target"),
+            CloneStorageEntry("../a", "b"),
+            CloneStorageEntry("a", "b/../c"),
+            CloneStorageEntry("a", ""),
+            # Two remaps landing on the same target are ambiguous.
+            [CloneStorageEntry("a", "c"), CloneStorageEntry("b", "c")],
+        ]
+        for invalid in invalid_entries:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(DriverError):
+                    normalize_clone_paths(invalid)
+
+    def test_local_clone_copies_multiple_relative_roots(self) -> None:
+        with patch.object(
+            LocalMacOSRuntimeBinding, "_consume_prepared_binary"
+        ):
+            binding = LocalMacOSRuntimeBinding()
+        with tempfile.TemporaryDirectory() as run_root:
+            source_root = Path(run_root) / "bob1" / "storage"
+            target_root = Path(run_root) / "bob2" / "storage"
+            keys = source_root / "secure-store" / "identity-keys"
+            keys.mkdir(parents=True)
+            (keys / "actor.key").write_text("identity", encoding="utf-8")
+            source_auth = (
+                source_root / "peers-touch" / "chat-native-bob1" / "data"
+                / "auth"
+            )
+            source_auth.mkdir(parents=True)
+            (source_auth / "device_id").write_text(
+                "01JINSTALLDEVICEID", encoding="utf-8"
+            )
+
+            binding.clone_actor_storage(
+                "bob1",
+                {"storage_root": source_root},
+                "bob2",
+                {"storage_root": target_root},
+                (
+                    "secure-store/identity-keys",
+                    CloneStorageEntry(
+                        "peers-touch/chat-native-bob1/data/auth/device_id",
+                        "peers-touch/chat-native-bob2/data/auth/device_id",
+                    ),
+                ),
+            )
+
+            copied_key = (
+                target_root
+                / "secure-store"
+                / "identity-keys"
+                / "actor.key"
+            )
+            copied_device = (
+                target_root / "peers-touch" / "chat-native-bob2" / "data"
+                / "auth" / "device_id"
+            )
+            self.assertEqual(copied_key.read_text(encoding="utf-8"), "identity")
+            self.assertEqual(
+                copied_device.read_text(encoding="utf-8"),
+                "01JINSTALLDEVICEID",
+            )
+            self.assertFalse(
+                (
+                    target_root / "peers-touch" / "chat-native-bob1"
+                ).exists()
+            )
+
+    def test_verified_direct_override_keeps_station_discovery_untouched(
+        self,
+    ) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+        session = Mock()
+        session.is_alive.return_value = True
+        binding._sessions_by_client["alice"] = session
+        handle = binding.create_transport_override(
+            "alice",
+            "station",
+            "/ip4/127.0.0.1/tcp/39000/p2p/"
+            "12D3KooWGo2HxmjfSQZKTheDEbgDBpSuhUxTNsr8DnTkXCDzdaZL",
+        )
+
+        binding.apply_verified_direct_route_override(
+            "alice",
+            "station",
+            handle,
+        )
+        binding.clear_verified_direct_route_override(
+            "alice",
+            "station",
+            handle,
+        )
+
+        self.assertEqual(
+            session.invoke_app_result.call_args_list,
+            [
+                call(
+                    "acceptance_station_direct_route_override",
+                    {
+                        "input": {
+                            "dial_multiaddr": (
+                                "/ip4/127.0.0.1/tcp/40123/p2p/"
+                                "12D3KooWGo2HxmjfSQZKTheDEbgDBpSuhUxTNsr8DnTkXCDzdaZL"
+                            )
+                        }
+                    },
+                ),
+                call(
+                    "acceptance_station_direct_route_override",
+                    {"input": {"dial_multiaddr": None}},
+                ),
+            ],
+        )
+        self.assertEqual(
+            lifecycle.released_endpoints,
+            ["orchestrator-endpoint-1"],
+        )
+
+    def test_bound_session_launches_observes_and_accumulates_proof(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+        proof = BindingProofRecord(
+            evidence_run_id="evidence-run",
+            provisioning_run_id="provisioning-run",
+            environment_id="native-tauri-embedded-webdriver",
+            gate_id="chat-native",
+            client_id="alice",
+            binding_role="station",
+            declared_service_id="station-four",
+            launch_generation=1,
+            service_attestation_ref={
+                "artifactKind": "acceptance-artifact-ref",
+                "sha256": "a" * 64,
+            },
+            service_attestation_digest="a" * 64,
+            client_runtime_identity=ClientRuntimeIdentity(
+                runtime="native-tauri",
+                instance_id="alice-generation-1",
+                identity_digest="b" * 64,
+            ),
+            observed_runtime_identity="station-peer-four",
+            captured_at="2026-09-03T00:00:00+00:00",
+            proof_mechanism="native-tauri-peer-id-check",
+            verifier_id="core-client-binding",
+            verifier_source_digest="c" * 64,
+        )
+        reference = {
+            "artifactKind": "acceptance-artifact-ref",
+            "path": "runtime/client-bindings/alice/generation-1/station.json",
+        }
+
+        with (
+            patch.object(TauriSession, "start"),
+            patch.object(TauriSession, "wait_for_acceptance_harness"),
+            patch.object(
+                binding,
+                "_configure_session_station",
+            ) as configure,
+            patch.object(
+                binding,
+                "_observe_live_service_identity",
+                return_value="station-peer-four",
+            ) as observe,
+            patch(
+                "tooling.acceptance.drivers.native.runtime."
+                "persist_client_binding_observation",
+                return_value=(proof, reference),
+            ) as persist,
+        ):
+            session = binding.create_bound_session("alice")
+
+        self.assertIsNotNone(session)
+        configure.assert_called_once_with(
+            session,
+            "http://station.example",
+            "station-four",
+            "station-peer-four",
+        )
+        observe.assert_called_once()
+        persist.assert_called_once()
+        self.assertEqual(binding.proof_refs(), (reference,))
+        launch_environment = lifecycle.calls[-1][1][2]
+        self.assertNotIn("PEERS_STATION_URL", launch_environment)
+        self.assertEqual(
+            launch_environment["PT_STATION_URL"],
+            "http://station.example",
+        )
+        self.assertEqual(
+            launch_environment["PT_STATION_HEALTH_URL"],
+            "http://station.example/sub-oss/healthz",
+        )
+
+    def test_prelaunch_transport_override_keeps_canonical_discovery_and_origin(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native", "source-commit", lifecycle,
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+        binding.create_transport_override(
+            "alice", "station", "http://127.0.0.1:39000",
+        )
+        with (
+            patch.object(TauriSession, "start"),
+            patch.object(TauriSession, "wait_for_acceptance_harness"),
+            patch.object(binding, "_configure_session_station") as configure,
+            patch.object(
+                binding, "_observe_live_service_identity",
+                return_value="station-peer-four",
+            ),
+            patch(
+                "tooling.acceptance.drivers.native.runtime.persist_client_binding_observation",
+                return_value=(Mock(), {"artifactKind": "acceptance-artifact-ref"}),
+            ) as persist,
+        ):
+            session = binding.create_bound_session("alice")
+        configure.assert_called_once_with(
+            session, "http://station.example", "station-four", "station-peer-four",
+        )
+        self.assertEqual(
+            persist.call_args.kwargs["observed_runtime_identity"], "station-peer-four",
+        )
+        self.assertEqual(
+            lifecycle.calls[-1][1][2]["PT_STATION_URL"], "http://station.example",
+        )
+
+    def test_relay_binding_stages_attested_tls_anchor_before_launch(
+        self,
+    ) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/relay-ca.pem"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        manifest = self.runtime_manifest()
+        manifest["services"] = {
+            "station-via-relay": {
+                "kind": "station",
+                "endpoint": "https://relay.example:18081",
+                "runtimeIdentity": "station-peer-four",
+            }
+        }
+        client = manifest["clients"][0]
+        client["service_bindings"] = {
+            "station": {
+                "service_id": "station-via-relay",
+                "required_kind": "station",
+            }
+        }
+        binding.set_runtime_manifest(manifest)
+
+        with (
+            patch.object(
+                binding,
+                "_relay_tls_trust_anchor",
+                return_value=(Path("/evidence/relay-ca.pem"), "b" * 64),
+            ),
+            patch.object(TauriSession, "start"),
+            patch.object(TauriSession, "wait_for_acceptance_harness"),
+            patch.object(binding, "_configure_session_station"),
+            patch.object(
+                binding,
+                "_observe_live_service_identity",
+                return_value="station-peer-four",
+            ),
+            patch(
+                "tooling.acceptance.drivers.native.runtime."
+                "persist_client_binding_observation",
+                return_value=(object(), {}),
+            ),
+        ):
+            binding.create_bound_session("alice")
+
+        stage_call = next(
+            item for item in lifecycle.calls if item[0] == "stage_actor_file"
+        )
+        hash_call = next(
+            item for item in lifecycle.calls if item[0] == "actor_file_sha256"
+        )
+        launch_call = next(
+            item for item in lifecycle.calls if item[0] == "launch_actor"
+        )
+        self.assertEqual(
+            stage_call[1],
+            ("alice", Path("/evidence/relay-ca.pem")),
+        )
+        self.assertEqual(
+            hash_call[1],
+            (
+                "alice",
+                "/workspace/run/actors/alice/relay-ca.pem",
+            ),
+        )
+        self.assertEqual(
+            launch_call[1][2]["PT_ACCEPTANCE_RELAY_TLS_CA_FILE"],
+            "/workspace/run/actors/alice/relay-ca.pem",
+        )
+
+    def test_direct_binding_stages_same_station_relay_anchor(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle(
+            "/workspace/run/actors/alice/relay-ca.pem"
+        )
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        manifest = self.runtime_manifest()
+        manifest["services"]["station-via-relay"] = {
+            "kind": "station",
+            "endpoint": "https://relay.example:18081",
+            "runtimeIdentity": "station-peer-four",
+        }
+        binding.set_runtime_manifest(manifest)
+
+        with (
+            patch.object(
+                binding,
+                "_relay_tls_trust_anchor",
+                return_value=(Path("/evidence/relay-ca.pem"), "b" * 64),
+            ) as trust_anchor,
+            patch.object(TauriSession, "start"),
+            patch.object(TauriSession, "wait_for_acceptance_harness"),
+            patch.object(binding, "_configure_session_station"),
+            patch.object(
+                binding,
+                "_observe_live_service_identity",
+                return_value="station-peer-four",
+            ),
+            patch(
+                "tooling.acceptance.drivers.native.runtime."
+                "persist_client_binding_observation",
+                return_value=(object(), {}),
+            ),
+        ):
+            binding.create_bound_session("alice")
+
+        trust_anchor.assert_called_once_with("station-via-relay")
+        launch_call = next(
+            item for item in lifecycle.calls if item[0] == "launch_actor"
+        )
+        self.assertEqual(
+            launch_call[1][2]["PT_ACCEPTANCE_RELAY_TLS_CA_FILE"],
+            "/workspace/run/actors/alice/relay-ca.pem",
+        )
+
+    def test_relay_tls_anchor_resolves_only_from_bound_attestations(
+        self,
+    ) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        run_id = "20261010T000000000000Z-" + "1" * 32
+
+        def artifact(path: str, digest: str, media_type: str) -> dict[str, str]:
+            return {
+                "artifactKind": "acceptance-artifact-ref",
+                "workspaceId": workspace_id(Path.cwd()),
+                "gateId": "chat-native",
+                "runId": run_id,
+                "path": path,
+                "sha256": digest,
+                "mediaType": media_type,
+            }
+
+        route_ref = artifact(
+            "runtime/services/station-via-relay/attestation.json",
+            "a" * 64,
+            "application/json",
+        )
+        relay_ref = artifact(
+            "runtime/services/relay/attestation.json",
+            "b" * 64,
+            "application/json",
+        )
+        trust_ref = artifact(
+            "runtime/services/relay/tls-ca.pem",
+            "c" * 64,
+            "application/x-pem-file",
+        )
+        manifest = self.runtime_manifest()
+        manifest["services"] = {
+            "station-via-relay": {
+                "kind": "station",
+                "endpoint": "https://relay.example:18081",
+                "runtimeIdentity": "station-peer-four",
+                "attestationArtifact": route_ref,
+            },
+            "relay": {
+                "kind": "relay",
+                "endpoint": "https://relay.example:18081",
+                "runtimeIdentity": "relay-peer",
+                "attestationArtifact": relay_ref,
+            },
+        }
+        binding.set_runtime_manifest(manifest)
+        store = Mock()
+        store.read_json.side_effect = (
+            {
+                "route": {
+                    "relayServiceId": "relay",
+                    "relayPeerId": "relay-peer",
+                    "relayAttestationRef": relay_ref,
+                }
+            },
+            {
+                "runtimeIdentity": "relay-peer",
+                "runtimeSecurity": {
+                    "tlsTrustAnchor": {
+                        "sha256": "sha256:" + "c" * 64,
+                        "artifact": trust_ref,
+                    }
+                }
+            },
+        )
+        store.resolve.return_value = Path("/evidence/relay-ca.pem")
+
+        with patch(
+            "tooling.acceptance.drivers.native.runtime."
+            "EvidenceStore.from_environment",
+            return_value=store,
+        ):
+            resolved = binding._relay_tls_trust_anchor(
+                "station-via-relay"
+            )
+
+        self.assertEqual(
+            resolved,
+            (Path("/evidence/relay-ca.pem"), "c" * 64),
+        )
+        store.resolve.assert_called_once()
+
+    def test_macos_session_injects_declared_actor_identity_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            identity_root = Path(directory) / "actor-identity"
+            identity_root.mkdir()
+            with patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_NATIVE_DEV": "1"},
+            ):
+                binding = LocalMacOSRuntimeBinding()
+                session = binding._create_session(
+                    "alice",
+                    {
+                        "worktree": str(Path.cwd()),
+                        "webdriver_port": 4447,
+                        "gateway_port": 3140,
+                        "renderer_port": 3410,
+                        "profile": "chat-native-alice",
+                        "storage_root": "/tmp/chat-native-alice",
+                        "actor_identity_root": str(identity_root),
+                    },
+                    {"PT_STATION_URL": "http://station.example"},
+                )
+
+            self.assertEqual(
+                session.launcher.environment["PEERS_ACTOR_IDENTITY_ROOT"],
+                str(identity_root),
+            )
+            self.assertNotEqual(
+                session.launcher.environment["PEERS_ACTOR_IDENTITY_ROOT"],
+                session.storage_root,
+            )
+
+    def test_bound_session_uses_client_id_for_same_actor_devices(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        manifest = self.runtime_manifest()
+        client = manifest["clients"][0]
+        client["id"] = "alice2"
+        client["actor"] = "alice"
+        binding.set_runtime_manifest(manifest)
+
+        with (
+            patch.object(TauriSession, "start"),
+            patch.object(TauriSession, "wait_for_acceptance_harness"),
+            patch.object(binding, "_configure_session_station"),
+            patch.object(
+                binding,
+                "_observe_live_service_identity",
+                return_value="station-peer-four",
+            ),
+            patch(
+                "tooling.acceptance.drivers.native.runtime."
+                "persist_client_binding_observation",
+                return_value=(object(), {}),
+            ),
+        ):
+            binding.create_bound_session("alice2")
+
+        launch_call = next(
+            call for call in lifecycle.calls if call[0] == "launch_actor"
+        )
+        self.assertEqual(launch_call[1][0], "alice2")
+        self.assertEqual(launch_call[1][1]["actor"], "alice")
+
+    def test_restored_session_observes_persisted_binding_without_reconfigure(
+        self,
+    ) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+        binding.set_runtime_manifest(self.runtime_manifest())
+
+        with (
+            patch.object(TauriSession, "start"),
+            patch.object(TauriSession, "wait_for_acceptance_harness"),
+            patch.object(
+                binding,
+                "_configure_session_station",
+            ) as configure,
+            patch.object(
+                binding,
+                "_observe_live_service_identity",
+                return_value="station-peer-four",
+            ),
+            patch(
+                "tooling.acceptance.drivers.native.runtime."
+                "persist_client_binding_observation",
+                return_value=(object(), {}),
+            ),
+        ):
+            binding.create_bound_session(
+                "alice",
+                NativeLaunchOptions(restore_session=True),
+            )
+
+        configure.assert_not_called()
+
+    def test_linux_binding_keeps_posix_absolute_path_validation(self) -> None:
+        lifecycle = SyntheticRemoteNativeLifecycle("relative/fixture.png")
+        binding = LinuxNativeDesktopRuntimeBinding(
+            "chat-native",
+            "source-commit",
+            lifecycle,
+        )
+
+        with self.assertRaisesRegex(
+            DriverError,
+            "desktop-linux-native returned a relative staged file path",
+        ):
+            binding.stage_native_file("alice", Path("fixture.png"))
+
+    def test_resolver_uses_registered_lifecycle_for_remote_platforms(self) -> None:
+        linux_lifecycle = SyntheticRemoteNativeLifecycle("/tmp/fixture.png")
+        windows_lifecycle = SyntheticRemoteNativeLifecycle(
+            r"C:\acceptance\fixture.png"
+        )
+        lifecycles = {
+            "desktop-linux-native": linux_lifecycle,
+            "desktop-windows-native": windows_lifecycle,
+        }
+
+        with patch(
+            "tooling.acceptance.provisioners.get_runtime_cell_lifecycle",
+            side_effect=lifecycles.__getitem__,
+        ) as get_lifecycle:
+            linux = resolve_native_desktop_runtime(
+                "desktop-linux-native",
+                gate_id="chat-native",
+                source_commit="source-commit",
+            )
+            windows = resolve_native_desktop_runtime(
+                "desktop-windows-native",
+                gate_id="chat-native",
+                source_commit="source-commit",
+            )
+
+        self.assertIsInstance(linux, LinuxNativeDesktopRuntimeBinding)
+        self.assertIsInstance(windows, WindowsNativeDesktopRuntimeBinding)
+        self.assertEqual(
+            [call.args[0] for call in get_lifecycle.call_args_list],
+            ["desktop-linux-native", "desktop-windows-native"],
+        )
+
+    def test_macos_development_binding_launches_through_make(self) -> None:
+        client = {
+            "worktree": str(Path.cwd()),
+            "webdriver_port": 4447,
+            "gateway_port": 3140,
+            "renderer_port": 3410,
+            "profile": "chat-native-alice",
+            "storage_root": "/tmp/chat-native-alice",
+        }
+        with patch.dict(
+            "os.environ",
+            {"PT_ACCEPTANCE_NATIVE_DEV": "1"},
+        ):
+            binding = LocalMacOSRuntimeBinding()
+            session = binding._create_session(
+                "alice",
+                client,
+                {
+                    "PT_ACCEPTANCE_WINDOW_SLOT": "0",
+                    "PT_ACCEPTANCE_WINDOW_COUNT": "2",
+                },
+            )
+
+        self.assertIsInstance(session.launcher, MakeDesktopLauncher)
+        self.assertEqual(session.launcher.worktree, Path.cwd())
+        self.assertEqual(session.launcher.port, 4447)
+        self.assertEqual(session.launcher.gateway_port, 3140)
+        self.assertEqual(session.launcher.renderer_port, 3410)
+        self.assertEqual(session.launcher.profile, "chat-native-alice")
+
+    def test_make_launcher_uses_allocated_ports_after_managed_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "peers-group-chat"
+            root.mkdir(parents=True)
+            (root / "Makefile").write_text("desktop-stop:\n\t@true\n", encoding="utf-8")
+            profile = Path(temp_dir) / "four.env"
+            profile.write_text(
+                "\n".join(
+                    (
+                        "PT_DEV_PROFILE=four",
+                        "PT_DEV_SLOT=3",
+                        "PT_STATION_URL=http://stale-station.example",
+                        (
+                            "PT_STATION_HEALTH_URL="
+                            "http://stale-station.example/sub-oss/healthz"
+                        ),
+                        "PT_DESKTOP_APP_GATEWAY_PORT=3140",
+                        "PT_DESKTOP_APP_WEB_PORT=3410",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            launcher = MakeDesktopLauncher(
+                worktree=root,
+                port=4476,
+                gateway_port=3141,
+                renderer_port=3411,
+                profile="four-app",
+                storage_root=str(root / "storage"),
+                environment={
+                    "PT_STATION_URL": "http://bound-station.example",
+                    "PT_STATION_HEALTH_URL": (
+                        "http://bound-station.example/sub-oss/healthz"
+                    ),
+                },
+            )
+            process = Mock(pid=1234)
+            process.poll.return_value = 0
+            response = Mock()
+            resolved_profile = Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "ok": True,
+                        "profile": {"resolvedPath": str(profile)},
+                    }
+                ),
+                stderr="",
+            )
+
+            with patch(
+                "tooling.acceptance.drivers.tauri.subprocess.Popen",
+                return_value=process,
+            ), patch(
+                "tooling.acceptance.drivers.tauri.subprocess.run",
+                return_value=resolved_profile,
+            ), patch(
+                "tooling.acceptance.drivers.tauri.urllib.request.urlopen",
+                return_value=response,
+            ), patch.object(
+                launcher,
+                "_managed_process_pid",
+                return_value=5678,
+            ), patch.object(
+                launcher,
+                "_owned_listener_pid",
+                return_value=9012,
+            ) as owned_listener:
+                metadata = launcher.start()
+
+            self.assertEqual(metadata.process_id, 9012)
+            owned_listener.assert_called_once_with(4476, 5678)
+            runtime_profile = Path(
+                launcher._launch_environment["PT_DEV_PROFILE_FILE"]
+            )
+            rendered = runtime_profile.read_text(encoding="utf-8")
+            self.assertIn("PT_DEV_PROFILE=four-app", rendered)
+            self.assertIn(
+                "PT_STATION_URL=http://bound-station.example",
+                rendered,
+            )
+            self.assertIn(
+                "PT_STATION_HEALTH_URL="
+                "http://bound-station.example/sub-oss/healthz",
+                rendered,
+            )
+            self.assertNotIn("http://stale-station.example", rendered)
+            self.assertIn("PT_DESKTOP_APP_GATEWAY_PORT=3141", rendered)
+            self.assertIn("PT_DESKTOP_APP_WEB_PORT=3411", rendered)
+            self.assertEqual(
+                launcher._launch_environment[
+                    "PT_DEV_PROFILE_FILE_AUTHORITY"
+                ],
+                "acceptance-runtime-manifest",
+            )
+            self.assertEqual(
+                launcher._launch_environment["PT_DESKTOP_E2E"],
+                "true",
+            )
+            self.assertEqual(
+                launcher._launch_environment["VITE_ACCEPTANCE_HARNESS"],
+                "1",
+            )
+            self.assertEqual(
+                launcher._launch_environment["TAURI_WEBDRIVER_PORT"],
+                "4476",
+            )
+
+            stopped = Mock(returncode=0, stdout="", stderr="")
+            runtime_profile_root = runtime_profile.parent
+            with patch(
+                "tooling.acceptance.drivers.tauri.subprocess.run",
+                return_value=stopped,
+            ) as run:
+                launcher.stop()
+
+            self.assertIn(
+                ["make", "desktop-stop"],
+                [call.args[0] for call in run.call_args_list],
+            )
+            self.assertFalse(runtime_profile_root.exists())
+
+    def test_make_launcher_reads_machine_workspace_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "peers-group-chat"
+            root.mkdir()
+            home = Path(temp_dir) / "home"
+            state_path = (
+                home
+                / ".peers-touch"
+                / "dev"
+                / "workspaces"
+                / workspace_id(root)
+                / "runtime"
+                / "four-app"
+                / "desktop-app-tauri.json"
+            )
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "service": "desktop-app-tauri",
+                        "profile": "four-app",
+                        "worktreeId": "peers-group-chat",
+                        "pid": 5678,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launcher = MakeDesktopLauncher(
+                worktree=root,
+                port=4447,
+                gateway_port=3140,
+                renderer_port=3410,
+                profile="four-app",
+                storage_root=str(root / "storage"),
+                environment={"HOME": str(home)},
+            )
+            launcher._launch_environment = {"HOME": str(home)}
+
+            self.assertEqual(launcher._managed_process_pid(), 5678)
+
+    def test_make_launcher_reads_explicit_profile_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "peers-group-chat"
+            root.mkdir()
+            home = Path(temp_dir) / "home"
+            runtime_profile_root = Path(temp_dir) / "runtime-profile"
+            runtime_profile_root.mkdir()
+            state_path = runtime_profile_root / "desktop-app-tauri.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "service": "desktop-app-tauri",
+                        "profile": "four-app",
+                        "worktreeId": "peers-group-chat",
+                        "pid": 6789,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launcher = MakeDesktopLauncher(
+                worktree=root,
+                port=4447,
+                gateway_port=3140,
+                renderer_port=3410,
+                profile="four-app",
+                storage_root=str(root / "storage"),
+                environment={"HOME": str(home)},
+            )
+            launcher._launch_environment = {"HOME": str(home)}
+            launcher._runtime_profile_root = runtime_profile_root
+
+            self.assertEqual(launcher._managed_process_pid(), 6789)
+
+    def test_macos_cleanup_retains_persistent_client_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ephemeral = root / "ephemeral"
+            persistent = root / "persistent"
+            ephemeral.mkdir()
+            persistent.mkdir()
+            (ephemeral / "state").write_text("temporary", encoding="utf-8")
+            (persistent / "state").write_text("durable", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_NATIVE_DEV": "1"},
+            ):
+                binding = LocalMacOSRuntimeBinding()
+            client_specs = {
+                "alice": {
+                    "webdriver_port": 4445,
+                    "gateway_port": 3140,
+                    "renderer_port": 3410,
+                    "storage_root": str(persistent),
+                    "storage_lifecycle": "persistent",
+                },
+                "bob": {
+                    "webdriver_port": 4446,
+                    "gateway_port": 3141,
+                    "renderer_port": 3411,
+                    "storage_root": str(ephemeral),
+                    "storage_lifecycle": "ephemeral",
+                },
+            }
+
+            with patch(
+                "tooling.acceptance.drivers.native.runtime._wait_for",
+                return_value=True,
+            ):
+                cleanup = binding.finalize_cleanup([], client_specs)
+
+            self.assertTrue(persistent.is_dir())
+            self.assertEqual(
+                (persistent / "state").read_text(encoding="utf-8"),
+                "durable",
+            )
+            self.assertFalse(ephemeral.exists())
+            self.assertTrue(cleanup["storageReleased"])
+            self.assertTrue(cleanup["persistentStorageRetained"])
+            self.assertEqual(
+                cleanup["persistentStorageRoots"],
+                [str(persistent)],
+            )
+            self.assertEqual(
+                cleanup["releasedStorageRoots"],
+                [str(ephemeral)],
+            )
+
+    def test_macos_cleanup_shares_release_budget_and_preserves_live_storage(self) -> None:
+        for ports_free, process_stopped in ((True, True), (False, True), (True, False), (False, False)):
+            with self.subTest(ports_free=ports_free, process_stopped=process_stopped):
+                with tempfile.TemporaryDirectory() as tmp:
+                    storage = Path(tmp) / "owned"
+                    storage.mkdir()
+                    specs = {"alice": {
+                        "webdriver_port": 4445, "gateway_port": 3140,
+                        "renderer_port": 3410, "storage_root": str(storage),
+                    }}
+                    session = Mock(spec=TauriSession)
+                    session.process_id = 12345
+                    session.log_path = None
+                    with patch.dict("os.environ", {"PT_ACCEPTANCE_NATIVE_DEV": "1"}):
+                        binding = LocalMacOSRuntimeBinding()
+                    clock = [0.0]
+
+                    def advance(seconds: float) -> None:
+                        clock[0] += seconds
+
+                    with (
+                        patch("tooling.acceptance.drivers.native.runtime.time.monotonic", side_effect=lambda: clock[0]),
+                        patch("tooling.acceptance.drivers.native.runtime.time.sleep", side_effect=advance),
+                        patch("tooling.acceptance.drivers.native.runtime._port_is_free", return_value=ports_free),
+                        patch("tooling.acceptance.drivers.native.runtime._pid_is_stopped", return_value=process_stopped),
+                    ):
+                        cleanup = binding.finalize_cleanup([session], specs)
+                    self.assertLessEqual(clock[0], 30.0 + 1e-9)
+                    self.assertEqual(cleanup["portsReleased"], ports_free)
+                    self.assertEqual(cleanup["processesReleased"], process_stopped)
+                    self.assertEqual(cleanup["pids"], [12345])
+                    self.assertEqual(storage.exists(), not process_stopped)
+                    self.assertEqual(cleanup["storageReleased"], process_stopped)
+
+    def test_macos_cleanup_rejects_unknown_storage_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Path(temp_dir) / "unknown"
+            storage.mkdir()
+            with patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_NATIVE_DEV": "1"},
+            ):
+                binding = LocalMacOSRuntimeBinding()
+            client_specs = {
+                "alice": {
+                    "webdriver_port": 4445,
+                    "gateway_port": 3140,
+                    "renderer_port": 3410,
+                    "storage_root": str(storage),
+                    "storage_lifecycle": "mystery",
+                },
+            }
+
+            with patch(
+                "tooling.acceptance.drivers.native.runtime._wait_for",
+                return_value=True,
+            ):
+                cleanup = binding.finalize_cleanup([], client_specs)
+
+            self.assertTrue(storage.is_dir())
+            self.assertFalse(cleanup["storageReleased"])
+            self.assertIn(
+                "invalid runtime client storage_lifecycle",
+                cleanup["storageErrors"][0]["error"],
+            )
+
+    def test_macos_development_binding_attests_running_make_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binary = Path(temp_dir) / "peers-touch-desktop"
+            binary.write_bytes(b"native-binary")
+            launcher = MakeDesktopLauncher(
+                worktree=Path.cwd(),
+                port=4447,
+                gateway_port=3140,
+                renderer_port=3410,
+                profile="four",
+                storage_root=str(Path(temp_dir) / "storage"),
+            )
+            session = TauriSession(launcher)
+            with patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_NATIVE_DEV": "1"},
+            ):
+                binding = LocalMacOSRuntimeBinding()
+                binding._sessions_by_client["alice"] = session
+                with patch.object(
+                    launcher,
+                    "runtime_binary_path",
+                    return_value=binary,
+                ):
+                    identity = binding.binary_identity()
+
+        self.assertEqual(identity["path"], str(binary))
+        instances = json.loads(identity["instances"])
+        self.assertEqual(
+            instances,
+            [
+                {
+                    "path": str(binary),
+                    "sha256": hashlib.sha256(b"native-binary").hexdigest(),
+                }
+            ],
+        )
+        self.assertEqual(
+            identity["sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    instances,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

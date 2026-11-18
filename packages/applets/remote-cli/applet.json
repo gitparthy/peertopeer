@@ -1,0 +1,39 @@
+{
+  "id": "remote-cli",
+  "name": "Remote CLI",
+  "version": "1.0.0",
+  "description": "Remote terminal and SSH client",
+  "author": "Peers Touch",
+  "icon": "assets/icon.png",
+  "minPlatformVersion": "0.1.0",
+  "targets": ["standalone"],
+  "entries": {
+    "lynx": "index.html",
+    "standalone": "index.html"
+  },
+  "load": {
+    "standalone": {
+      "type": "web-spa",
+      "entry": "index.html"
+    }
+  },
+  "bridge": {
+    "protocol": "peers-touch.applet.bridge",
+    "version": "1.0.0"
+  },
+  "permissions": [
+    "app.getContext",
+    "app.getLaunchOptions",
+    "lifecycle.reportReady",
+    "storage.get",
+    "storage.set",
+    "tasks.start",
+    "agent.stream",
+    "telemetry.track",
+    "telemetry.mark",
+    "system.getInfo"
+  ],
+  "capabilities": [],
+  "services": [],
+  "skills": []
+}

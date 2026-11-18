@@ -1,0 +1,225 @@
+---
+status: active
+owner: Client Platform Team
+updated: 2026-10-31
+review-cadence: on-change
+---
+
+# Frontend Component Tree Registry
+
+---
+
+## 1. Purpose
+
+This registry records which frontend surfaces are alive, which are not alive, and which are intentionally lazy, cached, or virtualized.
+
+It is the operational companion to `frontend-component-tree.md`.
+
+Architecture source: `docs/architecture/platform/client/frontend-runtime/README.md` defines the upstream runtime lifecycle, budget, and evidence model. Registry rows should be interpretable as `RuntimeSurface` entries from `docs/architecture/platform/client/frontend-runtime/data-model.md`.
+
+Use it to answer:
+
+- Which primary modules stay mounted across tab switches?
+- Which dynamic pages use bounded LRU caching?
+- Which settings/provider sections mount only on intent?
+- Which surfaces are explicitly non-alive?
+- Which runtime/store owns freshness for each visible tree?
+- Which rows need follow-up evidence before changing behavior?
+
+## 2. Registry Model
+
+Each row records one user-visible surface or section.
+
+| Field | Meaning |
+|-------|---------|
+| Feature / Surface | Product-facing name of the page, section, or runtime surface |
+| Platform | Desktop, Mobile, Web, Applet, or Cross-client. Platform-scoped section tables (§4–§7 Desktop, §8 Mobile, §9 Applet) inherit their platform from the section header and omit a per-row Platform column; add an explicit Platform value only for cross-client rows that do not live under a platform-scoped section. |
+| Owner Layer | Canonical tree owner: Shell, Navigation, PageHost, PageFrame, PageBoundary, SectionBoundary/SectionHost, OverlayHost, AppletContainerShell, RuntimeProjection |
+| Alive Category | Exactly one of the enum: `eager + forever`, `idle + forever`, `on-visit + lru`, `on-visit + none`, `lazy section`, or `virtualized content`. Add clarifying scope in parentheses (e.g. `virtualized content` inside alive page), but the leading token must be one enum value. |
+| Trigger | When the tree mounts or becomes active |
+| Cache Policy | Forever, LRU count, selected-only, none, or virtual window |
+| Runtime / Store Owner | Projection that owns freshness |
+| Status | `alive`, `lazy`, `lru`, `not alive`, `needs audit`, or `deprecated` |
+| Evidence | Current proof or required verification |
+| Review Owner | Team or module owner responsible for changes |
+
+Budget fields are recorded inside `Evidence` until the registry grows explicit columns. A row that lacks runtime sampling must say `unproven`, `needs audit`, or list the exact missing proof instead of implying the surface is proven.
+
+## 3. Alive Status Vocabulary
+
+- `alive`: The tree intentionally remains mounted while inactive.
+- `lazy`: The parent is alive, but this section mounts only on user intent.
+- `lru`: Dynamic instances stay mounted within a bounded cache.
+- `not alive`: The tree unmounts when inactive.
+- `needs audit`: The implementation exists, but lifetime or hidden render cost is not yet proven.
+- `deprecated`: The surface should not receive new lifetime investment.
+
+## 4. Desktop Primary Module Registry
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Search overlay | OverlayHost | `on-visit + none` | Search button or Cmd/Ctrl+K | Session memory: 32 frames / 640 items, maximum 200 visible results; native bounded read cache | Session-scoped `search` runtime/store, original Messaging and Social read authorities | not alive | `components/search/SearchHost.tsx` lazy mounts one overlay in the Shell slot. Source-bound query/resolve, scoped invalidation and original-domain openers retain query/scroll; identity clears them. Social result metadata reads existing identity projections without profile loading. Current Social native Acceptance and performance distribution remain unproven | Client Platform |
+| Chat primary module | PageHost | `eager + forever` | Default ready landing | Forever | `social` identity projection + session-scoped `messaging` and `call` runtime projections | alive | `pages/SocialChatPage.descriptor.tsx` is the eager landing descriptor; PageHost owns lifetime. Virtualized timeline locates historical message anchors via index and rendered node | Chat / Client Platform |
+| Desktop Chat drawer assembly | PageContent / shared UI controller | `lazy section` within alive Chat | Select conversation or open inner task | Main instance persists; only current detail/thread retained while parked; conversation replacement retires the inner task | Shared UI owns measured guides; Social Runtime/store owns selection and commands | needs audit | Back/resize retains main composer and reading position. Inert/aria-hidden gates covered inputs. Native physical resize, hidden-tree cost and assistive technology require current-source evidence | Chat / Client Platform |
+| Agent primary module and Chat work surface | PageHost / PageFrame | `idle + forever` | First idle slot or first visit | Forever while Desktop Shell is alive | `agentCapability`, `agentTopic`, `social` | alive | `pages/AgentChatPage.descriptor.tsx` registered (`preload: idle`, `keepAlive: forever`, `runtime-projections.md §7`). Atelier is withheld; old Atelier/orchestration routes return to Chat. Agent/Topic/message stores preserve equal projection identity and Topic runtime coalesces reconciliation without replaying cache bootstrap. Native stability and hidden render costs require current-source sampling | Agent / Client Platform |
+| Settings primary module | PageHost / SectionHost | `idle + forever` | First idle slot or first visit | Forever for page shell; SectionHost policy for sections | `settings`, `chat-storage`, `federation`, provider/model, package catalog, Memory, Channels, Cron, and OSS stores | alive | `pages/SettingsPage.descriptor.tsx` registered, PageHost-owned; `kernel/SectionHost.tsx` owns section mount/cache; Discover, Memory, My Files, Cron Jobs, Channels, and Command Palette have no primary-nav or standalone-page ownership | Client Platform |
+| Moments / Social primary module | PageHost | `idle + forever` | First idle slot or first visit | Forever | `moments`, `social`, `messaging` runtime/store projections | alive | `pages/moments/MomentsApp.descriptor.tsx` declares all three audience-data owners; hidden feed selector/render cost not sampled (§12) | Social / Client Platform |
+
+## 5. Desktop Dynamic Surface Registry
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Hidden Applets launcher | PageHost | `idle + forever` | Internal runtime or Acceptance navigation | Forever for launcher shell | `applets` runtime/store projection | alive | `pages/AppletsPage.descriptor.tsx` remains registered for runtime handoff; `AppSideNav` and the Settings registry expose no launcher or dynamic applet injection API | Applet Platform |
+| Applet runtime instance | PageHost / AppletContainerShell | `on-visit + lru` | Navigate to `applet:<id>` | LRU by applet id; standalone window uses window lease | `applets` runtime/store projection; applet host bridge | lru | PageHost dispatches page runtime lease events; `appletsRuntime.acquirePage/releasePage` owns materialize/load/unload; `applet/AppletContainerShell.tsx` owns contained/immersive/standalone shell chrome; runtime sample confirmed `hello-lynx` contained shell, immersive mode, floating controls hide/show/exit, route-to-visible ~122ms, page-acquire ~792ms | Applet Platform |
+| Agent profile page | PageBoundary / PageFrame | `idle + forever` | First profile visit | Forever while Agent module is alive | Agent and `agent-capability` projections | alive | Production `AgentProfilePage.tsx` now keeps only Identity, SOUL/AGENTS, avatar and selected Skill/MCP bindings beside the persistent Agent rail; model/workspace/memory/activity/diagnostic/Builder controls are removed. Hidden-render cost still needs sampling | Agent |
+| Atelier orchestration mode / canvas | PageBoundary / PageFrame | `idle + forever` | First Atelier orchestration visit | Forever while Atelier is alive | Agent canvas/orchestration stores | alive | Orchestration is an Atelier-owned mode, not a sibling navigation destination; production mount cost and memory sampling remain required | Agent |
+| Agent creation | PageBoundary | `on-visit + none` | Explicit Create Agent intent | New Agent persists immediately and opens Profile | Agent store | not alive | Shared create flow submits one Station creation and immediately selects Profile; no separate runtime/model form mounts | Agent |
+| Agent Chat artifacts | SectionBoundary | `on-visit + none` | Open a message artifact | Panel unmounts on close or Profile navigation | Chat message artifacts + Portal view projection | not alive | ConversationRail mounts the existing PortalPanel in artifacts-only mode; list/detail reuse current Topic messages and omit working tabs and developer views. Native list/detail and cleanup proof pending | Agent |
+| Agent Chat roster prototype | PageFrame / SectionBoundary | `idle + forever` within Agent | Agent module first visit | Same roster tree in chat and Profile, including collapsed state | Prototype AgentChatPage roster state | alive | Creation/search slots, group spacing, rows and scroll container remain mounted; changing width hides only labels/actions. One persisted `initial / emoji / image` avatar value projects into roster and Profile; Topic rail deliberately keeps name only. Browser QA checks identity persistence and projection; production large-list performance remains unproven | Agent |
+| Agent Chat Profile Builder prototype | PageContent | `on-visit + none` | Create Local or Agent Profile action | Selected Agent only; draft persists before leaving | Prototype Agent roster and localStorage profile/binding draft; Shell ToastHost owns save feedback | not alive | One selected `AgentProfile` mounts beside the persistent roster. Its measured reference grid uses a 64px left track and 12px gap: 36px Back and 64px unframed avatar share the left edge, avatar and 64px description share the top edge, and name/description share the content edge. Autosave feedback is transient shared LobeUI Toast at the Chat-standard bottom-right placement, so no status line changes row geometry. SOUL/AGENTS fill remaining height. QA covers exact geometry, success toast, absent inline status, avatar persistence, bounded pickers, deletion, and return; production persistence is outside this evidence | Agent |
+| Agent Profile avatar picker prototype | OverlayHost | `on-visit + none` | Explicit Change Agent avatar action | None; upload preview is transient and committed avatar remains in Agent owner | Prototype Agent roster identity state | not alive | Anchored Emoji/Upload dialog mounts only while open. Emoji search filters a bounded 40-item directory; Upload validates PNG/JPEG/WebP/GIF and 2 MB before preview, Cancel preserves the committed value, Save writes one data URL projection, and close restores the avatar trigger. Browser QA covers validation, Cancel, Save, persistence, and roster/Profile projection | Agent |
+| Agent Profile extension picker prototype | OverlayHost / SectionBoundary | `on-visit + none` | Explicit Add skill or Add MCP tool action | None; catalog search is transient and selected binding persists in Profile owner | Shared prototype Settings catalog + Agent profile binding state | not alive | Picker mounts only on intent, searches the Settings-owned catalog, renders 12 results at a time, traps focus, restores the Add trigger, and unmounts after select/close. A 100-skill browser scenario proves Profile still renders only its single selected binding | Agent |
+| Agent Chat Topic rail prototype | PageContent / SectionBoundary | `idle + forever` within Agent Chat | Agent Chat becomes active | Same rail tree remains mounted while Desktop Chat is active; Profile does not mount it; ultra-narrow uses selected-only Topic list and transient left Agent drawer projections | Prototype AgentChatPage plus production Agent/Topic/Chat projections | alive | Production `AgentSidebar.tsx` now projects the selected Agent name, three equal actions, in-place title Search, and Pin/Rename/Delete only; `ChatPage.tsx` owns Topic title and virtualized current-conversation Search. Prototype `shell/qa/agent_chat_checks.cjs` binds 11 Journeys / 121 contracts; production ultra-narrow, batch deletion and hidden-render cost remain unproven | Agent |
+| Agent Chat row menus and delete dialogs prototype | OverlayHost | `on-visit + none` | Explicit Agent/Topic row or batch action | None; mutation state remains in AgentChatPage | Prototype AgentChatPage roster/thread state | not alive | Agent menus expose only Profile and allowed Delete; Start/Profile/Search stay in equal Topic-rail slots. Agent/Topic menus portal from live trigger rectangles, dismiss on Escape/outside click/source movement/resize, and restore focus. Single and batch delete dialogs trap focus and default to Cancel; batch confirmation clears selected Topic drafts, attachments, active selection, and run ownership. QA covers every emitted mutation and mobile drawer anchoring | Agent |
+| Find People discovery | OverlayHost | `on-visit + none` | Explicit Find People intent from Chat | None; scope and query reset on close | Federation context and relationship stores | not alive | `FindPeopleModal` uses `destroyOnHidden`; All and Station-provided Federation contexts are the only discovery scopes; the native OAuth Gate rejects member Station directory or selector exposure | Chat / Federation |
+| Import/export flows | OverlayHost / PageBoundary | `on-visit + none` | Explicit user intent | None | Owning feature store | not alive | Must preserve draft or recovery externally if interrupted | Client Platform |
+| Chat attachment detail, Desktop/Mobile | OverlayHost | `on-visit + none` | Select a file card | One PDF/Word/slide page or bounded workbook viewport; no hidden decoder tree after close; verified transfers stay Runtime-owned | Messaging Runtime `ChatAttachmentAccessController`, Engine protobuf projection and client-chat-core selected decoder disposal | not alive | Native macOS 14-format local-file preview, navigation, close/reopen and revocation checks pass; Office workers terminate and images use reduced representations. Sender/receiver transport, OS export, assistive technology, dark Native theme and platform performance remain UNPROVEN | Chat |
+| Notifications preview / complete viewer prototype | OverlayHost | `on-visit + none` | Rail bell; More notifications expands into centered dialog | None; at most four preview rows or six current-page rows | Prototype Shell notification state; production projection unproven | not alive | `packages/prototypes/desktop/shell/src/Notifications.tsx` reuses one list; geometry gate covers live source alignment, search/page stability, shared mutations, teardown and focus return; production runtime and high-volume search sampling remain unproven | Client Platform |
+| Command palette / transient search overlay | OverlayHost | `on-visit + none` or selected draft cache | Keyboard/command intent | None or explicit draft cache | Navigation/search projection; Agent palette consumes Station command snapshot | needs audit | Agent Commands & Skills unmounts on close, restores trigger focus and retains no hidden result tree; global result virtualization remains unproven | Client Platform / Agent |
+| Desktop call surface | OverlayHost | `on-visit + none` | Incoming or outgoing one-to-one call | None; call snapshot remains in runtime owner | Session-scoped `call` runtime + `callP2p` | needs audit | `ReadyView` owns the global overlay, so incoming and active calls remain visible while Chat is hidden; native media and reconnect evidence remain required | Chat / Client Platform |
+| Mobile group call surface | OverlayHost | `on-visit + none` | Explicit group voice/video/join intent | No token/media persistence; one participant roster and active media attachments | Session social runtime + shared GroupCallController and device MediaReservation | needs audit | Global MobileShell mount survives page navigation; SDK owns media revision, roster and connection state. UI and real iOS/Android media, revoke and cleanup proof remain required | Chat / Client Platform |
+| Device-link approval modal | OverlayHost | `on-visit + none` | Settings "Sign in on a phone" | None; offer state stays device-link runtime owned, unmounted on close | `deviceLinkRuntime` projection / store | alive | `components/settings/DeviceLinkPanel.tsx` mounts one 340px fixed stage; QR, approval, finishing, complete, and expired phases render as absolutely-positioned layers inside identical geometry and the footer reserves the 36px button slot, so the modal measures a constant 400x557 across phases (real camera Journey geometry observation, 2026-10-28; the stage grew from 280px because the v15 compact reference requires 4px modules) | Identity / Client Platform |
+
+## 6. Settings And Model Section Registry
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Settings page shell | PageHost / PageBoundary / SectionHost | `idle + forever` | Idle prewarm or first settings visit | Forever shell; section policy delegated to `SectionHost` | `settings` runtime/store projection | alive | `SettingsPage.tsx` delegates section lifecycle to `kernel/SectionHost.tsx`; first-visit-cache preserves config drafts, selected-only unmounts diagnostics/read-only sections | Client Platform |
+| Dashboard Provider configuration | Active Dashboard page / selected editor | `on-visit + none` | Administrator selects DM or CLI Provider | One selected draft, retained across refresh; discarded on Provider or admin-session replacement | Agent management port / Dashboard AI store | needs audit | Installation is inside the selected CLI Provider. Config, credentials, models, global AI users, grants and actual-call verification share its lifecycle. Installation polls do not remount forms. Current-source rendered and consumption proof remain required | Agent / Client Platform |
+| Model discovery and account default | SectionBoundary / RuntimeProjection | `lazy section` | Explicit authorized selection or personal discovery | Effective-owner Station runtime snapshot; Actor-scoped CAS default | `agent-capability` and Provider/model stores | needs audit | AI / Models owns only the current account default; selectors compare `(provider_id, model_id)`. Source `5b77000bf` Development Native checks cover keyboard save, Models selection, Alice/Bob default isolation, selected-model revocation and five-width geometry. No local registry or detail cache remains. Actual discovery, formal Acceptance, hidden-tree performance and assistive-technology proof remain unproven; see `20261031-provider-consumer-review.md` | Client Platform |
+| Discover package catalog | SectionHost / SectionBoundary | `on-visit + none` within alive Settings | Select AI > Discover | Selected-only; explicit sync invalidates the catalog snapshot | Desktop Rust verified package catalog plus Station target authorities | not alive | `modules/discover.ts` registers only a selected-only Settings panel; `components/settings/DiscoverSettings.tsx` owns source, package, detail, install, uninstall, and recovery states while visible; no standalone Marketplace descriptor remains | Agent / Client Platform |
+| Memory management | SectionHost / SectionBoundary | `on-visit + none` within alive Settings | Select AI > Memory | Selected-only; leaving stops event polling and discards view-local filters | Station Memory APIs and Agent projection | not alive | `modules/memory.ts` registers only selected-only `MemorySettingsSection`; browse, search, persona, events, and configuration share one Settings owner; no standalone Memory route remains | Agent / Client Platform |
+| Advanced settings panels | SectionBoundary | `lazy section` | Expand advanced section | Selected section only | Owning settings store | needs audit | Target: defer heavy validation and schema compilation until the panel is visible — not yet verified | Client Platform |
+| Encryption backup and recovery | SectionBoundary / OverlayHost | `lazy section` within Account settings | Visit Account settings; Restore modal on explicit intent | Actor-keyed local phrase state; no draft retention across Actor changes | Authenticated-critical `messaging-recovery` runtime and scope-fenced store | needs audit | Store/runtime tests cover create/restore/read, same-Actor Session isolation, committed activation before status, lost-wake retry and teardown. Recovery bootstraps before Messaging; nullable local identity permits actual-backup Restore. Native binding readback precedes Messaging-owned scope rebuild. Wide/narrow, keyboard and native replacement-device proof remain required | Identity / Client Platform |
+| Chat storage overview | SectionHost / SectionBoundary | `lazy section` | Select Storage in Settings | Selected-only; snapshot remains in runtime projection | Session-scoped `chat-storage` runtime over Device Messaging Engine | alive | Scope-fenced runtime tests cover Station/actor/device/generation changes; native scan timing remains part of `chat-storage-accounting-e2e` | Chat / Client Platform |
+| My Files | SectionHost / SectionBoundary | `on-visit + none` | Select Data > My Files | Selected-only | OSS list and mutation requests | not alive | `modules/oss.ts` registers only `settingsPanel` with `selected-only`; leaving the section unmounts filters and drawers | Client Platform |
+| Cron Jobs | SectionHost / SectionBoundary | `on-visit + none` | Select Tools > Cron Jobs | Selected-only | Cron list and polling requests | not alive | `modules/cron.ts` registers only `settingsPanel` with `selected-only`; unmount owns polling cleanup | Client Platform |
+| Channels | SectionHost / SectionBoundary | `on-visit + none` | Select Channels > Channels | Selected-only | Channel list and mutation requests | not alive | `modules/channels.ts` registers the full management surface only in Settings; the reduced overview panel is deleted | Client Platform |
+| Command Palette settings action | SectionHost / OverlayHost | `on-visit + none` | Select Tools > Command Palette or press `Cmd/Ctrl+Shift+K` | Selected-only section; transient overlay | Global `commandMenu` store | not alive | Settings invokes the canonical `CommandMenu`; Cmd/Ctrl+K belongs only to Search | Client Platform |
+| Desktop phone sign-in authorization | SectionHost / OverlayHost | `on-visit + none` | Global Settings > Account > Sign in on a phone | One transient panel; closing clears QR and avatar | `deviceLinkRuntime` / `deviceLink` store over native window-scoped Device Link owner | needs audit | Native owner uses original Session activation and registered device certificate; two-second single-flight reconciliation pauses while hidden and resumes in foreground. Desktop BIN and TypeScript checks pass; native layout, keyboard, accessibility and performance remain UNPROVEN | Identity / Client Platform |
+
+## 7. Large Content Registry
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Chat message list | SectionBoundary | `virtualized content` inside alive page | Chat page active or prewarmed | Virtual window + scroll restoration | Session-scoped `messaging` runtime/store projection | needs audit | Large conversations must not render all messages | Chat |
+| Moments feed | SectionBoundary | `virtualized content` inside alive page | Moments page active or prewarmed | Virtual window or incremental list | `moments` runtime/store projection | needs audit | Feed hidden render cost must be checked when adding cards/actions | Social |
+| Moments inline comments | SectionBoundary | `on-visit + none` within painted card | Expanded card intersects viewport and PageHost is active | Viewport interest; comment projection stays in original Store | `acquireMomentComments`, Moments Runtime; original public/private comments Store | needs audit | Shared MomentCard defaults to inline comments. IntersectionObserver only binds interest; Runtime owns first read and visible public missed-event reconciliation. Close/out-of-view/hidden/unmount releases the lease; Actor replacement clears interest. Four source regressions cover duplicate leases, pre-dispatch release, private owner and outgoing Actor lease. Native hidden-tree/read cost remains unproven | Social |
+| Moments public text editor | OverlayHost | `on-visit + none` | Own verified public Moment's edit action | Selected-only; failed draft retained while open | `moments` Store command plus Native signed journal | needs audit | `App` supplies one stable UIProvider; `MomentTextEditor` mounts only for the selected Moment. Pending closes are fenced, retries retain the same operation ID for unchanged text. Prototype save/cancel/keyboard source-focus and narrow layout observed; Native behavior, error recovery and hidden-tree cost remain unproven | Social |
+| Moments identity popover / image Lightbox | OverlayHost | `on-visit + none` | Semantic actor or image activation | Selected-only; no business cache in UI | Identity/Relationships/OSS original projections; peers-ui owns overlay | needs audit | Shared identity and nine-image keyboard/close/focus specimens observed; canonical resource/profile adapters retained. Production identity cutover, Native source/paint, and hidden cost remain unproven | Social / Client Platform |
+| Contacts / roster list | SectionBoundary | `virtualized content` if large | Chat/Agent page active | Virtual window or filtered selector | `social`, agent projections | needs audit | Search/filter derivation should be selector-backed | Chat / Agent |
+| Logs, diagnostics, or debug output | SectionHost / SectionBoundary | `on-visit + none` or `virtualized content` | Explicit diagnostic intent | Selected-only unless virtualized | Owning diagnostic store | needs audit | `logs` settings module declares `sectionHostPolicy: selected-only`; runtime sample confirmed `logs` unmounts when switching back to `statistics`; high-volume log virtualization remains a separate audit | Client Platform |
+
+## 8. Web Operator Surface Registry
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Station Dashboard Relay Attachments | Navigation / PageBoundary | `on-visit + none` | Select Relay Attachments | None; page-local polling is torn down on navigation | Station `AttachmentController` projection | not alive | Hash route changes synchronously; only the active page mounts; 3-second projection polling is page-local and cancelled on unmount; browser long-task and narrow-layout evidence pending | Node Connectivity / Station |
+| Station Dashboard AI management | Navigation / PageBoundary | `on-visit + none` | Select AI Providers | Active page only; authentication changes clear projections | Agent management port and Dashboard AI store | not alive | DM and CLI share configuration, grants, global AI users and actual-call verification. Installation polling stops on unmount. Development checks cover rendered configuration, narrow layout and Native consumption; formal Acceptance and hidden-tree performance remain unproven | Agent / Station |
+| Station Dashboard selected Provider form | SectionBoundary | `lazy section` | Select one shared DM or named CLI profile | One selected connection draft survives refresh, resource revisions and section switching; Provider or administrator replacement discards it | Agent management projection and `useControlPlaneAction` | lazy | Connection remains mounted while hidden; Models, Users and Try mount only when selected. Form owns the draft's observed version; a newer server revision preserves the draft, blocks save and offers explicit reload. Shared source identity is immutable; its models and credentials stay at that source. Prompt, argv and environment are collapsed. Verification resets on configuration, grant or policy revision. Async validation and writes are fenced by administrator epoch and mounted lifetime | Agent / Station |
+| Station Dashboard CLI selection and installation | Adapter Select and selected profile toolbar | `on-visit + none` | Explicitly choose a missing or failed CLI option, then a named profile | Job state survives popup dismissal and profile switching; defaults are owner + adapter preferences | Station managed CLI manager / Agent profile management | needs audit | Adapter dropdown starts installation and fills the selected option background. Multiple profiles share one install and status poll per adapter. Profile creation, deletion and default selection are adjacent to the editor; Actor model defaults stay separate. Late polls cannot overwrite a new install. Shared binaries and private execution state have separate owners. Supplier login and successful CLI reply require their own evidence | Agent / Station |
+| Station Dashboard Federation management | Navigation / PageBoundary | `on-visit + none` | Select Federation | Active page only; form drafts removed on unmount | Federation management port | not alive | Separate live administrator authentication delegates governance to Federation. Desktop consumes Find People contexts and has no Federation Settings section. Native lifecycle fixture uses independent administrator sessions; real cross-Station/UI proof remains unproven | Federation / Station |
+
+## 9. Mobile Surface Registry
+
+Mobile does not use the Desktop `PageHost` keep-alive model.
+`MobileNavigationStore` owns the descriptor-backed primary route and detail
+stack. `MobileNavigationHost` retains visited primary views and the last four
+current-stack details through React Activity; hidden Effects are suspended.
+Messages panes and Moments Feed/Home/Explore/Circles views have bounded
+subhosts. Projection freshness stays with the Mobile runtime registry. See
+`frontend-component-tree.md §14` for the Mobile platform tree standard.
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Mobile primary tab shell | NavigationShell / PageHost | `on-visit + lru` | Visit primary destination | Three primary views; four current-stack details; identity-fenced | Mobile runtime registry projections | needs audit | Activity suspends hidden Effects; frames restore before paint. 2026-11-14 native continuity/memory proof required | Mobile |
+| Mobile acceptance Debug diagnostics | OverlayHost | `on-visit + none` | Explicit Debug action in acceptance builds | One bounded snapshot; no closed panel tree | `collectMobileDebugSnapshot` and original reconciliation commands | needs audit | Shared bottom Drawer pins close controls and scrolls diagnostics; rapid touch, safe-area, outside/Escape and unchanged underlying scroll pass component checks. Native touch/scroll/close proof required through the original whole-product owner | Mobile / Acceptance |
+| Mobile chat tab | PageBoundary | `on-visit + lru` | Open Messages | One Messages frame; two visited panes; external draft/scroll recovery | `socialRuntime` + session-scoped `messaging` projection | needs audit | Messages header remains mounted across pane changes; initialized controllers survive reveal. Native no-refresh and draft/scroll evidence required | Mobile / Chat |
+| Mobile Search detail | NavigationShell / PageBoundary | `on-visit + lru` | Shell header action or scoped conversation search | Shared four-view current-stack bound; 100 result rows, 32 cursors | `search` runtime descriptor + original Messaging and Social authorities | needs audit | Shell lazy-loads Search; source-bound openers remain original authorities. Hidden subscriptions suspend; native return/focus/performance proof required | Mobile / Search |
+| Mobile Moments tab/feed | PageBoundary / SectionBoundary | `on-visit + lru` + `virtualized content` | Open Moments | One root; three visited scope frames; 100 feed items; 10 comments per item | `MobileSocialFacade` + public/private runtime projections | needs audit | Hidden Effects suspend; selected composer assets survive hiding and release on removal. Native continuity, memory and media proof required | Mobile / Social |
+| Mobile Social detail routes | NavigationShell / PageBoundary | `on-visit + lru` | Open Profile, Search, Circles, members or exception Moment Detail | Shared last-four current-stack bound | Mobile navigation store + `MobileSocialFacade` projection | needs audit | Ordinary comments stay inline; initialized profile/circle state survives reveal. Native focus/scroll/no-leak evidence required | Mobile / Social |
+| Mobile Social composer and transient surfaces | OverlayHost / PageBoundary | `on-visit + none` | Compose, Audience, Reaction, media preview, Circle edit, sort or danger confirmation intent | Selected-only; encrypted draft externalized; Feed anchor retained | `MobileSocialFacade` + Rust draft/command owners | alive | `mobile-social-thread-media-native` proves route-free selected-only media, public Blob revocation, private `MEDIA_READY` materialization, and source-focus restoration; native keyboard, safe-area, decoder, and exact visual evidence remain acceptance work | Mobile / Social |
+| Mobile Contacts pane/roster | PageBoundary / SectionBoundary | `on-visit + lru` + `virtualized content` | Select Contacts in Messages | Two visited Messages panes; 100 contact rows | `socialRuntime` + session-scoped `messaging` projection | needs audit | Shares a stable Messages header; subscriptions suspend while hidden. Native navigation/roster/recovery proof required | Mobile / Chat |
+| Mobile Me/settings shell | PageBoundary / SectionHost | `on-visit + lru` with `lazy section` details | Visit Me / select setting | One root; selected details within shared four-view stack | `profileRuntime`, `profile-images`, `deviceSettingsRuntime`, `chat-storage` runtime | needs audit | Identity layout stays mounted; permission/version loading is section-local. Original CAS/exit guard and identity fences remain. Native image/restart/clipboard/continuity proof required | Mobile |
+| Mobile Moments Feed/Circles scopes | NavigationShell / PageHost | `on-visit + lru` with `virtualized content` | Select Home/Explore feed or Circles | Three visited scope frames; navigation-owned queries; bounded lists | `MobileSocialFacade`, Social circle reconciliation, navigation | needs audit | Scope frames retain DOM/scroll and suspend hidden Effects; original shared header controls/actions remain. Native pane/query/return proof required | Mobile / Social |
+| Mobile notification center | OverlayHost | `on-visit + none` with `virtualized content` | Open notifications from Moments or Me | 60 visible items, Station pagination; no hidden Drawer tree | Social notification Gateway and session-fenced read/mutation owner | needs audit | Shell mounts one Drawer. Read/all-read/delete validate authoritative readback across the retained page window. Old session operations cannot update the next session. Exact conversation/message/post/comment targets are preserved; native controls and deep-link proof remain required | Mobile / Social |
+| Mobile descriptor detail routes | NavigationShell / PageBoundary | `on-visit + lru` | Push conversation/contact/group/moment/setting | Last four current-stack views; pop removes; older views use external recovery | Mobile navigation store + owning feature runtime projection | needs audit | One host controls lifetime and readiness; warm preparation retains content. Native stack/scroll/eviction/identity evidence required | Mobile |
+| Mobile OAuth/access recovery | PageBoundary / OverlayHost | `on-visit + none` | Station gate requests credentials | None; attempt state in `authRuntime` | `authRuntime`, `accessRuntime` | needs audit | Prototype covers provider progress; target must add cancel, expiry, replay/mismatch, following-gate, Station identity mismatch and focus restoration evidence | Mobile / Auth |
+| Mobile scan sign-in | PageBoundary | `on-visit + none` | Scan intent before Station selection or normal login; native deep-link wakeup | One redacted attempt; native secrets and route-transition intent in SecureStorage | `device-link` descriptor, original native Session/Station owners and lifecycle kernel | needs audit | Source places camera intent and polling in runtime, native ingress in the existing event bridge and Gate forms in `AccessGateHost`; Android/iOS camera, focus, narrow-screen and real account admission remain unproven | Mobile / Identity |
+| Mobile blocking recovery surfaces | OverlayHost | `on-visit + none` per visible recovery surface | Recovery projection reports a cross-route action or blocking state | None; app-level host retains only its projection subscription | `recoveryProjection` plus lifecycle/auth/command action owners | needs audit | The app-level host mounts only actionable cross-route children and delegates Station/session actions to lifecycle/auth owners; passive overflow reconciliation and route-owned runtime failures do not become global cards; W4 command/draft actions, native focus restoration, and runtime screenshots remain unproven | Mobile |
+| Mobile call surface | OverlayHost | `on-visit + none` | Incoming or outgoing one-to-one call | None; call snapshot remains in runtime owner | `mobileCallManager` fed by `socialRuntime` realtime ingress | needs audit | Shell-level overlay survives Chat page unmount; encrypted signaling, durable resolution readback, media cleanup, narrow-screen bounds, and native camera/microphone behavior require final runtime evidence | Mobile / Chat |
+| Mobile conversation action sheet | OverlayHost | `on-visit + none` | Tap conversation actions | None | Chat action state | not alive | `ChatActionSheet` returns `null` when `!open`; bottom action sheet, not a right drawer (`ChatPage.tsx`) | Mobile / Chat |
+| Mobile chat composer | SectionBoundary | Within `on-visit + lru` detail | Open Direct/Group conversation | Four-detail bound; durable draft/media externalized; retained preview grants | ChatPage + draft restoration port + Messaging commands | needs audit | Reveal preserves initialized draft; hiding stops recorder/typing/observers; removal disposes preview grants. Native keyboard/media/restart/receiver evidence required | Mobile / Chat |
+| Mobile contact name/note sheet | OverlayHost / SectionBoundary | `on-visit + none` | Contact detail remark action | Form input retained after save failure; actor-local preferences externalized | ContactRemarkForm + contact-preferences runtime + personalizationScope | needs audit | One selected peers-ui BottomSheet; Contact/Chat read one name projection. Identity replacement clears projection and stale async writes. Current-source native keyboard, logout and contact search proof remain required | Mobile / Contacts |
+| Mobile Find People | Navigation / PageBoundary | `on-visit + lru` | Find People from either Messages pane | Shared four-detail return-stack bound; query/results survive reveal, pop removes | Social discovery gateway, relationship command/checkpoint projection | needs audit | Top search and results scroller; default Station discovery, explicit Federation; native TextField focus and real directory/keyboard/request proof required | Mobile / Contacts |
+| Mobile message actions and selection | OverlayHost / SectionBoundary | `on-visit + none` | Long press, overflow or Select message | Selection survives command failure within current route | ChatPage + native message command ledger | needs audit | Shared BottomSheet owns modal lifetime and focus; scroll cancels a pending hold. Multi-forward/hide removes acknowledged items and retains remaining items after failure. Current-source native receiver/readback proof remains required | Mobile / Chat |
+| Mobile tabbar | NavigationShell | `idle + forever` | App ready | Mounted until identity exits; hidden during immersive detail/overlay | Mobile navigation descriptor + Messaging/Social unread projection | needs audit | Three shared destinations; hiding does not reconstruct dock. Native return and safe-area proof required | Mobile |
+
+## 10. Applet Registry
+
+| Feature / Surface | Owner Layer | Alive Category | Trigger | Cache Policy | Runtime / Store Owner | Status | Evidence | Review Owner |
+|-------------------|-------------|----------------|---------|--------------|------------------------|--------|----------|--------------|
+| Official Note applet | Applet runtime instance | `on-visit + lru` (inherits applet runtime) | Open Note applet | Applet runtime LRU | Note applet service + applet host bridge | lru | Note UI must stay applet-local; Desktop host owns runtime shell only | Applet Platform |
+| Third-party applets | Applet runtime instance | `on-visit + lru` by default | Open applet | Applet runtime LRU | Applet manifest/runtime projection | lru | Each applet must not request global forever lifetime without product approval | Applet Platform |
+| Applet launcher cards | SectionBoundary | `lazy section` inside alive Applets launcher | Applets page mount/prewarm | Launcher list projection | `applets` runtime/store projection | alive | Cards should not materialize applet bundle on render | Applet Platform |
+
+## 11. Change Process
+
+Update this registry when any of these changes happen:
+
+- A new primary module, page, applet host, provider editor, overlay, or large content surface is introduced.
+- A surface changes alive category.
+- A cache bound changes.
+- A runtime/store owner changes.
+- A previously `needs audit` surface receives evidence.
+- A heavy section is moved from eager render to lazy section or virtualization.
+
+Required update fields:
+
+- Adjust alive category and status.
+- Add evidence or required evidence.
+- Add owner and revisit condition for exceptions.
+- Update `Updated` date at the top of this file.
+
+## 12. Review Gates
+
+Before approving a UI change covered by this registry:
+
+- [ ] The touched feature row exists.
+- [ ] The alive category matches implementation.
+- [ ] Hidden alive trees have selector/render invalidation protection.
+- [ ] Lazy sections mount only on intent.
+- [ ] LRU surfaces have a bounded cache size.
+- [ ] Non-alive surfaces preserve user task recovery where needed.
+- [ ] Evidence is current enough for the change risk.
+
+## 13. Open Audits
+
+These rows are intentionally marked `needs audit` until measured or redesigned:
+
+| Surface | Audit Needed | Suggested Evidence |
+|---------|--------------|--------------------|
+| Moments / Social hidden tree | Hidden render cost after feed updates | Browser long-task sampling during tab switch and feed reconcile |
+| Chat message list | Large conversation rendering and scroll restoration | Virtualization proof, route return proof, long-task sample |
+| Agent canvas/orchestration | Mount cost and state persistence policy | First-visit timing, memory/cache reasoning, state recovery proof |
+| Mobile chat tab tree | Re-mount cost when switching tabs or returning from a thread | Mobile long-task sampling on tab switch and thread back; confirm store keeps freshness without re-fetch |
+| Command palette / transient search overlay | Hidden result tree policy | Confirm unmount or virtualized cache |
+
+## 14. Related Documents
+
+- `docs/client/common/ui-identity/frontend-component-tree.md`
+- `docs/client/common/ui-identity/README.md`
+- `docs/client/common/ui-identity/review-checklist.md`
+- `docs/client/desktop/runtime-projections.md`
+- `docs/client/mobile/chat-layout-contract.md`
+- `docs/client/chat/chat-ux-contract.md`

@@ -1,0 +1,63 @@
+[package]
+name = "peers-touch-mobile"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "peers_touch_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+prost-build = "=0.14.3"
+tauri-build = { version = "2.0.1", features = [] }
+
+[dependencies]
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+bip39 = "2"
+x-config-core = { path = "../../../packages/x-config-core" }
+ed25519-dalek = { version = "2", features = ["pem", "rand_core"] }
+hkdf = "0.12"
+hex = "0.4"
+hyper = { version = "1", default-features = false }
+libp2p-identity = { version = "=0.3.0", features = ["ed25519", "peerid"] }
+messaging-core = { path = "../../../packages/messaging-core" }
+messaging-native-filesystem = { path = "../../../packages/messaging-native-filesystem" }
+search-core = { path = "../../../packages/search-core" }
+futures-lite = "2"
+secure-content-core = { path = "../../../packages/secure-content-core" }
+station-libp2p-http = { path = "../../../packages/station-libp2p-http" }
+station-trust = { path = "../../../packages/station-trust" }
+schema-core = { path = "../../../packages/schema-core" }
+device-link-core = { path = "../../../packages/device-link-core" }
+prost = "=0.14.3"
+prost-types = "=0.14.3"
+log = "0.4"
+rand = "0.8"
+reqwest = { version = "=0.13.2", features = ["blocking", "multipart", "stream"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2.0.1", features = ["devtools"] }
+tauri-plugin-deep-link = "=2.4.9"
+tauri-plugin-log = "=2.8.0"
+tauri-plugin-opener = "=2.5.4"
+tauri-plugin-peers-platform-permissions = { path = "plugins/platform-permissions" }
+tauri-plugin-peers-secure-input = { path = "plugins/secure-input" }
+tokio = { version = "1", features = ["time"] }
+ulid = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[features]
+default = ["custom-protocol"]
+acceptance-harness = []
+custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-peers-secure-storage = { path = "plugins/secure-storage" }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "=2.5.3"

@@ -1,0 +1,813 @@
+use crate::contracts::{
+    ConfigFieldResetInput, ConfigSectionInput, ConfigSectionSetInput, ContextActionDispatchInput,
+    ContextSnapshotGetInput, ExternalUrlInput, LogsTailInput, OAuthCreateBotSessionInput,
+    OAuthSessionInput, OAuthSimulateStartInput, OnboardingSetInput, PreferencesSetInput,
+    ShareIdInput, ShareSessionInput, StubPayload, WizardExecuteApiInput, WizardStepInput,
+};
+use crate::error::{AppResult, ErrorCode};
+use crate::infrastructure::auth_identity;
+use crate::infrastructure::storage::{self, StorageKind};
+use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+static GLOBAL_CONTEXT_STATE: OnceLock<Mutex<serde_json::Value>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+const DESKTOP_HOST_OS: &str = "macos";
+#[cfg(target_os = "windows")]
+const DESKTOP_HOST_OS: &str = "windows";
+#[cfg(target_os = "linux")]
+const DESKTOP_HOST_OS: &str = "linux";
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+compile_error!("Desktop host OS must be macOS, Windows, or Linux");
+
+fn success_payload(command: &str, data: serde_json::Value) -> AppResult<StubPayload> {
+    AppResult::success(StubPayload {
+        command: command.to_string(),
+        status: data.to_string(),
+    })
+}
+
+fn invalid_argument(message: &str) -> AppResult<StubPayload> {
+    AppResult::fail(ErrorCode::InvalidArgument, message, None)
+}
+
+fn context_storage_path() -> Result<PathBuf, String> {
+    storage::app_file_path(
+        "desktop",
+        StorageKind::Data,
+        &["system", "global_context.json"],
+    )
+    .map_err(|err| format!("failed to resolve global context path: {err:?}"))
+}
+
+fn default_global_context_snapshot() -> serde_json::Value {
+    json!({
+        "identity": {
+            "userId": null,
+            "displayName": null,
+            "provider": null,
+            "email": null,
+            "avatarUrl": null,
+            "profileUrl": null,
+            "registerTime": null,
+            "lastLoginAt": null
+        },
+        "session": {
+            "loginStatus": "unknown",
+            "authenticated": false,
+            "activeAccountId": null,
+            "lastAuthAt": null
+        },
+        "oauth": {
+            "connectedAccounts": [],
+            "connectedCount": 0
+        },
+        "runtime": {
+            "appState": "booting",
+            "online": true,
+            "networkMode": "online"
+        },
+        "network": {
+            "online": true,
+            "mode": "online",
+            "degraded": false,
+            "lastChangedAt": 0
+        },
+        "capability": {
+            "oauth": false,
+            "chat": true,
+            "groupChat": true,
+            "timeline": true,
+            "settings": true
+        },
+        "workspace": {
+            "id": null,
+            "name": null,
+            "environment": null
+        },
+        "task": {
+            "items": {}
+        },
+        "notification": {
+            "items": []
+        },
+        "meta": {
+            "version": 1,
+            "updatedAt": 0
+        }
+    })
+}
+
+fn load_global_context_state() -> serde_json::Value {
+    let path = match context_storage_path() {
+        Ok(v) => v,
+        Err(_) => return default_global_context_snapshot(),
+    };
+    if !path.exists() {
+        return default_global_context_snapshot();
+    }
+    let text = match fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(_) => return default_global_context_snapshot(),
+    };
+    if text.trim().is_empty() {
+        return default_global_context_snapshot();
+    }
+    serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or_else(|_| default_global_context_snapshot())
+}
+
+fn persist_global_context_state(state: &serde_json::Value) -> Result<(), String> {
+    let path = context_storage_path()?;
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|err| format!("failed to serialize global context: {err}"))?;
+    storage::write_string_atomic(&path, &body)
+        .map_err(|err| format!("failed to write global context: {err:?}"))
+}
+
+fn global_context_state() -> &'static Mutex<serde_json::Value> {
+    GLOBAL_CONTEXT_STATE.get_or_init(|| Mutex::new(load_global_context_state()))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn system_health(
+    meta: Option<&crate::application::meta::ClientMeta>,
+) -> AppResult<StubPayload> {
+    success_payload(
+        "system_health",
+        json!({
+            "status": "ok",
+            "clientForm": "desktop",
+            "releaseTarget": "desktop",
+            "processModel": "tauri-desktop",
+            "hostOs": DESKTOP_HOST_OS,
+            "sourceCommit": env!("PT_BUILD_SOURCE_COMMIT"),
+            "meta": meta.map(|value| value.projection())
+        }),
+    )
+}
+
+pub fn client_meta(meta: &crate::application::meta::ClientMeta) -> AppResult<StubPayload> {
+    let value = serde_json::to_value(meta.projection()).unwrap_or(serde_json::Value::Null);
+    success_payload("client_meta", value)
+}
+
+pub fn open_external_url(input: ExternalUrlInput) -> AppResult<StubPayload> {
+    let url = input.url.trim();
+    if url.is_empty() {
+        return invalid_argument("url is required");
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg("start").arg("").arg(url);
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+
+    if let Err(err) = command.spawn() {
+        tracing::error!(error = %err, "Failed to spawn command to open external URL");
+        return AppResult::fail(
+            ErrorCode::InternalError,
+            format!("Failed to open URL: {}", err),
+            None,
+        );
+    }
+    success_payload("open_external_url", json!({ "ok": true }))
+}
+
+pub fn onboarding_get() -> AppResult<StubPayload> {
+    success_payload(
+        "onboarding_get",
+        json!({"completed": false, "step": "welcome"}),
+    )
+}
+
+pub fn onboarding_set(_input: OnboardingSetInput) -> AppResult<StubPayload> {
+    success_payload("onboarding_set", json!({"ok": true}))
+}
+
+pub fn wizard_get() -> AppResult<StubPayload> {
+    success_payload(
+        "wizard_get",
+        json!({
+            "steps": [],
+            "current_step": null,
+            "completed": false
+        }),
+    )
+}
+
+pub fn wizard_state_get() -> AppResult<StubPayload> {
+    success_payload(
+        "wizard_state_get",
+        json!({
+            "current_step": null,
+            "completed_steps": [],
+            "data": {}
+        }),
+    )
+}
+
+pub fn wizard_step_save(_input: WizardStepInput) -> AppResult<StubPayload> {
+    success_payload("wizard_step_save", json!({"ok": true}))
+}
+
+pub fn wizard_complete() -> AppResult<StubPayload> {
+    success_payload("wizard_complete", json!({"ok": true}))
+}
+
+pub fn wizard_api_execute(_input: WizardExecuteApiInput) -> AppResult<StubPayload> {
+    success_payload("wizard_api_execute", json!({"ok": true, "result": null}))
+}
+
+pub fn onboarding_reset() -> AppResult<StubPayload> {
+    // Only clear the *active* account — never wipe other accounts' data.
+    let mut identity_state = match auth_identity::read_state() {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(error = %err, "onboarding_reset: failed to read identity state");
+            return AppResult::fail(ErrorCode::InternalError, err, None);
+        }
+    };
+
+    let active_id = match &identity_state.active_account_id {
+        Some(id) => id.clone(),
+        None => {
+            // No active account — nothing to reset.
+            return success_payload("onboarding_reset", json!({ "ok": true }));
+        }
+    };
+
+    // Extract the provider portion from account id ("{provider}:{provider_user_id}")
+    let active_provider = active_id.split(':').next().unwrap_or("").to_string();
+
+    // Remove only the active account from identities; keep all others intact.
+    identity_state.accounts.retain(|a| a.id != active_id);
+    identity_state.active_account_id = None;
+    if let Err(err) = auth_identity::write_state(&identity_state) {
+        tracing::error!(error = %err, "onboarding_reset: failed to write identity state");
+        return AppResult::fail(ErrorCode::InternalError, err, None);
+    }
+
+    // Remove only the matching provider entry from OAuth connections.
+    if !active_provider.is_empty() {
+        let conn_path = storage::app_file_path(
+            "desktop",
+            StorageKind::Data,
+            &["oauth2", "connections.json"],
+        );
+        if let Ok(path) = conn_path {
+            if path.exists() {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    if let Ok(mut map) = serde_json::from_str::<
+                        std::collections::HashMap<String, serde_json::Value>,
+                    >(&text)
+                    {
+                        map.remove(&active_provider);
+                        if let Ok(json) = serde_json::to_string_pretty(&map) {
+                            let _ = storage::write_string_atomic(&path, &json);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    success_payload("onboarding_reset", json!({ "ok": true }))
+}
+
+pub fn preferences_get() -> AppResult<StubPayload> {
+    success_payload("preferences_get", json!({}))
+}
+
+pub fn preferences_set(input: PreferencesSetInput) -> AppResult<StubPayload> {
+    let _ = input.prefs;
+    success_payload("preferences_set", json!({ "ok": true }))
+}
+
+pub fn share_create(input: ShareSessionInput) -> AppResult<StubPayload> {
+    if input.session_key.trim().is_empty() {
+        return invalid_argument("session_key is required");
+    }
+    success_payload(
+        "share_create",
+        json!({
+            "share_id":"share-1",
+            "session_key":input.session_key,
+            "title":"Shared Session",
+            "visibility":"public"
+        }),
+    )
+}
+
+pub fn share_delete(input: ShareSessionInput) -> AppResult<StubPayload> {
+    if input.session_key.trim().is_empty() {
+        return invalid_argument("session_key is required");
+    }
+    success_payload("share_delete", json!({ "ok": true }))
+}
+
+pub fn share_get(input: ShareIdInput) -> AppResult<StubPayload> {
+    if input.share_id.trim().is_empty() {
+        return invalid_argument("share_id is required");
+    }
+    success_payload(
+        "share_get",
+        json!({
+            "share_id":input.share_id,
+            "title":"Shared Session",
+            "messages":[]
+        }),
+    )
+}
+
+struct LogTailChunk {
+    cursor: usize,
+    lines: Vec<String>,
+    truncated: bool,
+    reset: bool,
+}
+
+fn is_application_log_file(name: &str) -> bool {
+    name == "app.log" || name.starts_with("app.log.")
+}
+
+fn tail_log_content(
+    content: &str,
+    requested_cursor: i64,
+    limit: usize,
+    max_bytes: usize,
+) -> LogTailChunk {
+    let file_size = content.len();
+    let limit = limit.max(1);
+    let max_bytes = max_bytes.max(1);
+    let reset = requested_cursor > 0 && requested_cursor as usize > file_size;
+    let requested_start = if requested_cursor < 0 || reset {
+        0
+    } else {
+        (requested_cursor as usize).min(file_size)
+    };
+    let use_tail_snapshot =
+        requested_cursor < 0 || reset || file_size.saturating_sub(requested_start) > max_bytes;
+    let mut start = if use_tail_snapshot {
+        file_size.saturating_sub(max_bytes)
+    } else {
+        requested_start
+    };
+    while start < file_size && !content.is_char_boundary(start) {
+        start += 1;
+    }
+
+    let mut window = &content[start..];
+    if start > 0 {
+        window = window
+            .find('\n')
+            .map(|line_end| &window[line_end + 1..])
+            .unwrap_or_default();
+    }
+    let mut lines = window
+        .lines()
+        .rev()
+        .take(limit)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    lines.reverse();
+
+    LogTailChunk {
+        cursor: file_size,
+        lines,
+        truncated: start > requested_start,
+        reset,
+    }
+}
+
+pub fn logs_tail(input: LogsTailInput) -> AppResult<StubPayload> {
+    let limit = input.limit.unwrap_or(200) as usize;
+    let max_bytes = input.max_bytes.unwrap_or(512_000) as usize;
+
+    let log_dir = match storage::app_file_path("desktop", StorageKind::Logs, &[]) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve logs directory path");
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                format!("Failed to resolve logs directory: {}", e),
+                None,
+            );
+        }
+    };
+
+    let mut log_files: Vec<_> = fs::read_dir(&log_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            is_application_log_file(&name)
+        })
+        .collect();
+    log_files.sort_by_key(|e| {
+        std::cmp::Reverse(
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
+
+    let file_name = log_files
+        .first()
+        .map(|f| f.file_name().to_string_lossy().to_string())
+        .unwrap_or_else(|| "app.log".to_string());
+
+    let file_path = log_dir.join(&file_name);
+    if !file_path.exists() {
+        return success_payload(
+            "logs_tail",
+            json!({
+                "file": file_name, "cursor": input.cursor, "size": 0,
+                "lines": [], "truncated": false, "reset": false,
+                "limit": limit, "max_bytes": max_bytes
+            }),
+        );
+    }
+
+    let content = fs::read_to_string(&file_path).unwrap_or_default();
+    let file_size = content.len();
+    let chunk = tail_log_content(&content, input.cursor, limit, max_bytes);
+
+    success_payload(
+        "logs_tail",
+        json!({
+            "file": file_name, "cursor": chunk.cursor, "size": file_size,
+            "lines": chunk.lines, "truncated": chunk.truncated,
+            "reset": chunk.reset,
+            "limit": limit, "max_bytes": max_bytes
+        }),
+    )
+}
+
+#[cfg(test)]
+mod log_tail_tests {
+    use super::{is_application_log_file, tail_log_content};
+
+    #[test]
+    fn initial_snapshot_returns_latest_lines() {
+        let content = (0..100)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+
+        let chunk = tail_log_content(&content, -1, 3, 80);
+
+        assert_eq!(chunk.lines, ["line-97", "line-98", "line-99"]);
+        assert_eq!(chunk.cursor, content.len());
+        assert!(chunk.truncated);
+        assert!(!chunk.reset);
+    }
+
+    #[test]
+    fn oversized_incremental_backlog_jumps_to_latest_window() {
+        let content = (0..100)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+
+        let chunk = tail_log_content(&content, 10, 2, 40);
+
+        assert_eq!(chunk.lines, ["line-98", "line-99"]);
+        assert_eq!(chunk.cursor, content.len());
+        assert!(chunk.truncated);
+    }
+
+    #[test]
+    fn truncated_file_resets_with_current_content_instead_of_emptying() {
+        let content = "new-1\nnew-2\n";
+
+        let chunk = tail_log_content(content, 10_000, 20, 1_024);
+
+        assert_eq!(chunk.lines, ["new-1", "new-2"]);
+        assert_eq!(chunk.cursor, content.len());
+        assert!(chunk.reset);
+    }
+
+    #[test]
+    fn log_selection_excludes_unrelated_jsonl_files() {
+        assert!(is_application_log_file("app.log"));
+        assert!(is_application_log_file("app.log.2026-10-08"));
+        assert!(!is_application_log_file("storage-migration.jsonl"));
+        assert!(!is_application_log_file("acceptance.log"));
+    }
+}
+
+pub fn oauth_simulate_lark_start(input: OAuthSimulateStartInput) -> AppResult<StubPayload> {
+    success_payload(
+        "oauth_simulate_lark_start",
+        json!({
+            "status":"pending",
+            "session_id":"sim-1",
+            "qr_url":"https://example.com/qr",
+            "create_bot":input.create_bot.unwrap_or(false),
+            "app_name":input.app_name.unwrap_or_else(|| "Lark Bot".to_string())
+        }),
+    )
+}
+
+pub fn oauth_simulate_lark_poll(input: OAuthSessionInput) -> AppResult<StubPayload> {
+    if input.session_id.trim().is_empty() {
+        return invalid_argument("session_id is required");
+    }
+    success_payload(
+        "oauth_simulate_lark_poll",
+        json!({
+            "status":"done",
+            "session_id":input.session_id
+        }),
+    )
+}
+
+pub fn oauth_simulate_lark_create_bot_session(
+    input: OAuthCreateBotSessionInput,
+) -> AppResult<StubPayload> {
+    success_payload(
+        "oauth_simulate_lark_create_bot_session",
+        json!({
+            "status":"ok",
+            "bot":{"app_id":"app-1","app_secret":"secret"},
+            "channel_id":"channel-1",
+            "app_name":input.app_name.unwrap_or_else(|| "Lark Bot".to_string())
+        }),
+    )
+}
+
+pub fn config_section_get(input: ConfigSectionInput) -> AppResult<StubPayload> {
+    if input.section.trim().is_empty() {
+        return invalid_argument("section is required");
+    }
+    success_payload("config_section_get", json!({}))
+}
+
+pub fn config_section_set(input: ConfigSectionSetInput) -> AppResult<StubPayload> {
+    if input.section.trim().is_empty() {
+        return invalid_argument("section is required");
+    }
+    let _ = input.values;
+    success_payload("config_section_set", json!({ "ok": true }))
+}
+
+pub fn config_field_reset(input: ConfigFieldResetInput) -> AppResult<StubPayload> {
+    if input.section.trim().is_empty() || input.field.trim().is_empty() {
+        return invalid_argument("section and field are required");
+    }
+    success_payload("config_field_reset", json!({ "ok": true }))
+}
+
+pub fn visitor_heartbeat() -> AppResult<StubPayload> {
+    success_payload(
+        "visitor_heartbeat",
+        json!({ "online": 1, "ip": "127.0.0.1" }),
+    )
+}
+
+pub fn visitor_online() -> AppResult<StubPayload> {
+    success_payload("visitor_online", json!({ "online": 1 }))
+}
+
+pub fn context_snapshot_get(input: Option<ContextSnapshotGetInput>) -> AppResult<StubPayload> {
+    let mut snapshot = match global_context_state().lock() {
+        Ok(v) => v.clone(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to acquire global context lock");
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                format!("Failed to access application context: {}", e),
+                None,
+            );
+        }
+    };
+    if let Ok(account_state) = auth_identity::read_state() {
+        let active = match account_state.active_account_id {
+            Some(ref active_id) => account_state
+                .accounts
+                .iter()
+                .find(|item| item.id == *active_id),
+            None => account_state.accounts.first(),
+        };
+        if let Some(account) = active {
+            snapshot["identity"]["userId"] = json!(account.id);
+            snapshot["identity"]["displayName"] = json!(account.name);
+            snapshot["identity"]["provider"] = json!(account.provider);
+            snapshot["identity"]["email"] = json!(account.email);
+            snapshot["identity"]["avatarUrl"] = json!(account.avatar_url);
+            snapshot["identity"]["profileUrl"] = json!(account.profile_url);
+            snapshot["identity"]["registerTime"] = json!(if account.created_at.is_empty() {
+                account.last_login_at.clone()
+            } else {
+                account.created_at.clone()
+            });
+            snapshot["identity"]["lastLoginAt"] = json!(account.last_login_at);
+            snapshot["session"]["loginStatus"] = json!("authenticated");
+            snapshot["session"]["authenticated"] = json!(true);
+            snapshot["session"]["activeAccountId"] = json!(account.id);
+            snapshot["session"]["lastAuthAt"] = json!(account.last_login_at);
+        } else {
+            snapshot["session"]["loginStatus"] = json!("unauthenticated");
+            snapshot["session"]["authenticated"] = json!(false);
+            snapshot["session"]["activeAccountId"] = serde_json::Value::Null;
+            snapshot["session"]["lastAuthAt"] = serde_json::Value::Null;
+        }
+    }
+    if let Some(req) = input {
+        if let Some(slices) = req.slices {
+            let mut scoped = serde_json::Map::new();
+            for key in slices {
+                if let Some(v) = snapshot.get(&key) {
+                    scoped.insert(key, v.clone());
+                }
+            }
+            return success_payload("context_snapshot_get", serde_json::Value::Object(scoped));
+        }
+    }
+    success_payload("context_snapshot_get", snapshot)
+}
+
+pub fn context_action_dispatch(input: ContextActionDispatchInput) -> AppResult<StubPayload> {
+    if input.action.trim().is_empty() {
+        return invalid_argument("action is required");
+    }
+    let mut state = match global_context_state().lock() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to acquire global context lock");
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                format!("Failed to access application context: {}", e),
+                None,
+            );
+        }
+    };
+    let payload = input.payload.unwrap_or_else(|| json!({}));
+    if input.action == "set_runtime_state" {
+        if let Some(app_state) = payload
+            .get("appState")
+            .and_then(|v: &serde_json::Value| v.as_str())
+        {
+            state["runtime"]["appState"] = json!(app_state);
+        }
+    } else if input.action == "set_network_mode" {
+        if let Some(online) = payload
+            .get("online")
+            .and_then(|v: &serde_json::Value| v.as_bool())
+        {
+            state["runtime"]["online"] = json!(online);
+            state["runtime"]["networkMode"] = json!(if online { "online" } else { "offline" });
+            state["network"]["online"] = json!(online);
+            state["network"]["mode"] = json!(if online { "online" } else { "offline" });
+            state["network"]["degraded"] = json!(!online);
+            state["network"]["lastChangedAt"] = json!(now_ms());
+        }
+    } else if input.action == "merge_snapshot" {
+        if let Some(obj) = payload.as_object() {
+            for (k, v) in obj {
+                let k: &String = k;
+                let v: &serde_json::Value = v;
+                state[k] = v.clone();
+            }
+        }
+    } else {
+        return AppResult::fail(
+            ErrorCode::InvalidArgument,
+            "Unsupported system action",
+            None,
+        );
+    }
+    state["meta"]["updatedAt"] = json!(now_ms());
+    if let Err(err) = persist_global_context_state(&state) {
+        tracing::error!(error = %err, "Failed to persist global application context");
+        return AppResult::fail(
+            ErrorCode::InternalError,
+            format!("Failed to persist application context: {}", err),
+            None,
+        );
+    }
+    success_payload(
+        "context_action_dispatch",
+        json!({
+            "ok": true,
+            "action": input.action,
+            "snapshot": state.clone()
+        }),
+    )
+}
+
+pub fn context_capabilities() -> AppResult<StubPayload> {
+    let state = match global_context_state().lock() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to acquire global context lock");
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                format!("Failed to access application context: {}", e),
+                None,
+            );
+        }
+    };
+    success_payload(
+        "context_capabilities",
+        json!({
+            "capability": state["capability"].clone(),
+            "updatedAt": state["meta"]["updatedAt"].clone()
+        }),
+    )
+}
+
+pub fn context_health() -> AppResult<StubPayload> {
+    let state = match global_context_state().lock() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to acquire global context lock");
+            return AppResult::fail(
+                ErrorCode::InternalError,
+                format!("Failed to access application context: {}", e),
+                None,
+            );
+        }
+    };
+    let app_state = state["runtime"]["appState"].as_str().unwrap_or("unknown");
+    let network_online = state["network"]["online"].as_bool().unwrap_or(true);
+    let degraded =
+        state["network"]["degraded"].as_bool().unwrap_or(false) || app_state == "degraded";
+    let status = if degraded {
+        "degraded"
+    } else if app_state == "booting" {
+        "booting"
+    } else {
+        "ready"
+    };
+    let mut issues = Vec::<String>::new();
+    if !network_online {
+        issues.push("network_offline".to_string());
+    }
+    if app_state == "shutdown" {
+        issues.push("runtime_shutdown".to_string());
+    }
+    success_payload(
+        "context_health",
+        json!({
+            "status": status,
+            "runtimeState": app_state,
+            "networkOnline": network_online,
+            "degraded": degraded,
+            "issues": issues,
+            "updatedAt": state["meta"]["updatedAt"].clone()
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_health_reports_compiled_desktop_identity() {
+        let result = system_health(None);
+        assert!(result.ok);
+        assert!(result.error.is_none());
+
+        let payload = result.data.expect("system health payload");
+        assert_eq!(payload.command, "system_health");
+        let status: serde_json::Value =
+            serde_json::from_str(&payload.status).expect("valid system health JSON");
+        assert_eq!(status["status"], json!("ok"));
+        assert_eq!(status["clientForm"], json!("desktop"));
+        assert_eq!(status["releaseTarget"], json!("desktop"));
+        assert_eq!(status["processModel"], json!("tauri-desktop"));
+        assert_eq!(status["hostOs"], json!(DESKTOP_HOST_OS));
+        assert_eq!(
+            status["sourceCommit"],
+            json!(env!("PT_BUILD_SOURCE_COMMIT"))
+        );
+        // Meta is injected by the command layer with AppState; the function
+        // itself accepts None when called without state (e.g. this unit test).
+        assert_eq!(status["meta"], serde_json::Value::Null);
+    }
+}

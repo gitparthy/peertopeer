@@ -1,0 +1,144 @@
+---
+kind: pitfall
+title: Embedded controls leak square UA chrome into rounded glass frames
+status: active
+owns:
+  - packages/ui/web/src/fields.tsx
+  - packages/ui/web/src/styles.css
+  - packages/prototypes/shared/ui-system/DesignDirections.tsx
+  - packages/prototypes/shared/ui-system/design-directions.css
+  - tooling/scripts/ui-system/craft-battery.mjs
+  - tooling/scripts/ui-system/suites/north-star.suite.json
+related:
+  - docs/architecture/platform/client/ui-system/prototype/north-star-frame.md
+detected: 2026-10-30
+owner: Client Platform / UI System
+review-cadence: on-change
+---
+
+# Embedded controls leak square UA chrome into rounded glass frames
+
+## Symptom
+
+Inside the rounded, translucent desktop-prototype frame the owner kept
+finding "boxes that do not belong": a hard square dark rectangle around the
+search field on keyboard focus, a gray outset rectangle behind a heart icon
+button, and hairline borders where the icon rail, top bar and conversation
+rail meet. Each was reported individually ("方框圆角", "这个边界不要",
+"怎么会这样") and each was initially fixed as a one-off, so the same class
+of defect recurred across different elements over multiple rounds.
+
+## Root cause
+
+Native/global control chrome was allowed to paint *inside* a rounded
+material host:
+
+1. The global `.pt-ui :where(input,...):focus-visible { outline: 2px solid
+   var(--pt-focus) }` rule has higher specificity than a bare
+   `input { outline: 0 }`, so the 2px square outline rendered on a
+   radius-0 `<input>` that visually lives inside a 12px rounded host.
+2. A custom `<button>` without border/background reset inherited the UA
+   `outset` border and system-gray face (`2px outset rgb(0,0,0)`,
+   `rgb(239,239,239)`).
+3. Chrome zones (icon rail / top bar / side rail) were separated with
+   `1px` hairlines; in a glass material surface hierarchy strokes read as
+   admin-frame tiling, while the intended separation is material
+   (translucent surfaces + blur + shadow).
+
+The deeper process failure was that owner-reported craft defects were fixed
+at the instance layer and never promoted into deterministic gates, so the
+next identical defect had to be noticed by a human again.
+
+## Mitigation
+
+### What was done in code
+
+- `design-directions.css`: embedded search input neutralizes the global
+  outline at sufficient specificity (`.sk-shell .sk-chat-search
+  input:focus-visible { outline: none }`); the rounded HOST paints keyboard
+  focus via `.sk-chat-search:focus-within { box-shadow: 0 0 0 2px ... }`, so
+  the ring follows the 12px radius. The range control gets a pill-shaped
+  focus shadow of its own.
+- The heart button carries an explicit reset (`border:0; background:
+  transparent; appearance` inherited from the frame button reset).
+- `.sk-rail`, `.sk-feed-head`, `.sk-chats` have zero border width on all
+  sides; zone separation is material-only.
+
+### What guards against regression
+
+- Craft battery rules in `tooling/scripts/ui-system/craft-battery.mjs`:
+  C9 `embedded-control-square-focus` (focuses each text-like control,
+  fails when a radius-0 input inside a radius-≥8 host paints a visible
+  outline), C10 `chrome-zone-hairline` (rail/head/aside must have zero
+  border), C11 `ua-button-chrome` (no visible button may keep an `outset`
+  border).
+- `tooling/scripts/ui-system/suites/north-star.suite.json` runs the battery
+  against `.sk-shell` and asserts `outline-style: none` on the focused
+  search input plus the rounded host focus ring.
+
+## How to detect a recurrence
+
+### Identity controls and catalogue presentation
+
+The 2026-11-16 comparison with WeChat exposed a 44px self tile plus private
+button chrome, 40px catalogue avatars, and centred avatar-only rows despite
+208px of exposed paper. Stable drag preference was incorrectly used as the
+row-presentation threshold, with another threshold hiding all header tools.
+
+The frame contract now separates preference from presentation. Shared avatar
+roles and `Button appearance="identity"` own the complete contour; app CSS
+only positions the control. Avatar radius must never override the general
+control radius. Verify real exposure just below/at/above 200px, both tab
+glyphs plus search/new, label restoration, identity hover/keyboard activation,
+and the current native screenshot. A browser pass is not OS-resize proof.
+See [the frame contract](../../architecture/platform/client/ui-system/prototype/north-star-frame.md)
+for the current values.
+
+### Embedded writing insets and expanded bounds
+
+The 2026-11-15 Desktop composer put its caret against the curved upper-left
+edge. Its app class declared wider padding, but the shared embedded
+`FieldFrame` descendant selector won the cascade with `8px 4px`. That same
+selector reset min/max height, leaving the expand button pressed while the
+editor stayed one line tall.
+
+Embedded TextArea now consumes public `--pt-textarea-padding`,
+`--pt-textarea-caret-color`, `--pt-textarea-min-height` and
+`--pt-textarea-max-height` inputs. Chat binds the shared `12px 16px 8px`
+writing inset and accent caret; Desktop passes its existing height bounds.
+The default embedded geometry and comfortable touch floor still apply to
+other callers. Never fix this by increasing the app selector's specificity.
+The writing dock's shared radius is 8px. The craft battery checks resolved
+padding and caret paint, so a source-only assertion cannot hide another
+cascade override. Check an empty native editor, expansion and collapse, plus
+single-line/multiline text and narrow geometry on the current source.
+
+### Embedded composer touch height
+
+The 2026-11-13 whole-product native iOS run failed `chat.direct-thread`:
+the comfortable Message textarea measured 40px despite its 44px parent.
+Embedded framing had removed the textarea's minimum height, and auto-growth
+used only one 24px text line plus 16px padding. The parent's touch target
+does not enlarge its child's input hit area.
+
+The shared comfortable embedded textarea now inherits the 44px control token.
+Auto-growth clamps both row limits against the computed minimum height and
+re-measures when it changes. Page-level height overrides are forbidden.
+The craft battery's `composer-input-touch-height` guards the actual input;
+repeat the complete native usability inventory after the affected batch
+to verify real WebView hit areas and containment.
+
+```sh
+node tooling/scripts/ui-system/evaluate-specimens.mjs \
+  --suite tooling/scripts/ui-system/suites/north-star.suite.json
+```
+
+rollup must be `OBSERVED`. A human-only screenshot pass cannot replace the
+gate: focus-state defects are invisible in static screenshots.
+
+## Crosswalks
+
+- Design grammar (radius on the painting layer, material-not-hairline
+  chrome, focus follows host radius):
+  `docs/architecture/platform/client/ui-system/prototype/north-star-frame.md`
+- Generic craft geometry gate: `tooling/scripts/ui-system/craft-battery.mjs`

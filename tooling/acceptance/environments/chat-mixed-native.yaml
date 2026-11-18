@@ -1,0 +1,216 @@
+{
+  "id": "chat-mixed-native",
+  "base_environment": "mobile-simulator",
+  "profile": {
+    "required": false,
+    "identity_match": false
+  },
+  "source_identity": {
+    "commit_required": true,
+    "workspace_digest_required": true
+  },
+  "services": {
+    "station-primary": {
+      "kind": "station",
+      "required": true,
+      "runtime_identity_required": true,
+      "endpoint_ref": "env:PT_MOBILE_STATION_PRIMARY_URL",
+      "deployment_environment_ref": "env:PT_MOBILE_STATION_PRIMARY_DEPLOY_ENV",
+      "health_action": "station-check",
+      "status_action": "station-status",
+      "attestation_producer": "station-deployment"
+    },
+    "station-secondary": {
+      "kind": "station",
+      "required": true,
+      "runtime_identity_required": true,
+      "endpoint_ref": "env:PT_MOBILE_STATION_SECONDARY_URL",
+      "deployment_environment_ref": "env:PT_MOBILE_STATION_SECONDARY_DEPLOY_ENV",
+      "health_action": "station-check",
+      "status_action": "station-status",
+      "attestation_producer": "station-deployment"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "chat-mixed-native-actors",
+      "authorization_required": true,
+      "authorization_ref": "station.reset:chat-mixed-native-actors",
+      "target_assertion": "both Stations are approved disposable targets",
+      "initial_assertion": "Alice, Bob, and Carol have canonical identities on their assigned Stations"
+    }
+  ],
+  "credentials": [],
+  "clients": [
+    {
+      "id": "desktop-alice",
+      "actor": "alice",
+      "runtime": "native-tauri",
+      "required_service_roles": ["station"],
+      "service_bindings": {
+        "station": {
+          "service_id": "station-primary",
+          "required_kind": "station"
+        }
+      }
+    },
+    {
+      "id": "desktop-bob",
+      "actor": "bob",
+      "runtime": "native-tauri",
+      "required_service_roles": ["station"],
+      "service_bindings": {
+        "station": {
+          "service_id": "station-secondary",
+          "required_kind": "station"
+        }
+      }
+    },
+    {
+      "id": "desktop-bob-peer",
+      "actor": "bob",
+      "runtime": "native-tauri",
+      "required_service_roles": ["station"],
+      "service_bindings": {
+        "station": {
+          "service_id": "station-primary",
+          "required_kind": "station"
+        }
+      }
+    },
+    {
+      "id": "sim-ios",
+      "actor": "bob",
+      "runtime": "tauri-ios-simulator",
+      "required_service_roles": ["station"],
+      "service_bindings": {
+        "station": {
+          "service_id": "station-secondary",
+          "required_kind": "station"
+        }
+      }
+    },
+    {
+      "id": "sim-ios-peer",
+      "actor": "charlie",
+      "runtime": "tauri-ios-simulator",
+      "required_service_roles": ["station"],
+      "service_bindings": {
+        "station": {
+          "service_id": "station-primary",
+          "required_kind": "station"
+        }
+      }
+    }
+  ],
+  "default_client_ids": [
+    "desktop-alice",
+    "desktop-bob",
+    "sim-ios",
+    "sim-ios-peer"
+  ],
+  "gate_client_ids": {
+    "chat-lifecycle-group-live-e2e": [
+      "desktop-alice",
+      "desktop-bob",
+      "sim-ios-peer"
+    ],
+    "station-access-session-class-suite-e2e": [
+      "desktop-alice",
+      "desktop-bob",
+      "desktop-bob-peer",
+      "sim-ios",
+      "sim-ios-peer"
+    ]
+  },
+  "gate_client_actor_bindings": {
+    "station-access-session-class-suite-e2e": {
+      "sim-ios-peer": "bob"
+    }
+  },
+  "gate_mobile_identity_sources": {
+    "station-access-session-class-suite-e2e": {
+      "sim-ios": "desktop-bob",
+      "sim-ios-peer": "desktop-bob"
+    }
+  },
+  "gate_client_service_bindings": {
+    "chat-lifecycle-mixed-client-multi-device-e2e": {
+      "desktop-alice": "station-secondary"
+    },
+    "station-access-session-class-suite-e2e": {
+      "desktop-bob": "station-primary",
+      "desktop-bob-peer": "station-primary",
+      "sim-ios": "station-primary",
+      "sim-ios-peer": "station-primary"
+    }
+  },
+  "harness": {
+    "namespace": "__PEERS_MOBILE_ACCEPTANCE__",
+    "required_actions": [
+      "build.identity",
+      "lifecycle.suspend",
+      "lifecycle.resume",
+      "lifecycle.restart",
+      "lifecycle.scope.read",
+      "messaging.createDirect",
+      "messaging.createGroup",
+      "messaging.attachment.stage",
+      "messaging.attachment.open",
+      "messaging.send",
+      "messaging.interact",
+      "messaging.read",
+      "messaging.typing",
+      "messaging.reconcile",
+      "messaging.command.read",
+      "messaging.search",
+      "messaging.projection.read",
+      "navigation.apply",
+      "navigation.snapshot",
+      "recovery.snapshot",
+      "social.reconcile",
+      "social.projection.read",
+      "getRealtimeDevice",
+      "initiateCall",
+      "callResolutionState",
+      "callSnapshot", "callMediaStats", "callRestartConnection",
+      "acceptCall",
+      "rejectCall",
+      "cleanup",
+      "groupCallStart", "groupCallLeave", "groupCallToggleMic",
+      "groupCallToggleCamera", "groupCallSnapshot", "groupCallMediaStats"
+    ],
+    "policy": "Chat production actions only; Station endpoints and Appium authority remain parent-owned"
+  },
+  "proof_scope": {
+    "proves": [
+      "macOS Desktop and iOS simulator mixed-client Chat convergence",
+      "same-Station and cross-Station Direct and Group receiver behavior",
+      "same-actor Desktop and Mobile continuity",
+      "cross-device durable call resolution",
+      "Mobile incoming and outgoing single-call audio/video RTP, controls, ICE restart and release",
+      "three-actor Desktop and iOS group audio/video with RTP progress and permission withdrawal"
+    ],
+    "does_not_prove": [
+      "Linux or Windows Desktop behavior",
+      "Android Mobile behavior",
+      "physical-device behavior"
+    ]
+  },
+  "cleanup": {
+    "resources": [
+      "desktop-processes",
+      "desktop-ports",
+      "desktop-storage",
+      "appium-sessions",
+      "appium-process",
+      "machine-resource-leases",
+      "simulator-ports",
+      "simulator-storage",
+      "actor-fixture",
+      "profile-leases",
+      "deployment-leases"
+    ],
+    "deterministic": true
+  }
+}

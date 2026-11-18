@@ -1,0 +1,224 @@
+"""Trace the confirmed prototype operations without manufacturing Native proof."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any, Mapping
+
+
+ROOT = Path(__file__).resolve().parents[4]
+PROTOTYPE_CHECKS = (
+    ROOT / "packages/prototypes/desktop/shell/qa/agent_chat_checks.cjs"
+)
+GROUP_TARGETS = {
+    "Agent roster keeps stable ownership and reference-style row actions":
+        ("profile", "profile-create"),
+    "Profile edits one Agent and binds capabilities from bounded pickers":
+        ("profile", "profile-documents"),
+    "Topic rail owns new, switch, pin, title search, edit and delete":
+        ("topics", "topics-rename-cancel"),
+    "Provider settings create Direct and CLI profiles without type tabs":
+        ("models", "models-default"),
+    "Composer owns Topic model, slash commands, attachment and keyboard semantics":
+        ("models", "models-topic-isolation"),
+    "Conversation preserves activity, copy, quick reply and basic artifacts":
+        ("conversation", "conversation-follow-up"),
+    "Running turns keep the draft without exposing a queue":
+        ("conversation", "conversation-send-stop"),
+    "Clarification and approval remain inline and continue the Agent":
+        ("conversation", "conversation-clarification"),
+    "Stop and typed recovery preserve honest failure semantics":
+        ("conversation", "conversation-retry"),
+    "Agent and Topic owners preserve isolated drafts":
+        ("topics", "topics-rename-cancel"),
+    "Wide, compact and mobile topology matches observed reference behavior":
+        ("layout", "workspace-narrow"),
+}
+ADDITIONAL_OPERATIONS = {
+    "profile.soul.save": ("profile", "profile-documents"),
+    "profile.agents.save": ("profile", "profile-documents"),
+    "profile.documents.authority-readback": ("profile", "profile-documents"),
+    "profile.documents.restart": ("profile", "profile-restart"),
+    "profile.documents.provider-consumption": ("profile", "profile-prompt-consumption"),
+    "profile.documents.explicit-empty": ("profile", "profile-documents"),
+    "topic.model.provider-id-isolation": ("models", "models-topic-isolation"),
+    "topic.delete.atomic-authority": ("topics", "topics-batch-delete"),
+    "agent.delete.workspace-cleanup": ("topics", "agent-delete-cascade"),
+    "ask.answer.persisted": ("conversation", "conversation-clarification"),
+    "ask.restart-continuation": ("conversation", "conversation-clarification"),
+    "layout.drawer.close-focus": ("layout", "workspace-narrow"),
+}
+
+# The approved management boundary supersedes these Desktop prototype actions.
+# Keep their historical baseline identifiable; never manufacture their proof.
+RETIRED_PROVIDER_OPERATIONS = {
+    "settings.provider-list.mixed", "settings.provider-create.kind-choice",
+    "settings.provider-create.direct", "settings.provider-create.cli",
+    "settings.provider-schema.selected-only", "settings.provider-cli.no-api-fields",
+    "settings.provider-cli.registered-adapter", "settings.provider-cli.fields",
+    "settings.provider-cli.advanced", "settings.provider-cli.no-command-editor",
+    "settings.provider-cli.check", "settings.provider-cli.restore",
+    "settings.provider-cli.save-toast", "settings.feedback.bottom-right",
+    "settings.providers.usable-only.default", "settings.providers.usable-only.persisted",
+    "settings.provider.enabled-projection", "settings.model.enabled-projection",
+}
+MANAGEMENT_OPERATIONS = {
+    "dashboard.provider.methods": "models-default",
+    "dashboard.provider.selected-schema": "models-default",
+    "dashboard.provider.cli-install": "models-default",
+    "dashboard.provider.cli-advanced": "models-default",
+    "dashboard.provider.cli-no-command-editor": "models-default",
+    "dashboard.provider.dm-create-consumed": "models-default",
+    "dashboard.provider.cli-discovery": "models-cli-discovery",
+    "dashboard.provider.availability-consumed": "models-disable-recovery",
+}
+GATE_BY_AREA = {
+    "commands": "agent-slash-command-native-e2e",
+    "attribution": "agent-context-projection-native-e2e",
+}
+
+OPERATION_TARGETS = {
+    "agent.create.instant-profile": ("profile", "profile-create"),
+    "profile.model-ownership-absent": ("profile", "profile-create"),
+    "profile.identity.autosave-surface": ("profile", "profile-create"),
+    "agent.delete.confirm": ("topics", "agent-delete-cascade"),
+    "topic.pin": ("topics", "topics-pin"),
+    "topic.batch-select": ("topics", "topics-batch-delete"),
+    "topic.batch-delete-confirm": ("topics", "topics-batch-delete"),
+    "topic.batch-delete-cleanup": ("topics", "topics-batch-delete"),
+    "composer.settings-default-model": ("models", "models-default"),
+    "approval.cancel": ("conversation", "conversation-tool-approval"),
+    "approval.safe-focus": ("conversation", "conversation-tool-approval"),
+    "approval.run": ("conversation", "conversation-tool-approval"),
+    "approval.system-receipt": ("conversation", "conversation-tool-approval"),
+    "approval.continue": ("conversation", "conversation-tool-approval"),
+    "turn.stop": ("conversation", "conversation-send-stop"),
+    "turn.stop.execution-cancelled": ("conversation", "conversation-send-stop"),
+    "turn.stop.topic-error": ("conversation", "conversation-send-stop"),
+    "layout.wide-roster-topic-chat": ("layout", "workspace-wide"),
+    "layout.compact-rails": ("layout", "workspace-compact"),
+    "profile.extensions.skill-remove": ("profile", "profile-skill-consumption"),
+    "composer.slash": ("commands", "commands-authority"),
+    "composer.command.help": ("commands", "commands-authority"),
+    "composer.command.tools": ("commands", "commands-authority"),
+    "composer.command.skills": ("commands", "commands-authority"),
+    "composer.command.clear-preserves-history":
+        ("commands", "commands-authority"),
+    "composer.command.typing-slash-opens": ("commands", "commands-authority"),
+    "composer.command.stale-disables-capabilities":
+        ("commands", "commands-degraded"),
+    "composer.command.unavailable-disables-capabilities":
+        ("commands", "commands-degraded"),
+    "composer.command.text-chat-survives-stale":
+        ("commands", "commands-degraded"),
+    "composer.command.narrow-palette": ("commands", "commands-narrow"),
+    "turn.attribution.compact-badges":
+        ("attribution", "historical-attribution"),
+    "turn.attribution.detail-included":
+        ("attribution", "historical-attribution"),
+    "turn.attribution.detail-omitted":
+        ("attribution", "historical-attribution"),
+    "turn.attribution.detail-truncated":
+        ("attribution", "historical-attribution"),
+    "turn.attribution.version-pinned":
+        ("attribution", "historical-attribution"),
+    "turn.attribution.current-binding-does-not-rewrite-history":
+        ("attribution", "historical-attribution"),
+}
+
+
+def gate_for_area(area: str) -> str:
+    return GATE_BY_AREA.get(area, f"agent-chat-{area}-native")
+
+
+def operation_contract() -> list[dict[str, str]]:
+    source = PROTOTYPE_CHECKS.read_text(encoding="utf-8")
+    block = source.split("const operationCoverageByCheck = {", 1)[1].split(
+        "\n};", 1
+    )[0]
+    groups = re.findall(r"'([^']+)': \[(.*?)\]", block, re.S)
+    if {name for name, _ in groups} != set(GROUP_TARGETS):
+        raise ValueError("confirmed prototype Journey groups changed")
+    rows = []
+    for name, body in groups:
+        area, scenario = GROUP_TARGETS[name]
+        for operation in re.findall(r"'([^']+)'", body):
+            target_area, target_scenario = OPERATION_TARGETS.get(
+                operation, (area, scenario),
+            )
+            rows.append({
+                "operationId": operation,
+                "journey": name,
+                "featureId": "agent-chat-production",
+                "capabilityId": "agent-chat-production",
+                "gateId": gate_for_area(target_area),
+                "scenarioId": target_scenario,
+                "origin": "confirmed-prototype",
+            })
+    if len(rows) != 136 or len({row["operationId"] for row in rows}) != 136:
+        raise ValueError("confirmed prototype must have 136 unique operations")
+    rows = [row for row in rows if row["operationId"] not in RETIRED_PROVIDER_OPERATIONS]
+    for operation, scenario_id in MANAGEMENT_OPERATIONS.items():
+        rows.append({
+            "operationId": operation,
+            "journey": "dashboard-management-native-consumption",
+            "featureId": "agent-chat-production",
+            "capabilityId": "agent-chat-production",
+            "gateId": gate_for_area("models"),
+            "scenarioId": scenario_id,
+            "origin": "management-boundary",
+        })
+    for operation, (area, scenario) in ADDITIONAL_OPERATIONS.items():
+        rows.append({
+            "operationId": operation,
+            "journey": "authority-and-restoration",
+            "featureId": "agent-chat-production",
+            "capabilityId": "agent-chat-production",
+            "gateId": gate_for_area(area),
+            "scenarioId": scenario,
+            "origin": "production-closure",
+        })
+    return rows
+
+
+def coverage_report(
+    observations: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Require observed action and receiver assertion for every operation."""
+    rows: list[dict[str, Any]] = []
+    expected = {row["operationId"] for row in operation_contract()}
+    unknown = set(observations) - expected
+    if unknown:
+        raise ValueError(f"unknown operation evidence: {sorted(unknown)}")
+    for contract in operation_contract():
+        observation = observations.get(contract["operationId"], {})
+        proven = (
+            observation.get("status") == "passed"
+            and bool(observation.get("uiAction"))
+            and bool(observation.get("receiverAssertion"))
+            and bool(observation.get("sourceCommit"))
+            and bool(observation.get("runtimeId"))
+            and bool(observation.get("artifactRefs"))
+            and observation.get("gateId") == contract["gateId"]
+            and observation.get("operationId") == contract["operationId"]
+            and observation.get("scenarioId") == contract["scenarioId"]
+            and observation.get("suiteProofStatus") == "PROVEN"
+            and observation.get("cleanupStatus") == "passed"
+        )
+        rows.append({
+            **contract,
+            "proofStatus": "PROVEN" if proven else "UNPROVEN",
+            "observation": dict(observation),
+        })
+    missing = [row["operationId"] for row in rows if row["proofStatus"] != "PROVEN"]
+    return {
+        "artifactKind": "agent-chat-operation-coverage",
+        "baselineOperationCount": 136,
+        "retiredOperations": sorted(RETIRED_PROVIDER_OPERATIONS),
+        "activePrototypeOperationCount": 136 - len(RETIRED_PROVIDER_OPERATIONS),
+        "operationCount": len(rows),
+        "status": "passed" if not missing else "unproven",
+        "missingOperations": missing,
+        "operations": rows,
+    }

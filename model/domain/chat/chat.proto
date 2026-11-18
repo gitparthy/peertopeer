@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package peers_touch.model.chat.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model/chat;chat";
+
+// 聊天会话
+message ChatSession {
+  reserved "participant_ids";
+
+  string id = 1;
+  string topic = 2;
+  repeated string participant_ptids = 3;
+  google.protobuf.Timestamp last_message_at = 4;
+  string last_message_snippet = 5;
+  SessionType type = 6;
+  bool is_pinned = 7;
+  int64 unread_count = 8;
+  map<string, string> metadata = 9;
+  bool is_muted = 10;                     // 是否静音
+  MessageType last_message_type = 11;     // 最后消息类型
+  string target_id = 12;                  // 对方ID (好友ID或群ID)
+  string avatar_url = 13;                 // 头像URL
+}
+
+// 聊天消息
+message ChatMessage {
+  reserved "sender_id", "mentioned_ids";
+
+  string id = 1;
+  string session_id = 2;
+  string sender_ptid = 3;
+  string content = 4;
+  google.protobuf.Timestamp sent_at = 5;
+  MessageType type = 6;
+  MessageStatus status = 7;
+  string encrypted_content = 8;           // 加密内容
+  repeated MessageAttachment attachments = 9;
+  map<string, string> metadata = 10;
+  string reply_to_id = 11;                // Thread 回复的消息ID
+  repeated string mentioned_ptids = 12;   // @的用户PTID列表
+  bool mention_all = 13;                  // @所有人
+  bool is_deleted = 14;                   // 是否已删除/撤回
+  google.protobuf.Timestamp deleted_at = 15; // 删除时间
+}
+
+// 消息附件
+message MessageAttachment {
+  string id = 1;
+  string name = 2;
+  int64 size = 3;
+  string type = 4;
+  string url = 5;
+  string thumbnail_url = 6;
+  map<string, string> metadata = 7;
+}
+
+// 好友关系
+message Friend {
+  string actor_ptid = 1;
+  FriendshipStatus status = 2;
+  google.protobuf.Timestamp friendship_created_at = 3;
+  string public_key = 4;  // 用于端到端加密
+  map<string, string> metadata = 5;
+}
+
+// 好友请求
+message FriendRequest {
+  reserved "sender_id", "receiver_id";
+
+  string id = 1;
+  string sender_ptid = 2;
+  string receiver_ptid = 3;
+  string message = 4;
+  FriendRequestStatus status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp responded_at = 7;
+  // Enriched participant profile (populated at query time)
+  string sender_display_name = 8;
+  string sender_avatar = 9;
+  string receiver_display_name = 10;
+  string receiver_avatar = 11;
+}
+
+// 会话类型
+enum SessionType {
+  SESSION_TYPE_UNSPECIFIED = 0;
+  SESSION_TYPE_DIRECT = 1;    // 私聊
+  SESSION_TYPE_GROUP = 2;     // 群聊
+}
+
+// 消息类型
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  MESSAGE_TYPE_TEXT = 1;          // 文本
+  MESSAGE_TYPE_IMAGE = 2;         // 图片
+  MESSAGE_TYPE_FILE = 3;          // 文件
+  MESSAGE_TYPE_LOCATION = 4;      // 位置
+  MESSAGE_TYPE_SYSTEM = 5;        // 系统消息
+  MESSAGE_TYPE_STICKER = 6;       // 贴纸
+  MESSAGE_TYPE_AUDIO = 7;         // 语音
+  MESSAGE_TYPE_VIDEO = 8;         // 视频
+}
+
+// 消息状态
+enum MessageStatus {
+  MESSAGE_STATUS_UNSPECIFIED = 0;
+  MESSAGE_STATUS_SENDING = 1;     // 发送中
+  MESSAGE_STATUS_SENT = 2;        // 已发送
+  MESSAGE_STATUS_DELIVERED = 3;   // 已送达
+  MESSAGE_STATUS_READ = 4;        // 已读
+  MESSAGE_STATUS_FAILED = 5;      // 发送失败
+}
+
+// 好友关系状态
+enum FriendshipStatus {
+  FRIENDSHIP_STATUS_UNSPECIFIED = 0;
+  FRIENDSHIP_STATUS_PENDING = 1;   // 待接受
+  FRIENDSHIP_STATUS_ACCEPTED = 2;  // 已接受
+  FRIENDSHIP_STATUS_BLOCKED = 3;   // 已屏蔽
+  FRIENDSHIP_STATUS_REMOVED = 4;   // 已删除
+}
+
+// 好友请求状态
+enum FriendRequestStatus {
+  FRIEND_REQUEST_STATUS_UNSPECIFIED = 0;
+  FRIEND_REQUEST_STATUS_PENDING = 1;   // 待处理
+  FRIEND_REQUEST_STATUS_ACCEPTED = 2;  // 已接受
+  FRIEND_REQUEST_STATUS_REJECTED = 3;  // 已拒绝
+  FRIEND_REQUEST_STATUS_EXPIRED = 4;   // 已过期
+}

@@ -1,0 +1,155 @@
+{
+  "kind": "peers-touch-legacy-inventory",
+  "projectId": "CSG-20260926",
+  "status": "complete-for-plan-baseline",
+  "updatedAt": "2026-10-26",
+  "dimensions": [
+    "production-source",
+    "client-command-wrapper",
+    "station-route-handler",
+    "proto-generated",
+    "schema-backfill",
+    "test-fixture-mock",
+    "acceptance-runner",
+    "docs-locales-prototype",
+    "build-runtime-registration"
+  ],
+  "scanRoots": [
+    "apps/desktop",
+    "apps/mobile",
+    "apps/station/app/subserver/conversation",
+    "apps/station/frame/touch/model/chat",
+    "model/domain/chat",
+    "packages/messaging-core",
+    "packages/client-chat-core",
+    "packages/client-storage",
+    "packages/locales",
+    "packages/prototypes/desktop/features/social-chat",
+    "packages/prototypes/mobile/chat",
+    "tooling/acceptance",
+    "tooling/scripts",
+    "docs/architecture/domains/chat/lifecycle",
+    "docs/architecture/domains/chat/messaging",
+    "docs/architecture/domains/chat/encryption",
+    "docs/client/chat",
+    "Makefile",
+    "Cargo.toml",
+    "go.mod",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml"
+  ],
+  "ownerTasks": {
+    "CSG-L01": "CSG-05-local-clear-hard-cut",
+    "CSG-L02": "CSG-04-redaction-recovery",
+    "CSG-L03": "CSG-05-local-clear-hard-cut",
+    "CSG-L04": "CSG-01-storage-observability",
+    "CSG-L05": "CSG-05-local-clear-hard-cut"
+  },
+  "matchContract": "Case-sensitive symbols are searched across every scanRoot. seedPaths are starting evidence, not an allowlist. Live references fail. Reviewed schema removal, schema rejection and regression references remain visible in the report only while their complete file SHA-256 matches retirementProofs. New references or changed protection source fail closed.",
+  "rule": "Every entry must reach zero live references across all nine dimensions before its owner Task completes. Retirement references prove removal or rejection, never compatibility or business use.",
+  "retirementProofs": [
+    {
+      "file": "apps/station/app/subserver/conversation/infrastructure/persistence/schema.go",
+      "sha256": "96266dab5543b1cc659e9294e13054b57a8e4fc5a516e254facee69ba0d07778",
+      "entryIds": ["CSG-L01", "CSG-L03"],
+      "role": "schema-retirement"
+    },
+    {
+      "file": "apps/station/app/subserver/conversation/infrastructure/persistence/unit_of_work.go",
+      "sha256": "fbf83b5c36bb87ec25b65355697270f01005fe11051cfc4c6e7f5c5f5b211c94",
+      "entryIds": ["CSG-L01", "CSG-L03"],
+      "role": "schema-rejection"
+    },
+    {
+      "file": "apps/station/app/subserver/conversation/infrastructure/persistence/schema_test.go",
+      "sha256": "208ead70b5912fa3ce07b92dab5930d0824612eedbe619a1ad741f0385b3566d",
+      "entryIds": ["CSG-L01", "CSG-L03"],
+      "role": "regression-proof"
+    },
+    {
+      "file": "apps/station/app/subserver/conversation/infrastructure/persistence/unit_of_work_postgres_test.go",
+      "sha256": "6a10d74a7dc7ccfa36ca3fee381fe678d6507afde5bc8683cb352f2c08979471",
+      "entryIds": ["CSG-L01", "CSG-L03"],
+      "role": "regression-proof"
+    },
+    {
+      "file": "apps/station/app/subserver/conversation/production_composition_schema_test.go",
+      "sha256": "c282381ac4ea232f103c2413a54ec1a253b41ba5c0cf1dfe1b06c82142f8a328",
+      "entryIds": ["CSG-L01", "CSG-L03"],
+      "role": "regression-proof"
+    }
+  ],
+  "entries": [
+    {
+      "id": "CSG-L01",
+      "concern": "conversation clear marker and 24-hour restore",
+      "symbols": [
+        "cleared_at",
+        "cleared_at_ms",
+        "cleared_at_unix_ms",
+        "HISTORY_RESTORE_WINDOW_MS",
+        "historyRestoreWindow"
+      ],
+      "routes": [],
+      "seedPaths": [
+        "model/domain/chat/conversation_api.proto",
+        "apps/station/app/subserver/conversation/infrastructure/persistence/models.go",
+        "apps/station/app/subserver/conversation/application/command/projections.go",
+        "apps/desktop/src/components/chat/ChatDetailPanel.tsx",
+        "apps/mobile/src/pages/ChatPage.tsx"
+      ],
+      "target": "delete"
+    },
+    {
+      "id": "CSG-L02",
+      "concern": "desktop-only local message deletion overlay",
+      "symbols": ["deletedMessageUlids"],
+      "routes": [],
+      "seedPaths": [
+        "apps/desktop/src/store/socialChat.ts",
+        "apps/desktop/src/store/socialProjection.ts"
+      ],
+      "target": "replace-with-hide-message-for-actor"
+    },
+    {
+      "id": "CSG-L03",
+      "concern": "undeployed disappearing-message skeleton",
+      "symbols": ["disappear_timer_seconds", "disappearTimerSeconds"],
+      "routes": [],
+      "seedPaths": [
+        "model/domain/chat/command.proto",
+        "model/domain/chat/event.proto",
+        "model/domain/chat/conversation.proto",
+        "apps/station/app/subserver/conversation/infrastructure/persistence/models.go",
+        "apps/mobile/src-tauri/src/messaging/adapter.rs"
+      ],
+      "target": "delete"
+    },
+    {
+      "id": "CSG-L04",
+      "concern": "fixed-zero desktop statistics API",
+      "symbols": ["statistics_get"],
+      "routes": [],
+      "seedPaths": [
+        "apps/desktop/src-tauri/src/application/system/mod.rs",
+        "apps/desktop/src-tauri/src/interface/tauri_commands/system.rs",
+        "apps/desktop/src/services/desktop_api.ts"
+      ],
+      "target": "delete-or-replace-by-owned-real-statistics"
+    },
+    {
+      "id": "CSG-L05",
+      "concern": "affected schema backfills and compatibility readers",
+      "symbols": ["BackfillConversationDefaults"],
+      "routes": [],
+      "seedPaths": [
+        "packages/messaging-core/src/store/schema.rs",
+        "apps/station/app/subserver/conversation/infrastructure/persistence/backfill.go",
+        "apps/desktop/src-tauri/src/messaging/store.rs",
+        "apps/mobile/src-tauri/src/messaging/adapter.rs"
+      ],
+      "target": "replace-with-clean-baseline"
+    }
+  ]
+}

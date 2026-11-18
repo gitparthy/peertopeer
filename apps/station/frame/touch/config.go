@@ -1,0 +1,117 @@
+package touch
+
+import (
+	cfg "github.com/peers-labs/peers-touch/station/frame/core/config"
+	"github.com/peers-labs/peers-touch/station/frame/core/option"
+	"github.com/peers-labs/peers-touch/station/frame/touch/validator"
+)
+
+var (
+	touchConfig = TouchConfig{}
+)
+
+func init() {
+	cfg.RegisterOptions(&touchConfig)
+}
+
+// TouchConfig holds configuration for the touch layer
+type TouchConfig struct {
+	Peers struct {
+		Actor struct {
+			// DevSeedEnabled must be explicitly turned on for development images to
+			// create preset actors/friendships at startup. It defaults to false so a
+			// production deployment can never inject seeded accounts, even if
+			// preset_users is populated. Seeding has no HTTP/RPC entry point.
+			DevSeedEnabled bool                `json:"dev_seed_enabled" pconf:"dev_seed_enabled" yaml:"dev_seed_enabled"`
+			PresetUsers    []PresetActorConfig `json:"preset_users" pconf:"preset_users" yaml:"preset_users"`
+		} `json:"actor" pconf:"actor" yaml:"actor"`
+		Touch struct {
+			Routers  RouterConfig   `json:"routers" pconf:"routers" yaml:"routers"`
+			Security SecurityConfig `json:"security" pconf:"security" yaml:"security"`
+		} `json:"touch" pconf:"touch"`
+	} `json:"peers" pconf:"peers"`
+}
+
+type PresetActorConfig struct {
+	Username      string            `json:"username" pconf:"username" yaml:"username"`
+	Email         string            `json:"email" pconf:"email" yaml:"email"`
+	Password      string            `json:"password" pconf:"password" yaml:"password"`
+	DisplayName   string            `json:"display_name" pconf:"display_name" yaml:"display_name"`
+	Avatar        string            `json:"avatar" pconf:"avatar" yaml:"avatar"`
+	LegacyAvatars []string          `json:"legacy_avatars" pconf:"legacy_avatars" yaml:"legacy_avatars"`
+	Endpoints     map[string]string `json:"endpoints" pconf:"endpoints" yaml:"endpoints"`
+}
+
+// RouterConfig controls which routers are enabled
+type RouterConfig struct {
+	Management  bool `json:"management" pconf:"management" yaml:"management"`
+	ActivityPub bool `json:"activitypub" pconf:"activitypub" yaml:"activitypub"`
+	WellKnown   bool `json:"wellknown" pconf:"wellknown" yaml:"wellknown"`
+	User        bool `json:"user" pconf:"user" yaml:"user"`
+	Peer        bool `json:"peer" pconf:"peer" yaml:"peer"`
+	Message     bool `json:"message" pconf:"message" yaml:"message"`
+	Mastodon    bool `json:"mastodon" pconf:"mastodon" yaml:"mastodon"`
+	Social      bool `json:"social" pconf:"social" yaml:"social"`
+}
+
+// SecurityConfig holds security-related configuration
+type SecurityConfig struct {
+	Password PasswordConfig `json:"password" pconf:"password" yaml:"password"`
+}
+
+// PasswordConfig holds password validation configuration
+type PasswordConfig struct {
+	// Pattern is the regex pattern for password validation
+	Pattern string `json:"pattern" pconf:"pattern" yaml:"pattern"`
+	// MinLength is the minimum password length (default: 8)
+	MinLength int `json:"min_length" pconf:"min-length" yaml:"min_length"`
+	// MaxLength is the maximum password length (default: 20)
+	MaxLength int `json:"max_length" pconf:"max-length" yaml:"max_length"`
+}
+
+func (r *RouterConfig) Options() []option.Option {
+	// Router config doesn't need to return options as it's used directly
+	return nil
+}
+
+// GetRouterConfig returns the router configuration with default values
+func GetRouterConfig() *RouterConfig {
+	return &touchConfig.Peers.Touch.Routers
+}
+
+func GetPresetUsers() []PresetActorConfig {
+	return touchConfig.Peers.Actor.PresetUsers
+}
+
+// GetDevSeedEnabled reports whether development-only preset seeding is
+// explicitly enabled for this deployment. It is opt-in and defaults off.
+func GetDevSeedEnabled() bool {
+	return touchConfig.Peers.Actor.DevSeedEnabled
+}
+
+// GetPasswordConfig returns the password configuration with default values
+func GetPasswordConfig() *validator.PasswordConfig {
+	config := &touchConfig.Peers.Touch.Security.Password
+
+	// Set default values if not configured
+	if config.Pattern == "" || config.MinLength == 0 || config.MaxLength == 0 {
+		return &validator.PasswordConfig{
+			Pattern:   `^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};':"\|,.<>/?]{8,20}$`,
+			MinLength: 8,
+			MaxLength: 20,
+		}
+	}
+
+	// Convert to validator.PasswordConfig
+	return &validator.PasswordConfig{
+		Pattern:   config.Pattern,
+		MinLength: config.MinLength,
+		MaxLength: config.MaxLength,
+	}
+}
+
+// ValidatePassword validates password using configurable pattern
+func ValidatePassword(password string) error {
+	config := GetPasswordConfig()
+	return validator.ValidatePassword(password, config)
+}

@@ -1,0 +1,1137 @@
+"""Shared production-action journey for Mobile Messaging Acceptance."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from tooling.acceptance.core import DriverError, GateError
+
+
+ATTACHMENT_BYTES = b"peers-touch mobile acceptance attachment\n"
+STATION_ACCOUNT_REF_PREFIX = "station-account:"
+FRIEND_REQUEST_STATUS_ACCEPTED = 2
+TERMINAL_FAILURE_STATES = frozenset({"failed", "terminal", "superseded"})
+# Mirrors the canonical mobile write-admission handling in
+# gates/chat/mixed_native_runtime.py. The ingress closes write admission across
+# resync/cursor-repair until every data domain reconciles, so a rejected write
+# is a pre-mutation signal to re-synchronize rather than a failed mutation.
+MOBILE_WRITE_REVOKED_ERROR_KEY = "mobile.recovery.writeRevocation.body"
+MOBILE_WRITE_ADMISSION_STABLE_SECONDS = 1.25
+# Same admission-gated surface as gates/chat/mixed_native_runtime.py: every
+# mutation the app routes through requireMobileMutationAdmission. Keeping this in
+# sync ensures a revoked write barrier is retried for all gated actions, not
+# only messaging.send.
+MOBILE_WRITE_ACTIONS = frozenset({
+    "messaging.createDirect",
+    "messaging.createGroup",
+    "messaging.send",
+    "messaging.interact",
+    "messaging.read",
+    "messaging.typing",
+})
+
+
+class MessagingJourneySession(Protocol):
+    def call_action(
+        self,
+        action: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Any:
+        ...
+
+
+@dataclass(frozen=True)
+class MessagingActor:
+    client_id: str
+    role: str
+    station_url: str
+    station_peer_id: str
+    ptid: str
+    account_ref: str
+    federated_handle: str
+    federation_id: str
+
+
+class MobileMessagingJourney:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 30.0,
+        poll_interval_seconds: float = 0.25,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if timeout_seconds <= 0 or poll_interval_seconds <= 0:
+            raise ValueError("Messaging journey timeouts must be positive")
+        self.timeout_seconds = timeout_seconds
+        self.poll_interval_seconds = poll_interval_seconds
+        self.monotonic = monotonic
+        self.sleep = sleep
+
+    def authenticate(
+        self,
+        session: MessagingJourneySession,
+        actor: MessagingActor,
+        *,
+        password: str,
+    ) -> dict[str, str]:
+        email = self._station_account_email(actor)
+        station = self._mapping(
+            session.call_action("station.add", {"url": actor.station_url}),
+            f"{actor.client_id} station.add",
+        )
+        if station.get("verifiedStationPeerId") != actor.station_peer_id:
+            raise GateError(
+                f"{actor.client_id} verified the wrong Station identity"
+            )
+        started = self._mapping(
+            session.call_action("access.submit", {"kind": "start"}),
+            f"{actor.client_id} access start",
+        )
+        decision = self._mapping(
+            started.get("decision"),
+            f"{actor.client_id} access decision",
+        )
+        attempt_id = self._text(
+            decision.get("attemptId"),
+            f"{actor.client_id} access attempt",
+        )
+        authenticated = self._mapping(
+            session.call_action(
+                "access.submit",
+                {
+                    "kind": "login",
+                    "attemptId": attempt_id,
+                    "email": email,
+                    "password": password,
+                },
+            ),
+            f"{actor.client_id} login",
+        )
+        authenticated_session = self._mapping(
+            authenticated.get("session"),
+            f"{actor.client_id} authenticated session",
+        )
+        if (
+            authenticated_session.get("stationPeerId") != actor.station_peer_id
+            or authenticated_session.get("actorPtid") != actor.ptid
+        ):
+            raise GateError(
+                f"{actor.client_id} authenticated identity does not match its Fixture"
+            )
+        self._activate_authenticated_shell(session, actor)
+        return {
+            "clientId": actor.client_id,
+            "stationPeerId": actor.station_peer_id,
+            "actorPtid": actor.ptid,
+        }
+
+    def run_social_convergence(
+        self,
+        *,
+        sender_session: MessagingJourneySession,
+        receiver_session: MessagingJourneySession,
+        sender: MessagingActor,
+        receiver: MessagingActor,
+        journey_id: str,
+    ) -> dict[str, Any]:
+        started_at = self.monotonic()
+        conversation_id = self._create_direct(
+            sender_session,
+            receiver_session,
+            sender,
+            receiver,
+        )
+        self._call_write_action(
+            sender_session,
+            sender.client_id,
+            "messaging.typing",
+            {"conversationId": conversation_id, "isTyping": True},
+            "Direct typing",
+        )
+        typing_elapsed_ms = self._await_condition(
+            lambda: self._typing_visible(
+                receiver_session,
+                conversation_id,
+                sender.ptid,
+            ),
+            f"{receiver.client_id} typing projection",
+        )
+        text = f"mobile-social-{journey_id}"
+        submitted = self._call_write_action(
+            sender_session,
+            sender.client_id,
+            "messaging.send",
+            {
+                "conversationId": conversation_id,
+                "plaintext": text,
+            },
+            "Direct send",
+        )
+        message_id = self._text(submitted.get("messageId"), "Direct message ID")
+        delivered, delivery_elapsed_ms = self._await_message(
+            receiver_session,
+            conversation_id,
+            message_id,
+            lambda message: message.get("plaintext") == text,
+            f"{receiver.client_id} Direct delivery",
+        )
+        event_sequence = self._positive_int(
+            delivered.get("eventSequence"),
+            "Direct event sequence",
+        )
+        self._call_write_action(
+            receiver_session,
+            receiver.client_id,
+            "messaging.read",
+            {
+                "conversationId": conversation_id,
+                "lastReadSequence": event_sequence,
+            },
+            "Direct read receipt",
+        )
+        _, receipt_elapsed_ms = self._await_message(
+            sender_session,
+            conversation_id,
+            message_id,
+            lambda message: receiver.ptid in message.get("readByPtids", []),
+            f"{sender.client_id} Direct read receipt",
+        )
+        total_elapsed_ms = int((self.monotonic() - started_at) * 1000)
+        return {
+            "scenario": "social-convergence",
+            "directScope": self.direct_scope(sender, receiver),
+            "conversationId": conversation_id,
+            "messageId": message_id,
+            "senderPtid": sender.ptid,
+            "receiverPtid": receiver.ptid,
+            "typingVisibleElapsedMs": typing_elapsed_ms,
+            "deliveryElapsedMs": delivery_elapsed_ms,
+            "receiptElapsedMs": receipt_elapsed_ms,
+            "totalElapsedMs": total_elapsed_ms,
+        }
+
+    def wait_for_authenticated_runtime(
+        self,
+        session: MessagingJourneySession,
+        actor: MessagingActor,
+    ) -> int:
+        return self._await_authenticated_runtime_scope(session, actor)
+
+    def wait_for_conversation(
+        self,
+        session: MessagingJourneySession,
+        conversation_id: str,
+        *,
+        kind: int,
+    ) -> int:
+        return self._await_conversation(
+            session,
+            conversation_id,
+            kind=kind,
+        )
+
+    def wait_for_message(
+        self,
+        session: MessagingJourneySession,
+        conversation_id: str,
+        message_id: str,
+        predicate: Callable[[Mapping[str, Any]], bool],
+        label: str,
+    ) -> tuple[dict[str, Any], int]:
+        return self._await_message(
+            session,
+            conversation_id,
+            message_id,
+            predicate,
+            label,
+        )
+
+    def run_chat_contacts(
+        self,
+        *,
+        sender_session: MessagingJourneySession,
+        receiver_session: MessagingJourneySession,
+        sender: MessagingActor,
+        receiver: MessagingActor,
+        journey_id: str,
+    ) -> dict[str, Any]:
+        direct_id = self._create_direct(
+            sender_session,
+            receiver_session,
+            sender,
+            receiver,
+        )
+        direct = self._run_attachment_and_interaction_path(
+            sender_session=sender_session,
+            receiver_session=receiver_session,
+            sender=sender,
+            receiver=receiver,
+            conversation_id=direct_id,
+            text=f"mobile-direct-{journey_id}",
+        )
+
+        group_id = f"mobile-group-{journey_id}"
+        created = self._call_write_action(
+            sender_session,
+            sender.client_id,
+            "messaging.createGroup",
+            {
+                "conversationId": group_id,
+                "name": f"Acceptance {journey_id}",
+                "memberPtids": [sender.ptid, receiver.ptid],
+                "federationId": sender.federation_id,
+            },
+            "Group creation",
+        )
+        if created.get("conversationId") != group_id:
+            raise GateError("Group creation returned the wrong conversation ID")
+        self._await_conversation(sender_session, group_id, kind=2)
+        self._await_conversation(receiver_session, group_id, kind=2)
+        group = self._run_attachment_and_interaction_path(
+            sender_session=sender_session,
+            receiver_session=receiver_session,
+            sender=sender,
+            receiver=receiver,
+            conversation_id=group_id,
+            text=f"mobile-group-{journey_id}",
+        )
+        return {
+            "scenario": "chat-contacts",
+            "senderPtid": sender.ptid,
+            "receiverPtid": receiver.ptid,
+            "direct": direct,
+            "group": group,
+        }
+
+    def _create_direct(
+        self,
+        sender_session: MessagingJourneySession,
+        receiver_session: MessagingJourneySession,
+        sender: MessagingActor,
+        receiver: MessagingActor,
+    ) -> str:
+        same_station = self._same_station(sender, receiver)
+        open_payload: dict[str, Any] = {"peerPtid": receiver.ptid}
+        if same_station:
+            # Local scope: both actors are attested against the same Home
+            # Station and the accepted relationship is seeded for it. The
+            # Station derives the Direct scope, so the client never performs a
+            # federated search nor selects a Federation id.
+            if not (sender.ptid.strip() and receiver.ptid.strip()) or (
+                sender.ptid == receiver.ptid
+            ):
+                raise GateError(
+                    "Mobile same-Station Direct requires two distinct PTIDs"
+                )
+        else:
+            federation_id = self._resolve_cross_station_federation(
+                sender_session,
+                sender=sender,
+                receiver=receiver,
+            )
+            self._ensure_accepted_relationship(
+                sender_session,
+                receiver_session,
+                sender=sender,
+                receiver=receiver,
+                receiver_home_station_peer_id=receiver.station_peer_id,
+                federation_id=federation_id,
+            )
+            open_payload["federationId"] = federation_id
+        self._await_write_admission(
+            sender_session,
+            f"{sender.client_id} contact Direct write admission",
+        )
+        conversation: dict[str, Any] = {}
+
+        def contact_ready() -> bool:
+            nonlocal conversation
+            try:
+                value = sender_session.call_action(
+                    "social.contact.open",
+                    open_payload,
+                )
+            except DriverError as error:
+                if "mobile.contacts.conversationPreparing" in str(error):
+                    return False
+                raise
+            conversation = self._mapping(value, "Contact Direct creation")
+            return bool(conversation.get("conversationId"))
+
+        self._await_condition(
+            contact_ready,
+            f"{sender.client_id} contact Direct conversation",
+        )
+        conversation_id = self._text(
+            conversation.get("conversationId"),
+            "Direct conversation ID",
+        )
+        self._await_conversation(sender_session, conversation_id, kind=1)
+        self._await_conversation(receiver_session, conversation_id, kind=1)
+        return conversation_id
+
+    @staticmethod
+    def _same_station(
+        sender: MessagingActor,
+        receiver: MessagingActor,
+    ) -> bool:
+        return bool(
+            sender.station_peer_id.strip()
+            and sender.station_peer_id == receiver.station_peer_id
+        )
+
+    @staticmethod
+    def direct_scope(sender: MessagingActor, receiver: MessagingActor) -> str:
+        return (
+            "local"
+            if MobileMessagingJourney._same_station(sender, receiver)
+            else "federation"
+        )
+
+    def _resolve_cross_station_federation(
+        self,
+        sender_session: MessagingJourneySession,
+        *,
+        sender: MessagingActor,
+        receiver: MessagingActor,
+    ) -> str:
+        if sender.federation_id != receiver.federation_id:
+            raise GateError("Mobile actors do not share one explicit Federation")
+        results = sender_session.call_action(
+            "social.people.search",
+            {
+                "query": receiver.federated_handle,
+                "federationId": sender.federation_id,
+            },
+        )
+        if not isinstance(results, list):
+            raise GateError("Federated actor search must return a list")
+        result = next(
+            (
+                dict(value)
+                for value in results
+                if isinstance(value, Mapping)
+                and value.get("ptid") == receiver.ptid
+            ),
+            None,
+        )
+        if result is None:
+            populated_ptids = sum(
+                1
+                for value in results
+                if isinstance(value, Mapping)
+                and isinstance(value.get("ptid"), str)
+                and bool(value["ptid"].strip())
+            )
+            raise GateError(
+                f"{sender.client_id} did not resolve the receiver identity "
+                f"(results={len(results)}, populatedPtids={populated_ptids})"
+            )
+        receiver_home_station_peer_id = self._text(
+            result.get("homeStationPeerId"),
+            "Receiver Home Station peer ID",
+        )
+        if receiver_home_station_peer_id != receiver.station_peer_id:
+            raise GateError(
+                f"{sender.client_id} resolved the receiver to the wrong Home Station"
+            )
+        federation_id = self._text(result.get("federationId"), "Federation ID")
+        if federation_id != sender.federation_id:
+            raise GateError(
+                f"{sender.client_id} resolved the receiver in the wrong Federation"
+            )
+        return federation_id
+
+    def _ensure_accepted_relationship(
+        self,
+        sender_session: MessagingJourneySession,
+        receiver_session: MessagingJourneySession,
+        *,
+        sender: MessagingActor,
+        receiver: MessagingActor,
+        receiver_home_station_peer_id: str,
+        federation_id: str,
+    ) -> None:
+        request_id = self._accepted_relationship_request_id(
+            sender_session,
+            sender_ptid=sender.ptid,
+            receiver_ptid=receiver.ptid,
+            federation_id=federation_id,
+        )
+        if request_id is None:
+            sender_session.call_action(
+                "social.request.send",
+                {
+                    "receiverPtid": receiver.ptid,
+                    "receiverHomeStationPeerId": receiver_home_station_peer_id,
+                    "federationId": federation_id,
+                    "message": "mobile acceptance",
+                },
+            )
+            request: dict[str, Any] = {}
+
+            def request_visible() -> bool:
+                nonlocal request
+                receiver_session.call_action("social.reconcile")
+                projection = self._mapping(
+                    receiver_session.call_action("social.projection.read"),
+                    "Receiver Social projection",
+                )
+                requests = projection.get("friendRequests")
+                if not isinstance(requests, list):
+                    return False
+                for value in requests:
+                    if not isinstance(value, Mapping):
+                        continue
+                    if (
+                        value.get("senderPtid") == sender.ptid
+                        and value.get("receiverPtid") == receiver.ptid
+                    ):
+                        request = dict(value)
+                        return True
+                return False
+
+            self._await_condition(
+                request_visible,
+                f"{receiver.client_id} friend request",
+            )
+            request_id = self._text(
+                request.get("requestId"),
+                "Friend request ID",
+            )
+            receiver_session.call_action(
+                "social.request.accept",
+                {"requestId": request_id},
+            )
+            self._await_condition(
+                lambda: self._accepted_relationship_visible(
+                    sender_session,
+                    request_id=request_id,
+                    sender_ptid=sender.ptid,
+                    receiver_ptid=receiver.ptid,
+                    federation_id=federation_id,
+                ),
+                f"{sender.client_id} accepted relationship",
+            )
+
+    def _accepted_relationship_request_id(
+        self,
+        session: MessagingJourneySession,
+        *,
+        sender_ptid: str,
+        receiver_ptid: str,
+        federation_id: str,
+    ) -> str | None:
+        session.call_action("social.reconcile")
+        projection = self._mapping(
+            session.call_action("social.projection.read"),
+            "Accepted relationship projection",
+        )
+        requests = projection.get("friendRequests")
+        if not isinstance(requests, list):
+            return None
+        for value in requests:
+            if (
+                isinstance(value, Mapping)
+                and value.get("senderPtid") == sender_ptid
+                and value.get("receiverPtid") == receiver_ptid
+                and value.get("federationId") == federation_id
+                and value.get("status") == FRIEND_REQUEST_STATUS_ACCEPTED
+            ):
+                request_id = value.get("requestId")
+                if isinstance(request_id, str) and request_id.strip():
+                    return request_id
+        return None
+
+    def _accepted_relationship_visible(
+        self,
+        session: MessagingJourneySession,
+        *,
+        request_id: str,
+        sender_ptid: str,
+        receiver_ptid: str,
+        federation_id: str,
+    ) -> bool:
+        session.call_action("social.reconcile")
+        projection = self._mapping(
+            session.call_action("social.projection.read"),
+            "Accepted relationship projection",
+        )
+        requests = projection.get("friendRequests")
+        return isinstance(requests, list) and any(
+            isinstance(value, Mapping)
+            and value.get("requestId") == request_id
+            and value.get("senderPtid") == sender_ptid
+            and value.get("receiverPtid") == receiver_ptid
+            and value.get("federationId") == federation_id
+            and value.get("status") == FRIEND_REQUEST_STATUS_ACCEPTED
+            for value in requests
+        )
+
+    def _await_write_admission(
+        self,
+        session: MessagingJourneySession,
+        label: str,
+    ) -> None:
+        last_reason = "unavailable"
+
+        def admission_open() -> bool:
+            nonlocal last_reason
+            snapshot = self._mapping(
+                session.call_action("recovery.snapshot"),
+                f"{label} recovery snapshot",
+            )
+            admission = self._mapping(
+                snapshot.get("writeAdmission"),
+                f"{label} write admission",
+            )
+            if admission.get("open") is True:
+                return True
+            reason = admission.get("reason")
+            last_reason = reason if isinstance(reason, str) and reason else "closed"
+            return False
+
+        try:
+            self._await_condition(admission_open, label)
+        except GateError as error:
+            raise GateError(f"{error}; last reason: {last_reason}") from error
+
+    @staticmethod
+    def _write_admission_open(snapshot: Mapping[str, Any]) -> bool:
+        write_admission = snapshot.get("writeAdmission")
+        states = snapshot.get("states")
+        has_pending_reconcile = (
+            isinstance(states, list)
+            and any(
+                isinstance(state, Mapping)
+                and state.get("kind") == "event-overflow-reconcile"
+                for state in states
+            )
+        )
+        return (
+            snapshot.get("isWriteBlocked") is False
+            and isinstance(write_admission, Mapping)
+            and write_admission.get("open") is True
+            and not has_pending_reconcile
+        )
+
+    def _wait_for_mobile_write_admission(
+        self,
+        session: MessagingJourneySession,
+        client_id: str,
+        *,
+        force_reconcile: bool = False,
+    ) -> Mapping[str, Any]:
+        """Block until the ingress write barrier reopens and stays stable.
+
+        Mirrors the desktop mixed-runtime contract: trigger a social reconcile
+        when admission is closed, then require a stable-open window so a write
+        cannot race the next resync. A genuine reconciliation stall still fails
+        closed at the journey deadline instead of being retried forever.
+        """
+        initial = self._mapping(
+            session.call_action("recovery.snapshot"),
+            f"{client_id} recovery snapshot",
+        )
+        if self._write_admission_open(initial) and not force_reconcile:
+            return initial
+
+        session.call_action("social.reconcile", {})
+        deadline = self.monotonic() + self.timeout_seconds
+        stable_since: float | None = None
+        while self.monotonic() < deadline:
+            snapshot = session.call_action("recovery.snapshot")
+            if (
+                not isinstance(snapshot, Mapping)
+                or not self._write_admission_open(snapshot)
+            ):
+                stable_since = None
+            else:
+                now = self.monotonic()
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= MOBILE_WRITE_ADMISSION_STABLE_SECONDS:
+                    return self._mapping(
+                        snapshot, f"{client_id} settled write admission"
+                    )
+            self.sleep(self.poll_interval_seconds)
+        raise GateError(
+            f"{client_id} Mobile write admission did not reopen before timeout"
+        )
+
+    def _call_write_action(
+        self,
+        session: MessagingJourneySession,
+        client_id: str,
+        action: str,
+        payload: Mapping[str, Any],
+        label: str,
+    ) -> dict[str, Any]:
+        """Run a mutating action, re-synchronizing on a revoked write barrier.
+
+        A write-admission rejection happens before any mutation side effect, so
+        a single bounded retry after reconciliation is safe and cannot duplicate
+        a message. Any other DriverError propagates unchanged.
+        """
+        if action not in MOBILE_WRITE_ACTIONS:
+            raise GateError(
+                f"{action} is not a mobile write-admission-gated action"
+            )
+        try:
+            return self._mapping(
+                session.call_action(action, dict(payload)), label
+            )
+        except DriverError as error:
+            if MOBILE_WRITE_REVOKED_ERROR_KEY not in str(error):
+                raise
+            self._wait_for_mobile_write_admission(
+                session, client_id, force_reconcile=True
+            )
+            return self._mapping(
+                session.call_action(action, dict(payload)), label
+            )
+
+    def _run_attachment_and_interaction_path(
+        self,
+        *,
+        sender_session: MessagingJourneySession,
+        receiver_session: MessagingJourneySession,
+        sender: MessagingActor,
+        receiver: MessagingActor,
+        conversation_id: str,
+        text: str,
+    ) -> dict[str, Any]:
+        attachment = self._mapping(
+            sender_session.call_action(
+                "messaging.attachment.stage",
+                {
+                    "conversationId": conversation_id,
+                    "filename": "acceptance.txt",
+                    "mimeType": "text/plain",
+                    "bytesBase64": base64.b64encode(ATTACHMENT_BYTES).decode("ascii"),
+                    "sha256": hashlib.sha256(ATTACHMENT_BYTES).hexdigest(),
+                },
+            ),
+            "Attachment stage",
+        )
+        stage_id = self._text(attachment.get("stageId"), "Attachment stage ID")
+        submitted = self._call_write_action(
+            sender_session,
+            sender.client_id,
+            "messaging.send",
+            {
+                "conversationId": conversation_id,
+                "plaintext": text,
+                "attachmentStageIds": [stage_id],
+            },
+            "Attachment message send",
+        )
+        message_id = self._text(
+            submitted.get("messageId"),
+            "Attachment message ID",
+        )
+        delivered, delivery_elapsed_ms = self._await_message(
+            receiver_session,
+            conversation_id,
+            message_id,
+            lambda message: (
+                message.get("plaintext") == text
+                and len(message.get("attachments", [])) == 1
+            ),
+            "receiver attachment delivery",
+        )
+        attachments = delivered.get("attachments")
+        if not isinstance(attachments, list) or len(attachments) != 1:
+            raise GateError("Receiver attachment projection is incomplete")
+        received_attachment = self._mapping(attachments[0], "Receiver attachment")
+        if (
+            received_attachment.get("filename") != "acceptance.txt"
+            or received_attachment.get("mimeType") != "text/plain"
+        ):
+            raise GateError("Receiver attachment private metadata changed")
+        attachment_id = self._text(
+            received_attachment.get("attachmentId"),
+            "Receiver attachment ID",
+        )
+        self._await_condition(
+            lambda: self._attachment_available(receiver_session, attachment_id),
+            "receiver attachment open",
+        )
+
+        self._call_write_action(
+            receiver_session,
+            receiver.client_id,
+            "messaging.interact",
+            {
+                "kind": "reaction",
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "reaction": "ack",
+                "remove": False,
+            },
+            "Attachment reaction",
+        )
+        self._await_message(
+            sender_session,
+            conversation_id,
+            message_id,
+            lambda message: any(
+                reaction.get("actorPtid") == receiver.ptid
+                and reaction.get("reaction") == "ack"
+                for reaction in message.get("reactions", [])
+                if isinstance(reaction, Mapping)
+            ),
+            "sender reaction readback",
+        )
+        edited_text = f"{text}-edited"
+        self._call_write_action(
+            sender_session,
+            sender.client_id,
+            "messaging.interact",
+            {
+                "kind": "edit",
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "plaintext": edited_text,
+            },
+            "Attachment edit",
+        )
+        edited, _ = self._await_message(
+            receiver_session,
+            conversation_id,
+            message_id,
+            lambda message: message.get("editedText") == edited_text,
+            "receiver edit readback",
+        )
+        event_sequence = self._positive_int(
+            edited.get("eventSequence"),
+            "Attachment message event sequence",
+        )
+        self._call_write_action(
+            receiver_session,
+            receiver.client_id,
+            "messaging.read",
+            {
+                "conversationId": conversation_id,
+                "lastReadSequence": event_sequence,
+            },
+            "Attachment read receipt",
+        )
+        self._await_message(
+            sender_session,
+            conversation_id,
+            message_id,
+            lambda message: receiver.ptid in message.get("readByPtids", []),
+            "sender attachment read receipt",
+        )
+        searched = receiver_session.call_action(
+            "messaging.search",
+            {
+                "conversationId": conversation_id,
+                "query": edited_text,
+                "limit": 20,
+            },
+        )
+        if not isinstance(searched, list) or not any(
+            isinstance(message, Mapping)
+            and message.get("messageId") == message_id
+            for message in searched
+        ):
+            raise GateError("Receiver search did not return the edited message")
+
+        restart = self._mapping(
+            receiver_session.call_action("lifecycle.restart"),
+            "Receiver lifecycle restart",
+        )
+        if restart != {"requested": True, "scope": "webview"}:
+            raise GateError("Receiver lifecycle restart was not acknowledged")
+        self._await_authenticated_runtime_scope(
+            receiver_session,
+            receiver,
+        )
+        self._await_message(
+            receiver_session,
+            conversation_id,
+            message_id,
+            lambda message: (
+                message.get("editedText") == edited_text
+                and len(message.get("attachments", [])) == 1
+            ),
+            "receiver restart readback",
+        )
+        return {
+            "conversationId": conversation_id,
+            "messageId": message_id,
+            "attachmentId": attachment_id,
+            "deliveryElapsedMs": delivery_elapsed_ms,
+            "restartReadback": True,
+            "searchReadback": True,
+            "interactionReadback": True,
+            "receiptReadback": True,
+        }
+
+    def _await_conversation(
+        self,
+        session: MessagingJourneySession,
+        conversation_id: str,
+        *,
+        kind: int,
+    ) -> int:
+        return self._await_condition(
+            lambda: any(
+                conversation.get("conversationId") == conversation_id
+                and conversation.get("kind") == kind
+                and conversation.get("active") is True
+                for conversation in self._projection(session).get(
+                    "conversations",
+                    [],
+                )
+                if isinstance(conversation, Mapping)
+            ),
+            f"conversation projection {conversation_id}",
+        )
+
+    def _await_message(
+        self,
+        session: MessagingJourneySession,
+        conversation_id: str,
+        message_id: str,
+        predicate: Callable[[Mapping[str, Any]], bool],
+        label: str,
+    ) -> tuple[dict[str, Any], int]:
+        observed: dict[str, Any] = {}
+
+        def check() -> bool:
+            nonlocal observed
+            messages = self._projection(session).get("messages", {}).get(
+                conversation_id,
+                [],
+            )
+            for value in messages:
+                if not isinstance(value, Mapping):
+                    continue
+                if value.get("messageId") != message_id:
+                    continue
+                if value.get("state") in TERMINAL_FAILURE_STATES:
+                    raise GateError(f"{label} reached a terminal failure state")
+                observed = dict(value)
+                return predicate(value)
+            return False
+
+        elapsed_ms = self._await_condition(check, label)
+        return observed, elapsed_ms
+
+    def _await_authenticated_runtime_scope(
+        self,
+        session: MessagingJourneySession,
+        actor: MessagingActor,
+    ) -> int:
+        def ready() -> bool:
+            try:
+                scope = self._mapping(
+                    session.call_action("lifecycle.scope.read"),
+                    f"{actor.client_id} lifecycle scope",
+                )
+            except DriverError as error:
+                if self._action_unavailable(
+                    error,
+                    "lifecycle.scope.read",
+                ):
+                    return False
+                raise
+            return (
+                scope.get("phase") == "ACTIVE"
+                and scope.get("activeStationPeerId")
+                == actor.station_peer_id
+                and scope.get("runtimeStationPeerId")
+                == actor.station_peer_id
+                and scope.get("activeActorPtid") == actor.ptid
+            )
+
+        return self._await_condition(
+            ready,
+            f"{actor.client_id} authenticated runtime",
+        )
+
+    def _projection(
+        self,
+        session: MessagingJourneySession,
+    ) -> dict[str, Any]:
+        session.call_action("messaging.reconcile")
+        return self._mapping(
+            session.call_action("messaging.projection.read", {}),
+            "Messaging projection",
+        )
+
+    def _typing_visible(
+        self,
+        session: MessagingJourneySession,
+        conversation_id: str,
+        actor_ptid: str,
+    ) -> bool:
+        projection = self._mapping(
+            session.call_action("social.projection.read"),
+            "Social projection",
+        )
+        typing_peers = projection.get("typingPeers")
+        peers = (
+            typing_peers.get(conversation_id)
+            if isinstance(typing_peers, Mapping)
+            else None
+        )
+        entry = peers.get(actor_ptid) if isinstance(peers, Mapping) else None
+        return isinstance(entry, Mapping) and entry.get("typing") is True
+
+    @staticmethod
+    def _attachment_available(
+        session: MessagingJourneySession,
+        attachment_id: str,
+    ) -> bool:
+        opened = session.call_action(
+            "messaging.attachment.open",
+            {"attachmentId": attachment_id},
+        )
+        return isinstance(opened, Mapping) and (
+            opened.get("state") == "ready"
+            and opened.get("available") is True
+        )
+
+    def _await_condition(
+        self,
+        predicate: Callable[[], bool],
+        label: str,
+    ) -> int:
+        started_at = self.monotonic()
+        deadline = started_at + self.timeout_seconds
+        while self.monotonic() < deadline:
+            if predicate():
+                return int((self.monotonic() - started_at) * 1000)
+            self.sleep(self.poll_interval_seconds)
+        raise GateError(f"{label} did not converge before timeout")
+
+    @staticmethod
+    def _mapping(value: object, label: str) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise GateError(f"{label} must return an object")
+        return dict(value)
+
+    @staticmethod
+    def _text(value: object, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise GateError(f"{label} must be a non-empty string")
+        return value
+
+    def _activate_authenticated_shell(
+        self,
+        session: MessagingJourneySession,
+        actor: MessagingActor,
+    ) -> None:
+        restart = self._mapping(
+            session.call_action("lifecycle.restart"),
+            f"{actor.client_id} post-login restart",
+        )
+        if restart != {"requested": True, "scope": "webview"}:
+            raise GateError(
+                f"{actor.client_id} post-login restart was not acknowledged"
+            )
+
+        self._await_authenticated_runtime_scope(session, actor)
+
+        self._await_condition(
+            lambda: self._social_runtime_active(session, actor.client_id),
+            f"{actor.client_id} Social runtime activation",
+        )
+
+    @staticmethod
+    def _social_runtime_active(
+        session: MessagingJourneySession,
+        client_id: str,
+    ) -> bool:
+        try:
+            projection = MobileMessagingJourney._mapping(
+                session.call_action("social.projection.read"),
+                f"{client_id} Social projection",
+            )
+        except DriverError as error:
+            if MobileMessagingJourney._action_unavailable(
+                error,
+                "social.projection.read",
+            ):
+                return False
+            raise
+        ingress = projection.get("ingress")
+
+        active = (
+            projection.get("active") is True
+            and isinstance(ingress, Mapping)
+            and ingress.get("lifecycle") == "active"
+            and ingress.get("writeAdmissionOpen") is True
+            and ingress.get("staleDomains") == []
+        )
+        if not active:
+            MobileMessagingJourney._require_recoverable_runtime(
+                session,
+                client_id,
+            )
+        return active
+
+    @staticmethod
+    def _require_recoverable_runtime(
+        session: MessagingJourneySession,
+        client_id: str,
+    ) -> None:
+        try:
+            snapshot = MobileMessagingJourney._mapping(
+                session.call_action("lifecycle.snapshot"),
+                f"{client_id} lifecycle readiness",
+            )
+        except DriverError as error:
+            if MobileMessagingJourney._action_unavailable(
+                error,
+                "lifecycle.snapshot",
+            ):
+                return
+            raise
+        runtimes = snapshot.get("runtimes")
+        if not isinstance(runtimes, list):
+            raise GateError(f"{client_id} lifecycle runtimes must be a list")
+        for runtime in runtimes:
+            if not isinstance(runtime, Mapping):
+                raise GateError(f"{client_id} lifecycle runtime must be an object")
+            if runtime.get("status") == "failed":
+                raise GateError(
+                    f"{client_id} runtime {runtime.get('id')} failed "
+                    f"({runtime.get('errorKey')})"
+                )
+
+    @staticmethod
+    def _action_unavailable(error: DriverError, action: str) -> bool:
+        return (
+            f"acceptance.mobile.actionUnavailable:{action}"
+            in str(error)
+        )
+
+    @staticmethod
+    def _station_account_email(actor: MessagingActor) -> str:
+        if not actor.account_ref.startswith(STATION_ACCOUNT_REF_PREFIX):
+            raise GateError(
+                f"{actor.client_id} accountRef must be Station-owned"
+            )
+        return MobileMessagingJourney._text(
+            actor.account_ref.removeprefix(STATION_ACCOUNT_REF_PREFIX),
+            f"{actor.client_id} Station account email",
+        )
+
+    @staticmethod
+    def _positive_int(value: object, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise GateError(f"{label} must be a positive integer")
+        return value

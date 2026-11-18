@@ -1,0 +1,407 @@
+import type { NavigationLink } from '@peers-touch/schema';
+import { EVENT } from './catalog';
+
+export type SessionRevokedReason = 'expired' | 'kicked' | 'not_found' | 'unknown';
+
+export interface SessionRevokedPayload {
+  reason: SessionRevokedReason;
+  raw?: string;
+  /** Device type from the revoked session (for example, "desktop-native"). */
+  device_type?: string;
+}
+
+export interface StationActiveChangedPayload {
+  stationPeerId: string;
+  routeId: string;
+  displayName?: string;
+}
+
+/** Committed native profile activation; independent of authentication and inbox lanes. */
+export interface MessagingProfileActivatedPayload {
+  actorPtid: string;
+  sessionEpoch: number;
+  profileId: string;
+  stationPeerId: string;
+  endpointId: string;
+}
+
+export interface RealtimeMessageReceivedPayload {
+  /** Server-assigned monotonic ULID; opaque to the UI. */
+  eventId: string;
+  /** Friend-chat session this message belongs to. */
+  sessionUlid: string;
+  /** Business message ULID; idempotency key for upsert into local store. */
+  messageUlid: string;
+  /** Sender DID. May equal the local actor for multi-device sender echo. */
+  senderActorPtid: string;
+  /** Recipient DID (always the local actor's stream target). */
+  recipientActorPtid: string;
+  /** Raw envelope ciphertext bytes; today this is the marshaled
+   *  canonical ChatMessage protobuf, tomorrow the sealed-sender ciphertext. */
+  ciphertext: Uint8Array;
+  /** Sender's claim of when the message was sent. UI display only. */
+  sentTsUnixMs: number;
+}
+
+export interface RealtimePresenceFlipPayload {
+  actorPtid: string;
+  online: boolean;
+}
+
+export interface RealtimeResyncPayload {
+  /** Newest event_id the server holds for this actor at Resync time;
+   *  the client uses this as its new cursor after cold catch-up. */
+  newestEventId: string;
+  /** Free-text reason for the Resync (cursor evicted, server restart, …). */
+  reason: string;
+}
+
+export interface RealtimeConnectionStatePayload {
+  connected: boolean;
+  reason: string;
+}
+
+export type RealtimeCallSignalKind =
+  | 'OFFER'
+  | 'ANSWER'
+  | 'CANDIDATE'
+  | 'HANGUP'
+  // Application-layer ringing protocol — see CallSignal.Kind in
+  // model/domain/realtime/event.proto. These kinds wrap a JSON
+  // body (`{"callId":"<ulid>","kind":"audio"|"video"}`) inside the
+  // same sealed signaling envelope used for SDP / candidates, so
+  // Station never sees the call metadata.
+  | 'CALL_REQUEST'
+  | 'CALL_ACCEPT'
+  | 'CALL_REJECT'
+  | 'CALL_END'
+  | 'CALL_NO_ANSWER'
+  // Group call room lifecycle — see CallSignal.Kind in
+  // model/domain/realtime/event.proto. These carry group_ulid and
+  // room_name instead of ciphertext payload.
+  | 'ROOM_ACTIVE'
+  | 'ROOM_ENDED';
+
+export interface RealtimeCallSignalPayload {
+  /** Server-assigned event id. Opaque cursor; see contract §2.2. */
+  eventId: string;
+  /** Friend-chat session that owns the call. The receiver uses this
+   *  to look up the per-session ratchet for decryption. */
+  sessionUlid: string;
+  /** Originating actor DID (the caller). For multi-device sender
+   *  echo this can equal the local actor. */
+  fromActorPtid: string;
+  /** Which signaling phase this frame represents. */
+  kind: RealtimeCallSignalKind;
+  /** Opaque ciphertext envelope produced by the standalone signaling
+   *  envelope (contract §2.7.2 — X25519 + HKDF-SHA256 + AES-256-GCM
+   *  with random nonce + AAD bound to `sessionUlid` and `kind`). The
+   *  receiver opens it via `api.signalingEnvelopeOpen`, NOT the chat
+   *  ratchet — see §2.7.2.1 for the rationale (chat ratchet requires
+   *  strict in-order delivery and would stall on dropped candidates).
+   *  Wire layout: `eph_pub(32B) || nonce(12B) || ciphertext || tag(16B)`. */
+  payload: Uint8Array;
+  /** Group ULID for group call events (ROOM_ACTIVE / ROOM_ENDED).
+   *  Empty string for 1-to-1 signaling. */
+  groupUlid?: string;
+  /** LiveKit room name for group call events. Empty string for 1-to-1. */
+  roomName?: string;
+  /** Plaintext direct-call identifier used for Station arbitration. */
+  callId?: string;
+  /** Device that won first-terminal-action-wins arbitration. */
+  winningDeviceId?: string;
+}
+
+/**
+ * Receipt kind, mirrors `MessageReceipt.Kind` in the wire protobuf.
+ * `KIND_UNSPECIFIED` (enum 0) is dropped at the dispatch boundary —
+ * by the time a payload reaches an event subscriber the kind is
+ * guaranteed to be `DELIVERED` or `READ`.
+ */
+export type RealtimeMessageReceiptKind = 'DELIVERED' | 'READ';
+
+export interface RealtimeMessageReceiptPayload {
+  /** Server-assigned event id. Opaque cursor; see contract §2.2. */
+  eventId: string;
+  /** Session this receipt belongs to (matches `MessageEnvelope.sessionUlid`). */
+  sessionUlid: string;
+  /** ULID of the message being acknowledged (the *sender*'s ulid). */
+  messageUlid: string;
+  /** Originating actor DID — the *receiver* of the original message,
+   *  i.e. whoever is now reporting they got / read it. May equal the
+   *  local actor for multi-device echo. */
+  fromActorPtid: string;
+  /** Whether this is a delivery receipt or a read receipt. */
+  kind: RealtimeMessageReceiptKind;
+}
+
+export interface RealtimeTypingStatePayload {
+  /** Server-assigned event id. Opaque cursor; see contract §2.2. */
+  eventId: string;
+  /** Session this typing-state belongs to. */
+  sessionUlid: string;
+  /** Originating actor DID — whoever is (not) typing. May equal the
+   *  local actor for multi-device echo; consumers should ignore self. */
+  fromActorPtid: string;
+  /** True when the actor *started* typing, false when they stopped. */
+  typing: boolean;
+}
+
+/**
+ * Mutation kind, mirrors the wire `MessageMutation.Kind` enum. The
+ * dispatch boundary drops `KIND_UNSPECIFIED` so subscribers always
+ * see one of the concrete cases.
+ */
+export type RealtimeMessageMutationKind = 'RECALL' | 'EDIT' | 'DELETE';
+
+/**
+ * Group roster change kind, mirrors `GroupMembershipChange.Kind` on the
+ * wire. `KIND_UNSPECIFIED` (enum 0) is dropped at the dispatch boundary.
+ */
+export type RealtimeGroupMembershipChangeKind =
+  | 'ADDED'
+  | 'REMOVED'
+  | 'LEFT'
+  | 'UPDATED'
+  | 'TRANSFERRED'
+  | 'DISSOLVED';
+
+export interface RealtimeGroupMembershipChangePayload {
+  /** Monotonic SSE envelope id (Last-Event-ID cursor). */
+  eventId: string;
+  /** Shared logical id for one roster change across recipients. */
+  changeEventId: string;
+  groupUlid: string;
+  actorPtid: string;
+  kind: RealtimeGroupMembershipChangeKind;
+  changedTsUnixMs: number;
+}
+
+export interface RealtimeGroupFederationEventPayload {
+  eventId: string;
+  groupUlid: string;
+  groupEventUlid: string;
+  seq: number;
+  eventType: string;
+  authorityStationPeerId: string;
+  authorityEpoch: number;
+  eventHash: string;
+  messageUlid: string;
+  membershipEpoch: number;
+  committedTsUnixMs: number;
+  actorPtid: string;
+}
+
+export interface RealtimeEnvelopeDeliveredPayload {
+  eventId: string;
+  inboxItemId: string;
+  envelopeId: string;
+  conversationId: string;
+  payloadType: number;
+  payloadBytes: Uint8Array;
+  senderPtid: string;
+  senderDeviceId: string;
+  recipientDeviceId: string;
+  membershipEpoch: number;
+  queuedTsUnixMs: number;
+}
+
+/**
+ * Minimal wake signal emitted after the Station durably writes a service
+ * notification row in the same transaction as the published message.
+ * Inbox/unread derive from the envelope arm; this payload only decides whether
+ * to raise an OS banner.
+ */
+export interface RealtimeServiceNotificationPayload {
+  eventId: string;
+  notificationId: string;
+  recipientActorPtid: string;
+  notificationType: number;
+  category: number;
+  groupKey: string;
+  createdTsUnixMs: number;
+}
+
+/**
+ * Post-commit wake that an actor's authoritative profile changed (display
+ * name, avatar/icon). Carries identifiers only: consumers invalidate the
+ * cached profile for actorPtid and refetch. For a bot avatar change the event
+ * arrives on the owner's stream while actorPtid is the bot actor.
+ */
+export interface RealtimeActorProfileChangedPayload {
+  eventId: string;
+  actorPtid: string;
+  changedTsUnixMs: number;
+}
+
+export interface RealtimeConversationSettingsChangedPayload {
+  eventId: string;
+  conversationKind: 'friend' | 'group';
+  containerUlid: string;
+  actorPtid: string;
+  changedTsUnixMs: number;
+}
+
+export interface RealtimeSocialGraphEventPayload {
+  eventId: string;
+  kind:
+    | 'friend_request_received'
+    | 'friend_request_accepted'
+    | 'friend_request_rejected'
+    | 'conversation_created'
+    | 'unfriended'
+    | 'relationship_blocked'
+    | 'relationship_unblocked';
+  actorPtid: string;
+  targetPtid: string;
+  requestId: string;
+  conversationId: string;
+  actorDisplayName: string;
+}
+
+export interface RealtimeMessageMutationPayload {
+  /** Server-assigned event id. Opaque cursor; see contract §2.2. */
+  eventId: string;
+  /** Session that owns the mutated message. */
+  sessionUlid: string;
+  /** ULID of the *target* message — the one being recalled / edited
+   *  / deleted. Receiver uses this as the local store key. */
+  messageUlid: string;
+  /** DID of whoever performed the mutation. Today this must equal
+   *  the original sender (server-enforced); a future moderator path
+   *  could surface a different actor here. */
+  fromActorPtid: string;
+  /** Which mutation arm this frame represents. */
+  kind: RealtimeMessageMutationKind;
+  /** For EDIT only: the new plaintext body, or empty when the chat
+   *  is fully E2EE and only `newCiphertext` was supplied. */
+  newContent: string;
+  /** For EDIT only: the new ciphertext body, when applicable. */
+  newCiphertext: Uint8Array;
+  /** Server-stamped wall-clock at which the mutation landed.
+   *  Display-only: clients must NOT use it for ordering. */
+  mutatedTsUnixMs: number;
+}
+
+export interface MomentRealtimeBasePayload {
+  /** Monotonic realtime cursor when the event comes from Station SSE. */
+  eventId: string;
+  /** Authenticated actor whose Station stream carried this event. */
+  targetActorPtid: string;
+  /** Renderer session generation that opened the native stream. */
+  sessionEpoch: number;
+  /** Station peer ID captured when the native stream supervisor started. */
+  stationPeerId: string;
+  /** Normalized Station URL captured when the native stream supervisor started. */
+  stationUrl: string;
+  postId: string;
+  authorActorPtid?: string;
+  occurredAtUnixMs: number;
+}
+
+export interface MomentCreatedPayload extends MomentRealtimeBasePayload {
+  audience?: string;
+}
+
+export interface MomentDeletedPayload extends MomentRealtimeBasePayload {
+  deletedByActorPtid?: string;
+}
+
+export type PrivateResourceRevocationReason =
+  | 'RESOURCE_DELETED'
+  | 'RELATIONSHIP_REVOKED'
+  | 'RECIPIENT_BLOCKED';
+
+export interface MomentRevokedPayload extends MomentRealtimeBasePayload {
+  reason: PrivateResourceRevocationReason;
+}
+
+export interface MomentCommentedPayload extends MomentRealtimeBasePayload {
+  commentId: string;
+  commentAuthorActorPtid?: string;
+}
+
+export interface MomentReactedPayload extends MomentRealtimeBasePayload {
+  commentId?: string;
+  reactionActorPtid?: string;
+  kind?: string;
+  removed: boolean;
+}
+
+export interface MomentResyncRequestedPayload {
+  reason: string;
+  newestEventId?: string;
+}
+
+export interface RelationshipChangedPayload {
+  targetActorPtid: string;
+  action: 'follow' | 'unfollow' | 'block' | 'unblock';
+}
+
+export interface AgentTurnStreamEventPayload {
+  streamId: string;
+  streamGeneration: number;
+  ptid?: string;
+  conversationId: string;
+  agentId: string;
+  event: string;
+  data: Record<string, unknown>;
+  timestampMs: number;
+}
+
+export interface EventPayloadMap {
+  [EVENT.AUTH_IDENTITY_CHANGED]: void;
+  [EVENT.AUTH_SESSION_REVOKED]: SessionRevokedPayload;
+  [EVENT.OAUTH_CONNECTIONS_CHANGED]: void;
+  [EVENT.NAVIGATION_REQUESTED]: NavigationLink;
+  [EVENT.AGENT_BUILDER_STREAM_ENDED]: void;
+  [EVENT.AGENT_TURN_STREAM_EVENT]: AgentTurnStreamEventPayload;
+  [EVENT.AGENT_TURN_RECOVERY_RETRY_REQUESTED]: { conversationId: string };
+  [EVENT.AGENT_TURN_ADMITTED]: {
+    conversationId: string;
+    agentId: string;
+    turnId: string;
+  };
+  [EVENT.AGENT_TURN_QUEUE_CANCELLED]: {
+    conversationId: string;
+    turnId: string;
+  };
+  [EVENT.EVALUATION_PROJECTION_INVALIDATED]: {
+    reason: string;
+    runId?: string;
+  };
+  [EVENT.GLOBAL_CONTEXT_UPDATED]: { slice: string; timestamp_ms: number };
+  [EVENT.GLOBAL_CONTEXT_PIPELINE_STARTED]: { name: string; timestamp_ms: number };
+  [EVENT.GLOBAL_CONTEXT_PIPELINE_FINISHED]: { name: string; timestamp_ms: number };
+  [EVENT.GLOBAL_CONTEXT_PIPELINE_FAILED]: { name: string; error: string; timestamp_ms: number };
+  [EVENT.STATION_ACTIVE_CHANGED]: StationActiveChangedPayload;
+  [EVENT.MESSAGING_PROFILE_ACTIVATED]: MessagingProfileActivatedPayload;
+  [EVENT.REALTIME_MESSAGE_RECEIVED]: RealtimeMessageReceivedPayload;
+  [EVENT.REALTIME_PRESENCE_FLIP]: RealtimePresenceFlipPayload;
+  [EVENT.REALTIME_RESYNC]: RealtimeResyncPayload;
+  [EVENT.REALTIME_CONNECTION_STATE]: RealtimeConnectionStatePayload;
+  [EVENT.REALTIME_CALL_SIGNAL]: RealtimeCallSignalPayload;
+  [EVENT.REALTIME_MESSAGE_RECEIPT]: RealtimeMessageReceiptPayload;
+  [EVENT.REALTIME_TYPING_STATE]: RealtimeTypingStatePayload;
+  [EVENT.REALTIME_MESSAGE_MUTATION]: RealtimeMessageMutationPayload;
+  [EVENT.REALTIME_GROUP_MEMBERSHIP_CHANGE]: RealtimeGroupMembershipChangePayload;
+  [EVENT.REALTIME_GROUP_FEDERATION_EVENT]: RealtimeGroupFederationEventPayload;
+  [EVENT.REALTIME_ENVELOPE_DELIVERED]: RealtimeEnvelopeDeliveredPayload;
+  [EVENT.REALTIME_SERVICE_NOTIFICATION]: RealtimeServiceNotificationPayload;
+  [EVENT.REALTIME_CONVERSATION_SETTINGS_CHANGED]: RealtimeConversationSettingsChangedPayload;
+  [EVENT.REALTIME_SOCIAL_GRAPH_EVENT]: RealtimeSocialGraphEventPayload;
+  [EVENT.REALTIME_ACTOR_PROFILE_CHANGED]: RealtimeActorProfileChangedPayload;
+  [EVENT.MOMENT_CREATED]: MomentCreatedPayload;
+  [EVENT.MOMENT_DELETED]: MomentDeletedPayload;
+  [EVENT.MOMENT_REVOKED]: MomentRevokedPayload;
+  [EVENT.MOMENT_COMMENTED]: MomentCommentedPayload;
+  [EVENT.MOMENT_REACTED]: MomentReactedPayload;
+  [EVENT.MOMENT_UPDATED]: MomentRealtimeBasePayload;
+  [EVENT.MOMENT_RESYNC_REQUESTED]: MomentResyncRequestedPayload;
+  [EVENT.RELATIONSHIP_CHANGED]: RelationshipChangedPayload;
+}
+
+export interface AppEvent<TType extends keyof EventPayloadMap> {
+  type: TType;
+  payload: EventPayloadMap[TType];
+}

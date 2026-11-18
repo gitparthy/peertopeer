@@ -1,0 +1,3223 @@
+#!/usr/bin/env python3
+"""Prove durable Direct and Group interactions in isolated Native Tauri clients."""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import socket
+import time
+from typing import Any, Callable
+
+from tooling.acceptance.core import (
+    AcceptanceGate,
+    ActorRuntime,
+    GateError,
+    REPO_ROOT,
+)
+from tooling.acceptance.drivers.native import NativeDesktopRuntimeBinding
+from tooling.acceptance.core.evidence_store import write_current_artifact
+from tooling.acceptance.drivers.native.runtime import NativeLaunchOptions
+from tooling.acceptance.drivers.tauri import TauriSession
+from tooling.acceptance.fixtures.chat_native_reset import (
+    acceptance_station_environment,
+    duplicate_acceptance_queue_delivery,
+    restart_acceptance_station,
+)
+from tooling.acceptance.gates.chat.native_support import (
+    DEV_ACCOUNT_PASSWORD,
+    NativeClientLifecycleLedger,
+    async_harness,
+    cleanup_preserving_primary_failure,
+    commits_match,
+    current_commit,
+    current_workspace_digest,
+    enter_chat_page,
+    is_native_tauri_url,
+    is_station_authorization_rejection,
+    native_runtime_source_identity,
+    read_station_version,
+    runtime_station_service,
+    selected_native_runtime,
+    shared_federation_id,
+    station_readback as shared_station_readback,
+    stop_client,
+    verify_runtime_fixture_ready,
+    wait_for_peer_key_bundle,
+    wait_until,
+)
+
+
+DEFAULT_GATE_ID = "chat-native-interactions-e2e"
+LIFECYCLE_GATE_ID = "chat-lifecycle-interactions-group-e2e"
+GATE_ID = os.environ.get("PT_CHAT_INTERACTIONS_GATE_ID", DEFAULT_GATE_ID)
+REPORT_PATH = None
+CLIENT_PORTS = {"alice": 4451, "bob": 4452, "charlie": 4453}
+STEP_TIMEOUT = float(os.environ.get("CHAT_NATIVE_STEP_TIMEOUT_SECONDS", "120"))
+ACTORS = ("alice", "bob", "charlie")
+REQUIRED_ASSERTIONS = {
+    "native_runtime",
+    "actor_isolation",
+    "direct_reply_thread",
+    "direct_reply_thread_panel",
+    "direct_reply_target_unavailable",
+    "direct_author_only_edit",
+    "direct_author_only_retract",
+    "direct_reaction_idempotency",
+    "direct_reaction_remove_convergence",
+    "direct_pin_convergence",
+    "direct_read_progression",
+    "direct_retract_convergence",
+    "direct_client_restart",
+    "direct_offline_recovery",
+    "direct_duplicate_queue_replay",
+    "group_reply_thread",
+    "group_reply_thread_panel",
+    "group_reply_target_unavailable",
+    "group_author_only_edit",
+    "group_author_only_retract",
+    "group_reaction_idempotency",
+    "group_reaction_remove_convergence",
+    "group_pin_convergence",
+    "group_read_progression",
+    "group_retract_convergence",
+    "group_offline_recovery",
+    "group_duplicate_queue_replay",
+    "group_removed_member_denied",
+    "group_rename_convergence",
+    "group_role_convergence",
+    "group_owner_transfer_convergence",
+    "group_remote_owner_mutation",
+    "group_leave_convergence",
+    "group_dissolve_terminal",
+    "group_terminal_restart_history",
+    "revoked_device_denied",
+    "pending_interaction_timeout_retry",
+    "station_restart_convergence",
+    "station_authority_readback",
+    "engine_durable_readback",
+    "resources_released",
+}
+
+
+def selected_runtime() -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    NativeDesktopRuntimeBinding,
+] | None:
+    selected = selected_native_runtime(GATE_ID)
+    if selected is None:
+        return None
+    return selected.manifest, selected.actor_manifest, selected.binding
+
+
+def message_dom_observation(client: TauriSession, message_id: str) -> dict[str, Any]:
+    value = client.execute_script(
+        """
+        const id = arguments[0];
+        const row = document.querySelector(`[data-message-ulid="${CSS.escape(id)}"]`);
+        if (!row) {
+          return {
+            message: null,
+            activePanes: Array.from(
+              document.querySelectorAll('[data-chat-conversation-pane]'),
+            ).map((pane) => ({
+              conversationId: pane.getAttribute('data-chat-conversation-pane') || '',
+              groupSecurity: pane.getAttribute('data-group-security') || '',
+            })),
+            visibleRows: Array.from(
+              document.querySelectorAll('[data-message-ulid]'),
+            ).map((item) => ({
+              messageId: item.getAttribute('data-message-ulid') || '',
+              text: item.querySelector('[data-message-text]')?.innerText || '',
+              threadRoot: item.getAttribute('data-message-thread-root') || '',
+            })),
+            scrolls: Array.from(document.querySelectorAll('.chat-message-scroll'))
+              .map((scroll) => ({
+                top: scroll.scrollTop,
+                height: scroll.clientHeight,
+                contentHeight: scroll.scrollHeight,
+              })),
+            threadRoots: Array.from(
+              document.querySelectorAll('[data-chat-thread-panel="open"]'),
+            ).map((panel) => panel.getAttribute('data-chat-thread-root') || ''),
+          };
+        }
+        return { message: {
+          messageId: id,
+          text: row.innerText || '',
+          edited: row.getAttribute('data-message-edited') || '',
+          retracted: row.getAttribute('data-message-retracted') || '',
+          replyTo: row.getAttribute('data-message-reply-to') || '',
+          replyTargetState: row.querySelector('[data-message-reply-target-state]')
+            ?.getAttribute('data-message-reply-target-state') || '',
+          threadRoot: row.getAttribute('data-message-thread-root') || '',
+          threadReplyCount: Number(row.getAttribute('data-message-thread-reply-count') || '0'),
+          pinned: Boolean(row.querySelector('[data-message-pinned="true"]')),
+          readBy: (row.getAttribute('data-message-read-by') || '')
+            .split(',').filter(Boolean),
+          readState: row.querySelector('[data-message-read-state]')
+            ?.getAttribute('data-message-read-state') || '',
+          reactions: Array.from(row.querySelectorAll('[data-message-reaction]'))
+            .map((item) => item.getAttribute('data-message-reaction') || ''),
+          receipt: row.querySelector('[data-message-receipt]')
+            ?.getAttribute('data-message-receipt') || '',
+        }};
+        """,
+        message_id,
+    )
+    return value if isinstance(value, dict) else {"message": None}
+
+
+def thread_dom_snapshot(client: TauriSession) -> dict[str, Any] | None:
+    value = client.execute_script(
+        """
+        const panel = document.querySelector('[data-chat-thread-panel="open"]');
+        if (!panel) return null;
+        return {
+          rootMessageId: panel.getAttribute('data-chat-thread-root') || '',
+          replyCount: Number(
+            panel.getAttribute('data-chat-thread-reply-count') || '0'
+          ),
+          replyMessageIds: Array.from(
+            panel.querySelectorAll('[data-thread-message-role="reply"]')
+          ).map((row) => row.getAttribute('data-thread-message-id') || ''),
+          orders: Array.from(
+            panel.querySelectorAll('[data-thread-message-order]')
+          ).map((row) => Number(
+            row.getAttribute('data-thread-message-order') || '-1'
+          )),
+        };
+        """
+    )
+    return value if isinstance(value, dict) else None
+
+
+def station_mutation_fingerprint(evidence: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    authority_events = evidence.get("authorityEvents") or evidence.get("events") or []
+    authority_event_ids = tuple(
+        str(event.get("eventId") or "") for event in authority_events
+    )
+    authority_event_id_set = set(authority_event_ids)
+    return (
+        authority_event_ids,
+        tuple(
+            str(item.get("itemId") or "")
+            for item in evidence.get("queue") or []
+            if str(item.get("eventId") or "") in authority_event_id_set
+        ),
+    )
+
+
+def recipient_queue_item_ids(
+    evidence: dict[str, Any],
+    ptid: str,
+    device_id: str,
+) -> tuple[str, ...]:
+    return tuple(
+        str(item.get("itemId") or "")
+        for item in evidence.get("queue") or []
+        if item.get("recipientPtid") == ptid
+        and item.get("recipientDeviceId") == device_id
+    )
+
+
+class NativeInteractionsGate(AcceptanceGate):
+    gate_id = DEFAULT_GATE_ID
+    phase = "MP-W12"
+    bom = ("MP-G15",)
+    spec = (
+        "AS-W12-01",
+        "AS-W12-02",
+        "AS-W12-03",
+        "AS-W12-04",
+        "AS-W12-05",
+    )
+    report_path = REPORT_PATH
+    evidence_dir = (
+        REPORT_PATH.parent / "chat-native-interactions-evidence"
+        if REPORT_PATH is not None
+        else None
+    )
+
+    def __init__(
+        self,
+        *,
+        manifest: dict[str, Any] | None = None,
+        actor_manifest: dict[str, Any] | None = None,
+        runtime_binding: NativeDesktopRuntimeBinding | None = None,
+    ) -> None:
+        super().__init__()
+        injected = (manifest, actor_manifest, runtime_binding)
+        if any(value is not None for value in injected) and not all(
+            value is not None for value in injected
+        ):
+            raise GateError(
+                "runtime manifest, actor manifest, and runtime binding "
+                "must be injected together"
+            )
+        selected_cell = os.environ.get(
+            "PT_ACCEPTANCE_RUNTIME_CELL",
+            "",
+        ).strip()
+        if selected_cell and runtime_binding is None:
+            raise GateError(
+                "selected runtime cell requires injected runtime resources"
+            )
+        if (
+            runtime_binding is not None
+            and runtime_binding.cell_id != selected_cell
+        ):
+            raise GateError(
+                "injected runtime binding does not match "
+                "PT_ACCEPTANCE_RUNTIME_CELL"
+            )
+        self.runtime_binding = runtime_binding
+        self.manifest = manifest or {}
+        self.actor_manifest = actor_manifest or {}
+        self.client_specs: dict[str, dict[str, Any]] = {}
+        self.actor_specs: dict[str, dict[str, Any]] = {}
+        if self.runtime_binding is not None:
+            source = self.manifest.get("source")
+            station = runtime_station_service(self.manifest, "alice")
+            self.station_url = str(station.get("endpoint") or "").rstrip("/")
+            self.client_specs = {
+                str(client.get("id")): client
+                for client in self.manifest.get("clients", [])
+                if isinstance(client, dict)
+            }
+            self.actor_specs = {
+                str(actor.get("role")): actor
+                for actor in self.actor_manifest.get("actors", [])
+                if isinstance(actor, dict)
+            }
+            if not self.station_url:
+                raise GateError("runtime manifest Station URL is required")
+            if set(self.client_specs) != set(ACTORS):
+                raise GateError(
+                    "runtime manifest must allocate isolated Alice, Bob, "
+                    "and Charlie clients"
+                )
+            if set(self.actor_specs) != set(ACTORS):
+                raise GateError(
+                    "actor manifest must contain canonical Alice, Bob, "
+                    "and Charlie identities"
+                )
+            self.report.manifest = self.manifest
+        else:
+            raise GateError(
+                "Native interactions require provisioned runtime resources"
+            )
+        source = self.manifest.get("source")
+        self.tested_commit = (
+            str(source.get("commit") or "")
+            if isinstance(source, dict)
+            else current_commit()
+        )
+        self.workspace_digest = (
+            str(source.get("workspaceDigest") or "")
+            if isinstance(source, dict)
+            else current_workspace_digest()
+        )
+        self.steps: list[dict[str, Any]] = []
+        self._step_observation_sequence = 0
+        self._predicate_probes: list[dict[str, Any]] = []
+        self.clients: dict[str, TauriSession] = {}
+        self.runtime_instances: list[TauriSession] = []
+        self.client_lifecycles = NativeClientLifecycleLedger()
+        self.ptids: dict[str, str] = {}
+        self.device_ids: dict[str, str] = {}
+        self.conversations: dict[str, str] = {}
+        self.message_ids: dict[str, str] = {}
+        self.command_ids: dict[str, str] = {}
+        self.station_evidence: dict[str, Any] = {}
+        self.engine_evidence: dict[str, Any] = {}
+        self.restart_evidence: dict[str, str] = {}
+        self.timeout_retry_evidence: dict[str, Any] = {}
+        self.cleanup_evidence: dict[str, Any] = {}
+        self.report.runtime.update(
+            {
+                "runtimeCell": (
+                    self.runtime_binding.cell_id
+                    if self.runtime_binding is not None
+                    else "native-tauri-embedded-webdriver"
+                ),
+                "journey": "direct-and-group-message-interactions",
+                "steps": self.steps,
+                "conversations": self.conversations,
+                "messageIds": self.message_ids,
+                "commandIds": self.command_ids,
+                "stationReadback": self.station_evidence,
+                "engineReadback": self.engine_evidence,
+                "timeoutRetry": self.timeout_retry_evidence,
+                "stationRestart": self.restart_evidence,
+                "cleanup": self.cleanup_evidence,
+            }
+        )
+
+    def verify_fixture_ready(self) -> bool:
+        if self.runtime_binding is None:
+            raise GateError("Native Desktop runtime binding is required")
+        verify_runtime_fixture_ready(self.manifest, self.actor_manifest)
+        return True
+
+    def source_identity(
+        self,
+        station_live: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.runtime_binding is None:
+            return {
+                "orchestrator": {
+                    "commit": self.tested_commit,
+                    "workspaceDigest": self.workspace_digest,
+                },
+                "stationLive": station_live,
+            }
+        identity = native_runtime_source_identity(
+            gate_id=self.gate_id,
+            manifest=self.manifest,
+            runtime_binding=self.runtime_binding,
+            station_live=station_live,
+        )
+        runtime_cell = identity["runtimeCell"]
+        self.report.runtime["runtimeCellRunId"] = runtime_cell.get("runId")
+        self.report.runtime["sourceIdentity"] = identity
+        return identity
+
+    def observe_step(
+        self,
+        name: str,
+        client: str,
+        state: str,
+        started: float,
+        *,
+        predicate: dict[str, Any] | None = None,
+    ) -> None:
+        self._step_observation_sequence += 1
+        observation = {
+            "artifactKind": "acceptance-step-observation",
+            "evidenceClass": "SUPPORTING_OBSERVATION",
+            "proofStatus": "NOT_APPLICABLE",
+            "gateId": self.gate_id,
+            "sequence": self._step_observation_sequence,
+            "source": {
+                "commit": self.tested_commit,
+                "workspaceDigest": self.workspace_digest,
+            },
+            "step": name,
+            "client": client,
+            "state": state,
+            "elapsedMs": int((time.monotonic() - started) * 1000),
+        }
+        if predicate is not None:
+            observation["predicate"] = predicate
+        write_current_artifact(
+            f"observations/step-{self._step_observation_sequence:05d}.json",
+            (json.dumps(observation, sort_keys=True) + "\n").encode("utf-8"),
+            repo_root=REPO_ROOT,
+        )
+        print(json.dumps(observation, sort_keys=True), flush=True)
+
+    def wait_step(
+        self,
+        name: str,
+        probe: Callable[[], Any],
+        client: str,
+        *,
+        expected: Any = "non-empty projection",
+        ready: Callable[[Any], bool] = bool,
+        timeout: float = STEP_TIMEOUT,
+        interval: float = 0.25,
+    ) -> Any:
+        started = time.monotonic()
+        last_serialized = ""
+        last_recorded = float("-inf")
+
+        def predicate() -> Any:
+            nonlocal last_serialized, last_recorded
+            failure: Exception | None = None
+            probes: dict[str, Any] = {}
+            self._predicate_probes.append(probes)
+            try:
+                value = probe()
+                accepted = ready(value)
+                sample = {"expected": expected, "observed": value, "accepted": accepted}
+            except Exception as error:
+                failure = error
+                sample = {
+                    "expected": expected,
+                    "errorType": type(error).__name__,
+                    "error": str(error),
+                    "accepted": False,
+                }
+                value = None
+                accepted = False
+            finally:
+                self._predicate_probes.pop()
+            if probes:
+                sample["probes"] = probes
+            serialized = json.dumps(sample, sort_keys=True)
+            now = time.monotonic()
+            if serialized != last_serialized and (
+                accepted or now - last_recorded >= 1
+            ):
+                self.observe_step(
+                    name, client, "PREDICATE", started, predicate=sample,
+                )
+                last_serialized = serialized
+                last_recorded = now
+            if failure is not None:
+                raise failure
+            return value if accepted else None
+
+        return self.step(
+            name,
+            lambda: wait_until(predicate, name, timeout, interval),
+            client,
+        )
+
+    def wait_until(
+        self,
+        predicate: Callable[[], Any],
+        description: str,
+        timeout: float = 120,
+        interval: float = 0.25,
+        *,
+        expected: Any = "predicate returns a truthy value",
+    ) -> Any:
+        actor = description.split(" ", 1)[0]
+        return self.wait_step(
+            description,
+            predicate,
+            actor if actor in self.clients else "",
+            expected=expected,
+            timeout=timeout,
+            interval=interval,
+        )
+
+    def observe_probe(self, operation: str, actor: str, value: Any) -> Any:
+        if self._predicate_probes:
+            self._predicate_probes[-1][f"{actor}.{operation}"] = value
+        return value
+
+    def harness(
+        self,
+        client: TauriSession,
+        method: str,
+        payload: dict[str, Any],
+        timeout: float = 45.0,
+        *,
+        actor: str = "",
+    ) -> Any:
+        actor = actor or next(
+            (name for name, session in self.clients.items() if session is client),
+            "",
+        )
+        action = lambda: async_harness(client, method, payload, timeout)
+        if self._predicate_probes:
+            return self.observe_probe(method, actor, action())
+        # A caller may intentionally catch a rejected product operation.
+        # Its enclosing assertion owns failure judgment, not this RPC boundary.
+        return self.step(
+            f"harness.{method}", action, actor, judge_failure=False,
+        )
+
+    def station_readback(
+        self,
+        station_url: str,
+        conversation_id: str,
+        message_id: str,
+        *,
+        deployment_environment: str = "",
+    ) -> dict[str, Any]:
+        action = lambda: shared_station_readback(
+            conversation_id,
+            message_id,
+            station_url=station_url,
+            deployment_environment=deployment_environment,
+        )
+        if self._predicate_probes:
+            return self.observe_probe("stationReadback", station_url, action())
+        return self.step(f"station.readback:{conversation_id}:{message_id}", action)
+
+    def message_dom_snapshot(
+        self, client: TauriSession, message_id: str,
+    ) -> dict[str, Any] | None:
+        actor = next(
+            (actor for actor, session in self.clients.items() if session is client),
+            "",
+        )
+        observation = self.observe_probe(
+            f"messageDom:{message_id}", actor,
+            message_dom_observation(client, message_id),
+        )
+        message = observation.get("message")
+        return message if isinstance(message, dict) else None
+
+    def thread_dom_snapshot(self, client: TauriSession) -> dict[str, Any] | None:
+        actor = next(
+            (actor for actor, session in self.clients.items() if session is client),
+            "",
+        )
+        return self.observe_probe("threadDom", actor, thread_dom_snapshot(client))
+
+    def step(
+        self,
+        name: str,
+        action: Callable[[], Any],
+        client: str = "",
+        *,
+        judge_failure: bool = True,
+    ) -> Any:
+        started = time.monotonic()
+        self.observe_step(name, client, "STARTED", started)
+        try:
+            value = action()
+        except Exception as error:
+            if judge_failure:
+                self.report.runtime.setdefault("firstFailedStep", name)
+            self.steps.append(
+                {
+                    "step": name,
+                    "client": client,
+                    "status": "fail" if judge_failure else "error",
+                    "durationMs": int((time.monotonic() - started) * 1000),
+                    "error": str(error),
+                }
+            )
+            self.observe_step(name, client, "FAILED", started)
+            raise
+        self.steps.append(
+            {
+                "step": name,
+                "client": client,
+                "status": "pass",
+                "durationMs": int((time.monotonic() - started) * 1000),
+            }
+        )
+        self.observe_step(name, client, "COMPLETED", started)
+        return value
+
+    def start_client(self, actor: str) -> None:
+        client, ptid = self.create_authenticated_client(actor)
+        self.register_driver(client)
+        self.clients[actor] = client
+        self.ptids[actor] = ptid
+        device = self.harness(client, "getRealtimeDevice", {})
+        device_id = str((device or {}).get("deviceId") or "")
+        if not device_id:
+            raise GateError(f"{actor}: messaging device ID is missing")
+        self.device_ids[actor] = device_id
+        self.report.add_actor(
+            ActorRuntime(
+                name=actor,
+                runtime=(
+                    self.runtime_binding.cell_id
+                    if self.runtime_binding is not None
+                    else "native-tauri-embedded-webdriver"
+                ),
+                port=client.port,
+                gateway_port=client.gateway_port,
+                profile=client.profile,
+                storage_root=client.storage_root,
+                pid=client.process_id,
+            )
+        )
+        enter_chat_page(client)
+
+    def create_authenticated_client(
+        self,
+        actor: str,
+        *,
+        restore_session: bool = False,
+        restored_from: TauriSession | None = None,
+    ) -> tuple[TauriSession, str]:
+        if self.runtime_binding is None:
+            raise GateError("Native Desktop runtime binding is required")
+        client = self.runtime_binding.create_bound_session(
+            actor,
+            NativeLaunchOptions(
+                window_slot=ACTORS.index(actor),
+                window_count=len(ACTORS),
+            ),
+        )
+        self.runtime_instances.append(client)
+        expected_ptid = str(self.actor_specs[actor].get("ptid") or "")
+        self.client_lifecycles.register(client, expected_ptid)
+        if restored_from is not None:
+            self.client_lifecycles.transfer_preserved_session(
+                restored_from,
+                client,
+            )
+        try:
+            self.client_lifecycles.mark_live(client)
+            if restore_session:
+                self.wait_for_realtime_device(client, expected_ptid)
+                ptid = expected_ptid
+                self.client_lifecycles.mark_authenticated(client)
+            else:
+                account_ref = str(
+                    self.actor_specs[actor].get("accountRef") or ""
+                )
+                login = self.harness(
+                    client,
+                    "loginWithPassword",
+                    {
+                        "account": account_ref.removeprefix("station-account:"),
+                        "password": DEV_ACCOUNT_PASSWORD,
+                    },
+                    timeout=30,
+                    actor=actor,
+                )
+                if not (login or {}).get("authenticated"):
+                    raise GateError(f"{actor} login did not authenticate")
+                self.client_lifecycles.mark_authenticated(client)
+                ptid = str((login or {}).get("actorPtid") or "")
+                if ptid != expected_ptid:
+                    raise GateError(
+                        f"{actor} login identity mismatch: "
+                        f"expected={expected_ptid} actual={ptid}"
+                    )
+            if not is_native_tauri_url(client.get_current_url()):
+                raise GateError(
+                    f"{actor} is not running in native Tauri WebView: "
+                    f"{client.get_current_url()}"
+                )
+            return client, ptid
+        except Exception as error:
+            cleanup_errors = self.client_lifecycles.release(client)
+            if cleanup_errors and hasattr(error, "add_note"):
+                error.add_note(
+                    "Native interactions launch cleanup also failed: "
+                    f"{json.dumps(cleanup_errors, sort_keys=True)}"
+                )
+            raise
+
+    def wait_for_realtime_device(
+        self,
+        client: TauriSession,
+        expected_ptid: str,
+    ) -> dict[str, Any]:
+        return self.wait_until(
+            lambda: (
+                device
+                if (
+                    device := self.harness(
+                        client,
+                        "getRealtimeDevice",
+                        {},
+                        timeout=10,
+                    )
+                )
+                and str(device.get("actorPtid") or "") == expected_ptid
+                and str(device.get("deviceId") or "")
+                else None
+            ),
+            f"restored identity {expected_ptid}",
+            timeout=60,
+        )
+
+    def sync(self, actor: str, kind: str, conversation_id: str) -> None:
+        method = "syncFriendSession" if kind == "friend" else "syncGroup"
+        key = "sessionUlid" if kind == "friend" else "groupUlid"
+        if kind == "friend":
+            self.harness(self.clients[actor], method, {key: conversation_id})
+            return
+        self.wait_until(
+            lambda: self.harness(
+                self.clients[actor],
+                method,
+                {key: conversation_id},
+                timeout=30,
+            ),
+            f"{actor} projected Group {conversation_id}",
+            STEP_TIMEOUT,
+            1,
+        )
+
+    def group_lifecycle_snapshot(
+        self,
+        actor: str,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        value = self.harness(
+            self.clients[actor],
+            "groupLifecycleSnapshot",
+            {"groupUlid": conversation_id},
+        )
+        return self.observe_probe(
+            f"groupLifecycle:{conversation_id}", actor,
+            value if isinstance(value, dict) else None,
+        )
+
+    def wait_group_lifecycle(
+        self,
+        actors: tuple[str, ...],
+        conversation_id: str,
+        predicate: Callable[[dict[str, Any]], bool],
+        description: str,
+    ) -> dict[str, dict[str, Any]]:
+        def converged() -> dict[str, dict[str, Any]] | None:
+            snapshots = {
+                actor: self.group_lifecycle_snapshot(actor, conversation_id)
+                for actor in actors
+            }
+            if all(
+                snapshot is not None and predicate(snapshot)
+                for snapshot in snapshots.values()
+            ):
+                return snapshots
+            return None
+
+        return self.wait_until(
+            converged,
+            description,
+            STEP_TIMEOUT,
+            interval=0.5,
+        )
+
+    def restart_terminal_group_client(
+        self,
+        actor: str,
+        conversation_id: str,
+        expected_message_id: str,
+    ) -> dict[str, Any]:
+        if self.runtime_binding is None:
+            raise GateError("Native Desktop runtime binding is required")
+        predecessor = self.clients[actor]
+        self.client_lifecycles.stop_preserving_session(predecessor)
+        client = self.runtime_binding.create_bound_session(
+            actor,
+            NativeLaunchOptions(
+                window_slot=ACTORS.index(actor),
+                window_count=len(ACTORS),
+                restore_session=True,
+            ),
+        )
+        self.runtime_instances.append(client)
+        self.client_lifecycles.register(client, self.ptids[actor])
+        self.client_lifecycles.transfer_preserved_session(predecessor, client)
+        self.client_lifecycles.mark_live(client)
+        self.client_lifecycles.mark_authenticated(client)
+        self.register_driver(client)
+        self.clients[actor] = client
+        history = self.wait_until(
+            lambda: (
+                page
+                if isinstance(
+                    page := self.harness(
+                        client,
+                        "messagePage",
+                        {
+                            "conversationId": conversation_id,
+                            "limit": 100,
+                        },
+                    ),
+                    dict,
+                )
+                and expected_message_id in set(page.get("messageIds") or [])
+                else None
+            ),
+            f"{actor} retains dissolved Group history after restart",
+            STEP_TIMEOUT,
+        )
+        return history
+
+    def prove_group_lifecycle(self, group_id: str) -> dict[str, Any]:
+        active = ("alice", "bob")
+        before = self.wait_group_lifecycle(
+            active,
+            group_id,
+            lambda snapshot: snapshot.get("active") is True,
+            "retained Group members observe active lifecycle state",
+        )
+        renamed = f"Lifecycle {time.time_ns()}"
+        self.harness(
+            self.clients["alice"],
+            "updateGroup",
+            {"groupUlid": group_id, "name": renamed},
+        )
+        rename = self.wait_group_lifecycle(
+            active,
+            group_id,
+            lambda snapshot: snapshot.get("name") == renamed,
+            "Group rename convergence",
+        )
+        self.assert_condition("group_rename_convergence", True)
+
+        self.harness(
+            self.clients["alice"],
+            "updateGroupMember",
+            {
+                "groupUlid": group_id,
+                "memberPtid": self.ptids["bob"],
+                "role": 2,
+            },
+        )
+        role = self.wait_group_lifecycle(
+            active,
+            group_id,
+            lambda snapshot: any(
+                member.get("ptid") == self.ptids["bob"]
+                and int(member.get("role") or 0) == 2
+                for member in snapshot.get("members") or []
+            ),
+            "Group role convergence",
+        )
+        self.assert_condition("group_role_convergence", True)
+
+        self.harness(
+            self.clients["alice"],
+            "transferGroupOwnership",
+            {
+                "groupUlid": group_id,
+                "memberPtid": self.ptids["bob"],
+            },
+        )
+        ownership = self.wait_group_lifecycle(
+            active,
+            group_id,
+            lambda snapshot: snapshot.get("ownerPtid") == self.ptids["bob"],
+            "Group ownership convergence",
+        )
+        self.assert_condition("group_owner_transfer_convergence", True)
+
+        self.harness(
+            self.clients["bob"],
+            "updateGroupMember",
+            {
+                "groupUlid": group_id,
+                "memberPtid": self.ptids["alice"],
+                "muted": True,
+            },
+        )
+        remote_owner = self.wait_group_lifecycle(
+            active,
+            group_id,
+            lambda snapshot: any(
+                member.get("ptid") == self.ptids["alice"]
+                and member.get("muted") is True
+                for member in snapshot.get("members") or []
+            ),
+            "new owner later member mutation",
+        )
+        self.assert_condition("group_remote_owner_mutation", True)
+
+        self.harness(
+            self.clients["alice"],
+            "leaveGroup",
+            {"groupUlid": group_id},
+        )
+        left = self.wait_group_lifecycle(
+            ("bob",),
+            group_id,
+            lambda snapshot: (
+                snapshot.get("active") is True
+                and {
+                    member.get("ptid")
+                    for member in snapshot.get("members") or []
+                }
+                == {self.ptids["bob"]}
+            ),
+            "Group leave convergence",
+        )
+        self.assert_condition("group_leave_convergence", True)
+
+        self.harness(
+            self.clients["bob"],
+            "dissolveGroup",
+            {"groupUlid": group_id},
+        )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if isinstance(
+                    snapshot := self.group_lifecycle_snapshot("bob", group_id),
+                    dict,
+                )
+                and snapshot.get("active") is False
+                else None
+            ),
+            "Group dissolve terminal projection",
+            STEP_TIMEOUT,
+        )
+        self.assert_condition("group_dissolve_terminal", True)
+        history = self.restart_terminal_group_client(
+            "bob",
+            group_id,
+            self.message_ids["group.base"],
+        )
+        self.assert_condition("group_terminal_restart_history", True)
+        return {
+            "before": before,
+            "rename": rename,
+            "role": role,
+            "ownership": ownership,
+            "remoteOwner": remote_owner,
+            "left": left,
+            "history": history,
+        }
+
+    def projection(
+        self,
+        actor: str,
+        kind: str,
+        conversation_id: str,
+        message_id: str,
+        thread_root_message_id: str = "",
+    ) -> dict[str, Any] | None:
+        value = self.harness(
+            self.clients[actor],
+            "interactionProjection",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "threadRootMessageId": thread_root_message_id,
+            },
+        )
+        return self.observe_probe(
+            f"interactionProjection:{message_id}", actor,
+            value if isinstance(value, dict) else None,
+        )
+
+    def send(
+        self,
+        actor: str,
+        kind: str,
+        conversation_id: str,
+        content: str,
+        *,
+        reply_to: str = "",
+        thread_root: str = "",
+    ) -> dict[str, Any]:
+        result = self.harness(
+            self.clients[actor],
+            "sendInteractionMessage",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "content": content,
+                "replyToMessageId": reply_to,
+                "threadRootMessageId": thread_root,
+            },
+        )
+        if not isinstance(result, dict) or not result.get("messageId"):
+            raise GateError(f"{kind} send returned no message identity")
+        return result
+
+    def expect_rejected(self, action: Callable[[], Any], description: str) -> None:
+        def verify() -> None:
+            try:
+                action()
+            except Exception:
+                return
+            raise GateError(f"unauthorized action succeeded: {description}")
+
+        self.step(f"authorization.rejected:{description}", verify)
+
+    def engine_snapshot(
+        self,
+        actor: str,
+        conversation_id: str,
+        message_id: str,
+        command_id: str = "",
+    ) -> dict[str, Any]:
+        result = self.harness(
+            self.clients[actor],
+            "engineInteractionSnapshot",
+            {
+                "actorPtid": self.ptids[actor],
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "commandId": command_id,
+            },
+        )
+        if not isinstance(result, dict):
+            raise GateError(
+                "engineInteractionSnapshot returned invalid evidence"
+            )
+        return self.observe_probe(
+            f"engineInteractionSnapshot:{message_id}:{command_id}", actor, result,
+        )
+
+    def prove_lifecycle(
+        self,
+        kind: str,
+        conversation_id: str,
+        members: tuple[str, ...],
+    ) -> None:
+        claim_kind = "direct" if kind == "friend" else "group"
+        prefix = f"{claim_kind}-{time.time_ns()}"
+        base = self.step(
+            f"{claim_kind}.message.send",
+            lambda: self.send("alice", kind, conversation_id, f"{prefix}-base"),
+            "alice",
+        )
+        message_id = str(base["messageId"])
+        self.message_ids[f"{claim_kind}.base"] = message_id
+        for actor in members:
+            self.step(
+                f"{claim_kind}.message.visible",
+                lambda actor=actor: self.wait_until(
+                    lambda: (
+                        self.sync(actor, kind, conversation_id)
+                        or self.message_dom_snapshot(self.clients[actor], message_id)
+                    ),
+                    f"{actor} {claim_kind} base DOM",
+                    STEP_TIMEOUT,
+                ),
+                actor,
+            )
+
+        reply = self.step(
+            f"{claim_kind}.reply.send",
+            lambda: self.send(
+                "bob",
+                kind,
+                conversation_id,
+                f"{prefix}-reply",
+                reply_to=message_id,
+            ),
+            "bob",
+        )
+        reply_id = str(reply["messageId"])
+        self.wait_step(
+            f"{claim_kind}.reply.authority-projection",
+            lambda: self.projection(
+                "alice",
+                kind,
+                conversation_id,
+                reply_id,
+            ),
+            "alice",
+        )
+        thread = self.step(
+            f"{claim_kind}.thread.send",
+            lambda: self.send(
+                "bob",
+                kind,
+                conversation_id,
+                f"{prefix}-thread",
+                thread_root=message_id,
+            ),
+            "bob",
+        )
+        thread_id = str(thread["messageId"])
+        self.wait_step(
+            f"{claim_kind}.thread.authority-projection",
+            lambda: self.projection(
+                "alice",
+                kind,
+                conversation_id,
+                thread_id,
+                message_id,
+            ),
+            "alice",
+        )
+        nested = self.step(
+            f"{claim_kind}.thread.nested.send",
+            lambda: self.send(
+                "bob",
+                kind,
+                conversation_id,
+                f"{prefix}-thread-nested",
+                reply_to=thread_id,
+                thread_root=message_id,
+            ),
+            "bob",
+        )
+        nested_id = str(nested["messageId"])
+        self.message_ids[f"{claim_kind}.thread.first"] = thread_id
+        self.message_ids[f"{claim_kind}.thread.nested"] = nested_id
+        for actor in members:
+            self.step(
+                f"{claim_kind}.reply-thread.sync",
+                lambda actor=actor: self.sync(actor, kind, conversation_id),
+                actor,
+            )
+            reply_projection = self.wait_step(
+                f"{claim_kind}.reply.projection",
+                lambda actor=actor: self.projection(
+                    actor,
+                    kind,
+                    conversation_id,
+                    reply_id,
+                ),
+                actor,
+            )
+            thread_projection = self.wait_step(
+                f"{claim_kind}.thread.projection",
+                lambda actor=actor: self.projection(
+                    actor,
+                    kind,
+                    conversation_id,
+                    thread_id,
+                    message_id,
+                ),
+                actor,
+            )
+            if reply_projection.get("replyToMessageId") != message_id:
+                raise GateError(f"{actor} {claim_kind} reply linkage mismatch")
+            if thread_projection.get("threadRootMessageId") != message_id:
+                raise GateError(f"{actor} {claim_kind} thread linkage mismatch")
+            nested_projection = self.wait_step(
+                f"{claim_kind}.thread.nested.projection",
+                lambda actor=actor: self.projection(
+                    actor,
+                    kind,
+                    conversation_id,
+                    nested_id,
+                    message_id,
+                ),
+                actor,
+            )
+            if (
+                nested_projection.get("replyToMessageId") != thread_id
+                or nested_projection.get("threadRootMessageId") != message_id
+            ):
+                raise GateError(
+                    f"{actor} {claim_kind} nested thread linkage mismatch"
+                )
+            self.step(
+                f"{claim_kind}.thread.panel.open",
+                lambda actor=actor: self.harness(
+                    self.clients[actor],
+                    "openInteractionThread",
+                    {
+                        "conversationId": conversation_id,
+                        "kind": kind,
+                        "messageId": message_id,
+                    },
+                ),
+                actor,
+            )
+            panel = self.wait_step(
+                f"{claim_kind}.thread.panel.count-and-order",
+                lambda actor=actor: self.thread_dom_snapshot(self.clients[actor]),
+                actor,
+                expected={
+                    "rootMessageId": message_id,
+                    "replyCount": 2,
+                    "replyMessageIds": [thread_id, nested_id],
+                    "orders": [0, 1, 2],
+                },
+                ready=lambda snapshot: bool(
+                    snapshot and snapshot.get("rootMessageId") == message_id
+                    and snapshot.get("replyCount") == 2
+                    and snapshot.get("replyMessageIds") == [thread_id, nested_id]
+                    and snapshot.get("orders") == [0, 1, 2]
+                ),
+            )
+            if panel.get("replyMessageIds") != [thread_id, nested_id]:
+                raise GateError(
+                    f"{actor} {claim_kind} thread panel order mismatch"
+                )
+        self.assert_condition(f"{claim_kind}_reply_thread", True)
+        self.assert_condition(f"{claim_kind}_reply_thread_panel", True)
+
+        unavailable_base = self.step(
+            f"{claim_kind}.missing-target.base.send",
+            lambda: self.send(
+                "alice",
+                kind,
+                conversation_id,
+                f"{prefix}-missing-target-base",
+            ),
+            "alice",
+        )
+        unavailable_base_id = str(unavailable_base["messageId"])
+        unavailable_reply = self.step(
+            f"{claim_kind}.missing-target.reply.send",
+            lambda: self.send(
+                "bob",
+                kind,
+                conversation_id,
+                f"{prefix}-missing-target-reply",
+                reply_to=unavailable_base_id,
+            ),
+            "bob",
+        )
+        unavailable_reply_id = str(unavailable_reply["messageId"])
+        for actor in members:
+            self.wait_until(
+                lambda actor=actor: (
+                    self.sync(actor, kind, conversation_id)
+                    or self.projection(
+                        actor,
+                        kind,
+                        conversation_id,
+                        unavailable_reply_id,
+                    )
+                ),
+                f"{actor} {claim_kind} reply before local target deletion",
+                STEP_TIMEOUT,
+            )
+            self.wait_until(
+                lambda actor=actor: self.message_dom_snapshot(
+                    self.clients[actor],
+                    unavailable_reply_id,
+                ),
+                f"{actor} {claim_kind} reply DOM before local target deletion",
+                STEP_TIMEOUT,
+            )
+        target_actor = "bob"
+        target_station = self.station_readback(
+            self.station_url,
+            conversation_id,
+            unavailable_reply_id,
+        )
+        target_authority_sequence = max(
+            (
+                int(event.get("sequence") or 0)
+                for event in target_station.get("authorityEvents") or []
+            ),
+            default=0,
+        )
+        if target_authority_sequence <= 0:
+            raise GateError(
+                f"{claim_kind} actor-hide target has no Authority sequence"
+            )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    (snapshot := self.engine_snapshot(
+                        target_actor,
+                        conversation_id,
+                        unavailable_base_id,
+                    ))
+                    and int(
+                        (snapshot.get("authorityHead") or {}).get(
+                            "eventSequence"
+                        )
+                        or 0
+                    )
+                    >= target_authority_sequence
+                    and len(
+                        str(
+                            (snapshot.get("authorityHead") or {}).get(
+                                "eventHash"
+                            )
+                            or ""
+                        )
+                    )
+                    == 64
+                )
+                else None
+            ),
+            f"{target_actor} {claim_kind} authority head before actor-hide",
+            STEP_TIMEOUT,
+        )
+        deleted = self.harness(
+            self.clients[target_actor],
+            "deleteLocalInteractionMessage",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": unavailable_base_id,
+            },
+        )
+        if (deleted or {}).get("submitted") is not True:
+            raise GateError(
+                f"{target_actor} {claim_kind} actor-hide submission failed"
+            )
+        self.wait_until(
+            lambda: (
+                True
+                if self.projection(
+                    target_actor,
+                    kind,
+                    conversation_id,
+                    unavailable_base_id,
+                )
+                is None
+                else None
+            ),
+            f"{target_actor} {claim_kind} actor-hide convergence",
+            STEP_TIMEOUT,
+        )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.message_dom_snapshot(
+                        self.clients[target_actor],
+                        unavailable_reply_id,
+                    )
+                )
+                and snapshot.get("replyTargetState") == "unavailable"
+                else None
+            ),
+            f"{target_actor} {claim_kind} unavailable reply target DOM",
+            STEP_TIMEOUT,
+        )
+        self.assert_condition(f"{claim_kind}_reply_target_unavailable", True)
+
+        edited_text = f"{prefix}-edited"
+        edit = self.step(
+            f"{claim_kind}.edit.submit",
+            lambda: self.harness(
+                self.clients["alice"],
+                "editInteractionMessage",
+                {
+                    "conversationId": conversation_id,
+                    "kind": kind,
+                    "messageId": message_id,
+                    "plaintext": edited_text,
+                },
+            ),
+            "alice",
+        )
+        edit_command = str((edit or {}).get("command_id") or (edit or {}).get("commandId") or "")
+        if not edit_command:
+            raise GateError(f"{claim_kind} edit returned no command ID")
+        self.command_ids[f"{claim_kind}.edit"] = edit_command
+        for actor in members:
+            self.wait_step(
+                f"{claim_kind}.edit.projection",
+                lambda actor=actor: self.projection(
+                    actor, kind, conversation_id, message_id,
+                ),
+                actor,
+                expected={"content": edited_text, "edited": True},
+                ready=lambda snapshot: bool(
+                    snapshot and snapshot.get("content") == edited_text
+                    and snapshot.get("edited") is True
+                ),
+            )
+            self.wait_step(
+                f"{claim_kind}.edit.dom",
+                lambda actor=actor: self.message_dom_snapshot(
+                    self.clients[actor], message_id,
+                ),
+                actor,
+                expected={"textContains": edited_text, "edited": "true"},
+                ready=lambda snapshot: bool(
+                    snapshot and snapshot.get("edited") == "true"
+                    and edited_text in str(snapshot.get("text") or "")
+                ),
+            )
+        before_unauthorized_edit = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        self.expect_rejected(
+            lambda: self.harness(
+                self.clients["bob"],
+                "editInteractionMessage",
+                {
+                    "conversationId": conversation_id,
+                    "kind": kind,
+                    "messageId": message_id,
+                    "plaintext": f"{prefix}-unauthorized",
+                },
+            ),
+            f"bob edits alice {claim_kind} message",
+        )
+        after_unauthorized_edit = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        if station_mutation_fingerprint(before_unauthorized_edit) != station_mutation_fingerprint(
+            after_unauthorized_edit
+        ):
+            raise GateError(
+                f"unauthorized {claim_kind} edit mutated authority or queue"
+            )
+        self.assert_condition(f"{claim_kind}_author_only_edit", True)
+
+        for attempt in range(2):
+            before_consumption = {
+                actor: int(
+                    self.engine_snapshot(
+                        actor,
+                        conversation_id,
+                        message_id,
+                    ).get("consumptionCount")
+                    or 0
+                )
+                for actor in members
+            }
+            reaction = self.harness(
+                self.clients["bob"],
+                "submitMetadataInteraction",
+                {
+                    "conversationId": conversation_id,
+                    "kind": kind,
+                    "messageId": message_id,
+                    "interaction": "reaction",
+                    "reaction": "👍",
+                    "remove": False,
+                },
+            )
+            reaction_command = str(
+                (reaction or {}).get("command_id")
+                or (reaction or {}).get("commandId")
+                or ""
+            )
+            if not reaction_command:
+                raise GateError(
+                    f"{claim_kind} reaction attempt returned no command ID"
+                )
+            self.wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        snapshot := self.engine_snapshot(
+                            "bob",
+                            conversation_id,
+                            message_id,
+                            reaction_command,
+                        )
+                    )
+                    and (snapshot.get("intent") or {}).get("state")
+                    in {"submitted", "committed"}
+                    else None
+                ),
+                f"bob {claim_kind} reaction attempt {attempt + 1} submission",
+                STEP_TIMEOUT,
+            )
+            for actor in members:
+                self.wait_until(
+                    lambda actor=actor: (
+                        snapshot
+                        if (
+                            snapshot := self.engine_snapshot(
+                                actor,
+                                conversation_id,
+                                message_id,
+                            )
+                        )
+                        and int(snapshot.get("consumptionCount") or 0)
+                        > before_consumption[actor]
+                        else None
+                    ),
+                    f"{actor} {claim_kind} reaction attempt "
+                    f"{attempt + 1} consumption",
+                    STEP_TIMEOUT,
+                    expected={
+                        "consumptionCount": {"greaterThan": before_consumption[actor]},
+                    },
+                )
+                self.wait_until(
+                    lambda actor=actor: (
+                        snapshot
+                        if (
+                            snapshot := self.projection(
+                                actor,
+                                kind,
+                                conversation_id,
+                                message_id,
+                            )
+                        )
+                        and len(snapshot.get("reactions") or []) == 1
+                        else None
+                    ),
+                    f"{actor} {claim_kind} idempotent reaction",
+                    STEP_TIMEOUT,
+                )
+        self.assert_condition(f"{claim_kind}_reaction_idempotency", True)
+        self.harness(
+            self.clients["bob"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "interaction": "reaction",
+                "reaction": "👍",
+                "remove": True,
+            },
+        )
+        for actor in members:
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.projection(
+                            actor,
+                            kind,
+                            conversation_id,
+                            message_id,
+                        )
+                    )
+                    and len(snapshot.get("reactions") or []) == 0
+                    else None
+                ),
+                f"{actor} {claim_kind} reaction removal projection",
+                STEP_TIMEOUT,
+            )
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.message_dom_snapshot(
+                            self.clients[actor],
+                            message_id,
+                        )
+                    )
+                    and len(snapshot.get("reactions") or []) == 0
+                    else None
+                ),
+                f"{actor} {claim_kind} reaction removal DOM",
+                STEP_TIMEOUT,
+            )
+        self.assert_condition(f"{claim_kind}_reaction_remove_convergence", True)
+
+        pin = self.harness(
+            self.clients["alice"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "interaction": "pin",
+                "remove": False,
+            },
+        )
+        pin_command = str((pin or {}).get("command_id") or (pin or {}).get("commandId") or "")
+        for actor in members:
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.projection(
+                            actor,
+                            kind,
+                            conversation_id,
+                            message_id,
+                        )
+                    )
+                    and snapshot.get("pinned") is True
+                    else None
+                ),
+                f"{actor} {claim_kind} pin",
+                STEP_TIMEOUT,
+            )
+        self.harness(
+            self.clients["bob"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "interaction": "pin",
+                "remove": True,
+            },
+        )
+        for actor in members:
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.projection(
+                            actor,
+                            kind,
+                            conversation_id,
+                            message_id,
+                        )
+                    )
+                    and snapshot.get("pinned") is False
+                    else None
+                ),
+                f"{actor} {claim_kind} unpin",
+                STEP_TIMEOUT,
+            )
+        self.assert_condition(f"{claim_kind}_pin_convergence", True)
+
+        read = self.harness(
+            self.clients["bob"],
+            "submitReadCursor",
+            {"conversationId": conversation_id, "kind": kind},
+        )
+        read_sequence = int((read or {}).get("lastReadSequence") or 0)
+        if read_sequence <= 0:
+            raise GateError(f"{claim_kind} read cursor returned no sequence")
+        alice_engine = self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.engine_snapshot(
+                        "alice",
+                        conversation_id,
+                        message_id,
+                        edit_command,
+                    )
+                )
+                and any(
+                    cursor.get("actorPtid") == self.ptids["bob"]
+                    and int(cursor.get("lastReadSequence") or 0) >= read_sequence
+                    for cursor in snapshot.get("readCursors") or []
+                )
+                else None
+            ),
+            f"alice {claim_kind} read cursor projection",
+            STEP_TIMEOUT,
+        )
+        self.engine_evidence[f"{claim_kind}.alice"] = alice_engine
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.message_dom_snapshot(
+                        self.clients["alice"],
+                        message_id,
+                    )
+                )
+                and (
+                    snapshot.get("receipt") == "read"
+                    if kind == "friend"
+                    else (
+                        self.ptids["bob"] in (snapshot.get("readBy") or [])
+                        and snapshot.get("readState") == "read"
+                    )
+                )
+                else None
+            ),
+            f"alice {claim_kind} sender-visible read state",
+            STEP_TIMEOUT,
+        )
+        self.assert_condition(f"{claim_kind}_read_progression", True)
+
+        before_unauthorized_retract = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        self.expect_rejected(
+            lambda: self.harness(
+                self.clients["bob"],
+                "submitMetadataInteraction",
+                {
+                    "conversationId": conversation_id,
+                    "kind": kind,
+                    "messageId": message_id,
+                    "interaction": "retract",
+                    "remove": False,
+                },
+            ),
+            f"bob retracts alice {claim_kind} message",
+        )
+        after_unauthorized_retract = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        if station_mutation_fingerprint(
+            before_unauthorized_retract
+        ) != station_mutation_fingerprint(after_unauthorized_retract):
+            raise GateError(
+                f"unauthorized {claim_kind} retract mutated authority or queue"
+            )
+        self.assert_condition(f"{claim_kind}_author_only_retract", True)
+
+        retract = self.harness(
+            self.clients["alice"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "interaction": "retract",
+                "remove": False,
+            },
+        )
+        retract_command = str(
+            (retract or {}).get("command_id")
+            or (retract or {}).get("commandId")
+            or ""
+        )
+        for actor in members:
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.message_dom_snapshot(
+                            self.clients[actor],
+                            message_id,
+                        )
+                    )
+                    and snapshot.get("retracted") == "true"
+                    else None
+                ),
+                f"{actor} {claim_kind} retracted DOM",
+                STEP_TIMEOUT,
+            )
+        self.assert_condition(f"{claim_kind}_retract_convergence", True)
+        engine = self.engine_snapshot(
+            "alice",
+            conversation_id,
+            message_id,
+            retract_command or pin_command,
+        )
+        projection = engine.get("projection") or {}
+        if (
+            projection.get("retracted") is not True
+            or int(engine.get("consumptionCount") or 0) <= 0
+            or int(engine.get("laneSequence") or 0) <= 0
+        ):
+            raise GateError(
+                f"{claim_kind} Engine durable interaction evidence is incomplete"
+            )
+        self.engine_evidence[f"{claim_kind}.terminal"] = engine
+        station = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        if not station.get("events") or not station.get("queue"):
+            raise GateError(
+                f"{claim_kind} Station authority/queue evidence is incomplete"
+            )
+        self.station_evidence[claim_kind] = station
+
+    def prove_offline_recovery(
+        self,
+        kind: str,
+        conversation_id: str,
+        online_members: tuple[str, ...],
+    ) -> None:
+        claim_kind = "direct" if kind == "friend" else "group"
+        prefix = f"{claim_kind}-offline-{time.time_ns()}"
+        base = self.send(
+            "alice",
+            kind,
+            conversation_id,
+            f"{prefix}-base",
+        )
+        message_id = str(base["messageId"])
+        for actor in ("alice", "bob", *online_members):
+            self.sync(actor, kind, conversation_id)
+            self.wait_until(
+                lambda actor=actor: self.message_dom_snapshot(
+                    self.clients[actor],
+                    message_id,
+                ),
+                f"{actor} {claim_kind} offline seed DOM",
+                STEP_TIMEOUT,
+            )
+
+        self.stop_client_for_restart("bob")
+        edited_text = f"{prefix}-edited"
+        edit = self.harness(
+            self.clients["alice"],
+            "editInteractionMessage",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "plaintext": edited_text,
+            },
+        )
+        edit_command = str(
+            (edit or {}).get("command_id")
+            or (edit or {}).get("commandId")
+            or ""
+        )
+        if not edit_command:
+            raise GateError(f"{claim_kind} offline edit returned no command ID")
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.engine_snapshot(
+                        "alice",
+                        conversation_id,
+                        message_id,
+                        edit_command,
+                    )
+                )
+                and (snapshot.get("intent") or {}).get("state") == "committed"
+                else None
+            ),
+            f"alice {claim_kind} offline edit commit",
+            STEP_TIMEOUT,
+        )
+        reaction = self.harness(
+            self.clients["alice"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "interaction": "reaction",
+                "reaction": "👍",
+                "remove": False,
+            },
+        )
+        reaction_command = str(
+            (reaction or {}).get("command_id")
+            or (reaction or {}).get("commandId")
+            or ""
+        )
+        if not reaction_command:
+            raise GateError(
+                f"{claim_kind} offline reaction returned no command ID"
+            )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.engine_snapshot(
+                        "alice",
+                        conversation_id,
+                        message_id,
+                        reaction_command,
+                    )
+                )
+                and (snapshot.get("intent") or {}).get("state") == "committed"
+                else None
+            ),
+            f"alice {claim_kind} offline reaction commit",
+            STEP_TIMEOUT,
+        )
+        self.harness(
+            self.clients["alice"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "messageId": message_id,
+                "interaction": "pin",
+                "remove": False,
+            },
+        )
+        for actor in ("alice", *online_members):
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.projection(
+                            actor,
+                            kind,
+                            conversation_id,
+                            message_id,
+                        )
+                    )
+                    and snapshot.get("content") == edited_text
+                    and snapshot.get("edited") is True
+                    and snapshot.get("pinned") is True
+                    and len(snapshot.get("reactions") or []) == 1
+                    else None
+                ),
+                f"{actor} {claim_kind} offline mutation convergence",
+                STEP_TIMEOUT,
+            )
+
+        self.restart_client(
+            "bob",
+            kind,
+            conversation_id,
+            stop_existing=False,
+        )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.projection(
+                        "bob",
+                        kind,
+                        conversation_id,
+                        message_id,
+                    )
+                )
+                and snapshot.get("content") == edited_text
+                and snapshot.get("edited") is True
+                and snapshot.get("pinned") is True
+                and len(snapshot.get("reactions") or []) == 1
+                else None
+            ),
+            f"bob {claim_kind} offline queue recovery",
+            STEP_TIMEOUT,
+        )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.message_dom_snapshot(
+                        self.clients["bob"],
+                        message_id,
+                    )
+                )
+                and snapshot.get("edited") == "true"
+                and snapshot.get("pinned") is True
+                and len(snapshot.get("reactions") or []) == 1
+                and edited_text in str(snapshot.get("text") or "")
+                else None
+            ),
+            f"bob {claim_kind} offline recovery DOM",
+            STEP_TIMEOUT,
+        )
+        before_restart = self.engine_snapshot(
+            "bob",
+            conversation_id,
+            message_id,
+            edit_command,
+        )
+        self.restart_client("bob", kind, conversation_id)
+        after_restart = self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.engine_snapshot(
+                        "bob",
+                        conversation_id,
+                        message_id,
+                        edit_command,
+                    )
+                )
+                and len(snapshot.get("reactions") or []) == 1
+                and len(snapshot.get("pins") or []) == 1
+                else None
+            ),
+            f"bob {claim_kind} offline recovery after client restart",
+            STEP_TIMEOUT,
+        )
+        if before_restart.get("consumptionCount") != after_restart.get(
+            "consumptionCount"
+        ):
+            raise GateError(
+                f"{claim_kind} offline recovery duplicated consumption after restart"
+            )
+        self.engine_evidence[f"{claim_kind}.offline"] = after_restart
+        self.station_evidence[f"{claim_kind}.offline"] = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        self.assert_condition(f"{claim_kind}_offline_recovery", True)
+        self.prove_duplicate_queue_replay(
+            claim_kind,
+            conversation_id,
+            message_id,
+            "bob",
+        )
+
+    def prove_duplicate_queue_replay(
+        self,
+        claim_kind: str,
+        conversation_id: str,
+        message_id: str,
+        actor: str,
+    ) -> None:
+        delivery_station = runtime_station_service(self.manifest, actor)
+        delivery_station_url = str(
+            delivery_station.get("endpoint") or ""
+        ).rstrip("/")
+        delivery_environment = str(
+            delivery_station.get("deploymentEnvironment") or ""
+        ).strip()
+        if not delivery_station_url or not delivery_environment:
+            raise GateError(
+                f"{actor} duplicate replay requires a bound Station environment"
+            )
+
+        def delivery_station_readback() -> dict[str, Any]:
+            return self.station_readback(
+                delivery_station_url,
+                conversation_id,
+                message_id,
+                deployment_environment=delivery_environment,
+            )
+
+        before_station = delivery_station_readback()
+        event_ids = {
+            str(event.get("eventId") or "")
+            for event in before_station.get("authorityEvents") or []
+        }
+        candidates = [
+            item
+            for item in before_station.get("queue") or []
+            if item.get("recipientPtid") == self.ptids[actor]
+            and item.get("eventId") in event_ids
+            and int(item.get("state") or 0) == 5
+        ]
+        if not candidates:
+            raise GateError(
+                f"{claim_kind} duplicate replay has no ACKed source delivery"
+            )
+        source = max(
+            candidates,
+            key=lambda item: int(item.get("laneSequence") or 0),
+        )
+        before_engine = self.engine_snapshot(
+            actor,
+            conversation_id,
+            message_id,
+        )
+        before_dom = self.message_dom_snapshot(self.clients[actor], message_id)
+        try:
+            source_device = str(
+                source.get("recipientDeviceId") or self.device_ids[actor]
+            )
+            injected = duplicate_acceptance_queue_delivery(
+                delivery_station_url,
+                str(source.get("itemId") or ""),
+                self.ptids[actor],
+                source_device,
+                deployment_environment=delivery_environment,
+            )
+        except RuntimeError as error:
+            raise GateError(str(error)) from error
+        duplicate_item_id = str(injected.get("duplicateItemId") or "")
+        duplicate_lane = int(injected.get("laneSequence") or 0)
+        if not duplicate_item_id or duplicate_lane <= 0:
+            raise GateError(
+                f"{claim_kind} duplicate replay injection returned invalid evidence"
+            )
+
+        def acked_duplicate() -> dict[str, Any] | None:
+            evidence = delivery_station_readback()
+            acknowledged = any(
+                item.get("itemId") == duplicate_item_id
+                and int(item.get("state") or 0) == 5
+                and int(item.get("attemptCount") or 0) >= 1
+                for item in evidence.get("queue") or []
+            )
+            return evidence if acknowledged else None
+
+        after_station = self.wait_until(
+            acked_duplicate,
+            f"{actor} {claim_kind} duplicate queue delivery ACK",
+            STEP_TIMEOUT,
+        )
+        after_engine = self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.engine_snapshot(
+                        actor,
+                        conversation_id,
+                        message_id,
+                    )
+                )
+                and int(snapshot.get("laneSequence") or 0) >= duplicate_lane
+                else None
+            ),
+            f"{actor} {claim_kind} duplicate queue replay Engine cursor",
+            STEP_TIMEOUT,
+        )
+        after_dom = self.message_dom_snapshot(self.clients[actor], message_id)
+        for field in ("projection", "reactions", "pins"):
+            if before_engine.get(field) != after_engine.get(field):
+                raise GateError(
+                    f"{claim_kind} duplicate replay changed Engine {field}"
+                )
+        if before_dom != after_dom:
+            raise GateError(
+                f"{claim_kind} duplicate replay changed receiver-visible DOM"
+            )
+        self.station_evidence[f"{claim_kind}.duplicate"] = after_station
+        self.engine_evidence[f"{claim_kind}.duplicate"] = after_engine
+        self.assert_condition(f"{claim_kind}_duplicate_queue_replay", True)
+
+    def prove_pending_timeout_retry(
+        self,
+        kind: str,
+        conversation_id: str,
+    ) -> None:
+        claim_kind = "direct" if kind == "friend" else "group"
+        prefix = f"{claim_kind}-timeout-{time.time_ns()}"
+        original_text = f"{prefix}-original"
+        edited_text = f"{prefix}-edited"
+        base = self.send(
+            "alice",
+            kind,
+            conversation_id,
+            original_text,
+        )
+        message_id = str(base["messageId"])
+        for actor in ("alice", "bob"):
+            self.sync(actor, kind, conversation_id)
+            self.wait_until(
+                lambda actor=actor: self.message_dom_snapshot(
+                    self.clients[actor],
+                    message_id,
+                ),
+                f"{actor} {claim_kind} timeout seed DOM",
+                STEP_TIMEOUT,
+            )
+
+        before_station = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        command_id = ""
+        pending_engine: dict[str, Any] = {}
+        final_engine: dict[str, Any] = {}
+        fault_evidence: dict[str, Any] = {}
+        fault_armed = False
+        fault_clear_error = ""
+        lifecycle_paused = False
+        lifecycle_resume_error = ""
+        try:
+            self.clients["alice"].invoke_app_result(
+                "messaging_acceptance_pause_lifecycle",
+                {
+                    "input": {
+                        "expected_actor_ptid": self.ptids["alice"],
+                    }
+                },
+            )
+            lifecycle_paused = True
+            edit = self.harness(
+                self.clients["alice"],
+                "editInteractionMessage",
+                {
+                    "conversationId": conversation_id,
+                    "kind": kind,
+                    "messageId": message_id,
+                    "plaintext": edited_text,
+                },
+            )
+            command_id = str(
+                (edit or {}).get("command_id")
+                or (edit or {}).get("commandId")
+                or ""
+            )
+            if not command_id:
+                raise GateError("timeout edit returned no command ID")
+            fault_evidence = self.clients["alice"].invoke_app_result(
+                "messaging_acceptance_command_transport_fault",
+                {
+                    "input": {
+                        "expected_actor_ptid": self.ptids["alice"],
+                        "command_id": command_id,
+                    }
+                },
+            ).get("data") or {}
+            if fault_evidence.get("armedCommandId") != command_id:
+                raise GateError("exact command transport fault was not armed")
+            fault_armed = True
+            self.timeout_retry_evidence[claim_kind] = {
+                "commandId": command_id,
+                "messageId": message_id,
+                "armedFault": dict(fault_evidence),
+                "preparedEngine": self.engine_snapshot(
+                    "alice", conversation_id, message_id, command_id,
+                ),
+            }
+            self.clients["alice"].invoke_app_result(
+                "messaging_acceptance_resume_lifecycle",
+                {
+                    "input": {
+                        "expected_actor_ptid": self.ptids["alice"],
+                    }
+                },
+            )
+            lifecycle_paused = False
+
+            fault_evidence = self.wait_until(
+                lambda: (
+                    evidence
+                    if (
+                        (evidence := (
+                            self.clients["alice"].invoke_app_result(
+                                "messaging_acceptance_command_transport_fault",
+                                {
+                                    "input": {
+                                        "expected_actor_ptid": self.ptids["alice"],
+                                        "command_id": "",
+                                        "observe_only": True,
+                                    }
+                                },
+                            ).get("data")
+                            or {}
+                        ))
+                        and evidence.get("failedCommandId") == command_id
+                        and int(evidence.get("failureCount") or 0) == 1
+                    )
+                    else None
+                ),
+                f"Alice {claim_kind} exact command transport failure",
+                STEP_TIMEOUT,
+            )
+            self.clients["alice"].invoke_app_result(
+                "messaging_acceptance_pause_lifecycle",
+                {
+                    "input": {
+                        "expected_actor_ptid": self.ptids["alice"],
+                    }
+                },
+            )
+            lifecycle_paused = True
+
+            pending_engine = self.wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        (snapshot := self.engine_snapshot(
+                            "alice",
+                            conversation_id,
+                            message_id,
+                            command_id,
+                        ))
+                        and (snapshot.get("intent") or {}).get("state")
+                        == "retry_wait"
+                        and (snapshot.get("outbox") or {}).get("state")
+                        == "retry_wait"
+                        and int(
+                            (snapshot.get("outbox") or {}).get("attemptCount")
+                            or 0
+                        )
+                        >= 1
+                    )
+                    else None
+                ),
+                f"Alice {claim_kind} interaction retry_wait after connection loss",
+                STEP_TIMEOUT,
+            )
+            intent = pending_engine.get("intent") or {}
+            outbox = pending_engine.get("outbox") or {}
+            command_sha = str(intent.get("commandSha256") or "")
+            transport_error_code = str(
+                outbox.get("lastErrorCode") or ""
+            )
+            if (
+                not command_sha
+                or outbox.get("commandSha256") != command_sha
+                or transport_error_code != "network"
+            ):
+                raise GateError(
+                    "timeout retry did not preserve one exact "
+                    "transport-failed command"
+                )
+            def _sender_settled() -> dict[str, Any] | None:
+                value = self.harness(
+                    self.clients["alice"],
+                    "interactionProjection",
+                    {
+                        "conversationId": conversation_id,
+                        "kind": kind,
+                        "messageId": message_id,
+                    },
+                )
+                proj = value if isinstance(value, dict) else None
+                if (
+                    proj
+                    and proj.get("content") == original_text
+                    and proj.get("edited") is not True
+                ):
+                    return proj
+                content_state = (
+                    "missing"
+                    if proj is None
+                    else "original"
+                    if proj.get("content") == original_text
+                    else "edited"
+                    if proj.get("content") == edited_text
+                    else "other"
+                )
+                raise GateError(
+                    "Alice interaction projection is not settled: "
+                    f"present={proj is not None}, "
+                    f"contentState={content_state}, "
+                    f"edited={None if proj is None else proj.get('edited')}"
+                )
+
+            sender_projection = self.wait_until(
+                _sender_settled,
+                f"Alice {claim_kind} original preserved during retry_wait",
+                STEP_TIMEOUT,
+            )
+            sender_dom = self.message_dom_snapshot(
+                self.clients["alice"],
+                message_id,
+            )
+            if (
+                not sender_dom
+                or original_text not in str(sender_dom.get("text") or "")
+                or sender_dom.get("edited") == "true"
+            ):
+                raise GateError(
+                    "timeout changed the original sender-visible DOM"
+                )
+            during_station = self.station_readback(
+                self.station_url,
+                conversation_id,
+                message_id,
+            )
+            if any(
+                event.get("commandId") == command_id
+                for event in during_station.get("authorityEvents") or []
+            ):
+                raise GateError(
+                    "connection-loss submit reached Authority before retry"
+                )
+            fault_evidence = self.clients["alice"].invoke_app_result(
+                "messaging_acceptance_command_transport_fault",
+                {
+                    "input": {
+                        "expected_actor_ptid": self.ptids["alice"],
+                        "command_id": "",
+                        "observe_only": False,
+                    }
+                },
+            ).get("data") or {}
+            fault_armed = False
+            if (
+                fault_evidence.get("failedCommandId") != command_id
+                or int(fault_evidence.get("failureCount") or 0) != 1
+            ):
+                raise GateError(
+                    "command transport fault did not consume the exact command"
+                )
+            self.clients["alice"].invoke_app_result(
+                "messaging_acceptance_resume_lifecycle",
+                {
+                    "input": {
+                        "expected_actor_ptid": self.ptids["alice"],
+                    }
+                },
+            )
+            lifecycle_paused = False
+
+            def dispatch_until_submitted() -> dict[str, Any] | None:
+                snapshot = self.engine_snapshot(
+                    "alice",
+                    conversation_id,
+                    message_id,
+                    command_id,
+                )
+                state = str((snapshot.get("outbox") or {}).get("state") or "")
+                return snapshot if state in {"submitted", "committed"} else None
+
+            final_engine = self.wait_until(
+                dispatch_until_submitted,
+                "Alice exact interaction retry submission",
+                STEP_TIMEOUT,
+            )
+            if (
+                (final_engine.get("outbox") or {}).get("commandSha256")
+                != command_sha
+            ):
+                raise GateError("interaction retry changed exact command bytes")
+            self.wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        (snapshot := self.projection(
+                            "bob",
+                            kind,
+                            conversation_id,
+                            message_id,
+                        ))
+                        and snapshot.get("content") == edited_text
+                        and snapshot.get("edited") is True
+                    )
+                    else None
+                ),
+                f"Bob {claim_kind} timeout retry edited projection",
+                STEP_TIMEOUT,
+            )
+            receiver_dom = self.wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        (snapshot := self.message_dom_snapshot(
+                            self.clients["bob"],
+                            message_id,
+                        ))
+                        and snapshot.get("edited") == "true"
+                        and edited_text in str(snapshot.get("text") or "")
+                    )
+                    else None
+                ),
+                f"Bob {claim_kind} timeout retry edited DOM",
+                STEP_TIMEOUT,
+            )
+            visible_count = int(
+                self.clients["bob"].execute_script(
+                    """
+                    return document.querySelectorAll(
+                      `[data-message-ulid="${CSS.escape(arguments[0])}"]`
+                    ).length;
+                    """,
+                    message_id,
+                )
+                or 0
+            )
+            after_station = self.station_readback(
+                self.station_url,
+                conversation_id,
+                message_id,
+            )
+            command_events = [
+                event
+                for event in after_station.get("authorityEvents") or []
+                if event.get("commandId") == command_id
+            ]
+            if len(command_events) != 1 or visible_count != 1:
+                raise GateError(
+                    "exact retry did not converge to one Authority fact and "
+                    "one receiver-visible result"
+                )
+            self.timeout_retry_evidence[claim_kind] = {
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "commandId": command_id,
+                "commandSha256": command_sha,
+                "beforeStation": before_station,
+                "pendingEngine": pending_engine,
+                "finalEngine": final_engine,
+                "finalStation": after_station,
+                "receiverDom": receiver_dom,
+                "receiverVisibleCount": visible_count,
+                "faultTransport": fault_evidence,
+            }
+            self.command_ids[f"{claim_kind}.timeout-edit"] = command_id
+        except Exception:
+            diagnostics = self.timeout_retry_evidence.setdefault(claim_kind, {})
+            if command_id:
+                try:
+                    diagnostics["failedEngine"] = self.engine_snapshot(
+                        "alice", conversation_id, message_id, command_id,
+                    )
+                    diagnostics["failedStation"] = self.station_readback(
+                        self.station_url, conversation_id, message_id,
+                    )
+                except Exception as diagnostic_error:
+                    diagnostics["diagnosticError"] = str(diagnostic_error)
+            raise
+        finally:
+            if fault_armed or not fault_evidence:
+                try:
+                    fault_evidence = self.clients["alice"].invoke_app_result(
+                        "messaging_acceptance_command_transport_fault",
+                        {
+                            "input": {
+                                "expected_actor_ptid": self.ptids["alice"],
+                                "command_id": "",
+                                "observe_only": False,
+                            }
+                        },
+                    ).get("data") or {}
+                except Exception as error:
+                    fault_clear_error = str(error)
+            if lifecycle_paused:
+                try:
+                    self.clients["alice"].invoke_app_result(
+                        "messaging_acceptance_resume_lifecycle",
+                        {
+                            "input": {
+                                "expected_actor_ptid": self.ptids["alice"],
+                            }
+                        },
+                    )
+                except Exception as error:
+                    lifecycle_resume_error = str(error)
+            scenario_evidence = self.timeout_retry_evidence.setdefault(
+                claim_kind,
+                {},
+            )
+            scenario_evidence.setdefault(
+                "faultTransport",
+                fault_evidence,
+            )
+            scenario_evidence["faultClearError"] = fault_clear_error
+            scenario_evidence["lifecycleResumeError"] = (
+                lifecycle_resume_error
+            )
+
+    def restart_client(
+        self,
+        actor: str,
+        kind: str,
+        conversation_id: str,
+        *,
+        stop_existing: bool = True,
+    ) -> None:
+        predecessor = self.clients[actor]
+        if stop_existing:
+            self.stop_client_for_restart(actor)
+        client, ptid = self.create_authenticated_client(
+            actor,
+            restore_session=self.runtime_binding is not None,
+            restored_from=(
+                predecessor
+                if self.runtime_binding is not None
+                else None
+            ),
+        )
+        self.register_driver(client)
+        if ptid != self.ptids[actor]:
+            raise GateError(f"{actor} identity changed across client restart")
+        device = (
+            self.wait_for_realtime_device(client, ptid)
+            if self.runtime_binding is not None
+            else self.harness(client, "getRealtimeDevice", {})
+        )
+        device_id = str((device or {}).get("deviceId") or "")
+        if device_id != self.device_ids[actor]:
+            raise GateError(f"{actor} device changed across client restart")
+        self.clients[actor] = client
+        enter_chat_page(client)
+        self.sync(actor, kind, conversation_id)
+
+    def stop_client_for_restart(self, actor: str) -> None:
+        client = self.clients[actor]
+        if self.runtime_binding is None:
+            stop_client(client)
+            return
+        self.client_lifecycles.stop_preserving_session(client)
+
+    def prove_restart_convergence(
+        self,
+        kind: str,
+        conversation_id: str,
+        members: tuple[str, ...],
+    ) -> None:
+        claim_kind = "direct" if kind == "friend" else "group"
+        message_id = self.message_ids[f"{claim_kind}.base"]
+        thread_ids = [
+            self.message_ids[f"{claim_kind}.thread.first"],
+            self.message_ids[f"{claim_kind}.thread.nested"],
+        ]
+        for actor in members:
+            def _sync_and_dom(actor: str = actor) -> dict[str, Any] | None:
+                try:
+                    self.sync(actor, kind, conversation_id)
+                except Exception:
+                    return None
+                return (
+                    snapshot
+                    if (
+                        snapshot := self.message_dom_snapshot(
+                            self.clients[actor],
+                            message_id,
+                        )
+                    )
+                    and snapshot.get("retracted") == "true"
+                    and snapshot.get("pinned") is False
+                    and len(snapshot.get("reactions") or []) == 0
+                    else None
+                )
+
+            self.wait_until(
+                _sync_and_dom,
+                f"{actor} {claim_kind} terminal state after Station restart",
+                STEP_TIMEOUT,
+            )
+            self.harness(
+                self.clients[actor],
+                "openInteractionThread",
+                {
+                    "conversationId": conversation_id,
+                    "kind": kind,
+                    "messageId": message_id,
+                },
+            )
+            self.wait_until(
+                lambda actor=actor: (
+                    snapshot
+                    if (
+                        snapshot := self.thread_dom_snapshot(self.clients[actor])
+                    )
+                    and snapshot.get("rootMessageId") == message_id
+                    and snapshot.get("replyMessageIds") == thread_ids
+                    and snapshot.get("orders") == [0, 1, 2]
+                    else None
+                ),
+                f"{actor} {claim_kind} thread panel after Station restart",
+                STEP_TIMEOUT,
+            )
+
+    def prove_removed_group_member(self, conversation_id: str) -> None:
+        prefix = f"group-removed-{time.time_ns()}"
+        base = self.send(
+            "alice",
+            "group",
+            conversation_id,
+            f"{prefix}-base",
+        )
+        message_id = str(base["messageId"])
+        for actor in ACTORS:
+            self.sync(actor, "group", conversation_id)
+            self.wait_until(
+                lambda actor=actor: self.message_dom_snapshot(
+                    self.clients[actor],
+                    message_id,
+                ),
+                f"{actor} Group removal seed DOM",
+                STEP_TIMEOUT,
+            )
+
+        removed = self.harness(
+            self.clients["alice"],
+            "removeGroupMember",
+            {
+                "groupUlid": conversation_id,
+                "memberPtid": self.ptids["charlie"],
+            },
+        )
+        if not isinstance(removed, dict) or removed.get("success") is not True:
+            raise GateError("Charlie Group removal did not succeed")
+        before_denied = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        self.expect_rejected(
+            lambda: self.harness(
+                self.clients["charlie"],
+                "submitMetadataInteraction",
+                {
+                    "conversationId": conversation_id,
+                    "kind": "group",
+                    "messageId": message_id,
+                    "interaction": "reaction",
+                    "reaction": "🚫",
+                    "remove": False,
+                },
+            ),
+            "removed Group member submits interaction",
+        )
+        after_denied = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        if station_mutation_fingerprint(before_denied) != station_mutation_fingerprint(
+            after_denied
+        ):
+            raise GateError("removed Group member mutated authority or queue")
+
+        self.harness(
+            self.clients["alice"],
+            "submitMetadataInteraction",
+            {
+                "conversationId": conversation_id,
+                "kind": "group",
+                "messageId": message_id,
+                "interaction": "reaction",
+                "reaction": "✅",
+                "remove": False,
+            },
+        )
+        self.wait_until(
+            lambda: (
+                snapshot
+                if (
+                    snapshot := self.projection(
+                        "bob",
+                        "group",
+                        conversation_id,
+                        message_id,
+                    )
+                )
+                and len(snapshot.get("reactions") or []) == 1
+                else None
+            ),
+            "Bob receives post-removal Group interaction",
+            STEP_TIMEOUT,
+        )
+        after_allowed = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        charlie_before = recipient_queue_item_ids(
+            before_denied,
+            self.ptids["charlie"],
+            self.device_ids["charlie"],
+        )
+        charlie_after = recipient_queue_item_ids(
+            after_allowed,
+            self.ptids["charlie"],
+            self.device_ids["charlie"],
+        )
+        if charlie_after != charlie_before:
+            raise GateError("removed Group member received a future queue item")
+        charlie_dom = self.message_dom_snapshot(self.clients["charlie"], message_id)
+        if charlie_dom and charlie_dom.get("reactions"):
+            raise GateError("removed Group member observed a future interaction")
+        self.station_evidence["group.removed"] = after_allowed
+        self.assert_condition("group_removed_member_denied", True)
+
+    def prove_revoked_device(self, conversation_id: str) -> None:
+        prefix = f"direct-revoked-{time.time_ns()}"
+        base = self.send(
+            "alice",
+            "friend",
+            conversation_id,
+            f"{prefix}-base",
+        )
+        message_id = str(base["messageId"])
+        for actor in ("alice", "bob"):
+            self.sync(actor, "friend", conversation_id)
+            self.wait_until(
+                lambda actor=actor: self.message_dom_snapshot(
+                    self.clients[actor],
+                    message_id,
+                ),
+                f"{actor} revoked-device seed DOM",
+                STEP_TIMEOUT,
+            )
+
+        revoked = self.harness(
+            self.clients["bob"],
+            "revokeCurrentDevice",
+            {},
+        )
+        if (
+            (revoked or {}).get("revoked") is not True
+            or (revoked or {}).get("deviceId") != self.device_ids["bob"]
+        ):
+            raise GateError("Bob current-device revocation did not succeed")
+        before_denied = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        rejection = ""
+        try:
+            self.harness(
+                self.clients["bob"],
+                "submitMetadataInteraction",
+                {
+                    "conversationId": conversation_id,
+                    "kind": "friend",
+                    "messageId": message_id,
+                    "interaction": "reaction",
+                    "reaction": "🚫",
+                    "remove": False,
+                },
+            )
+        except GateError as error:
+            rejection = str(error)
+        if not is_station_authorization_rejection(rejection):
+            raise GateError(
+                "revoked Bob device did not receive an authorization "
+                f"rejection for metadata interaction: {rejection or 'accepted'}"
+            )
+
+        def denied_reaction_absent_after_settle() -> bool:
+            snapshot = self.station_readback(
+                self.station_url,
+                conversation_id,
+                message_id,
+            )
+            events = snapshot.get("events") or []
+            for event in events:
+                command_id = str(event.get("commandId") or "")
+                if "denied" in command_id or "🚫" in command_id:
+                    return False
+            return len(events) >= len(before_denied.get("events") or [])
+
+        self.wait_until(
+            denied_reaction_absent_after_settle,
+            "revoked-device denied reaction produces no Authority event",
+            STEP_TIMEOUT,
+        )
+        after_denied = self.station_readback(
+            self.station_url,
+            conversation_id,
+            message_id,
+        )
+        authority_event_count_before = len(before_denied.get("events") or [])
+        authority_event_count_after = len(after_denied.get("events") or [])
+        self.station_evidence["direct.revoked"] = after_denied
+        self.assert_condition(
+            "revoked_device_denied",
+            bool(rejection)
+            and authority_event_count_after == authority_event_count_before,
+            json.dumps(
+                {
+                    "deviceId": self.device_ids["bob"],
+                    "submissionRejected": True,
+                    "authorityEventCountBefore": authority_event_count_before,
+                    "authorityEventCountAfter": authority_event_count_after,
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def restart_station(self) -> None:
+        try:
+            self.restart_evidence = restart_acceptance_station(
+                self.station_url,
+                self.tested_commit,
+            )
+        except RuntimeError as error:
+            raise GateError(str(error)) from error
+
+    def reload_clients_after_station_restart(self) -> None:
+        for actor, client in self.clients.items():
+            client.driver.refresh()
+            client.wait_for_acceptance_harness(30)
+            enter_chat_page(client)
+
+    @staticmethod
+    def port_is_free(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            return connection.connect_ex(("127.0.0.1", port)) != 0
+
+    def cleanup_clients(self) -> dict[str, Any]:
+        cleanup_errors: list[dict[str, str]] = []
+        if self.runtime_binding is not None:
+            cleanup_errors.extend(self.client_lifecycles.release_all())
+        else:
+            for client in reversed(tuple(self.clients.values())):
+                try:
+                    stop_client(client)
+                except Exception as stop_error:
+                    cleanup_errors.append(
+                        {
+                            "resource": f"client-stop:{client.profile}",
+                            "error": str(stop_error),
+                        }
+                    )
+
+        if self.runtime_binding is not None:
+            try:
+                cleanup = self.runtime_binding.finalize_cleanup(
+                    self.runtime_instances,
+                    self.client_specs,
+                )
+            except Exception as error:
+                cleanup = {
+                    "ports": [],
+                    "portsReleased": False,
+                    "processesReleased": False,
+                    "storageReleased": False,
+                    "logsReleased": False,
+                    "cleanupErrors": [
+                        {
+                            "resource": "runtime-binding",
+                            "error": str(error),
+                        }
+                    ],
+                }
+            binding_errors = cleanup.get("cleanupErrors")
+            if isinstance(binding_errors, list):
+                cleanup_errors.extend(
+                    error
+                    for error in binding_errors
+                    if isinstance(error, dict)
+                )
+            cleanup["cleanupErrors"] = cleanup_errors
+            released = (
+                bool(cleanup.get("portsReleased"))
+                and bool(cleanup.get("processesReleased"))
+                and bool(cleanup.get("storageReleased"))
+                and bool(cleanup.get("logsReleased"))
+                and not cleanup_errors
+            )
+            cleanup["allPortsReleased"] = bool(
+                cleanup.get("portsReleased")
+            )
+            cleanup["clientsStopped"] = sorted(self.clients)
+        else:
+            ports = sorted(
+                {
+                    port
+                    for client in self.clients.values()
+                    for port in (client.port, client.gateway_port)
+                }
+            )
+            released = bool(
+                self.wait_until(
+                    lambda: all(self.port_is_free(port) for port in ports),
+                    "Native interaction client port release",
+                    30,
+                    0.25,
+                )
+            )
+            cleanup = {
+                "ports": ports,
+                "allPortsReleased": released,
+                "clientsStopped": sorted(self.clients),
+                "cleanupErrors": cleanup_errors,
+            }
+            released = released and not cleanup_errors
+
+        self.cleanup_evidence = cleanup
+        self.report.runtime["steps"] = self.steps
+        self.report.runtime["cleanup"] = cleanup
+        self.assert_condition(
+            "resources_released",
+            released,
+            json.dumps(cleanup, sort_keys=True),
+        )
+        return cleanup
+
+    def run(self) -> dict[str, Any]:
+        if self.runtime_binding is None:
+            try:
+                acceptance_station_environment(self.station_url)
+            except RuntimeError as error:
+                raise GateError(str(error)) from error
+        self.report.station_url = self.station_url
+        version = self.step(
+            "station.identity",
+            lambda: read_station_version(self.station_url),
+        )
+        source_identity = self.source_identity(version)
+        live_commit = str(version.get("build_commit") or "")
+        if not commits_match(live_commit, self.tested_commit):
+            raise GateError(
+                "Station/client commit mismatch: "
+                f"station={live_commit or 'missing'} client={self.tested_commit}"
+            )
+        self.step(
+            "fixture.reset",
+            self.verify_fixture_ready,
+        )
+        order = list(ACTORS)
+        random.SystemRandom().shuffle(order)
+        try:
+            for actor in order:
+                self.step(
+                    "client.authenticated",
+                    lambda actor=actor: self.start_client(actor),
+                    actor,
+                )
+            self.assert_condition(
+                "native_runtime",
+                all(
+                    is_native_tauri_url(client.get_current_url())
+                    for client in self.clients.values()
+                ),
+            )
+            self.assert_condition(
+                "actor_isolation",
+                len(set(self.ptids.values())) == len(ACTORS)
+                and len(set(self.device_ids.values())) == len(ACTORS)
+                and len({client.port for client in self.clients.values()}) == len(ACTORS)
+                and len({client.gateway_port for client in self.clients.values()}) == len(ACTORS)
+                and len({client.storage_root for client in self.clients.values()}) == len(ACTORS),
+            )
+            federation_id = self.step(
+                "federation.shared",
+                lambda: shared_federation_id(self.clients, ACTORS),
+            )
+
+            self.step(
+                "direct.peer_key_bundle",
+                lambda: wait_for_peer_key_bundle(
+                    self.clients["alice"],
+                    self.ptids["bob"],
+                    str(
+                        runtime_station_service(
+                            self.manifest,
+                            "bob",
+                        ).get("runtimeIdentity")
+                        or ""
+                    ),
+                ),
+                "alice",
+            )
+            direct = self.step(
+                "direct.create",
+                lambda: self.harness(
+                    self.clients["alice"],
+                    "createDirectConversation",
+                    {
+                        "peerPtid": self.ptids["bob"],
+                    },
+                ),
+                "alice",
+            )
+            direct_id = str((direct or {}).get("conversationId") or "")
+            if not direct_id:
+                raise GateError("Direct conversation creation returned no ID")
+            self.conversations["direct"] = direct_id
+            for actor in ("alice", "bob"):
+                self.step("direct.sync", lambda actor=actor: self.sync(actor, "friend", direct_id), actor)
+            self.step("direct.interactions", lambda: self.prove_lifecycle("friend", direct_id, ("alice", "bob")))
+            self.step("direct.timeout_retry", lambda: self.prove_pending_timeout_retry("friend", direct_id))
+            self.step("direct.offline_recovery", lambda: self.prove_offline_recovery("friend", direct_id, ()))
+
+            self.step(
+                "direct.client.restart",
+                lambda: self.restart_client("bob", "friend", direct_id),
+                "bob",
+            )
+            direct_terminal = self.message_ids["direct.base"]
+            self.wait_until(
+                lambda: (
+                    snapshot
+                    if (
+                        snapshot := self.message_dom_snapshot(
+                            self.clients["bob"],
+                            direct_terminal,
+                        )
+                    )
+                    and snapshot.get("retracted") == "true"
+                    else None
+                ),
+                "bob direct projection after restart",
+                STEP_TIMEOUT,
+            )
+            self.assert_condition("direct_client_restart", True)
+
+            group = self.step(
+                "group.create",
+                lambda: self.harness(
+                    self.clients["alice"],
+                    "createGroup",
+                    {
+                        "name": f"acceptance-{time.time_ns()}",
+                        "federationId": federation_id,
+                        "memberPtids": [
+                            self.ptids["bob"],
+                            self.ptids["charlie"],
+                        ],
+                    },
+                ),
+                "alice",
+            )
+            group_id = str((group or {}).get("groupUlid") or "")
+            if not group_id:
+                raise GateError("Group creation returned no conversation_id")
+            self.conversations["group"] = group_id
+            for actor in ACTORS:
+                self.step("group.sync", lambda actor=actor: self.sync(actor, "group", group_id), actor)
+            self.step("group.interactions", lambda: self.prove_lifecycle("group", group_id, ACTORS))
+            self.step("group.timeout_retry", lambda: self.prove_pending_timeout_retry("group", group_id))
+            self.assert_condition("pending_interaction_timeout_retry", True)
+            self.step("group.offline_recovery", lambda: self.prove_offline_recovery("group", group_id, ("charlie",)))
+
+            self.step("station.restart", self.restart_station)
+            self.step(
+                "clients.reload_after_station_restart",
+                self.reload_clients_after_station_restart,
+            )
+            self.prove_restart_convergence(
+                "friend",
+                direct_id,
+                ("alice", "bob"),
+            )
+            self.prove_restart_convergence(
+                "group",
+                group_id,
+                ACTORS,
+            )
+            self.assert_condition("station_restart_convergence", True)
+            self.prove_removed_group_member(group_id)
+            group_lifecycle = self.step(
+                "group.lifecycle",
+                lambda: self.prove_group_lifecycle(group_id),
+                "alice,bob",
+            )
+            self.prove_revoked_device(direct_id)
+            self.assert_condition(
+                "station_authority_readback",
+                all(
+                    evidence.get("events") and evidence.get("queue")
+                    for evidence in self.station_evidence.values()
+                ),
+            )
+            self.assert_condition(
+                "engine_durable_readback",
+                all(
+                    int(evidence.get("consumptionCount") or 0) > 0
+                    for evidence in self.engine_evidence.values()
+                ),
+            )
+            for actor, client in self.clients.items():
+                self.save_screenshot(client, actor)
+                self.save_dom(client, actor)
+                self.save_app_log(client, actor)
+        except Exception:
+            capture_errors = []
+            for actor, client in self.clients.items():
+                for capture in (
+                    self.save_screenshot,
+                    self.save_dom,
+                    self.save_app_log,
+                ):
+                    try:
+                        capture(client, f"{actor}-failure")
+                    except Exception as capture_error:
+                        capture_errors.append(
+                            f"{actor} {capture.__name__}: {capture_error}"
+                        )
+            self.report.runtime["failureCaptureErrors"] = capture_errors
+            raise
+        finally:
+            cleanup_preserving_primary_failure(
+                self.cleanup_clients,
+                self.report,
+                "Native interactions",
+            )
+
+        names = {assertion.name for assertion in self.report.assertions}
+        missing = REQUIRED_ASSERTIONS - names
+        if missing:
+            raise GateError(f"required assertions are missing: {sorted(missing)}")
+        journey = (
+            "CHAT-J04-interactions-and-group-lifecycle"
+            if self.gate_id == "chat-lifecycle-interactions-group-e2e"
+            else "direct-and-group-message-interactions"
+        )
+        self.report.runtime["journey"] = journey
+        return {
+            "runtimeCell": (
+                self.runtime_binding.cell_id
+                if self.runtime_binding is not None
+                else "native-tauri-embedded-webdriver"
+            ),
+            "journey": journey,
+            "testedCommit": self.tested_commit,
+            "testedWorkspaceDigest": self.workspace_digest,
+            "stationLive": version,
+            "sourceIdentity": source_identity,
+            "launchOrder": order,
+            "conversations": self.conversations,
+            "messageIds": self.message_ids,
+            "commandIds": self.command_ids,
+            "stationReadback": self.station_evidence,
+            "engineReadback": self.engine_evidence,
+            "timeoutRetry": self.timeout_retry_evidence,
+            "stationRestart": self.restart_evidence,
+            "groupLifecycle": group_lifecycle,
+            "cleanup": self.cleanup_evidence,
+            "steps": self.steps,
+            "clients": {
+                actor: {
+                    "ptid": self.ptids[actor],
+                    "deviceId": self.device_ids[actor],
+                    "webdriverPort": self.clients[actor].port,
+                    "gatewayPort": self.clients[actor].gateway_port,
+                    "profile": self.clients[actor].profile,
+                    "storageRoot": self.clients[actor].storage_root,
+                }
+                for actor in ACTORS
+            },
+        }
+
+
+class LifecycleInteractionsGroupGate(NativeInteractionsGate):
+    gate_id = LIFECYCLE_GATE_ID
+    phase = "CHAT-W04"
+    bom = ("CHAT-G08", "CHAT-G09", "CHAT-UR05")
+    spec = ("CHAT-J04", "chat-message-interactions", "chat-group-lifecycle")
+
+
+def main() -> int:
+    runtime = selected_runtime()
+    gate_type = (
+        LifecycleInteractionsGroupGate
+        if GATE_ID == LIFECYCLE_GATE_ID
+        else NativeInteractionsGate
+    )
+    gate = (
+        gate_type()
+        if runtime is None
+        else gate_type(
+            manifest=runtime[0],
+            actor_manifest=runtime[1],
+            runtime_binding=runtime[2],
+        )
+    )
+    return gate.execute()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,2335 @@
+use super::fenced_executor::{
+    CapabilityContract, ExecutionLease, FencedExecutor, ACCEPTANCE_BARRIER_APPLIED_BEFORE_RESULT,
+    ACCEPTANCE_BARRIER_CANCEL_RESULT_RACE, ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+    ACCEPTANCE_WORKER_INTERRUPTED, STATION_TAKEOVER_REQUIRED,
+};
+use super::local_executor::LocalCapabilityExecutor;
+use super::receipt_ledger::{ReceiptLedger, ToolCallSideEffectCount};
+use super::resource_registry::ResourceRegistry;
+use super::station_transport::{
+    CapabilityNegativeControl, CapabilityNegativeControlStationFact, CapabilityStationTransport,
+};
+use super::workspace_choices;
+use super::workspace_grants;
+use crate::application::oauth2;
+use crate::application::station_runtime::client::{StationClient, StationRequestScope};
+use crate::domain::identity::ActiveSession;
+use crate::model::agent::{
+    CapabilityAcceptanceScenarioFamily, CapabilityConstraints, CapabilityPermissionKind,
+    CapabilityPermissionState, ClientCapability, ClientCapabilityAdvertisement,
+    ClientCapabilityLease, ClientCapabilityLeaseRevokeReason, ClientPlatform,
+};
+use crate::state::AppState;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+const ACCEPTANCE_BARRIER_REVOKE_DISPATCH_RACE: &str = "revoke-dispatch-race";
+const ACCEPTANCE_BARRIER_CANCEL_BEFORE_CLEANUP: &str = "cancel-before-cleanup";
+const ACCEPTANCE_BARRIER_BUSINESS_LEASE_TERMINAL: &str = "business-lease-before-terminal";
+const ACCEPTANCE_BARRIER_DEADLINE_BEFORE_TERMINAL: &str = "execution-deadline-before-terminal";
+const ACCEPTANCE_BARRIER_RECEIPT_RECOVERY_TERMINAL: &str = "receipt-recovery-before-terminal";
+const ACCEPTANCE_BARRIER_STALE_FENCE_BEFORE_EVENT: &str = "stale-fence-before-event";
+const ACCEPTANCE_RECOVERY_RESTART_REQUIRED: &str =
+    "CAPABILITY_ACCEPTANCE_RECOVERY_RESTART_REQUIRED";
+
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PULL_LIMIT: u32 = 32;
+const RENEW_BEFORE_EXPIRY_MS: i64 = 60_000;
+const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_RESULT_BYTES: u64 = 256 * 1024;
+const NEGATIVE_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+const LEASE_EXPIRED_NEGATIVE_CONTROL_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+const LEASE_EXPIRY_SETTLE_DELAY_MS: i64 = 250;
+
+pub struct CapabilityWorkerSupervisor {
+    state: Arc<AppState>,
+    surface: ClientSurface,
+    app: Mutex<Option<tauri::AppHandle>>,
+    stopping: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    snapshot: Arc<Mutex<Vec<CapabilityWorkerSnapshot>>>,
+    negative_controls: Arc<Mutex<VecDeque<CapabilityNegativeControlRequest>>>,
+    /// Per actor/device project root selected for the current capability
+    /// session. Absent key means the private provisioned sandbox root.
+    desired_roots: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// Per actor/device machine-local shell authorization handle, shared with
+    /// the live executor so a user change applies without re-registering.
+    shell_modes: Arc<Mutex<HashMap<String, Arc<AtomicU8>>>>,
+    workspace_requests: Arc<Mutex<VecDeque<WorkspaceActivationRequest>>>,
+    acceptance_hooks: Arc<Mutex<HashMap<String, ExecutorAcceptanceHook>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientSurface {
+    Desktop,
+}
+
+impl ClientSurface {
+    fn from_environment() -> Self {
+        Self::Desktop
+    }
+
+    fn platform(self) -> ClientPlatform {
+        ClientPlatform::Desktop
+    }
+
+    fn connection_prefix(self) -> &'static str {
+        "desktop"
+    }
+
+    fn starts_automatically(self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityWorkerSnapshot {
+    pub actor_ptid: String,
+    pub device_id: String,
+    pub capability_session_id: String,
+    pub lease_id: String,
+    pub lease_revision: u64,
+    pub capability_set_hash: String,
+    pub platform: i32,
+    pub capability_ids: Vec<String>,
+    pub local_execution_attempt_count: u64,
+    pub local_side_effect_count: u64,
+    pub tool_call_side_effect_counts: Vec<ToolCallSideEffectCount>,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutorAcceptanceHook {
+    scenario_handle: String,
+    barrier: String,
+    family: CapabilityAcceptanceScenarioFamily,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedCapabilityNegativeControl {
+    Unsupported,
+    Unauthorized,
+    SignatureTamper,
+    SchemaMismatch,
+    CrossDevice,
+    LeasePause,
+    LeaseExpired,
+    PermissionDenied,
+    PermissionGranted,
+}
+
+impl RequestedCapabilityNegativeControl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Unauthorized => "unauthorized",
+            Self::SignatureTamper => "signatureTamper",
+            Self::SchemaMismatch => "schemaMismatch",
+            Self::CrossDevice => "crossDevice",
+            Self::LeasePause => "leasePause",
+            Self::LeaseExpired => "leaseExpired",
+            Self::PermissionDenied => "permissionDenied",
+            Self::PermissionGranted => "permissionGranted",
+        }
+    }
+
+    pub fn requires_lease_lifecycle_control(self) -> bool {
+        matches!(self, Self::LeasePause | Self::LeaseExpired)
+    }
+
+    fn receive_timeout(self) -> Duration {
+        match self {
+            Self::LeaseExpired => LEASE_EXPIRED_NEGATIVE_CONTROL_TIMEOUT,
+            _ => NEGATIVE_CONTROL_TIMEOUT,
+        }
+    }
+
+    fn station_control(self) -> Option<CapabilityNegativeControl> {
+        match self {
+            Self::Unauthorized => Some(CapabilityNegativeControl::Unauthorized),
+            Self::SignatureTamper => Some(CapabilityNegativeControl::SignatureTamper),
+            Self::CrossDevice => Some(CapabilityNegativeControl::CrossDevice),
+            Self::Unsupported
+            | Self::SchemaMismatch
+            | Self::LeasePause
+            | Self::LeaseExpired
+            | Self::PermissionDenied
+            | Self::PermissionGranted => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityExecutionCounters {
+    pub local_execution_attempt_count: u64,
+    pub local_side_effect_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityLeaseTransitionFacts {
+    pub source_capability_session_id_hash: String,
+    pub source_lease_id_hash: String,
+    pub source_lease_revision: u64,
+    pub source_expires_at_ms: i64,
+    pub current_capability_session_id_hash: String,
+    pub current_lease_id_hash: String,
+    pub current_expires_at_ms: i64,
+    pub current_lease_revision: u64,
+    pub current_pull_cursor: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityNegativeControlFacts {
+    pub control: &'static str,
+    pub availability: &'static str,
+    pub unavailable_reason: Option<&'static str>,
+    pub capability_session_id_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_paused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_expires_at_ms: Option<i64>,
+    pub before: CapabilityExecutionCounters,
+    pub station: Option<CapabilityNegativeControlStationFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_station: Option<CapabilityNegativeControlStationFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_station: Option<CapabilityNegativeControlStationFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_transition: Option<CapabilityLeaseTransitionFacts>,
+    pub after: CapabilityExecutionCounters,
+}
+
+struct CapabilityNegativeControlRequest {
+    control: RequestedCapabilityNegativeControl,
+    capability_session_id_hash: String,
+    cross_device_session_id: Option<String>,
+    capability_id: Option<String>,
+    permission_kind: Option<String>,
+    response: mpsc::SyncSender<Result<CapabilityNegativeControlFacts, String>>,
+}
+
+/// One user-initiated workspace activation. `None` restores the private
+/// sandbox root; `Some` authorizes a project directory for the session.
+struct WorkspaceActivationRequest {
+    actor_ptid: String,
+    device_id: String,
+    /// Canonical project root, or None to fall back to the sandbox root.
+    root: Option<PathBuf>,
+    response: mpsc::SyncSender<Result<Option<PathBuf>, String>>,
+}
+
+fn workspace_scope_key(actor_ptid: &str, device_id: &str) -> String {
+    format!("{actor_ptid}\x00{device_id}")
+}
+
+impl CapabilityWorkerSupervisor {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self {
+            state,
+            surface: ClientSurface::from_environment(),
+            app: Mutex::new(None),
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: Mutex::new(None),
+            snapshot: Arc::new(Mutex::new(Vec::new())),
+            negative_controls: Arc::new(Mutex::new(VecDeque::new())),
+            desired_roots: Arc::new(Mutex::new(HashMap::new())),
+            shell_modes: Arc::new(Mutex::new(HashMap::new())),
+            workspace_requests: Arc::new(Mutex::new(VecDeque::new())),
+            acceptance_hooks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Activate a user-selected project directory for the actor/device
+    /// capability session, or restore the private sandbox root when `root`
+    /// is None. Applies to a live worker immediately and is remembered for
+    /// the next registration when the worker is not up yet.
+    pub fn activate_workspace(
+        &self,
+        actor_ptid: &str,
+        device_id: &str,
+        root: Option<PathBuf>,
+    ) -> Result<Option<PathBuf>, String> {
+        let root = match root {
+            Some(path) => Some(workspace_choices::validate_directory(&path.to_string_lossy())?),
+            None => None,
+        };
+        let key = workspace_scope_key(actor_ptid, device_id);
+        {
+            let mut roots = self
+                .desired_roots
+                .lock()
+                .map_err(|_| "workspace roots lock poisoned".to_string())?;
+            match &root {
+                Some(path) => {
+                    roots.insert(key.clone(), path.clone());
+                }
+                None => {
+                    roots.remove(&key);
+                }
+            }
+        }
+        if self.thread.lock().map_err(|_| "supervisor lock poisoned".to_string())?.is_none() {
+            // Engine not running yet; the desired root is applied when the
+            // worker registers. Report the effective root that will be used.
+            return Ok(root);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.workspace_requests
+            .lock()
+            .map_err(|_| "workspace request lock poisoned".to_string())?
+            .push_back(WorkspaceActivationRequest {
+                actor_ptid: actor_ptid.to_string(),
+                device_id: device_id.to_string(),
+                root: root.clone(),
+                response: tx,
+            });
+        rx.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "workspace activation timed out".to_string())?
+    }
+
+    /// Current project root selected for an actor/device, if any.
+    pub fn active_workspace(
+        &self,
+        actor_ptid: &str,
+        device_id: &str,
+    ) -> Result<Option<PathBuf>, String> {
+        Ok(self
+            .desired_roots
+            .lock()
+            .map_err(|_| "workspace roots lock poisoned".to_string())?
+            .get(&workspace_scope_key(actor_ptid, device_id))
+            .cloned())
+    }
+
+    /// Sets the machine-local shell authorization for the actor's session.
+    /// Full Access lets arbitrary commands run (cwd still pinned inside the
+    /// granted workspace); Standard keeps the hard command allowlist. The
+    /// shared atomic applies to a live worker immediately.
+    pub fn set_shell_access(
+        &self,
+        actor_ptid: &str,
+        device_id: &str,
+        full_access: bool,
+    ) -> Result<(), String> {
+        let key = workspace_scope_key(actor_ptid, device_id);
+        let handle = {
+            let mut modes = self
+                .shell_modes
+                .lock()
+                .map_err(|_| "shell mode lock poisoned".to_string())?;
+            modes
+                .entry(key)
+                .or_insert_with(|| Arc::new(AtomicU8::new(0)))
+                .clone()
+        };
+        handle.store(if full_access { 1 } else { 0 }, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn shell_access_full(&self, actor_ptid: &str, device_id: &str) -> Result<bool, String> {
+        Ok(self
+            .shell_modes
+            .lock()
+            .map_err(|_| "shell mode lock poisoned".to_string())?
+            .get(&workspace_scope_key(actor_ptid, device_id))
+            .is_some_and(|handle| handle.load(Ordering::SeqCst) == 1))
+    }
+
+    /// Resolves the device id the worker for an actor registers under, taken
+    /// from the actor-device messaging engine the authenticated session
+    /// activated.
+    pub fn device_id_for_actor(&self, actor_ptid: &str) -> Result<String, String> {
+        let session = self
+            .state
+            .sessions
+            .snapshot_all()
+            .into_iter()
+            .find(|session| session.actor.ptid == actor_ptid)
+            .ok_or_else(|| "authenticated actor session is unavailable".to_string())?;
+        let engine = self
+            .state
+            .messaging_engines
+            .get(&session.account_id)?
+            .ok_or_else(|| "actor device engine is unavailable".to_string())?;
+        Ok(engine.endpoint().device_id.clone())
+    }
+
+    pub fn list_workspace_choices(
+        &self,
+        actor_ptid: &str,
+    ) -> Result<Vec<workspace_choices::WorkspaceChoice>, String> {
+        let device_id = self.device_id_for_actor(actor_ptid)?;
+        Ok(workspace_choices::list_choices(actor_ptid, &device_id))
+    }
+
+    /// Persists a user-picked directory as a reusable project choice. The
+    /// folder dialog runs in the UI surface; this validates and stores the
+    /// returned path, and is also the headless entry that accepts a path
+    /// directly.
+    pub fn add_workspace_choice(
+        &self,
+        actor_ptid: &str,
+        raw_path: &str,
+    ) -> Result<workspace_choices::WorkspaceChoice, String> {
+        let device_id = self.device_id_for_actor(actor_ptid)?;
+        let root = workspace_choices::validate_directory(raw_path)?;
+        workspace_choices::add_choice(actor_ptid, &device_id, &root, None)
+    }
+
+    /// Creates a user-initiated git worktree under
+    /// `<base>/.peers-worktrees/<name>` and persists it as a choice.
+    pub fn create_workspace_choice(
+        &self,
+        actor_ptid: &str,
+        base_path: &str,
+        name: &str,
+    ) -> Result<workspace_choices::WorkspaceChoice, String> {
+        let device_id = self.device_id_for_actor(actor_ptid)?;
+        let base = workspace_choices::validate_directory(base_path)?;
+        let worktree = workspace_choices::create_worktree(&base, name)?;
+        workspace_choices::add_choice(actor_ptid, &device_id, &worktree, Some(&base))
+    }
+
+    pub fn remove_workspace_choice(&self, actor_ptid: &str, locator: &str) -> Result<(), String> {
+        let device_id = self.device_id_for_actor(actor_ptid)?;
+        workspace_choices::remove_choice(actor_ptid, &device_id, locator)
+    }
+
+    /// Activates a stored project locator for the live capability session,
+    /// or restores the private sandbox when the locator is absent.
+    pub fn activate_workspace_choice(
+        &self,
+        actor_ptid: &str,
+        locator: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        let device_id = self.device_id_for_actor(actor_ptid)?;
+        let root = match locator.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(raw) => Some(workspace_choices::validate_directory(raw)?),
+            None => None,
+        };
+        self.activate_workspace(actor_ptid, &device_id, root)
+    }
+
+    /// Binds the Tauri handle before start. Device browser tools require the
+    /// handle to drive the managed browser worker from the supervisor thread.
+    pub fn attach_app(&self, app: tauri::AppHandle) -> Result<(), String> {
+        *self
+            .app
+            .lock()
+            .map_err(|_| "client capability supervisor app lock poisoned".to_string())? = Some(app);
+        Ok(())
+    }
+
+    pub fn start(&self) -> Result<(), String> {
+        let mut handle = self
+            .thread
+            .lock()
+            .map_err(|_| "client capability supervisor lock poisoned".to_string())?;
+        if handle.is_some() {
+            return Ok(());
+        }
+        self.stopping.store(false, Ordering::SeqCst);
+        let state = self.state.clone();
+        let app = self
+            .app
+            .lock()
+            .map_err(|_| "client capability supervisor app lock poisoned".to_string())?
+            .clone();
+        let stopping = self.stopping.clone();
+        let snapshot = self.snapshot.clone();
+        let negative_controls = self.negative_controls.clone();
+        let desired_roots = self.desired_roots.clone();
+        let shell_modes = self.shell_modes.clone();
+        let workspace_requests = self.workspace_requests.clone();
+        let acceptance_hooks = self.acceptance_hooks.clone();
+        let surface = self.surface;
+        *handle = Some(
+            thread::Builder::new()
+                .name("client-capability-supervisor".to_string())
+                .spawn(move || {
+                    run_supervisor(
+                        state,
+                        surface,
+                        app,
+                        stopping,
+                        snapshot,
+                        negative_controls,
+                        desired_roots,
+                        shell_modes,
+                        workspace_requests,
+                        acceptance_hooks,
+                    )
+                })
+                .map_err(|error| format!("start client capability supervisor: {error}"))?,
+        );
+        Ok(())
+    }
+
+    pub fn starts_automatically(&self) -> bool {
+        self.surface.starts_automatically()
+    }
+
+    pub fn shutdown(&self) -> Result<(), String> {
+        self.stopping.store(true, Ordering::SeqCst);
+        let handle = self
+            .thread
+            .lock()
+            .map_err(|_| "client capability supervisor lock poisoned".to_string())?
+            .take();
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .map_err(|_| "client capability supervisor thread panicked".to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Result<Vec<CapabilityWorkerSnapshot>, String> {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .map_err(|_| "client capability supervisor snapshot lock poisoned".to_string())
+    }
+
+    #[cfg(feature = "acceptance-webdriver")]
+    pub fn arm_acceptance_hook(
+        &self,
+        actor_ptid: &str,
+        scenario_handle: &str,
+        barrier: &str,
+        family: i32,
+    ) -> Result<(), String> {
+        let family = CapabilityAcceptanceScenarioFamily::try_from(family)
+            .map_err(|_| "CAPABILITY_ACCEPTANCE_EXECUTOR_HOOK_FAMILY_INVALID".to_string())?;
+        if !actor_ptid.starts_with("ptid:")
+            || scenario_handle.trim().is_empty()
+            || barrier.trim().is_empty()
+            || !matches!(
+                family,
+                CapabilityAcceptanceScenarioFamily::GovernedToolJ03
+                    | CapabilityAcceptanceScenarioFamily::McpJ04
+            )
+        {
+            return Err("CAPABILITY_ACCEPTANCE_EXECUTOR_HOOK_INVALID".to_string());
+        }
+        let mut hooks = self
+            .acceptance_hooks
+            .lock()
+            .map_err(|_| "capability acceptance hook registry lock poisoned".to_string())?;
+        if hooks.contains_key(actor_ptid) {
+            return Err("CAPABILITY_ACCEPTANCE_EXECUTOR_HOOK_ALREADY_ARMED".to_string());
+        }
+        hooks.insert(
+            actor_ptid.to_string(),
+            ExecutorAcceptanceHook {
+                scenario_handle: scenario_handle.to_string(),
+                barrier: barrier.to_string(),
+                family,
+            },
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "acceptance-webdriver")]
+    pub fn clear_acceptance_hook(
+        &self,
+        actor_ptid: &str,
+        scenario_handle: &str,
+    ) -> Result<(), String> {
+        let mut hooks = self
+            .acceptance_hooks
+            .lock()
+            .map_err(|_| "capability acceptance hook registry lock poisoned".to_string())?;
+        if hooks
+            .get(actor_ptid)
+            .is_some_and(|hook| hook.scenario_handle == scenario_handle)
+        {
+            hooks.remove(actor_ptid);
+        }
+        Ok(())
+    }
+
+    fn context_for_actor(&self, actor_ptid: &str) -> Result<WorkerContext, String> {
+        let session = self
+            .state
+            .sessions
+            .snapshot_all()
+            .into_iter()
+            .find(|session| session.actor.ptid == actor_ptid)
+            .ok_or_else(|| "authenticated actor session is unavailable".to_string())?;
+        let app = self
+            .app
+            .lock()
+            .map_err(|_| "client capability supervisor app lock poisoned".to_string())?
+            .clone();
+        worker_context(self.state.station.client(), &self.state, session, app)
+    }
+
+    pub fn emit_negative_control(
+        &self,
+        control: RequestedCapabilityNegativeControl,
+        capability_session_id_hash: String,
+        cross_device_session_id: Option<String>,
+        capability_id: Option<String>,
+        permission_kind: Option<String>,
+    ) -> Result<CapabilityNegativeControlFacts, String> {
+        if capability_session_id_hash.trim().is_empty() {
+            return Err("AS_F10_CAPABILITY_SESSION_HASH_REQUIRED".to_string());
+        }
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.negative_controls
+            .lock()
+            .map_err(|_| "client capability negative-control queue lock poisoned".to_string())?
+            .push_back(CapabilityNegativeControlRequest {
+                control,
+                capability_session_id_hash,
+                cross_device_session_id,
+                capability_id,
+                permission_kind,
+                response,
+            });
+        receiver
+            .recv_timeout(control.receive_timeout())
+            .map_err(|_| "AS_F10_NEGATIVE_CONTROL_TIMEOUT".to_string())?
+    }
+}
+
+struct WorkerContext {
+    station_client: StationClient,
+    station_scope: StationRequestScope,
+    account_id: String,
+    actor_ptid: String,
+    device_id: String,
+    token: String,
+    signing_key_id: String,
+    signing_key: ed25519_dalek::SigningKey,
+    app: Option<tauri::AppHandle>,
+}
+
+impl WorkerContext {
+    fn transport(&self) -> Result<CapabilityStationTransport<'_>, String> {
+        CapabilityStationTransport::new(
+            &self.station_client,
+            &self.actor_ptid,
+            &self.device_id,
+            &self.token,
+            &self.signing_key_id,
+            &self.signing_key,
+        )
+    }
+}
+
+struct ActiveWorker {
+    context: WorkerContext,
+    lease: ClientCapabilityLease,
+    ledger: Option<ReceiptLedger>,
+    resources: Option<ResourceRegistry>,
+    executor: Option<LocalCapabilityExecutor>,
+    workspace_root: Option<PathBuf>,
+    pull_cursor: u64,
+    surface: ClientSurface,
+    paused: bool,
+    connector_projection_epoch: u64,
+    mcp_projection_epoch: u64,
+}
+
+impl ActiveWorker {
+    fn register(
+        context: WorkerContext,
+        surface: ClientSurface,
+        desired_root: Option<PathBuf>,
+        shell_handle: Arc<AtomicU8>,
+    ) -> Result<Self, String> {
+        let connector_projection_epoch = oauth2::connector_projection_epoch();
+        let mcp_projection_epoch = crate::application::mcp::mcp_projection_epoch();
+        let contracts = local_contracts(surface, &context.actor_ptid)?;
+        let browser_bridge = context
+            .app
+            .clone()
+            .map(|app| {
+                Arc::new(crate::application::browser::AgentBrowserBridge::new(
+                    app,
+                    context.station_client.clone(),
+                    context.token.clone(),
+                    context.device_id.clone(),
+                ))
+            });
+        let (executor, ledger, resources) = if !contracts.is_empty() {
+            let executor = LocalCapabilityExecutor::new(
+                &context.actor_ptid,
+                contracts.clone(),
+                browser_bridge,
+                shell_handle,
+            )?;
+            let ledger = ReceiptLedger::open(&context.actor_ptid, &context.device_id)?;
+            let resources = ResourceRegistry::open(&context.actor_ptid, &context.device_id)?;
+            recover_persisted_receipts(&context, &ledger, &resources, &executor)?;
+            (Some(executor), Some(ledger), Some(resources))
+        } else {
+            (None, None, None)
+        };
+        let transport = CapabilityStationTransport::new(
+            &context.station_client,
+            &context.actor_ptid,
+            &context.device_id,
+            &context.token,
+            &context.signing_key_id,
+            &context.signing_key,
+        )?;
+        let lease = transport.register(advertisement(&context, &contracts, surface))?;
+        ensure_lease_identity(&context, &lease)?;
+        let workspace_root = match resources.as_ref() {
+            Some(registry) => {
+                let root = workspace_root_for_registration(
+                    &context.actor_ptid,
+                    &context.device_id,
+                    desired_root,
+                )?;
+                let grants = workspace_grants::build_workspace_grants(&lease, &root)?;
+                workspace_grants::register_workspace_grants(
+                    registry,
+                    &lease.capability_session_id,
+                    &grants,
+                )?;
+                if !grants.is_empty() {
+                    let references = grants
+                        .iter()
+                        .map(|grant| grant.reference.clone())
+                        .collect::<Vec<_>>();
+                    transport.declare_resource_grants(&lease.capability_session_id, &references)?;
+                }
+                Some(root)
+            }
+            None => None,
+        };
+        Ok(Self {
+            ledger,
+            resources,
+            context,
+            lease,
+            executor,
+            workspace_root,
+            pull_cursor: 0,
+            surface,
+            paused: false,
+            connector_projection_epoch,
+            mcp_projection_epoch,
+        })
+    }
+
+    /// Re-registers and re-declares workspace grants against the renewed
+    /// lease so the opaque roots remain valid while the worker stays online.
+    fn refresh_workspace_grants(&mut self) -> Result<(), String> {
+        let (Some(root), Some(registry)) = (&self.workspace_root, &self.resources) else {
+            return Ok(());
+        };
+        let grants = workspace_grants::build_workspace_grants(&self.lease, root)?;
+        if grants.is_empty() {
+            return Ok(());
+        }
+        workspace_grants::register_workspace_grants(
+            registry,
+            &self.lease.capability_session_id,
+            &grants,
+        )?;
+        let references = grants
+            .iter()
+            .map(|grant| grant.reference.clone())
+            .collect::<Vec<_>>();
+        self.transport()?
+            .declare_resource_grants(&self.lease.capability_session_id, &references)?;
+        Ok(())
+    }
+
+    /// Applies a freshly activated workspace root and atomically replaces the
+    /// declared grants. `None` restores the private provisioned sandbox. A
+    /// project root that has vanished since activation fails before the
+    /// current grants are touched, so a failed activation never downgrades
+    /// or widens the live authorization mid-session.
+    fn redeclare_workspace(&mut self, root: Option<PathBuf>) -> Result<PathBuf, String> {
+        let next = match root {
+            Some(path) => {
+                if !path.is_dir() {
+                    return Err(format!(
+                        "workspace directory is unavailable: {}",
+                        path.display()
+                    ));
+                }
+                path
+            }
+            None => workspace_grants::provision_actor_workspace(
+                &self.context.actor_ptid,
+                &self.context.device_id,
+            )?,
+        };
+        let previous = self.workspace_root.replace(next.clone());
+        if let Err(error) = self.refresh_workspace_grants() {
+            self.workspace_root = previous;
+            return Err(error);
+        }
+        Ok(next)
+    }
+
+    fn same_identity(&self, candidate: &WorkerContext) -> bool {
+        self.context.account_id == candidate.account_id
+            && self.context.station_scope == candidate.station_scope
+            && self.context.actor_ptid == candidate.actor_ptid
+            && self.context.device_id == candidate.device_id
+            && self.context.signing_key_id == candidate.signing_key_id
+            && token_digest(&self.context.token) == token_digest(&candidate.token)
+    }
+
+    fn tick(
+        &mut self,
+        acceptance_hooks: &Mutex<HashMap<String, ExecutorAcceptanceHook>>,
+    ) -> Result<(), String> {
+        let now_ms = now_unix_ms();
+        match lease_tick_decision(self.paused, lease_expiry_ms(&self.lease)?, now_ms) {
+            LeaseTickDecision::Paused => return Ok(()),
+            LeaseTickDecision::Expired => return Err("CLIENT_CAPABILITY_LEASE_EXPIRED".to_string()),
+            LeaseTickDecision::Renew => self.renew()?,
+            LeaseTickDecision::Pull => {}
+        }
+        if self.executor.is_none() {
+            return Ok(());
+        }
+
+        let transport = self.transport()?;
+        let ledger = self
+            .ledger
+            .as_ref()
+            .ok_or_else(|| "CLIENT_CAPABILITY_LEDGER_UNAVAILABLE".to_string())?;
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| "CLIENT_CAPABILITY_RESOURCE_REGISTRY_UNAVAILABLE".to_string())?;
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or_else(|| "CLIENT_CAPABILITY_EXECUTOR_UNAVAILABLE".to_string())?;
+        let response = transport.pull(
+            &self.lease.capability_session_id,
+            self.pull_cursor,
+            PULL_LIMIT,
+        )?;
+        let response_last_sequence = response.last_sequence;
+        let had_requests = !response.requests.is_empty();
+        let mut previous = self.pull_cursor;
+        for envelope in response.requests {
+            if envelope.dispatch_sequence <= previous {
+                return Err("CLIENT_CAPABILITY_PULL_SEQUENCE_REGRESSION".to_string());
+            }
+            let consumed_sequence = envelope.dispatch_sequence;
+            let execution_lease = execution_lease(&self.context, &self.lease)?;
+            let fenced = FencedExecutor::new(
+                &execution_lease,
+                ledger,
+                resources,
+                &self.context.signing_key_id,
+                &self.context.signing_key,
+                executor,
+                &transport,
+            );
+            let hook = acceptance_hooks
+                .lock()
+                .map_err(|_| "capability acceptance hook registry lock poisoned".to_string())?
+                .get(&self.context.actor_ptid)
+                .cloned();
+            let consume_result = fenced.consume_with_scenario_hook(envelope, &mut |barrier, _| {
+                let Some(hook) = hook.as_ref() else {
+                    return Ok(false);
+                };
+                if !executor_acceptance_hook_matches(hook.family, &hook.barrier, barrier) {
+                    return Ok(false);
+                }
+                let response = transport
+                    .reach_acceptance_scenario_barrier(&hook.scenario_handle, &hook.barrier)?;
+                if response.scenario_handle != hook.scenario_handle
+                    || response.barrier != hook.barrier
+                {
+                    return Err("CAPABILITY_ACCEPTANCE_EXECUTOR_HOOK_RESPONSE_MISMATCH".to_string());
+                }
+                Ok(response.interrupted)
+            });
+            if let Err(error) = consume_result {
+                return Err(classify_worker_execution_error(error, hook.as_ref()));
+            }
+            previous = advance_pull_cursor(previous, consumed_sequence, response_last_sequence)?;
+        }
+        self.pull_cursor = finalize_pull_cursor(previous, response_last_sequence, had_requests)?;
+        Ok(())
+    }
+
+    fn renew(&mut self) -> Result<(), String> {
+        let renewed = self.transport()?.renew(&self.lease)?;
+        if renewed.capability_session_id != self.lease.capability_session_id
+            || renewed.lease_id != self.lease.lease_id
+            || renewed.lease_revision <= self.lease.lease_revision
+            || renewed.capability_set_hash != self.lease.capability_set_hash
+            || renewed.device_signing_key_id != self.lease.device_signing_key_id
+        {
+            return Err("CLIENT_CAPABILITY_RENEW_RESPONSE_MISMATCH".to_string());
+        }
+        self.lease = renewed;
+        self.refresh_workspace_grants()
+    }
+
+    fn revoke(&mut self, reason: ClientCapabilityLeaseRevokeReason) -> Result<(), String> {
+        self.transport()?.revoke(&self.lease, reason)?;
+        Ok(())
+    }
+
+    fn transport(&self) -> Result<CapabilityStationTransport<'_>, String> {
+        CapabilityStationTransport::new(
+            &self.context.station_client,
+            &self.context.actor_ptid,
+            &self.context.device_id,
+            &self.context.token,
+            &self.context.signing_key_id,
+            &self.context.signing_key,
+        )
+    }
+}
+
+fn executor_acceptance_hook_matches(
+    family: CapabilityAcceptanceScenarioFamily,
+    configured: &str,
+    reached: &str,
+) -> bool {
+    match family {
+        CapabilityAcceptanceScenarioFamily::GovernedToolJ03
+        | CapabilityAcceptanceScenarioFamily::McpJ04 => {
+            configured == reached
+                || (configured == ACCEPTANCE_BARRIER_REVOKE_DISPATCH_RACE
+                    && reached == ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT)
+                || (configured == ACCEPTANCE_BARRIER_CANCEL_BEFORE_CLEANUP
+                    && reached == ACCEPTANCE_BARRIER_CANCEL_RESULT_RACE)
+                || (matches!(
+                    configured,
+                    ACCEPTANCE_BARRIER_BUSINESS_LEASE_TERMINAL
+                        | ACCEPTANCE_BARRIER_DEADLINE_BEFORE_TERMINAL
+                        | ACCEPTANCE_BARRIER_RECEIPT_RECOVERY_TERMINAL
+                        | ACCEPTANCE_BARRIER_STALE_FENCE_BEFORE_EVENT
+                ) && reached == ACCEPTANCE_BARRIER_APPLIED_BEFORE_RESULT)
+        }
+        _ => false,
+    }
+}
+
+fn run_supervisor(
+    state: Arc<AppState>,
+    surface: ClientSurface,
+    app: Option<tauri::AppHandle>,
+    stopping: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<Vec<CapabilityWorkerSnapshot>>>,
+    negative_controls: Arc<Mutex<VecDeque<CapabilityNegativeControlRequest>>>,
+    desired_roots: Arc<Mutex<HashMap<String, PathBuf>>>,
+    shell_modes: Arc<Mutex<HashMap<String, Arc<AtomicU8>>>>,
+    workspace_requests: Arc<Mutex<VecDeque<WorkspaceActivationRequest>>>,
+    acceptance_hooks: Arc<Mutex<HashMap<String, ExecutorAcceptanceHook>>>,
+) {
+    let mut workers = HashMap::<String, ActiveWorker>::new();
+    let mut enrollment_backoff: HashMap<String, std::time::Instant> = HashMap::new();
+    while !stopping.load(Ordering::SeqCst) {
+        reconcile_workers(
+            &state,
+            surface,
+            &app,
+            &mut workers,
+            &mut enrollment_backoff,
+            &desired_roots,
+            &shell_modes,
+        );
+        process_negative_controls(&negative_controls, &mut workers);
+        process_workspace_requests(&workspace_requests, &mut workers);
+        let mut replace_accounts = Vec::new();
+        for worker in workers.values_mut() {
+            if let Err(error) = worker.tick(&acceptance_hooks) {
+                tracing::warn!(
+                    actor = %worker.context.actor_ptid,
+                    device = %worker.context.device_id,
+                    error = %error,
+                    "client capability worker tick failed"
+                );
+                if requires_worker_replacement(&error) {
+                    replace_accounts.push(worker.context.account_id.clone());
+                }
+            }
+        }
+        for account in replace_accounts {
+            discard_worker(
+                &mut workers,
+                &account,
+                ClientCapabilityLeaseRevokeReason::WorkerShutdown,
+            );
+        }
+        if let Err(error) = publish_worker_snapshot(&snapshot, &workers) {
+            tracing::warn!(
+                error = %error,
+                "client capability worker snapshot publication failed"
+            );
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    stop_all(
+        &mut workers,
+        ClientCapabilityLeaseRevokeReason::WorkerShutdown,
+    );
+    if let Err(error) = publish_worker_snapshot(&snapshot, &workers) {
+        tracing::warn!(
+            error = %error,
+            "final client capability worker snapshot publication failed"
+        );
+    }
+}
+
+fn process_negative_controls(
+    queue: &Mutex<VecDeque<CapabilityNegativeControlRequest>>,
+    workers: &mut HashMap<String, ActiveWorker>,
+) {
+    let pending_count = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    for _ in 0..pending_count {
+        let request = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        let Some(request) = request else {
+            return;
+        };
+        if request.control == RequestedCapabilityNegativeControl::LeaseExpired {
+            match lease_expired_control_ready(workers, &request) {
+                Ok(false) => {
+                    queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_back(request);
+                    continue;
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    unpause_matching_worker(workers, &request.capability_session_id_hash);
+                    let _ = request.response.send(Err(error));
+                    continue;
+                }
+            }
+        }
+        let result = emit_negative_control_from_worker(workers, &request);
+        let _ = request.response.send(result);
+    }
+}
+
+fn process_workspace_requests(
+    queue: &Mutex<VecDeque<WorkspaceActivationRequest>>,
+    workers: &mut HashMap<String, ActiveWorker>,
+) {
+    let pending_count = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    for _ in 0..pending_count {
+        let request = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        let Some(request) = request else {
+            return;
+        };
+        let target_key = workspace_scope_key(&request.actor_ptid, &request.device_id);
+        let worker = workers.values_mut().find(|worker| {
+            workspace_scope_key(&worker.context.actor_ptid, &worker.context.device_id)
+                == target_key
+        });
+        match worker {
+            Some(worker) => {
+                let result = worker.redeclare_workspace(request.root.clone()).map(Some);
+                let _ = request.response.send(result);
+            }
+            None => {
+                // The worker is not registered yet (engine offline / lease
+                // backoff). The desired root is already stored and is applied
+                // atomically at registration; acknowledge with the root the
+                // next registration will use.
+                let _ = request.response.send(Ok(request.root.clone()));
+            }
+        }
+    }
+}
+
+fn emit_negative_control_from_worker(
+    workers: &mut HashMap<String, ActiveWorker>,
+    request: &CapabilityNegativeControlRequest,
+) -> Result<CapabilityNegativeControlFacts, String> {
+    let account_id = matching_worker_account_id(workers, &request.capability_session_id_hash)?;
+    let worker = workers
+        .get_mut(&account_id)
+        .ok_or_else(|| "AS_F10_CAPABILITY_SESSION_NOT_FOUND".to_string())?;
+    if request.control == RequestedCapabilityNegativeControl::LeasePause {
+        let before = execution_counters(worker)?;
+        let source_expires_at_ms = lease_expiry_ms(&worker.lease)?;
+        worker.paused = true;
+        return Ok(CapabilityNegativeControlFacts {
+            control: request.control.as_str(),
+            availability: "available",
+            unavailable_reason: None,
+            capability_session_id_hash: request.capability_session_id_hash.clone(),
+            worker_paused: Some(true),
+            source_expires_at_ms: Some(source_expires_at_ms),
+            before: before.clone(),
+            station: None,
+            source_station: None,
+            replay_station: None,
+            lease_transition: None,
+            after: before,
+        });
+    }
+    if request.control == RequestedCapabilityNegativeControl::LeaseExpired {
+        return emit_lease_expired_control_from_worker(worker, request);
+    }
+    if matches!(
+        request.control,
+        RequestedCapabilityNegativeControl::PermissionDenied
+            | RequestedCapabilityNegativeControl::PermissionGranted
+    ) {
+        return emit_permission_control_from_worker(worker, request);
+    }
+
+    let before = execution_counters(worker)?;
+    let Some(station_control) = request.control.station_control() else {
+        return Ok(CapabilityNegativeControlFacts {
+            control: request.control.as_str(),
+            availability: "unavailable",
+            unavailable_reason: Some("NO_PRODUCTION_CAPABILITY_ENDPOINT"),
+            capability_session_id_hash: request.capability_session_id_hash.clone(),
+            worker_paused: None,
+            source_expires_at_ms: None,
+            before: before.clone(),
+            station: None,
+            source_station: None,
+            replay_station: None,
+            lease_transition: None,
+            after: before,
+        });
+    };
+    let station = worker.transport()?.emit_negative_control(
+        station_control,
+        &worker.lease.capability_session_id,
+        request.cross_device_session_id.as_deref(),
+    )?;
+    Ok(CapabilityNegativeControlFacts {
+        control: station_control.as_str(),
+        availability: "available",
+        unavailable_reason: None,
+        capability_session_id_hash: request.capability_session_id_hash.clone(),
+        worker_paused: None,
+        source_expires_at_ms: None,
+        before,
+        station: Some(station),
+        source_station: None,
+        replay_station: None,
+        lease_transition: None,
+        after: execution_counters(worker)?,
+    })
+}
+
+fn emit_permission_control_from_worker(
+    worker: &mut ActiveWorker,
+    request: &CapabilityNegativeControlRequest,
+) -> Result<CapabilityNegativeControlFacts, String> {
+    let capability_id = request
+        .capability_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "GFE1_PERMISSION_CAPABILITY_ID_REQUIRED".to_string())?;
+    let permission_kind = parse_permission_kind(
+        request
+            .permission_kind
+            .as_deref()
+            .ok_or_else(|| "GFE1_PERMISSION_KIND_REQUIRED".to_string())?,
+    )?;
+    let before = execution_counters(worker)?;
+    let source_lease = worker.lease.clone();
+    let mut capabilities = source_lease.capabilities.clone();
+    let mut matched = false;
+    for capability in &mut capabilities {
+        if capability.capability_id == capability_id {
+            capability.permission = match request.control {
+                RequestedCapabilityNegativeControl::PermissionDenied => {
+                    CapabilityPermissionState::Denied as i32
+                }
+                RequestedCapabilityNegativeControl::PermissionGranted => {
+                    CapabilityPermissionState::Granted as i32
+                }
+                _ => unreachable!("permission control already matched"),
+            };
+            capability.permission_kind = permission_kind as i32;
+            matched = true;
+        }
+    }
+    if !matched {
+        return Err("GFE1_PERMISSION_CAPABILITY_NOT_FOUND".to_string());
+    }
+
+    let replacement = worker
+        .transport()?
+        .register(advertisement_from_capabilities(
+            &worker.context,
+            capabilities,
+            worker.surface,
+        ))?;
+    ensure_lease_identity(&worker.context, &replacement)?;
+    if replacement.capability_session_id == source_lease.capability_session_id
+        || replacement.lease_id == source_lease.lease_id
+        || replacement.capability_set_hash == source_lease.capability_set_hash
+    {
+        return Err("GFE1_PERMISSION_REPLACEMENT_LEASE_MISMATCH".to_string());
+    }
+    worker.transport()?.revoke(
+        &source_lease,
+        ClientCapabilityLeaseRevokeReason::AdminPolicy,
+    )?;
+    worker.lease = replacement;
+    worker.pull_cursor = 0;
+
+    Ok(CapabilityNegativeControlFacts {
+        control: request.control.as_str(),
+        availability: "available",
+        unavailable_reason: None,
+        capability_session_id_hash: request.capability_session_id_hash.clone(),
+        worker_paused: None,
+        source_expires_at_ms: None,
+        before,
+        station: None,
+        source_station: None,
+        replay_station: None,
+        lease_transition: Some(lease_transition_facts(
+            &source_lease,
+            &worker.lease,
+            worker.pull_cursor,
+        )?),
+        after: execution_counters(worker)?,
+    })
+}
+
+fn parse_permission_kind(value: &str) -> Result<CapabilityPermissionKind, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "clipboard" => Ok(CapabilityPermissionKind::Clipboard),
+        "filesystem" => Ok(CapabilityPermissionKind::Filesystem),
+        "camera" => Ok(CapabilityPermissionKind::Camera),
+        "microphone" => Ok(CapabilityPermissionKind::Microphone),
+        "notifications" => Ok(CapabilityPermissionKind::Notifications),
+        "screen_capture" => Ok(CapabilityPermissionKind::ScreenCapture),
+        _ => Err("GFE1_PERMISSION_KIND_INVALID".to_string()),
+    }
+}
+
+fn matching_worker_account_id(
+    workers: &HashMap<String, ActiveWorker>,
+    capability_session_id_hash: &str,
+) -> Result<String, String> {
+    let mut matches = workers.iter().filter(|(_, worker)| {
+        hash_identifier(&worker.lease.capability_session_id) == capability_session_id_hash
+    });
+    let account_id = matches
+        .next()
+        .map(|(account_id, _)| account_id.clone())
+        .ok_or_else(|| "AS_F10_CAPABILITY_SESSION_NOT_FOUND".to_string())?;
+    if matches.next().is_some() {
+        return Err("AS_F10_CAPABILITY_SESSION_AMBIGUOUS".to_string());
+    }
+    Ok(account_id)
+}
+
+fn unpause_matching_worker(
+    workers: &mut HashMap<String, ActiveWorker>,
+    capability_session_id_hash: &str,
+) {
+    if let Ok(account_id) = matching_worker_account_id(workers, capability_session_id_hash) {
+        if let Some(worker) = workers.get_mut(&account_id) {
+            worker.paused = false;
+        }
+    }
+}
+
+fn lease_expired_control_ready(
+    workers: &HashMap<String, ActiveWorker>,
+    request: &CapabilityNegativeControlRequest,
+) -> Result<bool, String> {
+    let account_id = matching_worker_account_id(workers, &request.capability_session_id_hash)?;
+    let worker = workers
+        .get(&account_id)
+        .ok_or_else(|| "AS_F10_CAPABILITY_SESSION_NOT_FOUND".to_string())?;
+    if !worker.paused {
+        return Err("GFE1_LEASE_EXPIRED_REQUIRES_PAUSED_WORKER".to_string());
+    }
+    Ok(lease_expiry_control_ready(
+        lease_expiry_ms(&worker.lease)?,
+        now_unix_ms(),
+    ))
+}
+
+fn emit_lease_expired_control_from_worker(
+    worker: &mut ActiveWorker,
+    request: &CapabilityNegativeControlRequest,
+) -> Result<CapabilityNegativeControlFacts, String> {
+    let result = (|| {
+        if !worker.paused {
+            return Err("GFE1_LEASE_EXPIRED_REQUIRES_PAUSED_WORKER".to_string());
+        }
+        let before = execution_counters(worker)?;
+        let source_lease = worker.lease.clone();
+        let source_pull_cursor = worker.pull_cursor;
+        let source_expires_at_ms = lease_expiry_ms(&source_lease)?;
+        if !lease_expiry_control_ready(source_expires_at_ms, now_unix_ms()) {
+            return Err("GFE1_LEASE_EXPIRY_NOT_REACHED".to_string());
+        }
+
+        let contracts = local_contracts(worker.surface, &worker.context.actor_ptid)?;
+        let replacement = {
+            let transport = worker.transport()?;
+            transport.register(advertisement(&worker.context, &contracts, worker.surface))?
+        };
+        ensure_lease_identity(&worker.context, &replacement)?;
+        ensure_replacement_lease(&source_lease, &replacement, now_unix_ms())?;
+
+        worker.lease = replacement;
+        worker.pull_cursor = 0;
+
+        let (source_station, replay_station) = worker.transport()?.emit_expired_lease_pull_replay(
+            &source_lease.capability_session_id,
+            source_pull_cursor,
+            PULL_LIMIT,
+        )?;
+        let lease_transition =
+            lease_transition_facts(&source_lease, &worker.lease, worker.pull_cursor)?;
+        Ok(CapabilityNegativeControlFacts {
+            control: request.control.as_str(),
+            availability: "available",
+            unavailable_reason: None,
+            capability_session_id_hash: request.capability_session_id_hash.clone(),
+            worker_paused: Some(false),
+            source_expires_at_ms: Some(source_expires_at_ms),
+            before: before.clone(),
+            station: Some(source_station.clone()),
+            source_station: Some(source_station),
+            replay_station: Some(replay_station),
+            lease_transition: Some(lease_transition),
+            after: before,
+        })
+    })();
+
+    worker.paused = false;
+    result.and_then(|mut facts| {
+        facts.after = execution_counters(worker)?;
+        Ok(facts)
+    })
+}
+
+fn ensure_replacement_lease(
+    source: &ClientCapabilityLease,
+    replacement: &ClientCapabilityLease,
+    now_ms: i64,
+) -> Result<(), String> {
+    if replacement.capability_session_id == source.capability_session_id
+        || replacement.lease_id == source.lease_id
+        || replacement.capability_set_hash != source.capability_set_hash
+        || replacement.device_signing_key_id != source.device_signing_key_id
+        || replacement.platform != source.platform
+        || lease_expiry_ms(replacement)? <= now_ms
+    {
+        return Err("GFE1_REPLACEMENT_LEASE_MISMATCH".to_string());
+    }
+    Ok(())
+}
+
+fn lease_transition_facts(
+    source: &ClientCapabilityLease,
+    current: &ClientCapabilityLease,
+    current_pull_cursor: u64,
+) -> Result<CapabilityLeaseTransitionFacts, String> {
+    Ok(CapabilityLeaseTransitionFacts {
+        source_capability_session_id_hash: hash_identifier(&source.capability_session_id),
+        source_lease_id_hash: hash_identifier(&source.lease_id),
+        source_lease_revision: source.lease_revision,
+        source_expires_at_ms: lease_expiry_ms(source)?,
+        current_capability_session_id_hash: hash_identifier(&current.capability_session_id),
+        current_lease_id_hash: hash_identifier(&current.lease_id),
+        current_expires_at_ms: lease_expiry_ms(current)?,
+        current_lease_revision: current.lease_revision,
+        current_pull_cursor,
+    })
+}
+
+fn execution_counters(worker: &ActiveWorker) -> Result<CapabilityExecutionCounters, String> {
+    let side_effect_counts = tool_call_side_effect_counts(worker)?;
+    Ok(CapabilityExecutionCounters {
+        local_execution_attempt_count: worker
+            .executor
+            .as_ref()
+            .map(LocalCapabilityExecutor::execution_attempt_count)
+            .unwrap_or_default(),
+        local_side_effect_count: side_effect_counts
+            .iter()
+            .map(|count| count.side_effect_count)
+            .sum(),
+    })
+}
+
+fn tool_call_side_effect_counts(
+    worker: &ActiveWorker,
+) -> Result<Vec<ToolCallSideEffectCount>, String> {
+    worker
+        .ledger
+        .as_ref()
+        .map(ReceiptLedger::side_effect_counts)
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn hash_identifier(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn publish_worker_snapshot(
+    target: &Mutex<Vec<CapabilityWorkerSnapshot>>,
+    workers: &HashMap<String, ActiveWorker>,
+) -> Result<(), String> {
+    let mut next = workers
+        .values()
+        .map(|worker| {
+            let tool_call_side_effect_counts = tool_call_side_effect_counts(worker)?;
+            let local_side_effect_count = tool_call_side_effect_counts
+                .iter()
+                .map(|count| count.side_effect_count)
+                .sum();
+            Ok(CapabilityWorkerSnapshot {
+                actor_ptid: worker.context.actor_ptid.clone(),
+                device_id: worker.context.device_id.clone(),
+                capability_session_id: worker.lease.capability_session_id.clone(),
+                lease_id: worker.lease.lease_id.clone(),
+                lease_revision: worker.lease.lease_revision,
+                capability_set_hash: worker.lease.capability_set_hash.clone(),
+                platform: worker.lease.platform,
+                capability_ids: worker
+                    .lease
+                    .capabilities
+                    .iter()
+                    .map(|capability| capability.capability_id.clone())
+                    .collect(),
+                local_execution_attempt_count: worker
+                    .executor
+                    .as_ref()
+                    .map(LocalCapabilityExecutor::execution_attempt_count)
+                    .unwrap_or_default(),
+                local_side_effect_count,
+                tool_call_side_effect_counts,
+                expires_at_ms: worker
+                    .lease
+                    .expires_at
+                    .as_ref()
+                    .map(|timestamp| {
+                        timestamp.seconds.saturating_mul(1_000)
+                            + i64::from(timestamp.nanos).div_euclid(1_000_000)
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    next.sort_by(|left, right| left.capability_session_id.cmp(&right.capability_session_id));
+    let mut current = target
+        .lock()
+        .map_err(|_| "client capability worker snapshot lock poisoned".to_string())?;
+    *current = next;
+    Ok(())
+}
+
+const KEY_NOT_FOUND_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Resolves the workspace root a freshly registered worker declares. An
+/// explicitly selected project root is honored only while it still exists;
+/// a root that vanished since activation fails closed to the private sandbox
+/// rather than blocking the whole capability worker.
+fn workspace_root_for_registration(
+    actor_ptid: &str,
+    device_id: &str,
+    desired_root: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    match desired_root {
+        Some(path) if path.is_dir() => Ok(path),
+        Some(path) => {
+            tracing::warn!(
+                actor = %actor_ptid,
+                path = %path.display(),
+                "selected workspace directory unavailable at registration; using private sandbox"
+            );
+            workspace_grants::provision_actor_workspace(actor_ptid, device_id)
+        }
+        None => workspace_grants::provision_actor_workspace(actor_ptid, device_id),
+    }
+}
+
+fn reconcile_workers(
+    state: &AppState,
+    surface: ClientSurface,
+    app: &Option<tauri::AppHandle>,
+    workers: &mut HashMap<String, ActiveWorker>,
+    enrollment_backoff: &mut HashMap<String, std::time::Instant>,
+    desired_roots: &Mutex<HashMap<String, PathBuf>>,
+    shell_modes: &Mutex<HashMap<String, Arc<AtomicU8>>>,
+) {
+    let mut desired = HashMap::new();
+    let all_sessions = state.sessions.snapshot_all();
+    if all_sessions.is_empty() {
+        tracing::info!("capability supervisor: no window sessions registered");
+    }
+    for session in all_sessions {
+        match worker_context(state.station.client(), state, session, app.clone()) {
+            Ok(context) => {
+                desired.insert(context.account_id.clone(), context);
+            }
+            Err(error) => tracing::warn!(
+                error = %error,
+                "client capability session is not ready for registration"
+            ),
+        }
+    }
+
+    let desired_accounts = desired.keys().cloned().collect::<HashSet<_>>();
+    let stale_accounts = workers
+        .keys()
+        .filter(|account| !desired_accounts.contains(*account))
+        .cloned()
+        .collect::<Vec<_>>();
+    for account in stale_accounts {
+        discard_worker(
+            workers,
+            &account,
+            ClientCapabilityLeaseRevokeReason::UserLogout,
+        );
+    }
+
+    for (account_id, context) in desired {
+        let identity_changed = workers
+            .get(&account_id)
+            .is_some_and(|worker| !worker.same_identity(&context));
+        let connector_projection_changed = workers.get(&account_id).is_some_and(|worker| {
+            connector_projection_changed(
+                worker.connector_projection_epoch,
+                oauth2::connector_projection_epoch(),
+            )
+        });
+        let mcp_projection_changed = workers.get(&account_id).is_some_and(|worker| {
+            worker.mcp_projection_epoch != crate::application::mcp::mcp_projection_epoch()
+        });
+        if identity_changed || connector_projection_changed || mcp_projection_changed {
+            discard_worker(
+                workers,
+                &account_id,
+                if identity_changed {
+                    ClientCapabilityLeaseRevokeReason::StationSwitch
+                } else {
+                    ClientCapabilityLeaseRevokeReason::AdminPolicy
+                },
+            );
+            enrollment_backoff.remove(&account_id);
+        }
+        if workers.contains_key(&account_id) {
+            continue;
+        }
+        if let Some(cooldown_until) = enrollment_backoff.get(&account_id) {
+            if cooldown_until.elapsed() < KEY_NOT_FOUND_BACKOFF {
+                continue;
+            }
+            enrollment_backoff.remove(&account_id);
+        }
+        let scope_key = workspace_scope_key(&context.actor_ptid, &context.device_id);
+        let desired_root = desired_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&scope_key)
+            .cloned();
+        let shell_handle = {
+            let mut modes = shell_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            modes
+                .entry(scope_key)
+                .or_insert_with(|| Arc::new(AtomicU8::new(0)))
+                .clone()
+        };
+        match ActiveWorker::register(context, surface, desired_root, shell_handle) {
+            Ok(worker) => {
+                workers.insert(account_id, worker);
+            }
+            Err(error) => {
+                if error.contains("command error 2") {
+                    tracing::info!(
+                        account = %account_id,
+                        "capability lease blocked by pending device enrollment, backing off"
+                    );
+                    enrollment_backoff.insert(account_id, std::time::Instant::now());
+                } else {
+                    tracing::warn!(
+                        account = %account_id,
+                        error = %error,
+                        "client capability lease registration failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn connector_projection_changed(registered_epoch: u64, current_epoch: u64) -> bool {
+    registered_epoch != current_epoch
+}
+
+// Removes a worker and closes both sides of its capability scope: a
+// best-effort Station revoke plus deletion of the reusable local session
+// grants. Local cleanup runs even when the parent auth session is already
+// dead and Station rejects the revoke (renderer reload takeover), so a
+// replaced or expired worker can never leave grants a stale session could
+// resolve; Station-side lease expiry remains the final backstop.
+fn discard_worker(
+    workers: &mut HashMap<String, ActiveWorker>,
+    account_id: &str,
+    reason: ClientCapabilityLeaseRevokeReason,
+) {
+    if let Some(mut worker) = workers.remove(account_id) {
+        if let Err(error) = worker.revoke(reason) {
+            tracing::warn!(
+                actor = %worker.context.actor_ptid,
+                device = %worker.context.device_id,
+                error = %error,
+                "client capability lease revoke failed; Station expiry remains authoritative"
+            );
+        }
+        // Remove the reusable local lease grants so a stale session cannot be
+        // resolved after teardown; expiry sweep remains the backstop.
+        if let Some(resources) = worker.resources.as_ref() {
+            if let Err(error) =
+                resources.delete_session_grants(&worker.lease.capability_session_id)
+            {
+                tracing::warn!(
+                    actor = %worker.context.actor_ptid,
+                    device = %worker.context.device_id,
+                    session = %worker.lease.capability_session_id,
+                    error = %error,
+                    "client capability grant cleanup failed; expiry sweep remains authoritative"
+                );
+            }
+        }
+    }
+}
+
+fn stop_all(
+    workers: &mut HashMap<String, ActiveWorker>,
+    reason: ClientCapabilityLeaseRevokeReason,
+) {
+    let accounts = workers.keys().cloned().collect::<Vec<_>>();
+    for account in accounts {
+        discard_worker(workers, &account, reason);
+    }
+}
+
+fn worker_context(
+    station_client: &StationClient,
+    state: &AppState,
+    session: ActiveSession,
+    app: Option<tauri::AppHandle>,
+) -> Result<WorkerContext, String> {
+    if session.account_id.trim().is_empty()
+        || session.jwt.trim().is_empty()
+        || !session.actor.ptid.starts_with("ptid:")
+    {
+        return Err(
+            "DESIGN_AMENDMENT_REQUIRED: active session has no canonical actor binding".to_string(),
+        );
+    }
+    let engine = state
+        .messaging_engines
+        .get(&session.account_id)?
+        .ok_or_else(|| {
+            let keys = state.messaging_engines.profile_ids().unwrap_or_default();
+            format!(
+                "DESIGN_AMENDMENT_REQUIRED: active session has no actor-device engine \
+                 (session.account_id={:?}, engines={:?})",
+                session.account_id, keys
+            )
+        })?;
+    if engine.endpoint().ptid != session.actor.ptid || engine.endpoint().device_id.trim().is_empty()
+    {
+        return Err(
+            "DESIGN_AMENDMENT_REQUIRED: session and actor-device endpoint disagree".to_string(),
+        );
+    }
+    let (signing_key_id, signing_key) = engine
+        .device_signing_identity()?
+        .ok_or_else(|| "device signing identity not yet enrolled".to_string())?;
+    let station_scope = station_client
+        .active_scope()
+        .ok_or_else(|| "client capability Station scope is unavailable".to_string())?;
+    Ok(WorkerContext {
+        station_client: station_client.clone(),
+        station_scope,
+        account_id: session.account_id,
+        actor_ptid: session.actor.ptid,
+        device_id: engine.endpoint().device_id.clone(),
+        token: session.jwt,
+        signing_key_id,
+        signing_key,
+        app,
+    })
+}
+
+fn advertisement(
+    context: &WorkerContext,
+    contracts: &[CapabilityContract],
+    surface: ClientSurface,
+) -> ClientCapabilityAdvertisement {
+    advertisement_from_capabilities(
+        context,
+        contracts
+            .iter()
+            .map(|contract| ClientCapability {
+                capability_id: contract.capability_id.clone(),
+                schema_version: contract.schema_version.clone(),
+                permission: CapabilityPermissionState::Granted as i32,
+                permission_kind: permission_kind_for_capability(&contract.capability_id) as i32,
+                constraints: Some(CapabilityConstraints {
+                    max_request_bytes: contract.max_argument_bytes as u64,
+                    max_result_bytes: contract.max_result_bytes as u64,
+                    allowed_resource_kinds: resource_kinds(&contract.capability_id),
+                }),
+            })
+            .collect(),
+        surface,
+    )
+}
+
+fn advertisement_from_capabilities(
+    context: &WorkerContext,
+    capabilities: Vec<ClientCapability>,
+    surface: ClientSurface,
+) -> ClientCapabilityAdvertisement {
+    ClientCapabilityAdvertisement {
+        advertisement_id: format!("capability_advertisement_{}", ulid::Ulid::new()),
+        platform: surface.platform() as i32,
+        capabilities,
+        connection_id: format!(
+            "{}:{}:{}",
+            surface.connection_prefix(),
+            std::process::id(),
+            context.device_id
+        ),
+        device_signing_key_id: context.signing_key_id.clone(),
+        device_id: context.device_id.clone(),
+    }
+}
+
+fn permission_kind_for_capability(capability_id: &str) -> CapabilityPermissionKind {
+    match capability_id {
+        "filesystem.read" | "filesystem.list" | "filesystem.write" | "filesystem.edit"
+        | "shell.execute" | "shell.allowlist" => CapabilityPermissionKind::Filesystem,
+        "clipboard.read" | "clipboard.write" => CapabilityPermissionKind::Clipboard,
+        _ => CapabilityPermissionKind::Unspecified,
+    }
+}
+
+fn local_contracts(
+    surface: ClientSurface,
+    actor_ptid: &str,
+) -> Result<Vec<CapabilityContract>, String> {
+    let mut contracts = Vec::new();
+    if surface == ClientSurface::Desktop {
+        contracts.extend(
+            [
+                "filesystem.read",
+                "filesystem.list",
+                "filesystem.write",
+                "filesystem.edit",
+                "clipboard.read",
+                "clipboard.write",
+                "shell.execute",
+                "shell.allowlist",
+                "skill.resource.read",
+            ]
+            .into_iter()
+            .map(|capability_id| CapabilityContract {
+                capability_id: capability_id.to_string(),
+                schema_version: "1".to_string(),
+                max_argument_bytes: MAX_ARGUMENT_BYTES,
+                max_result_bytes: MAX_RESULT_BYTES as usize,
+                supports_external_idempotency: cfg!(feature = "acceptance-webdriver")
+                    && capability_id == "clipboard.read",
+            }),
+        );
+        contracts.extend(
+            crate::application::mcp::mcp_client_capability_contracts(actor_ptid)?
+                .into_iter()
+                .map(|(capability_id, schema_version)| CapabilityContract {
+                    capability_id,
+                    schema_version,
+                    max_argument_bytes: MAX_ARGUMENT_BYTES,
+                    max_result_bytes: MAX_RESULT_BYTES as usize,
+                    supports_external_idempotency: false,
+                }),
+        );
+        // Browser capabilities are advertised only when the managed host is
+        // actually launchable and version-verified; config/MCP presence is
+        // never readiness (TW-D6).
+        if crate::application::browser::host_is_available() {
+            for capability_id in ["browser.observe", "browser.interact"] {
+                contracts.push(CapabilityContract {
+                    capability_id: capability_id.to_string(),
+                    schema_version: "1".to_string(),
+                    max_argument_bytes: MAX_ARGUMENT_BYTES,
+                    max_result_bytes: MAX_RESULT_BYTES as usize,
+                    supports_external_idempotency: false,
+                });
+            }
+        }
+    }
+    contracts.extend(
+        oauth2::connector_capability_contracts(actor_ptid)?
+            .into_iter()
+            .map(|(capability_id, schema_version)| CapabilityContract {
+                capability_id,
+                schema_version,
+                max_argument_bytes: MAX_ARGUMENT_BYTES,
+                max_result_bytes: MAX_RESULT_BYTES as usize,
+                supports_external_idempotency: false,
+            }),
+    );
+    contracts.sort_by(|left, right| {
+        left.capability_id
+            .cmp(&right.capability_id)
+            .then_with(|| left.schema_version.cmp(&right.schema_version))
+    });
+    Ok(contracts)
+}
+
+fn resource_kinds(capability_id: &str) -> Vec<String> {
+    match capability_id {
+        "filesystem.read" | "filesystem.list" | "filesystem.write" | "filesystem.edit"
+        | "shell.execute" | "shell.allowlist" => vec!["workspace".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn ensure_lease_identity(
+    context: &WorkerContext,
+    lease: &ClientCapabilityLease,
+) -> Result<(), String> {
+    if lease.ptid != context.actor_ptid
+        || lease.device_id != context.device_id
+        || lease.device_signing_key_id != context.signing_key_id
+    {
+        return Err("CLIENT_CAPABILITY_LEASE_IDENTITY_MISMATCH".to_string());
+    }
+    Ok(())
+}
+
+fn execution_lease(
+    context: &WorkerContext,
+    lease: &ClientCapabilityLease,
+) -> Result<ExecutionLease, String> {
+    ensure_lease_identity(context, lease)?;
+    Ok(ExecutionLease {
+        station_peer_id: context.station_scope.station_peer_id.clone(),
+        actor_ptid: context.actor_ptid.clone(),
+        device_id: context.device_id.clone(),
+        capability_session_id: lease.capability_session_id.clone(),
+        executor_lease_id: lease.lease_id.clone(),
+        lease_revision: lease.lease_revision,
+        expires_at_ms: lease_expiry_ms(lease)?,
+        revoked: false,
+    })
+}
+
+fn recover_persisted_receipts(
+    context: &WorkerContext,
+    ledger: &ReceiptLedger,
+    resources: &ResourceRegistry,
+    executor: &LocalCapabilityExecutor,
+) -> Result<(), String> {
+    resources.delete_expired(now_unix_ms())?;
+    for record in ledger.list()? {
+        if record.station_peer_id != context.station_scope.station_peer_id {
+            tracing::warn!(
+                tool_call_id = %record.envelope.tool_call_id,
+                receipt_station_peer_id = %record.station_peer_id,
+                active_station_peer_id = %context.station_scope.station_peer_id,
+                "persisted client capability receipt belongs to another Station; recovery deferred"
+            );
+            continue;
+        }
+        let envelope = record.envelope;
+        let recovery_lease = ExecutionLease {
+            station_peer_id: record.station_peer_id.clone(),
+            actor_ptid: context.actor_ptid.clone(),
+            device_id: context.device_id.clone(),
+            capability_session_id: envelope.capability_session_id.clone(),
+            executor_lease_id: envelope.executor_lease_id.clone(),
+            lease_revision: envelope.capability_lease_revision,
+            expires_at_ms: 0,
+            revoked: true,
+        };
+        let transport = CapabilityStationTransport::new(
+            &context.station_client,
+            &context.actor_ptid,
+            &context.device_id,
+            &context.token,
+            &context.signing_key_id,
+            &context.signing_key,
+        )?;
+        let fenced = FencedExecutor::new(
+            &recovery_lease,
+            ledger,
+            resources,
+            &context.signing_key_id,
+            &context.signing_key,
+            executor,
+            &transport,
+        );
+        match fenced.consume(envelope) {
+            Ok(_) => {}
+            Err(error) if error == "CLIENT_CAPABILITY_RECONCILIATION_DEADLINE_EXPIRED" => {}
+            Err(error) => {
+                tracing::warn!(
+                    station_peer_id = %record.station_peer_id,
+                    error = %error,
+                    "persisted client capability receipt recovery deferred"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lease_expiry_ms(lease: &ClientCapabilityLease) -> Result<i64, String> {
+    let value = lease
+        .expires_at
+        .as_ref()
+        .ok_or_else(|| "CLIENT_CAPABILITY_LEASE_EXPIRY_REQUIRED".to_string())?;
+    if value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos) {
+        return Err("CLIENT_CAPABILITY_LEASE_EXPIRY_INVALID".to_string());
+    }
+    value
+        .seconds
+        .checked_mul(1_000)
+        .and_then(|seconds| seconds.checked_add(i64::from(value.nanos) / 1_000_000))
+        .ok_or_else(|| "CLIENT_CAPABILITY_LEASE_EXPIRY_INVALID".to_string())
+}
+
+fn advance_pull_cursor(
+    current: u64,
+    consumed_sequence: u64,
+    response_last_sequence: u64,
+) -> Result<u64, String> {
+    if consumed_sequence <= current || consumed_sequence > response_last_sequence {
+        return Err("CLIENT_CAPABILITY_PULL_CURSOR_INVALID".to_string());
+    }
+    Ok(consumed_sequence)
+}
+
+fn finalize_pull_cursor(
+    consumed_sequence: u64,
+    response_last_sequence: u64,
+    had_requests: bool,
+) -> Result<u64, String> {
+    if had_requests && response_last_sequence < consumed_sequence {
+        return Err("CLIENT_CAPABILITY_PULL_CURSOR_REGRESSION".to_string());
+    }
+    Ok(consumed_sequence)
+}
+
+fn requires_worker_replacement(error: &str) -> bool {
+    error == "CLIENT_CAPABILITY_LEASE_EXPIRED"
+        || error == "CLIENT_CAPABILITY_RENEW_RESPONSE_MISMATCH"
+        || error == ACCEPTANCE_RECOVERY_RESTART_REQUIRED
+        || error == STATION_TAKEOVER_REQUIRED
+        || error.contains("Station rejected capability pull")
+        || error.contains("Station rejected capability lease renewal")
+}
+
+fn classify_worker_execution_error(error: String, hook: Option<&ExecutorAcceptanceHook>) -> String {
+    if error == ACCEPTANCE_WORKER_INTERRUPTED
+        && hook.is_some_and(|hook| {
+            hook.family == CapabilityAcceptanceScenarioFamily::GovernedToolJ03
+                && hook.barrier == ACCEPTANCE_BARRIER_RECEIPT_RECOVERY_TERMINAL
+        })
+    {
+        return ACCEPTANCE_RECOVERY_RESTART_REQUIRED.to_string();
+    }
+    error
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseTickDecision {
+    Paused,
+    Expired,
+    Renew,
+    Pull,
+}
+
+fn lease_tick_decision(paused: bool, expires_at_ms: i64, now_ms: i64) -> LeaseTickDecision {
+    if paused {
+        LeaseTickDecision::Paused
+    } else if expires_at_ms <= now_ms {
+        LeaseTickDecision::Expired
+    } else if expires_at_ms - now_ms <= RENEW_BEFORE_EXPIRY_MS {
+        LeaseTickDecision::Renew
+    } else {
+        LeaseTickDecision::Pull
+    }
+}
+
+fn lease_expiry_control_ready(expires_at_ms: i64, now_ms: i64) -> bool {
+    now_ms >= expires_at_ms.saturating_add(LEASE_EXPIRY_SETTLE_DELAY_MS)
+}
+
+fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_lease(
+        capability_session_id: &str,
+        lease_id: &str,
+        lease_revision: u64,
+        expires_at_ms: i64,
+    ) -> ClientCapabilityLease {
+        ClientCapabilityLease {
+            capability_session_id: capability_session_id.to_string(),
+            lease_id: lease_id.to_string(),
+            lease_revision,
+            capability_set_hash: "capability-set".to_string(),
+            device_signing_key_id: "signing-key".to_string(),
+            platform: ClientPlatform::Desktop as i32,
+            expires_at: Some(prost_types::Timestamp {
+                seconds: expires_at_ms / 1_000,
+                nanos: ((expires_at_ms % 1_000) * 1_000_000) as i32,
+            }),
+            ..ClientCapabilityLease::default()
+        }
+    }
+
+    fn test_worker(station_peer_id: &str, lifecycle_generation: u64) -> ActiveWorker {
+        ActiveWorker {
+            context: WorkerContext {
+                station_client: StationClient::testing_scoped(
+                    station_peer_id,
+                    lifecycle_generation,
+                ),
+                station_scope: StationRequestScope {
+                    station_peer_id: station_peer_id.to_string(),
+                    lifecycle_generation,
+                },
+                account_id: "account-1".to_string(),
+                actor_ptid: "ptid:person:alice".to_string(),
+                device_id: "device-1".to_string(),
+                token: "token-1".to_string(),
+                signing_key_id: "signing-key-1".to_string(),
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                app: None,
+            },
+            lease: ClientCapabilityLease::default(),
+            ledger: None,
+            resources: None,
+            executor: None,
+            workspace_root: None,
+            pull_cursor: 0,
+            surface: ClientSurface::Desktop,
+            paused: false,
+            connector_projection_epoch: 1,
+            mcp_projection_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn worker_identity_survives_same_station_route_change() {
+        let worker = test_worker("station-a", 7);
+        let candidate = test_worker("station-a", 7).context;
+
+        assert!(worker.same_identity(&candidate));
+    }
+
+    #[test]
+    fn worker_identity_rejects_changed_logical_station_scope() {
+        let worker = test_worker("station-a", 7);
+        let candidate = test_worker("station-b", 7).context;
+        let reselected = test_worker("station-a", 8).context;
+
+        assert!(!worker.same_identity(&candidate));
+        assert!(!worker.same_identity(&reselected));
+    }
+
+    #[test]
+    fn pull_cursor_never_advances_past_the_station_commit() {
+        assert_eq!(advance_pull_cursor(6, 7, 9).unwrap(), 7);
+        assert!(advance_pull_cursor(7, 7, 9).is_err());
+        assert!(advance_pull_cursor(7, 11, 9).is_err());
+        assert_eq!(finalize_pull_cursor(7, 0, false).unwrap(), 7);
+        assert!(finalize_pull_cursor(7, 6, true).is_err());
+    }
+
+    #[test]
+    fn worker_replacement_preserves_station_fenced_recovery() {
+        assert!(requires_worker_replacement(STATION_TAKEOVER_REQUIRED));
+        assert!(requires_worker_replacement(
+            ACCEPTANCE_RECOVERY_RESTART_REQUIRED
+        ));
+        assert!(requires_worker_replacement(
+            "Station rejected capability pull with command error 30001"
+        ));
+        assert!(!requires_worker_replacement(
+            "pull Station client capability requests: request failed"
+        ));
+    }
+
+    #[test]
+    fn recovery_credential_interruption_restarts_only_that_worker() {
+        let recovery_hook = ExecutorAcceptanceHook {
+            scenario_handle: "scenario-1".to_string(),
+            barrier: ACCEPTANCE_BARRIER_RECEIPT_RECOVERY_TERMINAL.to_string(),
+            family: CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+        };
+        assert_eq!(
+            classify_worker_execution_error(
+                ACCEPTANCE_WORKER_INTERRUPTED.to_string(),
+                Some(&recovery_hook),
+            ),
+            ACCEPTANCE_RECOVERY_RESTART_REQUIRED,
+        );
+
+        let in_place_hook = ExecutorAcceptanceHook {
+            scenario_handle: "scenario-2".to_string(),
+            barrier: ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT.to_string(),
+            family: CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+        };
+        assert_eq!(
+            classify_worker_execution_error(
+                ACCEPTANCE_WORKER_INTERRUPTED.to_string(),
+                Some(&in_place_hook),
+            ),
+            ACCEPTANCE_WORKER_INTERRUPTED,
+        );
+    }
+
+    #[test]
+    fn local_capability_advertisement_exposes_only_implemented_replay_claims() {
+        let contracts = local_contracts(ClientSurface::Desktop, "ptid:person:test").unwrap();
+        assert!(contracts.iter().all(|contract| {
+            contract.supports_external_idempotency
+                == (cfg!(feature = "acceptance-webdriver")
+                    && contract.capability_id == "clipboard.read")
+        }));
+        let capability_ids: Vec<&str> = contracts
+            .iter()
+            .map(|contract| contract.capability_id.as_str())
+            .collect();
+        for expected in [
+            "filesystem.read",
+            "filesystem.list",
+            "filesystem.write",
+            "filesystem.edit",
+            "clipboard.read",
+            "clipboard.write",
+            "shell.execute",
+            "shell.allowlist",
+            "skill.resource.read",
+        ] {
+            assert!(
+                capability_ids.contains(&expected),
+                "Desktop must advertise {expected}; got {capability_ids:?}"
+            );
+        }
+        // Browser capabilities join only when a managed host is actually
+        // verifiable on this machine; the contract count follows that probe.
+        let browser_contracts = if crate::application::browser::host_is_available() {
+            2
+        } else {
+            0
+        };
+        assert_eq!(contracts.len(), 9 + browser_contracts);
+    }
+
+    #[test]
+    fn acceptance_hook_maps_only_reviewed_tool_and_operation_boundaries() {
+        assert!(executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+        ));
+        assert!(executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+            ACCEPTANCE_BARRIER_REVOKE_DISPATCH_RACE,
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+        ));
+        assert!(!executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+            "binding-delete-dispatch-race",
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+        ));
+        assert!(executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+            ACCEPTANCE_BARRIER_CANCEL_BEFORE_CLEANUP,
+            ACCEPTANCE_BARRIER_CANCEL_RESULT_RACE,
+        ));
+        for barrier in [
+            ACCEPTANCE_BARRIER_BUSINESS_LEASE_TERMINAL,
+            ACCEPTANCE_BARRIER_DEADLINE_BEFORE_TERMINAL,
+            ACCEPTANCE_BARRIER_RECEIPT_RECOVERY_TERMINAL,
+            ACCEPTANCE_BARRIER_STALE_FENCE_BEFORE_EVENT,
+        ] {
+            assert!(executor_acceptance_hook_matches(
+                CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+                barrier,
+                ACCEPTANCE_BARRIER_APPLIED_BEFORE_RESULT,
+            ));
+        }
+        assert!(executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::McpJ04,
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+        ));
+        assert!(executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::McpJ04,
+            ACCEPTANCE_BARRIER_CANCEL_BEFORE_CLEANUP,
+            ACCEPTANCE_BARRIER_CANCEL_RESULT_RACE,
+        ));
+        for barrier in [
+            ACCEPTANCE_BARRIER_BUSINESS_LEASE_TERMINAL,
+            ACCEPTANCE_BARRIER_DEADLINE_BEFORE_TERMINAL,
+            ACCEPTANCE_BARRIER_RECEIPT_RECOVERY_TERMINAL,
+            ACCEPTANCE_BARRIER_STALE_FENCE_BEFORE_EVENT,
+        ] {
+            assert!(executor_acceptance_hook_matches(
+                CapabilityAcceptanceScenarioFamily::McpJ04,
+                barrier,
+                ACCEPTANCE_BARRIER_APPLIED_BEFORE_RESULT,
+            ));
+        }
+        assert!(!executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::GovernedToolJ03,
+            ACCEPTANCE_BARRIER_CANCEL_RESULT_RACE,
+            ACCEPTANCE_BARRIER_PREPARED_BEFORE_EFFECT,
+        ));
+        assert!(!executor_acceptance_hook_matches(
+            CapabilityAcceptanceScenarioFamily::McpJ04,
+            ACCEPTANCE_BARRIER_CANCEL_RESULT_RACE,
+            ACCEPTANCE_BARRIER_APPLIED_BEFORE_RESULT,
+        ));
+    }
+
+    #[test]
+    fn desktop_surface_starts_automatically() {
+        assert!(ClientSurface::Desktop.starts_automatically());
+    }
+
+    #[test]
+    fn connector_projection_change_replaces_a_stale_capability_lease() {
+        assert!(!connector_projection_changed(7, 7));
+        assert!(connector_projection_changed(7, 8));
+    }
+
+    #[test]
+    fn lease_pause_suppresses_pull_renew_and_expiry_replacement() {
+        assert_eq!(
+            lease_tick_decision(true, 1_000, 2_000),
+            LeaseTickDecision::Paused
+        );
+        assert_eq!(
+            lease_tick_decision(false, 1_000, 2_000),
+            LeaseTickDecision::Expired
+        );
+        assert_eq!(
+            lease_tick_decision(false, 61_000, 2_000),
+            LeaseTickDecision::Renew
+        );
+        assert_eq!(
+            lease_tick_decision(false, 62_001, 2_000),
+            LeaseTickDecision::Pull
+        );
+    }
+
+    #[test]
+    fn lease_expired_control_has_a_real_lease_sized_receive_timeout() {
+        assert_eq!(
+            RequestedCapabilityNegativeControl::LeaseExpired.receive_timeout(),
+            Duration::from_secs(6 * 60)
+        );
+        assert_eq!(
+            RequestedCapabilityNegativeControl::LeasePause.receive_timeout(),
+            NEGATIVE_CONTROL_TIMEOUT
+        );
+        assert!(RequestedCapabilityNegativeControl::LeaseExpired.requires_lease_lifecycle_control());
+    }
+
+    #[test]
+    fn lease_expiry_control_waits_past_the_station_expiry_boundary() {
+        assert!(!lease_expiry_control_ready(10_000, 10_249));
+        assert!(lease_expiry_control_ready(10_000, 10_250));
+    }
+
+    #[test]
+    fn lease_transition_exposes_only_hashed_authority_and_reset_cursor() {
+        let source = test_lease("source-session", "source-lease", 9, 10_000);
+        let current = test_lease("current-session", "current-lease", 1, 20_000);
+
+        ensure_replacement_lease(&source, &current, 15_000).unwrap();
+        let facts = lease_transition_facts(&source, &current, 0).unwrap();
+
+        assert_eq!(
+            facts.source_capability_session_id_hash,
+            hash_identifier("source-session")
+        );
+        assert_eq!(
+            facts.current_capability_session_id_hash,
+            hash_identifier("current-session")
+        );
+        assert_ne!(
+            facts.source_capability_session_id_hash,
+            facts.current_capability_session_id_hash
+        );
+        assert_eq!(facts.source_expires_at_ms, 10_000);
+        assert_eq!(facts.current_expires_at_ms, 20_000);
+        assert_eq!(facts.current_lease_revision, 1);
+        assert_eq!(facts.current_pull_cursor, 0);
+    }
+
+    #[test]
+    fn replacement_lease_must_be_new_current_authority() {
+        let source = test_lease("source-session", "source-lease", 9, 10_000);
+        let same_session = test_lease("source-session", "current-lease", 1, 20_000);
+        let stale = test_lease("current-session", "current-lease", 1, 15_000);
+
+        assert!(ensure_replacement_lease(&source, &same_session, 15_000).is_err());
+        assert!(ensure_replacement_lease(&source, &stale, 15_000).is_err());
+    }
+}

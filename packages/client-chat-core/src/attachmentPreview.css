@@ -1,0 +1,231 @@
+.chat-file-preview-resource {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  color: var(--chat-preview-text, #171717);
+}
+.chat-pdf-preview, .chat-text-preview, .chat-office-preview {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* One quiet WeChat/Quick Look style toolbar: pagination and zoom form a
+   single centered control group; the optional sheet selector anchors to
+   the leading edge. No second row, no stretched empty middle. */
+.chat-preview-toolbar {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--chat-preview-border, #e5e5e5);
+  background: var(--chat-preview-surface, white);
+}
+.chat-preview-toolbar-spacer {
+  display: none;
+}
+.chat-preview-toolbar-leading,
+.chat-preview-toolbar-trailing {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.chat-preview-toolbar-leading {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: calc(100% - 16px);
+}
+.chat-preview-toolbar-trailing {
+  flex: 0 0 auto;
+}
+.chat-preview-pager {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.chat-preview-pager-divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 6px;
+  background: var(--chat-preview-border, #e5e5e5);
+}
+.chat-preview-toolbar-leading select {
+  max-width: 160px;
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--chat-preview-text, #171717);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.chat-preview-toolbar-leading select:hover {
+  background: var(--chat-preview-hover, #f0f0f0);
+}
+.chat-preview-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--chat-preview-text, #171717);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.chat-preview-icon:hover:not(:disabled) {
+  background: var(--chat-preview-hover, #f0f0f0);
+}
+.chat-preview-icon:focus-visible {
+  outline: 2px solid var(--chat-preview-accent, #1677ff);
+  outline-offset: -2px;
+}
+.chat-preview-icon:disabled {
+  color: var(--chat-preview-secondary, #9a9a9a);
+  cursor: default;
+}
+.chat-preview-page-status {
+  min-width: 44px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  color: var(--chat-preview-text, #171717);
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+.chat-preview-column-status {
+  min-width: 56px;
+}
+.chat-preview-zoom {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+/* Hairline between the pagination cluster and the zoom cluster so the
+   single centered group reads as pagination | view actions. */
+.chat-preview-zoom::before {
+  content: "";
+  width: 1px;
+  height: 16px;
+  margin: 0 6px 0 0;
+  background: var(--chat-preview-border, #e5e5e5);
+}
+.chat-preview-zoom-button[aria-pressed="true"] {
+  background: var(--chat-preview-hover, #ececec);
+  color: var(--chat-preview-accent, #1677ff);
+}
+.chat-preview-toolbar[aria-busy="true"] .chat-preview-icon,
+.chat-preview-toolbar[aria-busy="true"] .chat-preview-page-status {
+  opacity: .55;
+}
+
+.chat-pdf-canvas-scroll, .chat-office-content, .chat-text-preview pre {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--chat-preview-canvas, #f5f5f5);
+}
+.chat-pdf-canvas-scroll {
+  padding: 16px;
+}
+.chat-pdf-preview canvas {
+  display: block;
+  max-width: none;
+  height: auto;
+  margin-inline: auto;
+  background: white;
+  border: 1px solid var(--chat-preview-border, #dedede);
+}
+.chat-file-preview-resource[aria-busy="true"] canvas {
+  visibility: hidden;
+}
+.chat-office-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: white;
+}
+.chat-office-content table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12px;
+  background: var(--chat-preview-surface, white);
+  min-width: 100%;
+}
+.chat-office-content caption {
+  text-align: start;
+  padding: 8px 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--chat-preview-secondary, #737373);
+}
+.chat-office-content th, .chat-office-content td {
+  padding: 6px 10px;
+  border-right: 1px solid var(--chat-preview-border, #dedede);
+  border-bottom: 1px solid var(--chat-preview-border, #dedede);
+  min-width: 96px;
+  max-width: 320px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.chat-office-content thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  text-align: center;
+  background: var(--chat-preview-hover, #f0f0f0);
+}
+.chat-office-content tbody th, .chat-office-content thead th:first-child {
+  position: sticky;
+  left: 0;
+  min-width: 44px;
+  background: var(--chat-preview-hover, #f0f0f0);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  z-index: 1;
+}
+.chat-office-content thead th:first-child { z-index: 3; }
+.chat-workbook-number { text-align: end; font-variant-numeric: tabular-nums; }
+.chat-text-preview pre {
+  margin: 0;
+  padding: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.chat-file-preview-resource > img, .chat-file-preview-resource > video {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.chat-file-preview-resource > video { width: 100%; height: 100%; }
+.chat-file-preview-resource > audio { width: min(100%, 480px); }

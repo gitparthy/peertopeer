@@ -1,0 +1,381 @@
+import type {
+  Conversation,
+  ConversationMember,
+} from '../gen/proto/domain/chat/conversation_pb'
+import type { ConversationEvent } from '../gen/proto/domain/chat/event_pb'
+import type { ActorDevice } from '../gen/proto/domain/actor/actor_pb'
+
+export type DeviceInfo = ActorDevice
+
+// --- Conversation Service Contract (v1) ---
+
+export interface ConversationServiceContract {
+  getConversation(conversationId: string): Promise<Conversation>
+  listConversations(): Promise<Conversation[]>
+  getMembers(conversationId: string): Promise<ConversationMember[]>
+  listEvents(conversationId: string, afterSeq?: number, limit?: number): Promise<ConversationEvent[]>
+  listMessages(conversationId: string, afterSeq?: number, limit?: number): Promise<{ events: ConversationEvent[]; hasMore: boolean }>
+  listThreadMessages(conversationId: string, rootId: string, afterSeq?: number, limit?: number): Promise<{ events: ConversationEvent[]; hasMore: boolean }>
+  syncFromStation(conversationId: string, limit?: number): Promise<{ events: ConversationEvent[]; hasMore: boolean }>
+}
+
+export interface ThreadCountResult {
+  rootUlid: string
+  replyCount: number
+  latestReplyUlid: string
+  latestReplyAt: number
+  unreadCount: number
+}
+
+export interface MemberSettingsResult {
+  nickname: string
+  muted: boolean
+  alertEnabled: boolean
+  pinned: boolean
+  background: string
+  backgroundImage: string
+}
+
+// --- KeyPackage Service Contract (v1) ---
+
+export interface KeyPackageServiceContract {
+  upload(deviceId: string, data: Uint8Array): Promise<void>
+  fetch(ptid: string, homeStationPeerId?: string): Promise<KeyPackageFetchResult>
+  countAvailable(): Promise<number>
+}
+
+export interface KeyPackageFetchResult {
+  data: Uint8Array | null
+  available: boolean
+  deviceId: string
+  homeStationPeerId: string
+}
+
+// --- Device Service Contract (v1) ---
+
+export interface DeviceServiceContract {
+  list(): Promise<DeviceInfo[]>
+  revoke(deviceId: string, observedProfileVersion: bigint): Promise<DeviceInfo>
+}
+
+export interface MlsLeaveIntentView {
+  version: number
+  intentId: string
+  federationId: string
+  authorityStationPeerId: string
+  authorityEpoch: number
+  homeStationPeerId: string
+  conversationId: string
+  actorPtid: string
+  actorDeviceId: string
+  actorSigningKeyId: string
+  observedMembershipEpoch: number
+  observedMlsEpoch: number
+  createdAtUnixMs: number
+  expiresAtUnixMs: number
+  actorSignature: Uint8Array
+  authoritySequence: number
+  authorityHash: Uint8Array
+}
+
+export interface RequestMlsLeaveIntentInput {
+  federationId: string
+  authorityStationPeerId: string
+  authorityEpoch: number
+  homeStationPeerId: string
+  conversationId: string
+  observedMembershipEpoch: number
+  observedMlsEpoch: number
+}
+
+export interface CommitAuthorizedMlsLeaveInput {
+  intent: MlsLeaveIntentView
+}
+
+export interface MessagingProjection {
+  eventId?: string
+  eventSequence?: number
+  messageId: string
+  senderPtid: string
+  senderDeviceId: string
+  plaintext: string
+  attachments: MessagingAttachmentProjection[]
+  state: string
+  timestampUnixMs: number
+  replyToMessageId?: string
+  threadRootMessageId?: string
+  editedText?: string
+  editedAtUnixMs?: number
+  retracted: boolean
+  reactions: MessagingReactionProjection[]
+  pinnedByPtid?: string
+  pinnedAtUnixMs?: number
+  readByPtids: string[]
+  /**
+   * MP-D34 sender verdict facts. Attempt metadata mirrors the local outbox;
+   * delivery counts aggregate per-device MessageReceipt projections. All
+   * values are projection-only facts; horizon judgments are derived in the
+   * renderer and never written back.
+   */
+  attemptCount: number
+  nextAttemptAtUnixMs?: number
+  lastErrorCode?: string
+  requiredDeviceCount: number
+  deliveredDeviceCount: number
+  /** @mention targets decoded from the in-ciphertext private body. */
+  mentions: MessageMention[]
+  /** Whether the message carries an owner/admin @all directive. */
+  mentionAll: boolean
+}
+
+/**
+ * One @mention target with its exact UTF-16 range inside the plaintext.
+ * Offsets and length index the displayed text (UTF-16 code units, matching
+ * the textarea selection model) so renderers can paint chips without
+ * reparsing names.
+ */
+export interface MessageMention {
+  actorPtid: string
+  offset: number
+  length: number
+  display: string
+}
+
+/** Send-side mention set sealed into the ciphertext. */
+export interface MessageMentionSet {
+  mentions: MessageMention[]
+  mentionAll: boolean
+}
+
+export interface MessagingReactionProjection {
+  actorPtid: string
+  reaction: string
+  createdAtUnixMs: number
+}
+
+export interface MessagingAttachmentProjection {
+  attachmentId: string
+  filename: string
+  mimeType: string
+  contentKind: 'file' | 'voice_note'
+  durationMs: number
+  plaintextSize: number
+  objectId: string
+  storageRef: string
+  ciphertextSize: number
+  availabilityState: 'uploading' | 'remote' | 'local' | 'failed'
+}
+
+export interface MessagingLocalAttachmentIntent {
+  filePath: string
+  filename: string
+  mimeType: string
+  contentKind: 'file' | 'voice_note'
+  durationMs: number
+  size?: number
+}
+
+export type MessagingSendState = 'draft' | 'pending' | 'attachment_failed' | 'failed';
+
+/**
+ * MP-D33 admission result. `admitted` means the message is durably local
+ * (including a deferred draft); there is no transport failure the caller may
+ * resend. `rejected` only exists as an IPC-level error/exception: no durable
+ * message was created.
+ */
+export interface MessagingSendOutcome {
+  admission: 'admitted';
+  commandId?: string
+  messageId: string
+  attachmentIds: string[]
+  attachmentCount: number
+  state: MessagingSendState
+}
+
+export interface MessagingSendIntentStatus {
+  admitted: boolean
+  commandId?: string
+  messageId?: string
+  attachmentIds: string[]
+  state: MessagingSendState | 'none'
+}
+
+export interface MessagingSendOutcomeRecord {
+  revision: number
+  outcome: MessagingSendOutcome
+}
+
+export interface MessagingConversationProjection {
+  conversationId: string
+  authorityStationId: string
+  federationId: string
+  kind: 1 | 2
+  name: string
+  description: string
+  avatarObjectId: string
+  ownerPtid: string
+  members: ConversationMember[]
+  membershipEpoch: number
+  mlsEpoch: number
+  mlsStatus: 'idle' | 'active' | 'establishing' | 'crypto_desynced' | null
+  active: boolean
+  updatedAtUnixMs: number
+  summary: MessagingConversationSummary
+}
+
+export interface MessagingConversationSummary {
+  unreadCount: number
+  latestMessage?: MessagingProjection
+}
+
+export interface MessagingMessagePage {
+  messages: MessagingProjection[]
+  hasMore: boolean
+  nextBeforeSequence?: number
+}
+
+export interface MessagingCommandStatus {
+  commandId: string
+  conversationId: string
+  state: 'pending' | 'retry_wait' | 'submitted' | 'committed' | 'failed' | 'superseded'
+  lastErrorCode: string
+}
+
+export interface CreateDirectConversationInput {
+  peerPtid: string
+  /**
+   * Deprecated for Direct creation: scope (Local vs Federation) is derived
+   * server-side from the two actors' Home Stations. Retained as optional only
+   * so older call sites keep compiling during the migration.
+   */
+  federationId?: string
+}
+
+export interface MessagingServiceContract {
+  createDirect(
+    input: CreateDirectConversationInput,
+  ): Promise<{ conversationId: string; state: 'projected' }>
+  createGroup(
+    conversationId: string,
+    name: string,
+    memberPtids: string[],
+    federationId: string,
+  ): Promise<{
+    conversationId: string
+    commandId: string
+    state: 'pending' | 'projected' | 'failed'
+  }>
+  submitMembershipIntent(
+    intent: MessagingActorMembershipIntent,
+  ): Promise<{ commandId: string; state: 'pending' }>
+  updateConversation(
+    conversationId: string,
+    update: { name?: string; description?: string; avatarObjectId?: string },
+  ): Promise<{ commandId: string; state: string }>
+  updateMemberAuthority(
+    conversationId: string,
+    targetPtid: string,
+    update: { role?: number; muted?: boolean; mutedUntilUnixMs?: number },
+  ): Promise<{ commandId: string; state: string }>
+  transferOwnership(
+    conversationId: string,
+    targetPtid: string,
+  ): Promise<{ commandId: string; state: string }>
+  dissolveConversation(
+    conversationId: string,
+  ): Promise<{ commandId: string; state: string }>
+  leaveConversation(
+    conversationId: string,
+  ): Promise<{ intentId: string; state: 'pending' }>
+  requestLeaveIntent(input: RequestMlsLeaveIntentInput): Promise<MlsLeaveIntentView>
+  listLeaveIntents(conversationId: string): Promise<MlsLeaveIntentView[]>
+  commitAuthorizedLeave(
+    input: CommitAuthorizedMlsLeaveInput,
+  ): Promise<{ commandId: string; state: 'pending' }>
+  getCommandStatus(commandId: string): Promise<MessagingCommandStatus>
+  listConversations(): Promise<MessagingConversationProjection[]>
+  pickAttachmentSource(): Promise<MessagingLocalAttachmentIntent>
+  stageAttachmentSource(filename: string, bytes: Uint8Array): Promise<string>
+  discardAttachmentSource(filePath: string): Promise<void>
+  captureAttachmentSource(): Promise<MessagingLocalAttachmentIntent>
+  sendMessage(
+    conversationId: string,
+    conversationKind: 'direct' | 'group',
+    plaintext: string,
+    attachments: readonly MessagingLocalAttachmentIntent[] | undefined,
+    relation: {
+      replyToMessageId?: string
+      threadRootMessageId?: string
+      sendIntentId: string
+    },
+    mentionSet?: MessageMentionSet,
+  ): Promise<MessagingSendOutcome>
+  sendIntentStatus(sendIntentId: string): Promise<MessagingSendIntentStatus>
+  listMessages(
+    conversationId: string,
+    options?: { beforeSequence?: number; limit?: number; anchorMessageId?: string },
+  ): Promise<MessagingMessagePage>
+  listServiceMessages(
+    conversationId: string,
+  ): Promise<import('../store/socialProjection').DesktopServiceMessage[]>
+  retryMessage(
+    conversationId: string,
+    messageId: string,
+  ): Promise<{ commandId?: string; messageId: string; state: 'pending' | 'retrying' | 'redriving' }>
+  listThreadMessages(
+    conversationId: string,
+    threadRootMessageId: string,
+  ): Promise<MessagingProjection[]>
+  threadCounts(
+    conversationId: string,
+    rootMessageIds: string[],
+  ): Promise<{ counts: ThreadCountResult[] }>
+  getMemberSettings(conversationId: string): Promise<MemberSettingsResult>
+  updateMemberSettings(
+    conversationId: string,
+    settings: Partial<MemberSettingsResult>,
+  ): Promise<MemberSettingsResult>
+  searchMessages(
+    conversationId: string,
+    query: string,
+    options?: {
+      beforeTimestampUnixMs?: number
+      beforeMessageId?: string
+      limit?: number
+    },
+  ): Promise<MessagingProjection[]>
+}
+
+export type MessagingActorMembershipIntent =
+  | {
+      conversationId: string
+      action: 'add_actor'
+      targetPtid: string
+      role?: string
+    }
+  | {
+      conversationId: string
+      action: 'remove_actor'
+      targetPtid: string
+    }
+  | {
+      conversationId: string
+      action: 'add_device'
+      targetPtid: string
+      targetDeviceId: string
+    }
+  | {
+      conversationId: string
+      action: 'remove_device'
+      targetPtid: string
+      targetDeviceId: string
+    }
+
+// --- Unified IM Service (aggregates above contracts) ---
+
+export interface IMServiceV1 {
+  conversation: ConversationServiceContract
+  keyPackage: KeyPackageServiceContract
+  device: DeviceServiceContract
+  messaging: MessagingServiceContract
+}

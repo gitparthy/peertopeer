@@ -1,0 +1,1685 @@
+import assert from 'node:assert/strict';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import {
+  machineLeasePath,
+  machineRegistryPath,
+  workspaceIdForRoot,
+} from '../lib/machine-dev-paths.mjs';
+import {
+  buildLeaseCommand,
+  MachineDevError,
+  checkWorkspace,
+  observeLeases,
+  registeredCanonicalRoots,
+  registerWorkspace,
+  resetPolicyForProfile,
+  resolveProfileDefinition,
+  selectWorkspaceProfile,
+  statusAll,
+  unregisterWorkspace,
+  unregisterWorkspaceByIdentity,
+  updateWorkspace,
+  validateLeaseRequest,
+} from './machine-dev-registry.mjs';
+import { acquireWorkspaceLifecycleLockSync } from './workspace-lifecycle-lock.mjs';
+
+const cli = fileURLToPath(new URL('./machine-dev.mjs', import.meta.url));
+const leaseCli = fileURLToPath(new URL('./machine-dev-lease.py', import.meta.url));
+
+function git(directory, ...args) {
+  return execFileSync('git', args, {
+    cwd: directory,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function initializeGitRepository(directory, branch = 'feat/test') {
+  mkdirSync(directory, { recursive: true });
+  execFileSync('git', ['init', '-b', branch], { cwd: directory });
+  git(directory, 'config', 'user.email', 'machine-dev-test@example.invalid');
+  git(directory, 'config', 'user.name', 'Machine Dev Test');
+  git(directory, 'config', 'core.hooksPath', '/dev/null');
+  writeFileSync(path.join(directory, 'README.md'), 'fixture\n');
+  git(directory, 'add', 'README.md');
+  git(directory, 'commit', '-m', 'test: initialize fixture');
+}
+
+function profileText({
+  name,
+  mode = 'remote',
+  stationUrl = 'http://192.0.2.4:18080',
+  deployEnvironment = 'station-four',
+}) {
+  return [
+    `PT_DEV_PROFILE=${name}`,
+    'PT_DEV_SLOT=1',
+    `PT_STATION_MODE=${mode}`,
+    `PT_STATION_NAME=${name}`,
+    `PT_STATION_URL=${stationUrl}`,
+    'PT_STATION_PORT=18080',
+    `PT_STATION_DEPLOY_ENV=${deployEnvironment}`,
+    `PT_STATION_HEALTH_URL=${stationUrl}/sub-oss/healthz`,
+    'PT_DESKTOP_APP_GATEWAY_PORT=3130',
+    'PT_DESKTOP_APP_WEB_PORT=3310',
+    'PT_MOBILE_WEB_PORT=5273',
+    '',
+  ].join('\n');
+}
+
+function addProfile(
+  scope,
+  {
+    name,
+    mode,
+    stationUrl,
+    deployEnvironment,
+    deployHost,
+    writeDeployDefinition = true,
+    tracked = true,
+  },
+) {
+  const profileDirectory = path.join(scope.envRepo, 'peers-touch', name);
+  const deployDirectory = path.join(profileDirectory, 'deploy');
+  mkdirSync(deployDirectory, { recursive: true });
+  writeFileSync(
+    path.join(profileDirectory, 'profile.env.example'),
+    profileText({
+      name,
+      mode,
+      stationUrl,
+      deployEnvironment,
+    }),
+  );
+  if (deployEnvironment && writeDeployDefinition) {
+    writeFileSync(
+      path.join(deployDirectory, `${deployEnvironment}.env.example`),
+      [
+        `PT_DEPLOY_HOST=${deployHost}`,
+        'PT_DEPLOY_USER=tester',
+        'PT_DEPLOY_PATH=peers-touch/repo',
+        'PT_DEPLOY_ROLE=station',
+        '',
+      ].join('\n'),
+    );
+  }
+  if (tracked) {
+    git(scope.envRepo, 'add', `peers-touch/${name}`);
+    git(scope.envRepo, 'commit', '-m', `test: add ${name} profile`);
+  }
+}
+
+function addLocalProfile(
+  scope,
+  {
+    name,
+    workspaceRoot = scope.workspaceA,
+    text = profileText({
+      name,
+      mode: 'compose',
+      stationUrl: 'http://127.0.0.1:18080',
+      deployEnvironment: '',
+    }),
+    mode = 0o600,
+  },
+) {
+  const directory = path.join(
+    workspaceRoot,
+    '.local',
+    'dev',
+    'profiles',
+  );
+  const file = path.join(directory, `${name}.env`);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(file, text);
+  chmodSync(file, mode);
+  return file;
+}
+
+function fixture() {
+  const root = mkdtempSync(path.join(tmpdir(), 'pt-machine-dev-'));
+  const home = path.join(root, 'home');
+  const workspaceA = path.join(root, 'workspace-a');
+  const workspaceB = path.join(root, 'workspace-b');
+  const envRepo = path.join(root, 'env');
+  mkdirSync(home, { recursive: true });
+  initializeGitRepository(workspaceA);
+  initializeGitRepository(workspaceB, 'feat/other');
+  initializeGitRepository(envRepo, 'main');
+  const scope = {
+    root,
+    home,
+    workspaceA,
+    workspaceB,
+    envRepo,
+    close() {
+      rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
+    },
+  };
+  addProfile(scope, {
+    name: 'four',
+    stationUrl: 'http://192.0.2.4:18080',
+    deployEnvironment: 'station-four',
+    deployHost: '192.0.2.4',
+  });
+  addProfile(scope, {
+    name: 'fiveArm',
+    stationUrl: 'http://192.0.2.5:18080',
+    deployEnvironment: 'station-five',
+    deployHost: '192.0.2.5',
+  });
+  return scope;
+}
+
+function registrationOptions(scope, overrides = {}) {
+  return {
+    home: scope.home,
+    workspaceRoot: scope.workspaceA,
+    envRepo: scope.envRepo,
+    profile: 'four',
+    slot: 5,
+    capabilities: 'station.connect,station.deploy,station.reset',
+    purpose: 'isolated machine control-plane test',
+    owner: 'machine-dev-test@example.invalid',
+    ...overrides,
+  };
+}
+
+function expectCode(code, operation) {
+  assert.throws(operation, (error) => {
+    assert.ok(error instanceof MachineDevError);
+    assert.equal(error.code, code);
+    return true;
+  });
+}
+
+function leaseArguments(
+  scope,
+  resourceKind,
+  resourceId,
+  budgetSeconds,
+  command,
+) {
+  const args = [
+    cli,
+    'lease',
+    '--home',
+    scope.home,
+    '--workspace-root',
+    scope.workspaceA,
+    '--env-repo',
+    scope.envRepo,
+    '--resource-kind',
+    resourceKind,
+    '--resource-id',
+    resourceId,
+    '--budget-seconds',
+    String(budgetSeconds),
+  ];
+  if (resourceKind === 'station.reset') {
+    args.push('--reset-scope', resourceId);
+  }
+  return [...args, '--', ...command];
+}
+
+async function waitForFile(file, failureDetail, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(file) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(
+    existsSync(file),
+    `timed out waiting for ${file}: ${failureDetail()}`,
+  );
+}
+
+function waitForChild(child) {
+  return new Promise((resolve) => {
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+}
+
+test('target Profile deploy preserves the workspace binding and freezes its target', () => {
+  const scope = fixture();
+  try {
+    registerWorkspace(registrationOptions(scope));
+    const registryFile = machineRegistryPath(scope.home);
+    const original = readFileSync(registryFile, 'utf8');
+    const options = {
+      ...registrationOptions(scope),
+      targetProfile: 'fiveArm',
+      resourceKind: 'station.deploy',
+      resourceId: 'station-five',
+      budgetSeconds: 5,
+    };
+    const resolved = checkWorkspace(options);
+    assert.equal(resolved.binding.profile, 'four');
+    assert.equal(resolved.binding.slot, 5);
+    assert.equal(resolved.profile.profile, 'fiveArm');
+    const runner = buildLeaseCommand({
+      ...options,
+      command: [process.execPath, '-e', 'process.stdout.write(process.env.PT_DEV_TARGET_PROFILE)'],
+    });
+    const result = spawnSync(runner.executable, runner.arguments, { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'fiveArm');
+    assert.equal(readFileSync(registryFile, 'utf8'), original);
+    const local = buildLeaseCommand({
+      ...registrationOptions(scope),
+      resourceKind: 'local.slot', resourceId: '5', budgetSeconds: 5,
+      command: [
+        process.execPath, '-e',
+        'process.stdout.write(JSON.stringify({file:process.env.PT_DEV_PROFILE_FILE,target:process.env.PT_DEV_TARGET_PROFILE ?? null}))',
+      ],
+    });
+    const contained = spawnSync(local.executable, local.arguments, {
+      encoding: 'utf8',
+      env: { ...process.env, PT_DEV_PROFILE_FILE: '/contained/runtime.env' },
+    });
+    assert.equal(contained.status, 0, contained.stderr);
+    assert.deepEqual(JSON.parse(contained.stdout), {
+      file: '/contained/runtime.env', target: null,
+    });
+    expectCode('DEPLOY_TARGET_MISMATCH', () =>
+      validateLeaseRequest({ ...options, resourceId: 'station-four' }));
+    const blocked = buildLeaseCommand({
+      ...options, command: [process.execPath, '-e', 'process.stdout.write("unexpected")'],
+    });
+    writeFileSync(path.join(scope.envRepo, 'peers-touch/fiveArm/unreviewed'), 'dirty\n');
+    const refused = spawnSync(blocked.executable, blocked.arguments, { encoding: 'utf8' });
+    assert.equal(refused.status, 2);
+    assert.equal(refused.stdout.includes('unexpected'), false);
+    assert.equal(readFileSync(machineLeasePath('station.deploy', 'station-five', scope.home), 'utf8'), '');
+  } finally {
+    scope.close();
+  }
+});
+
+test('registered canonical roots drive pull-based observation collection', () => {
+  const scope = fixture();
+  try {
+    assert.deepEqual(registeredCanonicalRoots({ home: scope.home }), []);
+    registerWorkspace(registrationOptions(scope));
+    assert.deepEqual(registeredCanonicalRoots({ home: scope.home }), [
+      realpathSync(scope.workspaceA),
+    ]);
+  } finally {
+    scope.close();
+  }
+});
+
+test('target Profile cannot borrow deployment authority for a stable Profile', () => {
+  const scope = fixture();
+  try {
+    addProfile(scope, {
+      name: 'corpStable', stationUrl: 'http://192.0.2.6:18080',
+      deployEnvironment: 'station-stable', deployHost: '192.0.2.6',
+    });
+    registerWorkspace(registrationOptions(scope));
+    const options = { ...registrationOptions(scope), targetProfile: 'corpStable' };
+    assert.equal(checkWorkspace({ ...options, capabilities: 'station.connect' }).profile.profile, 'corpStable');
+    expectCode('WORKSPACE_CAPABILITY_MISSING', () => checkWorkspace({
+      ...options, capabilities: 'station.deploy',
+    }));
+    expectCode('PROFILE_RESET_PROTECTED', () => checkWorkspace({
+      ...options, capabilities: 'station.reset',
+    }));
+    updateWorkspace(registrationOptions(scope, {
+      profile: 'corpStable', capabilities: 'station.connect,station.deploy',
+    }));
+    assert.equal(checkWorkspace({
+      ...options, profile: 'corpStable', capabilities: 'station.deploy',
+    }).profile.profile, 'corpStable');
+  } finally {
+    scope.close();
+  }
+});
+
+test('concurrent lease observers do not impersonate live holders', async () => {
+  const scope = fixture();
+  try {
+    const leaseFile = machineLeasePath('local.slot', '5', scope.home);
+    const leaseRoot = path.dirname(leaseFile);
+    mkdirSync(leaseRoot, { recursive: true });
+    writeFileSync(
+      leaseFile,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        leaseId: 'stale-observation',
+        resourceKind: 'local.slot',
+        resourceId: '5',
+        workspaceId: 'f'.repeat(16),
+        ownerPid: 999_999,
+        ownerProcessStart: 'stale',
+        acquiredAt: '2026-09-17T00:00:00.000Z',
+        expiresAt: '2026-09-17T00:00:01.000Z',
+      })}\n`,
+    );
+
+    const observations = Array.from({ length: 8 }, () => {
+      const child = spawn(
+        'python3',
+        [leaseCli, 'status', '--lease-root', leaseRoot],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      return waitForChild(child).then(({ code, signal }) => ({
+        code,
+        signal,
+        stdout,
+        stderr,
+      }));
+    });
+
+    for (const observation of await Promise.all(observations)) {
+      assert.equal(observation.code, 0, observation.stderr);
+      assert.equal(observation.signal, null);
+      const status = JSON.parse(observation.stdout);
+      assert.deepEqual(status.activeLeases, []);
+      assert.equal(status.staleMetadata.length, 1);
+    }
+  } finally {
+    scope.close();
+  }
+});
+
+test('registers, updates, checks, and reports the authoritative slot-5 binding', () => {
+  const scope = fixture();
+  try {
+    const registered = registerWorkspace(registrationOptions(scope));
+    assert.equal(registered.slot, 5);
+    assert.deepEqual(registered.allowedCapabilities, [
+      'station.connect',
+      'station.deploy',
+      'station.reset',
+    ]);
+    const checked = checkWorkspace({
+      home: scope.home,
+      workspaceRoot: scope.workspaceA,
+      envRepo: scope.envRepo,
+      workspaceId: registered.workspaceId,
+      profile: 'four',
+      slot: 5,
+      capabilities: 'station.connect,station.deploy',
+      budgetSeconds: 1200,
+    });
+    assert.equal(checked.ports.desktopAppGateway, 3530);
+    assert.equal(checked.ports.mobileWeb, 5673);
+    assert.equal(checked.profile.stationDeployEnvironment, 'station-four');
+    assert.equal(checked.profile.resetPolicy, 'agent-resettable');
+
+    const updated = updateWorkspace(
+      registrationOptions(scope, {
+        profile: 'fiveArm',
+        capabilities: 'station.connect',
+        purpose: 'switch fixture profile without changing the slot',
+      }),
+    );
+    assert.equal(updated.profile, 'fiveArm');
+    assert.equal(updated.slot, 5);
+    assert.deepEqual(updated.allowedCapabilities, ['station.connect']);
+
+    const status = statusAll({
+      home: scope.home,
+      envRepo: scope.envRepo,
+    });
+    assert.equal(status.authority, 'machine-control-plane');
+    assert.equal(status.registrations[0].activity, 'idle');
+    assert.equal(status.registrations[0].profileState, 'available');
+    assert.equal(status.registrations[0].resetPolicy, 'agent-resettable');
+  } finally {
+    scope.close();
+  }
+});
+
+test('current Git HEAD is source state, not durable registration identity', () => {
+  const scope = fixture();
+  try {
+    const registered = registerWorkspace(registrationOptions(scope));
+    assert.equal('head' in registered, false);
+    writeFileSync(path.join(scope.workspaceA, 'next.txt'), 'next\n');
+    git(scope.workspaceA, 'add', 'next.txt');
+    git(scope.workspaceA, 'commit', '-m', 'test: advance source');
+    const advancedHead = git(scope.workspaceA, 'rev-parse', 'HEAD');
+
+    const checked = checkWorkspace({
+      home: scope.home,
+      workspaceRoot: scope.workspaceA,
+      envRepo: scope.envRepo,
+    });
+    assert.equal(checked.source.head, advancedHead);
+    assert.equal(checked.source.branch, registered.branch);
+    assert.equal('head' in checked.binding, false);
+    assert.equal(
+      statusAll({ home: scope.home, envRepo: scope.envRepo })
+        .registrations[0].activity,
+      'idle',
+    );
+
+    git(scope.workspaceA, 'switch', '-c', 'feat/different');
+    expectCode('WORKTREE_IDENTITY_MISMATCH', () =>
+      checkWorkspace({
+        home: scope.home,
+        workspaceRoot: scope.workspaceA,
+        envRepo: scope.envRepo,
+      }),
+    );
+  } finally {
+    scope.close();
+  }
+});
+
+test('schema v1 remains headless and rejects incompatible registry shapes', () => {
+  const scope = fixture();
+  try {
+    const registryFile = machineRegistryPath(scope.home);
+    registerWorkspace(registrationOptions(scope));
+    const current = JSON.parse(readFileSync(registryFile, 'utf8'));
+    assert.equal(current.schemaVersion, 1);
+    assert.equal('head' in current.registrations[0], false);
+
+    const headBearing = `${JSON.stringify({
+      ...current,
+      registrations: current.registrations.map((registration) => ({
+        ...registration,
+        head: git(scope.workspaceA, 'rev-parse', 'HEAD'),
+      })),
+    })}\n`;
+    writeFileSync(
+      registryFile,
+      headBearing,
+    );
+    expectCode('MACHINE_REGISTRY_INVALID', () =>
+      checkWorkspace({
+        home: scope.home,
+        workspaceRoot: scope.workspaceA,
+        envRepo: scope.envRepo,
+      }),
+    );
+    assert.equal(readFileSync(registryFile, 'utf8'), headBearing);
+
+    const unsupportedVersion = `${JSON.stringify({
+      ...current,
+      schemaVersion: current.schemaVersion + 1,
+    })}\n`;
+    writeFileSync(registryFile, unsupportedVersion);
+    expectCode('MACHINE_REGISTRY_INVALID', () =>
+      checkWorkspace({
+        home: scope.home,
+        workspaceRoot: scope.workspaceA,
+        envRepo: scope.envRepo,
+      }),
+    );
+    assert.equal(readFileSync(registryFile, 'utf8'), unsupportedVersion);
+  } finally {
+    scope.close();
+  }
+});
+
+test('FLOW-A11 runtime admission needs no task declaration and remains fenced to the prepared Git HEAD', () => {
+  const scope = fixture();
+  try {
+    registerWorkspace(registrationOptions(scope));
+    const request = validateLeaseRequest({
+      ...registrationOptions(scope),
+      resourceKind: 'station.deploy',
+      resourceId: 'station-four',
+      budgetSeconds: 5,
+    });
+    assert.equal(request.source.head, git(scope.workspaceA, 'rev-parse', 'HEAD'));
+
+    const runner = buildLeaseCommand({
+      ...registrationOptions(scope),
+      resourceKind: 'station.deploy',
+      resourceId: 'station-four',
+      budgetSeconds: 5,
+      command: [process.execPath, '-e', 'process.exit(0)'],
+    });
+    writeFileSync(path.join(scope.workspaceA, 'next.txt'), 'next\n');
+    git(scope.workspaceA, 'add', 'next.txt');
+    git(scope.workspaceA, 'commit', '-m', 'test: advance declared source');
+    const result = spawnSync(runner.executable, runner.arguments, {
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /RUNTIME_IDENTITY_MISMATCH/);
+  } finally {
+    scope.close();
+  }
+});
+
+test('profile selection registers once with an available slot and minimum remote capabilities', () => {
+  const scope = fixture();
+  try {
+    registerWorkspace(registrationOptions(scope, { slot: 0 }));
+    const selected = selectWorkspaceProfile({
+      home: scope.home,
+      workspaceRoot: scope.workspaceB,
+      envRepo: scope.envRepo,
+      profile: 'fiveArm',
+      owner: 'machine-dev-test@example.invalid',
+    });
+
+    assert.equal(selected.slot, 1);
+    assert.deepEqual(selected.allowedCapabilities, [
+      'station.connect',
+      'station.deploy',
+    ]);
+    assert.equal(
+      selected.purpose,
+      'Interactive profile selection: fiveArm',
+    );
+
+    updateWorkspace({
+      home: scope.home,
+      workspaceRoot: scope.workspaceB,
+      envRepo: scope.envRepo,
+      capabilities: 'station.connect',
+    });
+    const switched = selectWorkspaceProfile({
+      home: scope.home,
+      workspaceRoot: scope.workspaceB,
+      envRepo: scope.envRepo,
+      profile: 'four',
+      owner: 'machine-dev-test@example.invalid',
+    });
+    assert.equal(switched.slot, 1);
+    assert.deepEqual(switched.allowedCapabilities, selected.allowedCapabilities);
+    assert.equal(switched.registeredAt, selected.registeredAt);
+
+    addProfile(scope, {
+      name: 'local-dev',
+      mode: 'local',
+      stationUrl: 'http://127.0.0.1:18080',
+    });
+    const narrowed = selectWorkspaceProfile({
+      home: scope.home,
+      workspaceRoot: scope.workspaceA,
+      envRepo: scope.envRepo,
+      profile: 'local-dev',
+      owner: 'machine-dev-test@example.invalid',
+    });
+    assert.deepEqual(narrowed.allowedCapabilities, ['station.connect']);
+  } finally {
+    scope.close();
+  }
+});
+
+test('FLOW-A11 unregister is blocked only by ownership and live OS leases', () => {
+  const scope = fixture();
+  try {
+    const registered = registerWorkspace(registrationOptions(scope));
+    expectCode('WORKSPACE_OWNER_MISMATCH', () =>
+      unregisterWorkspace({
+        home: scope.home,
+        workspaceRoot: scope.workspaceA,
+        owner: 'other@example.invalid',
+      }),
+    );
+    expectCode('STATION_CAPABILITY_CONFLICT', () =>
+      unregisterWorkspace({
+        home: scope.home,
+        workspaceRoot: scope.workspaceA,
+        owner: registered.owner,
+        observeLeases: () => ({
+          activeLeases: [
+            {
+              leaseId: 'lease-1',
+              workspaceId: registered.workspaceId,
+            },
+          ],
+        }),
+      }),
+    );
+
+    const removed = unregisterWorkspace({
+      home: scope.home,
+      workspaceRoot: scope.workspaceA,
+      owner: registered.owner,
+      now: new Date('2026-09-17T00:05:00.000Z'),
+      readLedger: () => {
+        throw new Error('task ledger must not be read');
+      },
+      readActiveWorkRecord: () => {
+        throw new Error('active-work must not be read');
+      },
+      readLivePlanMountId: () => {
+        throw new Error('PlanMount must not be read');
+      },
+    });
+    assert.equal(removed.workspaceId, registered.workspaceId);
+    assert.equal(removed.name, registered.name);
+    assert.equal(removed.unregisteredBy, registered.owner);
+    assert.equal(
+      statusAll({ home: scope.home, envRepo: scope.envRepo }).registrations.length,
+      0,
+    );
+  } finally {
+    scope.close();
+  }
+});
+
+test('unregisters a deleted worktree by exact workspace identity', () => {
+  const scope = fixture();
+  try {
+    const registered = registerWorkspace(
+      registrationOptions(scope, {
+        workspaceRoot: scope.workspaceB,
+        slot: 6,
+      }),
+    );
+    rmSync(scope.workspaceB, { recursive: true, force: true });
+
+    const removed = unregisterWorkspaceByIdentity({
+      home: scope.home,
+      workspaceId: registered.workspaceId,
+      owner: registered.owner,
+      now: new Date('2026-10-05T00:00:00.000Z'),
+    });
+
+    assert.equal(removed.workspaceId, registered.workspaceId);
+    assert.equal(removed.unregisteredBy, registered.owner);
+  } finally {
+    scope.close();
+  }
+});
+
+test('profile reset policy is derived from the canonical identifier', () => {
+  assert.equal(resetPolicyForProfile('dailyStable'), 'stable-protected');
+  assert.equal(resetPolicyForProfile('stable-canary'), 'agent-resettable');
+
+  const stableScope = fixture();
+  try {
+    addProfile(stableScope, {
+      name: 'dailyStable',
+      stationUrl: 'http://192.0.2.7:18080',
+      deployEnvironment: 'station-stable',
+      deployHost: '192.0.2.7',
+    });
+    expectCode('PROFILE_RESET_PROTECTED', () =>
+      registerWorkspace(
+        registrationOptions(stableScope, {
+          profile: 'dailyStable',
+          capabilities: 'station.connect,station.deploy,station.reset',
+        }),
+      ),
+    );
+    const registered = registerWorkspace(
+      registrationOptions(stableScope, {
+        profile: 'dailyStable',
+        capabilities: 'station.connect,station.deploy',
+      }),
+    );
+    assert.equal(registered.profile, 'dailyStable');
+    const checked = checkWorkspace({
+      home: stableScope.home,
+      workspaceRoot: stableScope.workspaceA,
+      envRepo: stableScope.envRepo,
+    });
+    assert.equal(checked.profile.resetPolicy, 'stable-protected');
+
+    const selected = selectWorkspaceProfile({
+      home: stableScope.home,
+      workspaceRoot: stableScope.workspaceB,
+      envRepo: stableScope.envRepo,
+      profile: 'dailyStable',
+      owner: 'machine-dev-test@example.invalid',
+    });
+    assert.deepEqual(selected.allowedCapabilities, ['station.connect']);
+  } finally {
+    stableScope.close();
+  }
+});
+
+test(
+  'worktree-local profiles require private owned literal files',
+  { skip: process.platform === 'win32' },
+  () => {
+    const scope = fixture();
+    try {
+      const validFile = addLocalProfile(scope, { name: 'local-private' });
+      const valid = resolveProfileDefinition({
+        workspaceRoot: scope.workspaceA,
+        envRepo: scope.envRepo,
+        profile: 'local-private',
+      });
+      assert.equal(valid.profileFile, realpathSync.native(validFile));
+      assert.equal(valid.sourceState, 'local');
+      registerWorkspace(
+        registrationOptions(scope, {
+          profile: 'local-private',
+          capabilities: 'station.connect',
+        }),
+      );
+      const shellResolution = spawnSync(
+        process.execPath,
+        [
+          cli,
+          'resolve',
+          '--home',
+          scope.home,
+          '--workspace-root',
+          scope.workspaceA,
+          '--env-repo',
+          scope.envRepo,
+          '--format',
+          'shell',
+        ],
+        { encoding: 'utf8' },
+      );
+      assert.equal(shellResolution.status, 0, shellResolution.stderr);
+      assert.match(
+        shellResolution.stdout,
+        /export PT_DEV_PROFILE='local-private'/,
+      );
+      assert.match(
+        shellResolution.stdout,
+        /export PT_STATION_MODE='compose'/,
+      );
+
+      addLocalProfile(scope, {
+        name: 'local-public',
+        mode: 0o644,
+      });
+      expectCode('PROFILE_UNAVAILABLE', () =>
+        resolveProfileDefinition({
+          workspaceRoot: scope.workspaceA,
+          envRepo: scope.envRepo,
+          profile: 'local-public',
+        }),
+      );
+
+      const linkedTarget = path.join(scope.root, 'linked-local.env');
+      writeFileSync(
+        linkedTarget,
+        profileText({
+          name: 'local-linked',
+          mode: 'compose',
+          stationUrl: 'http://127.0.0.1:18080',
+          deployEnvironment: '',
+        }),
+      );
+      chmodSync(linkedTarget, 0o600);
+      const linkedFile = path.join(
+        scope.workspaceA,
+        '.local',
+        'dev',
+        'profiles',
+        'local-linked.env',
+      );
+      symlinkSync(linkedTarget, linkedFile);
+      expectCode('PROFILE_UNAVAILABLE', () =>
+        resolveProfileDefinition({
+          workspaceRoot: scope.workspaceA,
+          envRepo: scope.envRepo,
+          profile: 'local-linked',
+        }),
+      );
+
+      const marker = path.join(scope.root, 'unsafe-profile-side-effect');
+      addLocalProfile(scope, {
+        name: 'local-unsafe',
+        text: profileText({
+          name: 'local-unsafe',
+          mode: 'compose',
+          stationUrl: 'http://127.0.0.1:18080',
+          deployEnvironment: '',
+        }).replace(
+          'PT_STATION_NAME=local-unsafe',
+          `PT_STATION_NAME=$(touch ${marker})`,
+        ),
+      });
+      expectCode('PROFILE_UNAVAILABLE', () =>
+        resolveProfileDefinition({
+          workspaceRoot: scope.workspaceA,
+          envRepo: scope.envRepo,
+          profile: 'local-unsafe',
+        }),
+      );
+      assert.equal(existsSync(marker), false);
+    } finally {
+      scope.close();
+    }
+  },
+);
+
+test('agent-resettable profiles still require exact reset scope identity', () => {
+  const scope = fixture();
+  try {
+    registerWorkspace(registrationOptions(scope));
+    expectCode('RESET_SCOPE_MISMATCH', () =>
+      buildLeaseCommand({
+        ...registrationOptions(scope),
+        resourceKind: 'station.reset',
+        resourceId: 'station-four-fixture',
+        resetScope: 'station-other-fixture',
+        budgetSeconds: 5,
+        command: [process.execPath, '-e', 'process.exit(0)'],
+      }),
+    );
+  } finally {
+    scope.close();
+  }
+});
+
+test('promotes an observed snapshot only through explicit registration', () => {
+  const scope = fixture();
+  try {
+    const registryFile = machineRegistryPath(scope.home);
+    mkdirSync(path.dirname(registryFile), { recursive: true });
+    writeFileSync(
+      registryFile,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'peers-touch-machine-dev-registry',
+        authority: 'observed-snapshot',
+        generatedAt: '2026-09-13T11:05:38Z',
+        registrations: [
+          {
+            workspaceId: 'f'.repeat(16),
+            canonicalRoot: '/tmp/observed-only',
+            name: 'observed-only',
+          },
+        ],
+        discovery: { note: 'diagnostic only' },
+      })}\n`,
+    );
+    expectCode('WORKSPACE_UNREGISTERED', () =>
+      checkWorkspace(registrationOptions(scope)),
+    );
+    const observed = statusAll({ home: scope.home, envRepo: scope.envRepo });
+    assert.deepEqual(observed.registrations, []);
+    assert.equal(
+      observed.unregisteredObservations.observedRegistrations.length,
+      1,
+    );
+    registerWorkspace(registrationOptions(scope));
+    const registry = JSON.parse(readFileSync(registryFile, 'utf8'));
+    assert.equal(registry.authority, 'machine-control-plane');
+    assert.equal(registry.registrations.length, 1);
+    assert.equal(registry.registrations[0].workspaceId.length, 16);
+    assert.deepEqual(registry.discovery, {
+      note: 'diagnostic only',
+      observedRegistrations: [
+        {
+          workspaceId: 'f'.repeat(16),
+          canonicalRoot: '/tmp/observed-only',
+          name: 'observed-only',
+        },
+      ],
+    });
+  } finally {
+    scope.close();
+  }
+});
+
+test('fails closed for unregistered workspaces and durable slot conflicts', () => {
+  const scope = fixture();
+  try {
+    expectCode('WORKSPACE_UNREGISTERED', () =>
+      checkWorkspace(registrationOptions(scope)),
+    );
+    registerWorkspace(registrationOptions(scope));
+    expectCode('LOCAL_SLOT_CONFLICT', () =>
+      registerWorkspace(
+        registrationOptions(scope, {
+          workspaceRoot: scope.workspaceB,
+          profile: 'fiveArm',
+          capabilities: 'station.connect',
+        }),
+      ),
+    );
+  } finally {
+    scope.close();
+  }
+});
+
+test('fails closed for dirty and untracked selected profile definitions', () => {
+  const dirtyScope = fixture();
+  try {
+    writeFileSync(
+      path.join(
+        dirtyScope.envRepo,
+        'peers-touch',
+        'four',
+        'profile.env.example',
+      ),
+      `${profileText({
+        name: 'four',
+        stationUrl: 'http://192.0.2.4:18080',
+        deployEnvironment: 'station-four',
+      })}# dirty\n`,
+    );
+    expectCode('PROFILE_UNAVAILABLE', () =>
+      registerWorkspace(registrationOptions(dirtyScope)),
+    );
+  } finally {
+    dirtyScope.close();
+  }
+
+  const untrackedScope = fixture();
+  try {
+    addProfile(untrackedScope, {
+      name: 'untracked',
+      stationUrl: 'http://192.0.2.8:18080',
+      deployEnvironment: 'station-untracked',
+      deployHost: '192.0.2.8',
+      tracked: false,
+    });
+    expectCode('PROFILE_UNAVAILABLE', () =>
+      registerWorkspace(
+        registrationOptions(untrackedScope, { profile: 'untracked' }),
+      ),
+    );
+  } finally {
+    untrackedScope.close();
+  }
+});
+
+test('rejects local, compose, loopback, and mismatched deploy targets for Station mutation', () => {
+  for (const candidate of [
+    {
+      name: 'local-profile',
+      mode: 'local',
+      stationUrl: 'http://127.0.0.1:18580',
+      deployEnvironment: '',
+      deployHost: '',
+      code: 'PROFILE_UNAVAILABLE',
+    },
+    {
+      name: 'compose-profile',
+      mode: 'compose',
+      stationUrl: 'http://127.0.0.1:18580',
+      deployEnvironment: '',
+      deployHost: '',
+      code: 'PROFILE_UNAVAILABLE',
+    },
+    {
+      name: 'loopback-profile',
+      mode: 'remote',
+      stationUrl: 'http://127.0.0.1:18080',
+      deployEnvironment: 'station-loopback',
+      deployHost: '127.0.0.1',
+      code: 'PROFILE_UNAVAILABLE',
+    },
+    {
+      name: 'mismatch-profile',
+      mode: 'remote',
+      stationUrl: 'http://192.0.2.9:18080',
+      deployEnvironment: 'station-mismatch',
+      deployHost: '192.0.2.10',
+      code: 'DEPLOY_TARGET_MISMATCH',
+    },
+  ]) {
+    const scope = fixture();
+    try {
+      addProfile(scope, candidate);
+      expectCode(candidate.code, () =>
+        registerWorkspace(
+          registrationOptions(scope, {
+            profile: candidate.name,
+            capabilities: 'station.connect,station.deploy',
+          }),
+        ),
+      );
+    } finally {
+      scope.close();
+    }
+  }
+});
+
+test('malformed authoritative registry fails closed without replacement', () => {
+  const scope = fixture();
+  try {
+    const registryFile = machineRegistryPath(scope.home);
+    mkdirSync(path.dirname(registryFile), { recursive: true });
+    writeFileSync(
+      registryFile,
+      '{"schemaVersion":1,"kind":"peers-touch-machine-dev-registry","authority":"machine-control-plane","updatedAt":"invalid","registrations":[]}\n',
+    );
+    const before = readFileSync(registryFile, 'utf8');
+    expectCode('MACHINE_REGISTRY_INVALID', () =>
+      registerWorkspace(registrationOptions(scope)),
+    );
+    assert.equal(readFileSync(registryFile, 'utf8'), before);
+  } finally {
+    scope.close();
+  }
+});
+
+test('FLOW-A12 capability, stable policy, and target mismatch reject before command side effects', () => {
+  const scope = fixture();
+  try {
+    registerWorkspace(
+      registrationOptions(scope, {
+        capabilities: 'station.connect',
+      }),
+    );
+    const marker = path.join(scope.root, 'forbidden-side-effect');
+    const missingCapability = spawnSync(
+      process.execPath,
+      leaseArguments(scope, 'station.deploy', 'station-four', 5, [
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`,
+      ]),
+      { encoding: 'utf8' },
+    );
+    assert.equal(missingCapability.status, 2);
+    assert.match(missingCapability.stderr, /WORKSPACE_CAPABILITY_MISSING/);
+    assert.equal(existsSync(marker), false);
+
+    updateWorkspace(
+      registrationOptions(scope, {
+        capabilities: 'station.connect,station.deploy',
+      }),
+    );
+    const wrongTarget = spawnSync(
+      process.execPath,
+      leaseArguments(scope, 'station.deploy', 'station-five', 5, [
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`,
+      ]),
+      { encoding: 'utf8' },
+    );
+    assert.equal(wrongTarget.status, 2);
+    assert.match(wrongTarget.stderr, /DEPLOY_TARGET_MISMATCH/);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    scope.close();
+  }
+});
+
+test('FLOW-A13 profile aliases for one reviewed target contend on the same OS lease', async () => {
+  const scope = fixture();
+  let holder;
+  try {
+    addProfile(scope, {
+      name: 'fourAlias',
+      stationUrl: 'http://192.0.2.4:18080',
+      deployEnvironment: 'station-four',
+      deployHost: '192.0.2.4',
+      writeDeployDefinition: false,
+    });
+    registerWorkspace(registrationOptions(scope));
+    registerWorkspace(
+      registrationOptions(scope, {
+        workspaceRoot: scope.workspaceB,
+        profile: 'fourAlias',
+        slot: 6,
+      }),
+    );
+    const marker = path.join(scope.root, 'alias-lease-held');
+    holder = spawn(
+      process.execPath,
+      leaseArguments(scope, 'station.deploy', 'station-four', 30, [
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'held'); setInterval(() => {}, 1000)`,
+      ]),
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let holderError = '';
+    holder.stderr.setEncoding('utf8');
+    holder.stderr.on('data', (chunk) => {
+      holderError += chunk;
+    });
+    const holderExit = waitForChild(holder);
+    await waitForFile(
+      marker,
+      () => `exitCode=${holder.exitCode} stderr=${holderError}`,
+    );
+
+    const contender = spawnSync(
+      process.execPath,
+      [
+        cli,
+        'lease',
+        '--home',
+        scope.home,
+        '--workspace-root',
+        scope.workspaceB,
+        '--env-repo',
+        scope.envRepo,
+        '--resource-kind',
+        'station.deploy',
+        '--resource-id',
+        'station-four',
+        '--budget-seconds',
+        '5',
+        '--',
+        process.execPath,
+        '-e',
+        'process.exit(0)',
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(contender.status, 2);
+    assert.match(contender.stderr, /STATION_CAPABILITY_CONFLICT/);
+
+    holder.kill('SIGTERM');
+    const result = await holderExit;
+    holder = null;
+    assert.equal(result.code, 143, holderError);
+  } finally {
+    if (holder && holder.exitCode === null) holder.kill('SIGKILL');
+    scope.close();
+  }
+});
+
+for (const leaseCase of [
+  {
+    resourceKind: 'local.slot',
+    resourceId: '5',
+    conflictCode: 'LOCAL_SLOT_CONFLICT',
+  },
+  {
+    resourceKind: 'station.deploy',
+    resourceId: 'station-four',
+    conflictCode: 'STATION_CAPABILITY_CONFLICT',
+  },
+  {
+    resourceKind: 'station.reset',
+    resourceId: 'station-four-fixture',
+    conflictCode: 'STATION_CAPABILITY_CONFLICT',
+  },
+]) {
+  test(`${leaseCase.resourceKind} is OS-held and releases on success, failure, signal, timeout, and stale metadata`, async () => {
+    const scope = fixture();
+    let holder;
+    try {
+      registerWorkspace(registrationOptions(scope));
+      const marker = path.join(scope.root, `${leaseCase.resourceKind}.ready`);
+      holder = spawn(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          30,
+          [
+            process.execPath,
+            '-e',
+            `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); setInterval(() => {}, 1000);`,
+          ],
+        ),
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      );
+      let holderError = '';
+      holder.stderr.setEncoding('utf8');
+      holder.stderr.on('data', (chunk) => {
+        holderError += chunk;
+      });
+      const holderResult = waitForChild(holder);
+      await waitForFile(
+        marker,
+        () => `exitCode=${holder.exitCode} stderr=${holderError}`,
+      );
+
+      const active = observeLeases({ home: scope.home });
+      assert.equal(active.activeLeases.length, 1);
+      assert.equal(active.activeLeases[0].resourceKind, leaseCase.resourceKind);
+      assert.equal(active.activeLeases[0].resourceId, leaseCase.resourceId);
+      assert.ok(Number.isInteger(active.activeLeases[0].ownerPid));
+      assert.ok(active.activeLeases[0].ownerProcessStart);
+
+      const competitor = spawnSync(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          5,
+          [process.execPath, '-e', 'process.exit(0)'],
+        ),
+        { encoding: 'utf8' },
+      );
+      assert.equal(competitor.status, 2);
+      assert.match(competitor.stderr, new RegExp(leaseCase.conflictCode));
+
+      holder.kill('SIGTERM');
+      const signalled = await holderResult;
+      assert.equal(
+        signalled.code,
+        143,
+        `unexpected signal result: ${JSON.stringify(signalled)} ${holderError}`,
+      );
+      holder = null;
+      assert.equal(observeLeases({ home: scope.home }).activeLeases.length, 0);
+
+      const success = spawnSync(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          5,
+          [process.execPath, '-e', 'process.exit(0)'],
+        ),
+        { encoding: 'utf8' },
+      );
+      assert.equal(success.status, 0, success.stderr);
+
+      const inheritedVerification = spawnSync(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          20,
+          [
+            process.execPath,
+            cli,
+            'verify-held',
+            '--home',
+            scope.home,
+            '--workspace-root',
+            scope.workspaceA,
+            '--resource-kind',
+            leaseCase.resourceKind,
+            '--resource-id',
+            leaseCase.resourceId,
+          ],
+        ),
+        { encoding: 'utf8' },
+      );
+      assert.equal(
+        inheritedVerification.status,
+        0,
+        inheritedVerification.stderr,
+      );
+
+      const failure = spawnSync(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          5,
+          [process.execPath, '-e', 'process.exit(7)'],
+        ),
+        { encoding: 'utf8' },
+      );
+      assert.equal(failure.status, 7, failure.stderr);
+      assert.equal(observeLeases({ home: scope.home }).activeLeases.length, 0);
+
+      const timeout = spawnSync(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          1,
+          [process.execPath, '-e', 'setTimeout(() => {}, 10000)'],
+        ),
+        { encoding: 'utf8', timeout: 5_000 },
+      );
+      assert.equal(timeout.status, 124, timeout.stderr);
+      assert.match(timeout.stderr, /LEASE_BUDGET_EXCEEDED/);
+      assert.equal(observeLeases({ home: scope.home }).activeLeases.length, 0);
+
+      const leaseFile = machineLeasePath(
+        leaseCase.resourceKind,
+        leaseCase.resourceId,
+        scope.home,
+      );
+      writeFileSync(
+        leaseFile,
+        `${JSON.stringify({
+          leaseId: 'stale',
+          resourceKind: leaseCase.resourceKind,
+          resourceId: leaseCase.resourceId,
+          workspaceId: 'f'.repeat(16),
+          ownerPid: 999_999,
+          ownerProcessStart: 'stale',
+          acquiredAt: '2026-09-13T00:00:00.000Z',
+          expiresAt: '2026-09-13T00:00:01.000Z',
+        })}\n`,
+      );
+      assert.equal(observeLeases({ home: scope.home }).staleMetadata.length, 1);
+      const staleRecovery = spawnSync(
+        process.execPath,
+        leaseArguments(
+          scope,
+          leaseCase.resourceKind,
+          leaseCase.resourceId,
+          5,
+          [process.execPath, '-e', 'process.exit(0)'],
+        ),
+        { encoding: 'utf8' },
+      );
+      assert.equal(staleRecovery.status, 0, staleRecovery.stderr);
+      const finalObservation = observeLeases({ home: scope.home });
+      assert.deepEqual(finalObservation.activeLeases, []);
+      assert.deepEqual(finalObservation.staleMetadata, []);
+    } finally {
+      if (holder && holder.exitCode === null) holder.kill('SIGKILL');
+      scope.close();
+    }
+  });
+}
+
+test('FLOW-A11 deploy lease is admitted by the binding without an owner-action bypass', () => {
+  const scope = fixture();
+  try {
+    registerWorkspace(
+      registrationOptions(scope, {
+        capabilities: 'station.connect,station.deploy,station.reset',
+      }),
+    );
+    const marker = path.join(scope.root, 'binding-authorized-station-deploy');
+    const allowed = spawnSync(
+      process.execPath,
+      leaseArguments(
+        scope,
+        'station.deploy',
+        'station-four',
+        5,
+        [
+          process.execPath,
+          '-e',
+          `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready')`,
+        ],
+      ),
+      { encoding: 'utf8' },
+    );
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.equal(readFileSync(marker, 'utf8'), 'ready');
+
+    const bypassMarker = path.join(scope.root, 'owner-action-bypass');
+    const rejected = spawnSync(
+      process.execPath,
+      [
+        cli,
+        'lease',
+        '--home',
+        scope.home,
+        '--workspace-root',
+        scope.workspaceA,
+        '--env-repo',
+        scope.envRepo,
+        '--resource-kind',
+        'station.deploy',
+        '--resource-id',
+        'station-four',
+        '--budget-seconds',
+        '5',
+        '--owner-action',
+        'make.station',
+        '--',
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(bypassMarker)}, 'ran')`,
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /unsupported option: --owner-action/);
+    assert.equal(existsSync(bypassMarker), false);
+  } finally {
+    scope.close();
+  }
+});
+
+test('lease acquisition waits for the workspace lifecycle fence before validation', async () => {
+  const scope = fixture();
+  let child;
+  let lifecycle;
+  try {
+    registerWorkspace(registrationOptions(scope));
+    lifecycle = acquireWorkspaceLifecycleLockSync({
+      home: scope.home,
+      workspaceRoot: scope.workspaceA,
+    });
+    const marker = path.join(scope.root, 'lease-command-ran');
+    const runner = buildLeaseCommand({
+      ...registrationOptions(scope),
+      resourceKind: 'local.slot',
+      resourceId: '5',
+      budgetSeconds: 10,
+      command: [
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`,
+      ],
+    });
+    child = spawn(runner.executable, runner.arguments, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const childExit = new Promise((resolve) => {
+      child.once('close', (code) => resolve({ code, stdout, stderr }));
+    });
+
+    const deadline = Date.now() + 5_000;
+    let active = [];
+    while (Date.now() < deadline) {
+      active = observeLeases({ home: scope.home }).activeLeases;
+      if (active.some((lease) => lease.workspaceId === workspaceIdForRoot(scope.workspaceA))) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(
+      active.some((lease) => lease.workspaceId === workspaceIdForRoot(scope.workspaceA)),
+      true,
+    );
+    assert.equal(existsSync(marker), false);
+    assert.equal(child.exitCode, null);
+
+    lifecycle.release();
+    lifecycle = null;
+    const result = await childExit;
+    child = null;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(existsSync(marker), true);
+  } finally {
+    if (lifecycle) lifecycle.release();
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+    scope.close();
+  }
+});
+
+test('post-lock validation rejects a binding changed after lease preparation', () => {
+  const scope = fixture();
+  try {
+    const registration = registerWorkspace(registrationOptions(scope));
+    const leaseFile = machineLeasePath('local.slot', '5', scope.home);
+    mkdirSync(path.dirname(leaseFile), { recursive: true });
+    const forged = spawnSync(process.execPath, ['-e', `
+      const { execFileSync, spawnSync } = require('node:child_process');
+      const { openSync, writeFileSync } = require('node:fs');
+      const fd = openSync(${JSON.stringify(leaseFile)}, 'w+');
+      const processStart = execFileSync(
+        'ps',
+        ['-o', 'lstart=', '-p', String(process.pid)],
+        { encoding: 'utf8' },
+      ).trim();
+      writeFileSync(fd, JSON.stringify({
+        leaseId: 'forged',
+        resourceKind: 'local.slot',
+        resourceId: '5',
+        workspaceId: ${JSON.stringify(registration.workspaceId)},
+        ownerPid: process.pid,
+        ownerProcessStart: processStart,
+        acquiredAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 5000).toISOString(),
+      }));
+      const result = spawnSync(
+        process.execPath,
+        [
+          ${JSON.stringify(cli)},
+          'verify-held',
+          '--home',
+          ${JSON.stringify(scope.home)},
+          '--workspace-root',
+          ${JSON.stringify(scope.workspaceA)},
+          '--resource-kind',
+          'local.slot',
+          '--resource-id',
+          '5',
+        ],
+        {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PT_MACHINE_LEASE_FD: '3',
+            PT_MACHINE_LEASE_ID: 'forged',
+          },
+          stdio: ['ignore', 'pipe', 'pipe', fd],
+        },
+      );
+      process.stdout.write(result.stdout || '');
+      process.stderr.write(result.stderr || '');
+      process.exit(result.status ?? 2);
+    `], { encoding: 'utf8' });
+    assert.equal(forged.status, 2);
+    assert.match(
+      forged.stderr,
+      /inherited file descriptor does not hold the canonical lease/,
+    );
+
+    const runner = buildLeaseCommand({
+      ...registrationOptions(scope),
+      resourceKind: 'local.slot',
+      resourceId: '5',
+      budgetSeconds: 5,
+      command: [
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(path.join(scope.root, 'unexpected'))}, 'ran')`,
+      ],
+    });
+
+    updateWorkspace(registrationOptions(scope, { slot: 6 }));
+    const result = spawnSync(runner.executable, runner.arguments, {
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /RUNTIME_IDENTITY_MISMATCH/);
+    assert.equal(existsSync(path.join(scope.root, 'unexpected')), false);
+  } finally {
+    scope.close();
+  }
+});
+
+test('lease remains held when the Python supervisor is killed', async () => {
+  const scope = fixture();
+  let holder;
+  let mutationPid = null;
+  try {
+    registerWorkspace(registrationOptions(scope));
+    const marker = path.join(scope.root, 'sigkill-child.json');
+    const runner = buildLeaseCommand({
+      ...registrationOptions(scope),
+      resourceKind: 'local.slot',
+      resourceId: '5',
+      budgetSeconds: 30,
+      command: [
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify({pid:process.pid})); setInterval(() => {}, 1000);`,
+      ],
+    });
+    holder = spawn(runner.executable, runner.arguments, {
+      stdio: 'ignore',
+    });
+    const holderExit = new Promise((resolve) => {
+      holder.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    await waitForFile(
+      marker,
+      () => `exitCode=${holder.exitCode}`,
+    );
+    mutationPid = JSON.parse(readFileSync(marker, 'utf8')).pid;
+
+    holder.kill('SIGKILL');
+    await holderExit;
+    holder = null;
+
+    const competitor = spawnSync(
+      process.execPath,
+      leaseArguments(scope, 'local.slot', '5', 5, [
+        process.execPath,
+        '-e',
+        'process.exit(0)',
+      ]),
+      { encoding: 'utf8' },
+    );
+    assert.equal(competitor.status, 2);
+    assert.match(competitor.stderr, /LOCAL_SLOT_CONFLICT/);
+
+    process.kill(mutationPid, 'SIGTERM');
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(mutationPid, 0);
+      } catch {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    mutationPid = null;
+    const recovered = spawnSync(
+      process.execPath,
+      leaseArguments(scope, 'local.slot', '5', 5, [
+        process.execPath,
+        '-e',
+        'process.exit(0)',
+      ]),
+      { encoding: 'utf8' },
+    );
+    assert.equal(recovered.status, 0, recovered.stderr);
+  } finally {
+    if (holder && holder.exitCode === null) holder.kill('SIGKILL');
+    if (mutationPid !== null) {
+      try {
+        process.kill(mutationPid, 'SIGKILL');
+      } catch {
+        // The mutation process may have already exited.
+      }
+    }
+    scope.close();
+  }
+});

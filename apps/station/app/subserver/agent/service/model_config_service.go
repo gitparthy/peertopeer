@@ -1,0 +1,394 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/catalog"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/errcode"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/infrastructure/persistence"
+	"github.com/peers-labs/peers-touch/station/frame/core/logger"
+	"github.com/peers-labs/peers-touch/station/frame/core/store"
+)
+
+type ModelConfigService struct{}
+
+func NewModelConfigService() *ModelConfigService {
+	return &ModelConfigService{}
+}
+
+type ModelCreateRequest struct {
+	Scope         string
+	ActorPTID     string
+	ProviderID    string
+	ModelID       string
+	DisplayName   string
+	Enabled       bool
+	Capabilities  map[string]bool
+	ContextWindow int
+}
+
+type ModelUpdateRequest struct {
+	Scope         string
+	ActorPTID     string
+	ProviderID    string
+	ModelID       string
+	Version       int64
+	DisplayName   *string
+	Enabled       *bool
+	Capabilities  map[string]bool
+	ContextWindow *int
+}
+
+type EffectiveProviderModel struct {
+	ID             string
+	DisplayName    string
+	Type           string
+	Enabled        bool
+	ContextWindow  int
+	Capabilities   map[string]bool
+	PersistedModel *persistence.AgentModel
+}
+
+func ResolveEffectiveProviderModels(
+	provider *catalog.CatalogProvider,
+	persistedModels []persistence.AgentModel,
+	hidden []string,
+) ([]EffectiveProviderModel, error) {
+	persistedByID := make(map[string]*persistence.AgentModel, len(persistedModels))
+	for i := range persistedModels {
+		persistedByID[persistedModels[i].ModelID] = &persistedModels[i]
+	}
+
+	catalogIDs := make(map[string]bool, len(provider.Models))
+	result := make([]EffectiveProviderModel, 0, len(provider.Models)+len(persistedModels))
+	for i := range provider.Models {
+		catalogModel := &provider.Models[i]
+		catalogIDs[catalogModel.ID] = true
+		if containsModelID(hidden, catalogModel.ID) {
+			continue
+		}
+
+		persistedModel := persistedByID[catalogModel.ID]
+		capabilities, err := resolveModelCapabilityFacts(catalogModel, persistedModel)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"model %q capability metadata is invalid: %w",
+				catalogModel.ID,
+				err,
+			)
+		}
+		displayName := catalogModel.DisplayName
+		contextWindow := catalogModel.ContextWindow
+		enabled := catalogModel.Enabled
+		if persistedModel != nil {
+			enabled = enabled && persistedModel.Enabled
+			if strings.TrimSpace(persistedModel.DisplayName) != "" {
+				displayName = persistedModel.DisplayName
+			}
+			if persistedModel.ContextWindow > 0 {
+				contextWindow = persistedModel.ContextWindow
+			}
+		}
+		result = append(result, EffectiveProviderModel{
+			ID:             catalogModel.ID,
+			DisplayName:    displayName,
+			Type:           catalogModel.Type,
+			Enabled:        enabled,
+			ContextWindow:  contextWindow,
+			Capabilities:   map[string]bool(capabilities),
+			PersistedModel: persistedModel,
+		})
+	}
+	for i := range persistedModels {
+		persistedModel := &persistedModels[i]
+		if catalogIDs[persistedModel.ModelID] ||
+			containsModelID(hidden, persistedModel.ModelID) {
+			continue
+		}
+		capabilities, err := resolveModelCapabilityFacts(nil, persistedModel)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"model %q capability metadata is invalid: %w",
+				persistedModel.ModelID,
+				err,
+			)
+		}
+		result = append(result, EffectiveProviderModel{
+			ID:             persistedModel.ModelID,
+			DisplayName:    persistedModel.DisplayName,
+			Type:           "chat",
+			Enabled:        persistedModel.Enabled,
+			ContextWindow:  persistedModel.ContextWindow,
+			Capabilities:   map[string]bool(capabilities),
+			PersistedModel: persistedModel,
+		})
+	}
+
+	return result, nil
+}
+
+func containsModelID(modelIDs []string, modelID string) bool {
+	for _, candidate := range modelIDs {
+		if candidate == modelID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *ModelConfigService) List(ctx context.Context, actorPTID, providerID string) ([]persistence.AgentModel, error) {
+	if err := NewProviderConfigService().RequirePersonal(ctx, actorPTID); err != nil {
+		return nil, err
+	}
+	return s.ListOwned(ctx, ActorProviderOwner(actorPTID), providerID)
+}
+
+func (s *ModelConfigService) ListOwned(ctx context.Context, owner ProviderOwner, providerID string) ([]persistence.AgentModel, error) {
+	if err := owner.Validate(); err != nil {
+		return nil, err
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var models []persistence.AgentModel
+	if err := owner.Query(db.WithContext(ctx)).
+		Where("provider_id = ?", providerID).
+		Order("created_at ASC").
+		Find(&models).Error; err != nil {
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to list models", err)
+	}
+
+	return models, nil
+}
+
+func (s *ModelConfigService) Create(ctx context.Context, req ModelCreateRequest) (*persistence.AgentModel, error) {
+	owner := requestProviderOwner(req.Scope, req.ActorPTID)
+	if err := NewProviderConfigService().validateManagementOwner(ctx, owner); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(req.ProviderID) == "" || len(req.ProviderID) > 128 ||
+		strings.TrimSpace(req.ModelID) == "" || len(req.ModelID) > 128 ||
+		len(req.DisplayName) > 256 || !validModelContextWindow(req.ProviderID, req.ModelID, req.ContextWindow) {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest, "model configuration is invalid", nil)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	capabilitiesJSON, err := EncodeModelCapabilityFlags(req.Capabilities)
+	if err != nil {
+		return nil, errcode.New(
+			errcode.AgentInvalidRequest,
+			http.StatusBadRequest,
+			"invalid model capabilities",
+			err,
+		)
+	}
+
+	var existing persistence.AgentModel
+	if err := owner.Query(db.WithContext(ctx)).
+		Where("provider_id = ? AND model_id = ?", req.ProviderID, req.ModelID).
+		First(&existing).Error; err == nil {
+		return nil, errcode.New(errcode.AgentVersionConflict, http.StatusConflict, "model is already configured", nil)
+	} else if err != gorm.ErrRecordNotFound {
+		return nil, err
+	}
+
+	model := persistence.AgentModel{
+		ID:               uuid.New().String(),
+		Scope:            owner.Scope,
+		ActorPTID:        req.ActorPTID,
+		ProviderID:       req.ProviderID,
+		ModelID:          req.ModelID,
+		DisplayName:      req.DisplayName,
+		Enabled:          req.Enabled,
+		CapabilitiesJSON: capabilitiesJSON,
+		ContextWindow:    req.ContextWindow,
+		Version:          1,
+	}
+
+	now := time.Now()
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var provider persistence.AgentProvider
+		if err := owner.Query(tx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&provider, "name = ?", req.ProviderID).Error; err != nil {
+			return err
+		}
+		if provider.BackendProviderID != "" {
+			return invalidCLIProfile("model definitions belong to the referenced connection")
+		}
+		var count int64
+		if err := owner.Query(tx.Model(&persistence.AgentModel{})).
+			Where("provider_id = ? AND model_id = ?", req.ProviderID, req.ModelID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return errcode.New(errcode.AgentVersionConflict, http.StatusConflict, "model was configured concurrently", nil)
+		}
+		if err := tx.Table(model.TableName()).
+			Create(map[string]interface{}{
+				"id":                model.ID,
+				"scope":             model.Scope,
+				"actor_ptid":        model.ActorPTID,
+				"provider_id":       model.ProviderID,
+				"model_id":          model.ModelID,
+				"display_name":      model.DisplayName,
+				"enabled":           model.Enabled,
+				"capabilities_json": model.CapabilitiesJSON,
+				"context_window":    model.ContextWindow,
+				"version":           model.Version,
+				"created_at":        now,
+				"updated_at":        now,
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&provider).Update("version", gorm.Expr("version + 1")).Error
+	}); err != nil {
+		if business, ok := err.(*errcode.BizError); ok {
+			return nil, business
+		}
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to create model", err)
+	}
+	if err := db.WithContext(ctx).
+		Where("id = ?", model.ID).
+		First(&model).Error; err != nil {
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to reload created model", err)
+	}
+
+	logger.Infof(ctx, "model created: actor_ptid=%s, provider=%s, model=%s", req.ActorPTID, req.ProviderID, req.ModelID)
+	return &model, nil
+}
+
+func (s *ModelConfigService) Update(ctx context.Context, req ModelUpdateRequest) (*persistence.AgentModel, error) {
+	owner := requestProviderOwner(req.Scope, req.ActorPTID)
+	if err := NewProviderConfigService().validateManagementOwner(ctx, owner); err != nil {
+		return nil, err
+	}
+	if (req.DisplayName != nil && len(*req.DisplayName) > 256) ||
+		(req.ContextWindow != nil && !validModelContextWindow(req.ProviderID, req.ModelID, *req.ContextWindow)) {
+		return nil, errcode.New(errcode.AgentInvalidRequest, http.StatusBadRequest, "model configuration is invalid", nil)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var model persistence.AgentModel
+	if err := owner.Query(db.WithContext(ctx)).
+		Where("provider_id = ? AND model_id = ?", req.ProviderID, req.ModelID).
+		First(&model).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, errcode.New(errcode.AgentNotFound, http.StatusNotFound,
+				fmt.Sprintf("model %q not found for provider %q", req.ModelID, req.ProviderID), nil)
+		}
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to query model", err)
+	}
+
+	if model.Version != req.Version {
+		return nil, errcode.New(errcode.AgentVersionConflict, http.StatusConflict,
+			fmt.Sprintf("version conflict: current=%d, submitted=%d", model.Version, req.Version), nil)
+	}
+
+	updates := map[string]interface{}{
+		"version":    model.Version + 1,
+		"updated_at": time.Now(),
+	}
+	if req.DisplayName != nil {
+		updates["display_name"] = *req.DisplayName
+	}
+	if req.Enabled != nil {
+		updates["enabled"] = *req.Enabled
+	}
+	if req.Capabilities != nil {
+		capabilitiesJSON, encodeErr := EncodeModelCapabilityFlags(req.Capabilities)
+		if encodeErr != nil {
+			return nil, errcode.New(
+				errcode.AgentInvalidRequest,
+				http.StatusBadRequest,
+				"invalid model capabilities",
+				encodeErr,
+			)
+		}
+		updates["capabilities_json"] = capabilitiesJSON
+	}
+	if req.ContextWindow != nil {
+		updates["context_window"] = *req.ContextWindow
+	}
+
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var provider persistence.AgentProvider
+		if err := owner.Query(tx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&provider, "name = ?", req.ProviderID).Error; err != nil {
+			return err
+		}
+		if provider.BackendProviderID != "" {
+			return invalidCLIProfile("model definitions belong to the referenced connection")
+		}
+		result := tx.Model(&model).Where("version = ?", req.Version).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errcode.New(errcode.AgentVersionConflict, http.StatusConflict, "model changed during update", nil)
+		}
+		return tx.Model(&provider).Update("version", gorm.Expr("version + 1")).Error
+	}); err != nil {
+		if business, ok := err.(*errcode.BizError); ok {
+			return nil, business
+		}
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to update model", err)
+	}
+
+	if err := db.WithContext(ctx).
+		Where("id = ?", model.ID).
+		First(&model).Error; err != nil {
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"failed to reload updated model", err)
+	}
+	logger.Infof(ctx, "model updated: actor=%s, provider=%s, model=%s, version=%d",
+		req.ActorPTID, req.ProviderID, req.ModelID, model.Version)
+	return &model, nil
+}
+
+func (s *ModelConfigService) getDB(ctx context.Context) (*gorm.DB, error) {
+	db, err := store.GetRDS(ctx, store.WithRDSDBName("agent"))
+	if err != nil {
+		return nil, errcode.New(errcode.AgentInternal, http.StatusInternalServerError,
+			"database unavailable", err)
+	}
+	return db, nil
+}
+
+func validModelContextWindow(providerID, modelID string, window int) bool {
+	if window > 1 {
+		return true
+	}
+	// Zero is an inheritance marker only when the catalog supplies usable
+	// context. A custom model has no fallback and would disappear at admission.
+	if window == 0 {
+		if provider := catalog.Find(providerID); provider != nil {
+			for _, model := range provider.Models {
+				if model.ID == modelID {
+					return model.ContextWindow > 1
+				}
+			}
+		}
+	}
+	return false
+}

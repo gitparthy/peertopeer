@@ -1,0 +1,813 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => {
+  const session = {
+    authenticated: true,
+    sessionEpoch: 1,
+    currentUser: {
+      actorPtid: 'ptid:person:old',
+      name: 'Old',
+      email: '',
+      loginMethod: 'password',
+    } as {
+      actorPtid: string;
+      name: string;
+      email: string;
+      loginMethod: string;
+      avatarUrl?: string;
+      avatarLocalPath?: string;
+      avatarState?: 'ready' | 'absent' | 'failed';
+      profileRevision?: number;
+    } | null,
+  };
+  return {
+    order: [] as string[],
+    session,
+    accountSwitch: vi.fn(),
+    accountUnlock: vi.fn(),
+    authValidateToken: vi.fn(),
+    stationList: vi.fn(),
+    stationSetActive: vi.fn(),
+    accountListRestorable: vi.fn(),
+    accountLoad: vi.fn(),
+    accessStart: vi.fn(),
+    accessSubmitLogin: vi.fn(),
+    restoreSession: vi.fn(),
+    loginWithPassword: vi.fn(),
+    loginWithOAuth: vi.fn(),
+    logout: vi.fn(),
+    stationBindingComplete: vi.fn(),
+    resetSession: vi.fn(),
+    runIdentityPipeline: vi.fn(),
+    clearLocalIdentityAction: vi.fn(),
+    avatarPrepare: vi.fn(async () => ({
+      status: 'ready',
+      snapshot: { phase: 'ready', src: 'asset:///cache/a.png', degraded: false, identity: '/a.png' },
+    })),
+    avatarBindSession: vi.fn(),
+    avatarUnbindSession: vi.fn(),
+  };
+});
+
+vi.stubGlobal('window', {
+  location: { hash: '#/agent' },
+  history: { replaceState: vi.fn() },
+  sessionStorage: {
+    getItem: vi.fn(() => null),
+    setItem: vi.fn(),
+    removeItem: vi.fn(),
+  },
+});
+
+vi.mock('../store/accountIdentity', () => ({
+  useAccountIdentityStore: {
+    getState: () => ({ load: mocks.accountLoad }),
+  },
+}));
+
+vi.mock('../store/oauth2', () => ({
+  useOAuth2Store: {
+    getState: () => ({
+      completedLoopbackSessionId: 'lp-completed',
+      loadAll: vi.fn(async () => undefined),
+    }),
+  },
+}));
+
+vi.mock('../store/session', () => ({
+  useSessionStore: {
+    getState: () => ({
+      ...mocks.session,
+      activateAuthenticatedSession: (response: { actor_ptid?: string }) => {
+        mocks.order.push('activate');
+        mocks.session.currentUser = {
+          actorPtid: response.actor_ptid ?? '',
+          name: 'New',
+          email: '',
+          loginMethod: 'password',
+        };
+        mocks.session.authenticated = true;
+      },
+      accessStart: mocks.accessStart,
+      accessSubmitLogin: mocks.accessSubmitLogin,
+      loginWithPassword: mocks.loginWithPassword,
+      loginWithOAuth: mocks.loginWithOAuth,
+      restoreSession: mocks.restoreSession,
+      updateProfile: vi.fn((patch: Record<string, unknown>) => {
+        if (mocks.session.currentUser) {
+          Object.assign(mocks.session.currentUser, {
+            name: patch.name ?? mocks.session.currentUser.name,
+            email: patch.email ?? mocks.session.currentUser.email,
+            avatarUrl: 'avatarUrl' in patch ? patch.avatarUrl : mocks.session.currentUser.avatarUrl,
+            avatarLocalPath: patch.avatarLocalPath ?? mocks.session.currentUser.avatarLocalPath,
+            avatarState: 'avatarState' in patch ? patch.avatarState : mocks.session.currentUser.avatarState,
+            profileRevision: patch.profileRevision ?? mocks.session.currentUser.profileRevision,
+          });
+        }
+      }),
+      logout: mocks.logout,
+      reset: mocks.resetSession,
+    }),
+  },
+}));
+
+vi.mock('../store/socialChat', () => ({
+  useSocialChatStore: {
+    getState: () => ({ loadCurrentUserProfile: vi.fn() }),
+  },
+}));
+
+vi.mock('../services/identity_event', () => ({
+  clearLocalIdentityAction: mocks.clearLocalIdentityAction,
+  markLocalIdentityAction: vi.fn(),
+}));
+
+vi.mock('../services/identityPipeline', () => ({
+  runIdentityPipeline: mocks.runIdentityPipeline,
+}));
+
+vi.mock('../services/avatarAssets', () => ({
+  avatarAssets: {
+    prepare: mocks.avatarPrepare,
+    bindSession: mocks.avatarBindSession,
+    unbindSession: mocks.avatarUnbindSession,
+    request: vi.fn(),
+    invalidateSrc: vi.fn(),
+  },
+}));
+
+vi.mock('../storage/desktopClientStorage', () => ({
+  readDesktopPreferenceSync: vi.fn(() => null),
+  removeDesktopPreferenceSync: vi.fn(),
+  writeDesktopPreferenceSync: vi.fn(),
+}));
+
+vi.mock('../utils/logger', () => ({
+  log: {
+    info: vi.fn(),
+    warn: vi.fn(),
+  },
+}));
+
+vi.mock('./boot', () => ({
+  markPhaseEnd: vi.fn(),
+  markPhaseStart: vi.fn(),
+}));
+
+vi.mock('./events', () => ({
+  EVENT: { AUTH_IDENTITY_CHANGED: 'auth.identity_changed' },
+  eventBus: { subscribe: vi.fn(() => vi.fn()) },
+}));
+
+vi.mock('./global-context', () => ({
+  globalContext: {
+    bootstrap: vi.fn(),
+    setRuntimeAppState: vi.fn(),
+  },
+}));
+
+vi.mock('../services/desktop_api', () => ({
+  api: {
+    accountSwitch: mocks.accountSwitch,
+    accountUnlock: mocks.accountUnlock,
+    authValidateToken: mocks.authValidateToken,
+    stationList: mocks.stationList,
+    stationSetActive: mocks.stationSetActive,
+    syncUserProfile: vi.fn(async () => ({ name: 'New', email: '', avatar_url: '' })),
+    accountListRestorable: mocks.accountListRestorable,
+    stationBindingComplete: mocks.stationBindingComplete,
+  },
+  AuthCommandException: class AuthCommandException extends Error {
+    code: string;
+    details?: Record<string, unknown>;
+
+    constructor(error: { code: string; message: string; details?: Record<string, unknown> }) {
+      super(error.message);
+      this.code = error.code;
+      this.details = error.details;
+    }
+  },
+  onSessionRevoked: vi.fn(),
+}));
+
+vi.mock('../applet/productWindowE2E', () => ({
+  setAppletProductWindowLaunchContext: vi.fn(),
+}));
+
+const { AuthCommandException, api } = await import('../services/desktop_api');
+const {
+  identityRuntime,
+  resolveAppletProductWindowLaunchContext,
+} = await import('./identityRuntime');
+
+describe('identityRuntime applet launch context', () => {
+  it('preserves a launch context that resolves within the boot budget', async () => {
+    await expect(resolveAppletProductWindowLaunchContext(
+      Promise.resolve({ enabled: true, appletId: 'notes' }),
+      100,
+    )).resolves.toEqual({ enabled: true, appletId: 'notes' });
+  });
+
+  it('rejects a launch context request that exceeds the boot budget', async () => {
+    const neverSettles = new Promise<never>(() => {});
+
+    await expect(resolveAppletProductWindowLaunchContext(
+      neverSettles,
+      1,
+    )).rejects.toThrow('applet product window launch context timed out');
+  });
+});
+
+describe('identityRuntime account switch ordering', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.order.length = 0;
+    mocks.session.authenticated = true;
+    mocks.session.currentUser = {
+      actorPtid: 'ptid:person:old',
+      name: 'Old',
+      email: '',
+      loginMethod: 'password',
+    };
+    mocks.accountSwitch.mockImplementation(async () => {
+      mocks.order.push('switch');
+      return { ok: true };
+    });
+    mocks.accountUnlock.mockImplementation(async () => {
+      mocks.order.push('unlock');
+      return {
+        actor_ptid: 'ptid:person:new',
+        session_token: 'token',
+        login_method: 'password',
+      };
+    });
+    mocks.authValidateToken.mockImplementation(async () => {
+      mocks.order.push('validate');
+      return {
+        actor_ptid: 'ptid:person:new',
+        session_token: 'token',
+        login_method: 'password',
+      };
+    });
+    mocks.stationList.mockResolvedValue({
+      active_station_peer_id: 'station-peer',
+      binding: {
+        station_peer_id: 'station-peer',
+        active_route_id: 'route-direct',
+        route_revision: 1,
+        lifecycle_generation: 1,
+        phase: 'bound',
+      },
+      entries: [],
+    });
+    mocks.stationSetActive.mockResolvedValue(undefined);
+    mocks.runIdentityPipeline.mockImplementation(async () => {
+      mocks.order.push(`pipeline:${mocks.session.currentUser?.actorPtid}`);
+      return { ok: true, failures: [] };
+    });
+    mocks.accessStart.mockResolvedValue({
+      state: 'ACCESS_DECISION_STATE_ACTION_REQUIRED',
+      attemptId: 'attempt-1',
+      currentGateId: 'auth.login',
+      gates: [{
+        gateId: 'auth.login',
+        gateType: 'ACCESS_GATE_TYPE_AUTH_LOGIN',
+        state: 'ACCESS_GATE_STATE_ACTION_REQUIRED',
+        title: 'Login',
+        description: '',
+        blockingReason: '',
+        submitAction: 'access_submit_login',
+        inputSchemaJson: '',
+        alternativeActions: [],
+        actionId: 'auth.login.password',
+        schemaRevision: 1,
+        schemaDigest: 'login-schema',
+      }],
+      accessGrantId: '',
+      message: '',
+    });
+    mocks.accessSubmitLogin.mockImplementation(async () => {
+      mocks.order.push('access-login');
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:new',
+        name: 'New',
+        email: '',
+        loginMethod: 'password',
+      };
+      mocks.session.authenticated = true;
+    });
+    mocks.loginWithOAuth.mockImplementation(async () => {
+      mocks.order.push('oauth-session-login');
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:new',
+        name: 'New',
+        email: '',
+        loginMethod: 'oauth',
+      };
+      mocks.session.authenticated = true;
+    });
+    mocks.restoreSession.mockResolvedValue(undefined);
+    mocks.logout.mockResolvedValue(undefined);
+    mocks.accountListRestorable.mockResolvedValue([]);
+    mocks.restoreSession.mockImplementation(async () => {
+      mocks.order.push('restore');
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:restored',
+        name: 'Restored',
+        email: '',
+        loginMethod: 'password',
+      };
+      mocks.session.authenticated = true;
+    });
+    mocks.stationBindingComplete.mockImplementation(async () => {
+      mocks.order.push('station-bound');
+      return {
+        phase: 'bound',
+        station_peer_id: 'station-peer',
+        active_route_id: 'route-direct',
+        target_station_peer_id: null,
+        target_route_id: null,
+        route_revision: 1,
+        lifecycle_generation: 1,
+        error: null,
+      };
+    });
+    mocks.resetSession.mockImplementation(() => {
+      mocks.session.currentUser = null;
+      mocks.session.authenticated = false;
+    });
+  });
+
+  it('accepts and completes the session activated by password login', async () => {
+    mocks.session.currentUser = null;
+    mocks.session.authenticated = false;
+
+    await identityRuntime.loginWithPassword('alice@p.t', 'password');
+
+    expect(mocks.accessStart).toHaveBeenCalledOnce();
+    expect(mocks.accessSubmitLogin).toHaveBeenCalledWith(
+      'attempt-1',
+      expect.objectContaining({
+        gateId: 'auth.login',
+        actionId: 'auth.login.password',
+        schemaRevision: 1,
+        schemaDigest: 'login-schema',
+      }),
+      'alice@p.t',
+      'password',
+    );
+    expect(mocks.loginWithPassword).not.toHaveBeenCalled();
+    expect(identityRuntime.getSnapshot().phase.kind).toBe('authenticatedPendingCompletion');
+
+    await identityRuntime.completeCurrentSession();
+
+    expect(mocks.stationBindingComplete).toHaveBeenCalledOnce();
+    expect(identityRuntime.getSnapshot().lifecycle.state).toBe('ready');
+    expect(identityRuntime.getSnapshot().lifecycle.authenticated).toBe(true);
+  });
+
+  it('completes the persisted Station binding before accepting a restored session', async () => {
+    mocks.session.currentUser = null;
+    mocks.session.authenticated = false;
+
+    await identityRuntime.resolveSession('disk');
+
+    expect(mocks.order.slice(0, 2)).toEqual(['restore', 'station-bound']);
+    expect(mocks.stationBindingComplete).toHaveBeenCalledOnce();
+    expect(identityRuntime.getSnapshot().lifecycle.state).toBe('ready');
+    expect(identityRuntime.getSnapshot().lifecycle.restoredUser).toEqual(
+      expect.objectContaining({ name: 'New' }),
+    );
+  });
+
+  it('routes OAuth through the session lifecycle before accepting the actor', async () => {
+    mocks.session.currentUser = null;
+    mocks.session.authenticated = false;
+
+    await identityRuntime.loginWithOAuthBridge();
+
+    expect(mocks.loginWithOAuth).toHaveBeenCalledWith('oauth');
+    expect(identityRuntime.getSnapshot().phase.kind).toBe('authenticatedPendingCompletion');
+    expect(mocks.session.currentUser).toMatchObject({
+      actorPtid: 'ptid:person:new',
+    });
+  });
+
+  it('retries a pending OAuth acknowledgement without opening the account gate', async () => {
+    vi.useFakeTimers();
+    mocks.session.currentUser = null;
+    mocks.session.authenticated = false;
+    mocks.restoreSession
+      .mockRejectedValueOnce(new AuthCommandException({
+        code: 'UNAUTHORIZED',
+        message: 'oauth session activation pending',
+        details: { reason: 'oauth_acknowledgement_pending' },
+      }))
+      .mockImplementationOnce(async () => {
+        mocks.session.currentUser = {
+          actorPtid: 'ptid:person:new',
+          name: 'New',
+          email: '',
+          loginMethod: 'oauth',
+        };
+        mocks.session.authenticated = true;
+      });
+
+    await identityRuntime.resolveSession('disk');
+    expect(identityRuntime.getSnapshot().phase.kind).toBe('resolvingSession');
+    expect(mocks.restoreSession).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(mocks.restoreSession).toHaveBeenCalledTimes(2);
+    expect(identityRuntime.getSnapshot().phase.kind).toBe('authenticated');
+    vi.useRealTimers();
+  });
+
+  it('cleans the old actor projection before activating the restored actor', async () => {
+    await identityRuntime.switchAccount('local-account-new');
+
+    expect(mocks.order.slice(0, 5)).toEqual([
+      'switch',
+      'validate',
+      'pipeline:ptid:person:old',
+      'station-bound',
+      'activate',
+    ]);
+    expect(mocks.runIdentityPipeline).toHaveBeenCalledWith({
+      reason: 'switch',
+      actorPtid: 'ptid:person:new',
+      loginMethod: 'password',
+    }, null);
+    expect(mocks.session.currentUser?.actorPtid).toBe('ptid:person:new');
+  });
+
+  it('cleans the old actor projection before activating a PIN-unlocked session', async () => {
+    mocks.accountUnlock.mockImplementationOnce(async () => {
+      expect(identityRuntime.getSnapshot().phase.kind).toBe('resolvingSession');
+      mocks.order.push('unlock');
+      return {
+        actor_ptid: 'ptid:person:new',
+        session_token: 'token',
+        login_method: 'password',
+      };
+    });
+
+    await identityRuntime.unlockWithPin('local-account-new', '12345678');
+
+    expect(mocks.order.slice(0, 4)).toEqual([
+      'unlock',
+      'pipeline:ptid:person:old',
+      'station-bound',
+      'activate',
+    ]);
+    expect(mocks.runIdentityPipeline).toHaveBeenCalledWith({
+      reason: 'unlock',
+      actorPtid: 'ptid:person:new',
+      loginMethod: 'password',
+    }, null);
+    expect(mocks.session.currentUser?.actorPtid).toBe('ptid:person:new');
+    expect(mocks.session.authenticated).toBe(true);
+  });
+
+  it('returns to the PIN gate when Native unlock fails', async () => {
+    const unlockError = new Error('incorrect PIN');
+    mocks.accountUnlock.mockRejectedValueOnce(unlockError);
+
+    await expect(
+      identityRuntime.unlockWithPin('local-account-new', '00000000'),
+    ).rejects.toBe(unlockError);
+
+    expect(mocks.clearLocalIdentityAction).toHaveBeenCalledOnce();
+    expect(mocks.runIdentityPipeline).not.toHaveBeenCalled();
+    expect(identityRuntime.getSnapshot().phase).toEqual({
+      kind: 'pinGate',
+      accountId: 'local-account-new',
+    });
+  });
+
+  it('clears the authenticated projection when native detached before failing', async () => {
+    const detachedFailure = Object.assign(new Error('account switch failed'), {
+      details: {
+        detached: true,
+        reason: 'account_switch_failed_closed',
+        stage: 'acquire_new',
+      },
+    });
+    mocks.accountSwitch.mockRejectedValueOnce(detachedFailure);
+
+    await expect(identityRuntime.switchAccount('local-account-new')).rejects.toBe(detachedFailure);
+
+    expect(mocks.authValidateToken).not.toHaveBeenCalled();
+    expect(mocks.clearLocalIdentityAction).toHaveBeenCalledOnce();
+    expect(mocks.resetSession).toHaveBeenCalledOnce();
+    expect(mocks.session.currentUser).toBeNull();
+    expect(mocks.session.authenticated).toBe(false);
+    expect(identityRuntime.getSnapshot().phase).toEqual({
+      kind: 'accountGate',
+      reason: 'restore_failed',
+    });
+    expect(identityRuntime.getSnapshot().lifecycle.authenticated).toBe(false);
+    expect(identityRuntime.getSnapshot().lifecycle.restoredUser).toBeNull();
+  });
+
+  it('passes the current canonical PTID through revocation cleanup', async () => {
+    await identityRuntime.revokeSession();
+
+    expect(mocks.runIdentityPipeline).toHaveBeenCalledWith({
+      reason: 'revoked',
+      actorPtid: 'ptid:person:old',
+      loginMethod: null,
+    }, null);
+  });
+
+  it('enters the logged-out account gate before propagating cleanup failure', async () => {
+    const cleanupError = new Error('logout cleanup failed');
+    mocks.logout.mockRejectedValueOnce(cleanupError);
+
+    await expect(identityRuntime.logout()).rejects.toBe(cleanupError);
+
+    expect(identityRuntime.getSnapshot().phase).toEqual({
+      kind: 'accountGate',
+      reason: 'logout',
+    });
+    expect(identityRuntime.getSnapshot().lifecycle.authenticated).toBe(false);
+  });
+
+  it('preserves a native restorable session while the renderer is unauthenticated', async () => {
+    mocks.session.authenticated = false;
+    mocks.session.currentUser = null;
+    mocks.accountListRestorable.mockResolvedValue([{
+      id: 'station:local:password:alice',
+      provider: 'password',
+      provider_user_id: 'ptid:person:alice',
+      name: 'Alice',
+      email: 'alice@p.t',
+      avatar_url: '',
+      avatar_local_path: '',
+      profile_url: '',
+      created_at: 1,
+      last_login_at: 2,
+      has_pin: false,
+      has_session: true,
+    }]);
+
+    await identityRuntime.logout();
+
+    expect(identityRuntime.getSnapshot().lifecycle.knownAccounts).toEqual([
+      expect.objectContaining({
+        accountId: 'station:local:password:alice',
+        hasPin: false,
+        hasSession: true,
+      }),
+    ]);
+  });
+});
+
+describe('identityRuntime r3.1 avatar edge matrix', () => {
+  const gateDecision = {
+    state: 'ACCESS_DECISION_STATE_ACTION_REQUIRED',
+    attemptId: 'attempt-1',
+    currentGateId: 'auth.login',
+    gates: [{
+      gateId: 'auth.login',
+      gateType: 'ACCESS_GATE_TYPE_AUTH_LOGIN',
+      state: 'ACCESS_GATE_STATE_ACTION_REQUIRED',
+      title: 'Login',
+      description: '',
+      blockingReason: '',
+      submitAction: 'access_submit_login',
+      inputSchemaJson: '',
+      alternativeActions: [],
+      actionId: 'auth.login.password',
+      schemaRevision: 1,
+      schemaDigest: 'login-schema',
+    }],
+    accessGrantId: '',
+    message: '',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.session.authenticated = true;
+    mocks.session.currentUser = {
+      actorPtid: 'ptid:person:new',
+      name: 'New',
+      email: '',
+      loginMethod: 'password',
+    };
+    mocks.stationBindingComplete.mockResolvedValue({ phase: 'bound' });
+    mocks.accountListRestorable.mockResolvedValue([]);
+    mocks.accountLoad.mockResolvedValue(undefined);
+    vi.mocked(api.syncUserProfile).mockResolvedValue({
+      name: 'New',
+      email: '',
+      avatar_url: '',
+      synced: true,
+      profile_url: '',
+    });
+    mocks.avatarPrepare.mockResolvedValue({
+      status: 'ready',
+      snapshot: { phase: 'ready', src: 'asset:///cache/a.png', degraded: false, identity: '/a.png' },
+    });
+  });
+
+  it('routes password fresh edges through a local-only avatar gate', async () => {
+    mocks.accessStart.mockResolvedValue(gateDecision);
+    mocks.accessSubmitLogin.mockImplementation(async () => {
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:new',
+        name: 'New',
+        email: '',
+        loginMethod: 'password',
+        avatarUrl: '/sub-oss/new.png',
+        avatarLocalPath: '/cache/new.png',
+      };
+    });
+
+    await identityRuntime.loginWithPassword('alice@p.t', 'password');
+
+    expect(mocks.avatarPrepare).toHaveBeenCalledWith(
+      expect.objectContaining({ identity: '/sub-oss/new.png' }),
+      expect.objectContaining({ localOnly: true, budgetMs: 250, force: true }),
+    );
+  });
+
+  it('routes OAuth fresh edges through the network profile closure, not the local gate', async () => {
+    mocks.loginWithOAuth.mockImplementation(async () => {
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:new',
+        name: 'New',
+        email: '',
+        loginMethod: 'oauth',
+      };
+    });
+
+    await identityRuntime.loginWithOAuthBridge();
+
+    // The network closure reconciles the profile first, then prepares the
+    // avatar without the local-only fast lane.
+    for (let i = 0; i < 6; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await Promise.resolve();
+    }
+    expect(mocks.avatarPrepare).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ budgetMs: 2000 }),
+    );
+    expect(mocks.avatarPrepare).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ localOnly: true }),
+    );
+  });
+
+  it('waits only for local last-good decode (250ms) on restored sessions', async () => {
+    mocks.restoreSession.mockImplementation(async () => {
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:restored',
+        name: 'Restored',
+        email: '',
+        loginMethod: 'password',
+        avatarUrl: '/sub-oss/r.png',
+        avatarLocalPath: '/cache/r.png',
+      };
+      mocks.session.authenticated = true;
+    });
+
+    await identityRuntime.resolveSession('disk');
+
+    expect(mocks.avatarPrepare).toHaveBeenCalledWith(
+      expect.objectContaining({ localPath: '/cache/r.png' }),
+      expect.objectContaining({ localOnly: true, budgetMs: 250 }),
+    );
+  });
+
+  it('an authoritative absent profile clears the seed avatar instead of resurrecting it', async () => {
+    mocks.restoreSession.mockImplementation(async () => {
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:absent',
+        name: 'Absent',
+        email: '',
+        loginMethod: 'password',
+        avatarUrl: '/stale.png',
+      };
+      mocks.session.authenticated = true;
+    });
+    const { api } = await import('../services/desktop_api');
+    vi.mocked(api.syncUserProfile).mockResolvedValueOnce({
+      name: 'Absent',
+      email: '',
+      avatar_url: '',
+      avatar_identity: '',
+      avatar_local_path: null,
+      avatar_state: 'absent',
+      profile_revision: 2,
+      profile_url: '',
+      synced: true,
+    });
+
+    await identityRuntime.resolveSession('disk');
+
+    expect(identityRuntime.getSnapshot().phase).toMatchObject({
+      readiness: { avatar: 'absent', profile: 'ready' },
+    });
+  });
+
+  it('password completion waits only 250ms and never blocks on network reconcile', async () => {
+    vi.useFakeTimers();
+    mocks.avatarPrepare.mockReturnValue(
+      new Promise((resolve) => {
+        setTimeout(() => resolve({
+          status: 'ready' as const,
+          snapshot: { phase: 'ready' as const, src: 'asset://late', degraded: false, identity: '/late.png' },
+        }), 1000);
+      }),
+    );
+    mocks.accessStart.mockResolvedValue(gateDecision);
+    mocks.accessSubmitLogin.mockResolvedValue(undefined);
+
+    await identityRuntime.loginWithPassword('alice@p.t', 'password');
+    const completion = identityRuntime.completeCurrentSession();
+    await vi.advanceTimersByTimeAsync(300);
+    await completion;
+
+    expect(identityRuntime.getSnapshot().lifecycle.state).toBe('ready');
+    expect(identityRuntime.getSnapshot().phase).toMatchObject({
+      readiness: { avatar: 'degraded' },
+    });
+    // Network reconcile still runs (does not reject/throw in the background).
+    expect(vi.mocked(api.syncUserProfile)).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('dedupes concurrent completion calls (double-tap guard)', async () => {
+    mocks.avatarPrepare.mockResolvedValue({
+      status: 'ready',
+      snapshot: { phase: 'ready', src: 'asset://x', degraded: false, identity: '/x.png' },
+    });
+    mocks.accessStart.mockResolvedValue(gateDecision);
+    mocks.accessSubmitLogin.mockResolvedValue(undefined);
+
+    await identityRuntime.loginWithPassword('alice@p.t', 'password');
+    const callsBefore = mocks.stationBindingComplete.mock.calls.length;
+    await Promise.all([
+      identityRuntime.completeCurrentSession(),
+      identityRuntime.completeCurrentSession(),
+    ]);
+
+    expect(mocks.stationBindingComplete.mock.calls.length - callsBefore).toBe(1);
+  });
+
+  it('drops a late profile response after the session epoch advances', async () => {
+    mocks.restoreSession.mockImplementation(async () => {
+      mocks.session.currentUser = {
+        actorPtid: 'ptid:person:old',
+        name: 'Old',
+        email: '',
+        loginMethod: 'password',
+        avatarUrl: '/old.png',
+      };
+      mocks.session.authenticated = true;
+      mocks.session.sessionEpoch = 1;
+    });
+    const releaseRef: {
+      fn: null | ((v: Awaited<ReturnType<typeof api.syncUserProfile>>) => void);
+    } = { fn: null };
+    vi.mocked(api.syncUserProfile).mockReturnValue(
+      new Promise((resolve) => {
+        releaseRef.fn = resolve;
+      }),
+    );
+
+    const restore = identityRuntime.resolveSession('disk');
+    for (let i = 0; i < 10; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await Promise.resolve();
+    }
+    // Newer login supersedes the old restore before its sync returns.
+    mocks.session.sessionEpoch = 2;
+    mocks.session.currentUser = {
+      actorPtid: 'ptid:person:new',
+      name: 'New',
+      email: '',
+      loginMethod: 'password',
+      avatarUrl: '/new.png',
+    };
+    releaseRef.fn?.({
+      name: 'Old-renamed',
+      email: '',
+      avatar_url: '',
+      avatar_identity: '/stale.png',
+      avatar_local_path: '/stale.png',
+      avatar_state: 'ready',
+      profile_revision: 99,
+      profile_url: '',
+      synced: true,
+    });
+    await restore;
+    await Promise.resolve();
+
+    expect(mocks.session.currentUser.name).toBe('New');
+    expect(mocks.session.currentUser.avatarUrl).toBe('/new.png');
+  });
+});

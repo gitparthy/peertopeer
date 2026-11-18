@@ -1,0 +1,3967 @@
+import { createDesktopStore } from './createDesktopStore';
+import { replaceEqualDeep } from '@tanstack/query-core';
+import { EVENT, eventBus } from '../kernel/events';
+import { log } from '../utils/logger';
+import i18n, { resolveI18nValue } from '../i18n/index';
+import {
+  api,
+  type AgentConversation,
+  type AgentConversationRuntimeRebindResult,
+  type AgentConversationRuntimeResetResult,
+  type Session,
+  type StreamEvent,
+  type AgentAttachmentRefInput,
+  type AgentErrorResolutionAction,
+  type AgentRuntimeBudgetKind,
+  type AgentTypedErrorPayload,
+  type AgentTurnStreamError,
+  type AgentTurnQueueListOutput,
+  type AgentRuntimeBudgetInput,
+  classifyAgentTurnTerminalEvent,
+  isAgentLifecycleStaleVersionError,
+  isAgentLifecycleTerminalMutationError,
+  normalizeAgentTurnStreamError,
+  resolveAgentTypedErrorAction,
+} from '../services/desktop_api';
+import { agentService } from '../services/agent-service';
+import { useAgentStore, resolveAvailableModelSelection } from './agent';
+import { useAgentCapabilityStore } from './agentCapabilities';
+import { useAgentTopicStore } from './agentTopics';
+import { useChatArtifactStore } from './chatArtifacts';
+import { bindTurnMessageIdentity } from './chatTurnIdentity';
+import {
+  agentTurnRecoveryPhaseForEvent,
+  isAgentTurnRecoveryPhaseTransitionAllowed,
+  type AgentTurnRecoveryPhase,
+} from './agentTurnRecovery';
+import { currentAuthenticatedActorPtid } from './session';
+import {
+  agentIdFromDraftKey,
+  conversationIdFromAgentDraftKey,
+  createAgentDraftKey,
+  isAgentDraftKey,
+} from './agentDraft';
+import { getDesktopAgentChatCache } from '../storage/desktopAgentChatCache';
+import { deleteAgentAttachment } from '../services/agentAttachments';
+import {
+  readAgentComposerDraftsSync,
+  writeAgentComposerDraftsSync,
+} from '../storage/desktopAgentComposerDrafts';
+import { toolRuntime } from '../runtimes/toolRuntime';
+import { resolvePinnedClientCapabilitySessionId } from '../runtimes/agentCapabilityRuntime';
+import type { CachedAgentConversation, CachedAgentMessage } from '@peers-touch/client-chat-core';
+import type { AgentTurnSnapshotReloadResult } from '../runtimes/chatRuntime';
+import type {
+  ToolExecutionOwner,
+  TurnAttributionProjection,
+} from '../gen/proto/domain/agent/agent_pb';
+import { TurnAttributionState } from '../gen/proto/domain/agent/agent_pb';
+import {
+  reduceStreamEvent,
+  projectAgentTypedError,
+  createOperation,
+  completeOperation,
+  failOperation,
+  cancelOperation,
+  isActiveOperation,
+  type Operation,
+  type TurnStreamEvent,
+} from './streaming';
+
+export { useAgentStore } from './agent';
+export type { Session } from '../services/desktop_api';
+
+export type ToolCallStatus = 'queued' | 'approval_required' | 'approved' | 'denied' | 'pending' | 'success' | 'error' | 'cancelled' | 'expired' | 'unknown_side_effect';
+export type DelegationTaskStatus = 'completed' | 'failed' | 'timeout' | 'unknown';
+
+export interface DelegationTaskInfo {
+  taskId: string;
+  parentTurnId?: string;
+  taskDescription: string;
+  childToolset: string[];
+  status: DelegationTaskStatus;
+  resultSummary: string;
+  toolIterations: number;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+export interface ToolCallInfo {
+  id: string;
+  name: string;
+  args?: string;
+  result?: string;
+  pending?: boolean;
+  status?: ToolCallStatus;
+  progress?: string;
+  progressPct?: number;
+  approvalId?: string;
+  serverName?: string;
+  source?: string;
+  approvalActor?: string;
+  approvedAt?: string;
+  decisionId?: string;
+  decisionRevision?: number;
+  payloadHash?: string;
+  expiresAt?: string;
+  executionOwner?: ToolExecutionOwner;
+  approvalPolicy?: string;
+  manifestId?: string;
+  manifestVersion?: string;
+  bindingId?: string;
+  bindingRevision?: number;
+  readinessSnapshotId?: string;
+  targetDeviceId?: string;
+  error?: string;
+  delegationResults?: DelegationTaskInfo[];
+}
+
+export interface KnowledgeChunkInfo {
+  chunkId: string;
+  resourceId: string;
+  resourceTitle: string;
+  source: string;
+  chunkIndex: number;
+  score: number;
+  contentPreview: string;
+}
+
+export type MessageArtifactKind = 'code' | 'document' | 'diagram' | 'structured';
+
+export interface MessageArtifact {
+  id: string;
+  messageId: string;
+  kind: MessageArtifactKind;
+  title: string;
+  language?: string;
+  content: string;
+  createdAt: number;
+  sourceRange?: {
+    start: number;
+    end: number;
+  };
+}
+
+export interface ChatComposerAttachment {
+  cid: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+  previewUrl?: string | null;
+  url?: string;
+  attachment?: AgentAttachmentRefInput;
+}
+
+export interface AgentSendLifecycle {
+  onAccepted?: () => void;
+  onRejected?: (error?: AgentTypedErrorPayload) => void;
+  requestedBudget?: AgentRuntimeBudgetInput;
+  clientIdempotencyKey?: string;
+}
+
+export interface ComposerReferenceRemovalIntent {
+  sessionKey: string;
+  referenceKind: string;
+  referenceHash: string;
+  nonce: number;
+}
+
+export interface ComposerResourceSelectionIntent {
+  sessionKey: string;
+  resourceKind: string;
+  resourceRefHash: string;
+  nonce: number;
+}
+
+export type BudgetExhaustionKind = AgentRuntimeBudgetKind;
+
+export interface BudgetNotice {
+  kind: BudgetExhaustionKind;
+  turnId: string;
+  limit?: string;
+  localeKey: string;
+}
+
+export interface RecoveredTurnTerminal {
+  status: 'completed' | 'cancelled' | 'failed' | 'interrupted';
+  reason?: string;
+  content?: string;
+}
+
+export type ErrorResolutionAction = AgentErrorResolutionAction;
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'tool' | 'system';
+  content: string;
+  contentType?: 'text' | 'card';
+  images?: string[];
+  attachments?: ChatComposerAttachment[];
+  toolName?: string;
+  toolCallId?: string;
+  toolCalls?: ToolCallInfo[];
+  delegationResults?: DelegationTaskInfo[];
+  knowledgeChunks?: KnowledgeChunkInfo[];
+  loading?: boolean;
+  timestamp: number;
+  model?: string;
+  error?: string;
+  cancelled?: boolean;
+  terminalStatus?: 'completed' | 'failed' | 'cancelled' | 'interrupted';
+  typedError?: AgentTypedErrorPayload;
+  errorDetail?: string;
+  resolution?: ErrorResolutionAction | null;
+  providerId?: string;
+  thinking?: string;
+  thinkingDone?: boolean;
+  processDuration?: number;
+  followUpSuggestions?: string[];
+  translation?: string;
+  lastEventAt?: number;
+  operation?: 'regenerate' | 'retry' | 'branch';
+  replacementOf?: string;
+  replacedBy?: string;
+  turnId?: string;
+  // Persisted id of the assistant leg that supplied the projected content.
+  // A Turn persists one assistant row per LLM leg: tool-call legs have empty
+  // content while the final leg carries the answer. The folded bubble keeps
+  // the first leg's id, so byte-provenance consumers (artifact version
+  // claiming) must use this id, never the bubble id when they differ.
+  contentMessageId?: string;
+  // Client-generated correlation key for the owning send. It exists from the
+  // optimistic row onward and keeps one turn projected as one message even
+  // before the first turn-id-bearing event arrives.
+  clientIdempotencyKey?: string;
+  queued?: boolean;
+  queueEntryId?: string;
+  queuePosition?: number;
+  budgetNotice?: BudgetNotice;
+  turnAttribution?: TurnAttributionProjection;
+  // TW-D2: this user input produced no new Turn; Station merged it into the
+  // still-pre-dispatch Turn identified by turnId.
+  deliveryStatus?: 'amended';
+}
+
+// #region debug-point A-B:foundation-approval-receiver
+function reportFoundationApprovalReceiverDebug(
+  stage: string,
+  messages: readonly ChatMessage[],
+): void {
+  if (import.meta.env.VITE_ACCEPTANCE_HARNESS !== '1') return;
+  void fetch('http://127.0.0.1:7782/event', {
+    method: 'POST',
+    body: JSON.stringify({
+      sessionId: 'foundation-approval-receiver',
+      runId: 'post-fix',
+      hypothesisId: 'A-B',
+      location: 'chat.ts:syncMessages',
+      msg: `[DEBUG] ${stage}`,
+      data: {
+        messageCount: messages.length,
+        toolCallCount: messages.reduce(
+          (count, message) => count + (message.toolCalls?.length ?? 0),
+          0,
+        ),
+        pendingToolCallCount: messages.reduce(
+          (count, message) => count + (
+            message.toolCalls?.filter((toolCall) => toolCall.pending).length
+            ?? 0
+          ),
+          0,
+        ),
+      },
+      ts: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
+
+// #region debug-point A-E:approval-expiry-retry
+function reportApprovalExpiryRetryDebug(
+  hypothesisId: string,
+  stage: string,
+  data: Record<string, unknown>,
+): void {
+  if (import.meta.env.VITE_ACCEPTANCE_HARNESS !== '1') return;
+  void fetch('http://127.0.0.1:7777/event', {
+    method: 'POST',
+    body: JSON.stringify({
+      sessionId: 'approval-expiry-retry',
+      runId: 'post-fix',
+      hypothesisId,
+      location: 'chat.ts:retryMessage',
+      msg: `[DEBUG] ${stage}`,
+      data,
+      ts: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
+
+// #region debug-point N-Q:foundation-attachment-receiver
+function reportFoundationAttachmentReceiverDebug(
+  hypothesisId: string,
+  stage: string,
+  data: Record<string, unknown>,
+): void {
+  if (import.meta.env.VITE_ACCEPTANCE_HARNESS !== '1') return;
+  void fetch('http://127.0.0.1:7787/event', {
+    method: 'POST',
+    body: JSON.stringify({
+      sessionId: 'foundation-attachment-timeout',
+      runId: 'post-fix',
+      hypothesisId,
+      location: 'chat.ts:sendMessage',
+      msg: `[DEBUG] ${stage}`,
+      data,
+      ts: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
+
+const agentChatCache = getDesktopAgentChatCache();
+
+function cachedConversationToSession(conversation: CachedAgentConversation): Session {
+  return {
+    id: conversation.conversationId,
+    key: conversation.conversationId,
+    agent_name: conversation.agentId,
+    title: resolveI18nValue(conversation.title) || '',
+    message_count: 0,
+    version: conversation.version,
+    model_override: conversation.modelName,
+    provider_override: conversation.providerId,
+    created_at: conversation.createdAt,
+    updated_at: conversation.updatedAt,
+  };
+}
+
+export function cachedMessageToChatMessage(message: CachedAgentMessage): ChatMessage {
+  const persistedStatus = String(message.status || '').toLowerCase();
+  const terminalStatus = (
+    ['completed', 'failed', 'cancelled', 'interrupted'] as const
+  ).find((status) => status === persistedStatus);
+  let typedError: AgentTypedErrorPayload | undefined;
+  if (message.errorJson) {
+    try {
+      const parsed = JSON.parse(message.errorJson);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        typedError = projectAgentTypedError(parsed as Record<string, unknown>);
+      }
+    } catch {
+      typedError = undefined;
+    }
+  }
+  // User cancellation is a user action, not a failure: keep the typed payload
+  // for audit attributes but do not project the red error block or an error
+  // resolution. The stopped banner with Retry owns this terminal state,
+  // mirroring the live streaming 'cancelled' projection.
+  const isCancelledAssistant = message.role === 'assistant' && persistedStatus === 'cancelled';
+  if (isCancelledAssistant && typedError?.error_type !== 'LIFECYCLE_CANCELLED') {
+    typedError = undefined;
+  }
+  const resolution = isCancelledAssistant ? undefined : resolveAgentTypedErrorAction(typedError);
+  const chatMessage: ChatMessage = {
+    id: message.messageId,
+    role: message.role,
+    content: message.content,
+    contentType: 'text',
+    loading: message.role === 'assistant' && persistedStatus === 'pending',
+    timestamp: new Date(message.createdAt).getTime(),
+    model: message.modelName,
+    turnId: message.turnId,
+    error: isCancelledAssistant ? undefined : typedError?.locale_key
+      ?? (message.role === 'assistant' && persistedStatus === 'failed'
+        ? 'chat.message.diagnostics.failedTitle'
+        : undefined),
+    typedError,
+    resolution,
+    providerId: typedError?.details.provider_id,
+    attachments: message.attachments?.map((attachment) => ({
+      cid: attachment.objectRef,
+      filename: attachment.filename,
+      mime_type: attachment.mimeType,
+      size: attachment.sizeBytes,
+      attachment: {
+        attachment_id: attachment.attachmentId,
+        object_ref: attachment.objectRef,
+        mime_type: attachment.mimeType,
+        size_bytes: attachment.sizeBytes,
+        checksum: attachment.checksum,
+        filename: attachment.filename,
+        authorization_scope: attachment.authorizationScope,
+        expires_at: attachment.expiresAt,
+        extracted_content_ref: attachment.extractedContentRef,
+      },
+    })),
+  };
+  if (message.role === 'assistant' && terminalStatus) {
+    chatMessage.loading = false;
+    chatMessage.terminalStatus = terminalStatus;
+    chatMessage.cancelled = terminalStatus === 'cancelled';
+  }
+  if (message.role === 'assistant' && message.reasoningJson) {
+    try {
+      const reasoning = JSON.parse(message.reasoningJson) as { text?: string; done?: boolean; duration_ms?: number };
+      chatMessage.thinking = reasoning.text;
+      chatMessage.thinkingDone = reasoning.done ?? true;
+      if (typeof reasoning.duration_ms === 'number') chatMessage.processDuration = reasoning.duration_ms;
+    } catch {
+      chatMessage.thinking = message.reasoningJson;
+      chatMessage.thinkingDone = true;
+    }
+  }
+  if (message.role === 'assistant' && message.toolCallsJson) {
+    try {
+      const parsed = JSON.parse(message.toolCallsJson) as Array<{
+        id?: string;
+        name?: string;
+        args?: string;
+        result?: string;
+        status?: ToolCallStatus;
+        approval_id?: string;
+        decision_id?: string;
+        decision_revision?: number;
+        payload_hash?: string;
+        expires_at?: string;
+        execution_owner?: ToolExecutionOwner;
+        approval_policy?: string;
+        manifest_id?: string;
+        manifest_version?: string;
+        binding_id?: string;
+        binding_revision?: number;
+        readiness_snapshot_id?: string;
+        target_device_id?: string;
+        server_name?: string;
+        source?: string;
+        function?: {
+          name?: string;
+          arguments?: string;
+        };
+      }>;
+      chatMessage.toolCalls = parsed.map((toolCall) => ({
+        id: toolCall.id || toolCall.name || '',
+        name: toolCall.name || toolCall.function?.name || 'tool',
+        args: toolCall.args ?? toolCall.function?.arguments,
+        result: toolCall.result,
+        pending: toolCall.status === 'approval_required' ||
+          toolCall.status === 'approved' ||
+          toolCall.status === 'pending',
+        status: toolCall.status,
+        approvalId: toolCall.approval_id,
+        decisionId: toolCall.decision_id,
+        decisionRevision: toolCall.decision_revision,
+        payloadHash: toolCall.payload_hash,
+        expiresAt: toolCall.expires_at,
+        executionOwner: toolCall.execution_owner,
+        approvalPolicy: toolCall.approval_policy,
+        manifestId: toolCall.manifest_id,
+        manifestVersion: toolCall.manifest_version,
+        bindingId: toolCall.binding_id,
+        bindingRevision: toolCall.binding_revision,
+        readinessSnapshotId: toolCall.readiness_snapshot_id,
+        targetDeviceId: toolCall.target_device_id,
+        serverName: toolCall.server_name,
+        source: toolCall.source,
+      }));
+    } catch {
+      // Malformed persisted tool-call payload; render message without tool calls.
+    }
+  }
+  // A completed assistant row that still carries tool calls is an
+  // intermediate LLM leg of a multi-leg Turn: its row status means the leg
+  // stream finished, not that the Turn terminated. The Turn only becomes
+  // terminal with the final content leg (or a turn-level lifecycle event).
+  // Failed/cancelled legs remain terminal regardless of tool calls.
+  if (chatMessage.terminalStatus === 'completed' && chatMessage.toolCalls?.length) {
+    chatMessage.terminalStatus = undefined;
+  }
+  // Restore user-facing assistant projections persisted in message metadata.
+  if (message.metadataJson) {
+    try {
+      const meta = JSON.parse(message.metadataJson) as {
+        translation?: string;
+        follow_up_suggestions?: unknown;
+      };
+      if (meta.translation) chatMessage.translation = meta.translation;
+      if (
+        message.role === 'assistant'
+        && Array.isArray(meta.follow_up_suggestions)
+      ) {
+        const suggestions = meta.follow_up_suggestions.filter(
+          (suggestion): suggestion is string => (
+            typeof suggestion === 'string' && suggestion.trim().length > 0
+          ),
+        );
+        if (suggestions.length > 0) {
+          chatMessage.followUpSuggestions = suggestions;
+        }
+      }
+    } catch {
+      // Malformed metadata; ignore.
+    }
+  }
+  return chatMessage;
+}
+
+async function projectTurnAttributions(
+  messages: ChatMessage[],
+): Promise<ChatMessage[]> {
+  const turnIDs = Array.from(new Set(messages
+    .filter((message) => (
+      message.role === 'assistant'
+      && Boolean(message.turnId)
+      && Boolean(message.terminalStatus)
+      && !message.turnAttribution
+    ))
+    .map((message) => message.turnId as string)));
+  if (turnIDs.length === 0) return messages;
+
+  const response = await api.getAgentTurnAttributions(turnIDs);
+  const requested = new Set(turnIDs);
+  const byTurnID = new Map<string, TurnAttributionProjection>();
+  for (const projection of response.attributions) {
+    if (!requested.has(projection.turnId)) {
+      throw new Error('agent.error.turnAttributionIdentityMismatch');
+    }
+    // UNAVAILABLE is transient right after terminal close (context ledger
+    // commit ordering). Never cache it: leave the message unprojected so the
+    // next authoritative sync re-requests instead of pinning a permanent
+    // unavailable badge.
+    if (projection.state === TurnAttributionState.AVAILABLE) {
+      byTurnID.set(projection.turnId, projection);
+    }
+  }
+  return messages.map((message) => (
+    message.turnId && byTurnID.has(message.turnId)
+      ? { ...message, turnAttribution: byTurnID.get(message.turnId) }
+      : message
+  ));
+}
+
+async function projectTurnAttributionsOrKeep(
+  messages: ChatMessage[],
+  stage: string,
+): Promise<ChatMessage[]> {
+  try {
+    return await projectTurnAttributions(messages);
+  } catch (error) {
+    log.warn('chat', 'Turn attribution projection unavailable', {
+      stage,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return messages;
+  }
+}
+
+function mergeAssistantTurnLegs(
+  target: ChatMessage,
+  leg: ChatMessage,
+): void {
+  if (leg.toolCalls?.length) {
+    const seen = new Set(
+      (target.toolCalls ?? []).map((toolCall) => toolCall.id),
+    );
+    target.toolCalls = [
+      ...(target.toolCalls ?? []),
+      ...leg.toolCalls.filter((toolCall) => !seen.has(toolCall.id)),
+    ];
+  }
+  if (leg.content) {
+    target.content = leg.content;
+    // Record which persisted leg owns these bytes for provenance.
+    target.contentMessageId = leg.id;
+  }
+  if (leg.thinking) target.thinking = leg.thinking;
+  if (leg.thinkingDone != null) {
+    target.thinkingDone = target.thinkingDone || leg.thinkingDone;
+  }
+  if (leg.processDuration != null) {
+    target.processDuration = leg.processDuration;
+  }
+  if (leg.followUpSuggestions?.length) {
+    target.followUpSuggestions = leg.followUpSuggestions;
+  }
+  if (leg.turnAttribution) target.turnAttribution = leg.turnAttribution;
+  if (leg.attachments?.length) target.attachments = leg.attachments;
+  if (leg.images?.length) target.images = leg.images;
+  if (leg.model) target.model = leg.model;
+  if (leg.terminalStatus) {
+    target.terminalStatus = leg.terminalStatus;
+    target.loading = false;
+    target.cancelled = leg.terminalStatus === 'cancelled' || leg.cancelled === true;
+    target.typedError = leg.typedError ?? target.typedError;
+    target.errorDetail = leg.errorDetail ?? target.errorDetail;
+    target.resolution = leg.resolution ?? target.resolution;
+    target.error = leg.error ?? target.error;
+  } else if (leg.loading) {
+    // A later LLM leg of the same Turn is still streaming. An earlier
+    // leg's persisted "completed" row only means that leg finished — the
+    // Turn is not terminal until the final leg settles. Clear the early
+    // leg's terminal marker so the bubble and its actions stay gated.
+    target.terminalStatus = undefined;
+    target.cancelled = false;
+    target.loading = true;
+  }
+  if (leg.typedError && !target.typedError) {
+    target.typedError = leg.typedError;
+    target.errorDetail = leg.errorDetail ?? target.errorDetail;
+    target.error = leg.error ?? target.error;
+  }
+  if (
+    leg.lastEventAt != null
+    && (target.lastEventAt == null || leg.lastEventAt > target.lastEventAt)
+  ) {
+    target.lastEventAt = leg.lastEventAt;
+  }
+}
+
+export function foldToolMessages(messages: ChatMessage[]): ChatMessage[] {
+  const folded: ChatMessage[] = [];
+  // Station persists one assistant row per LLM leg of a Turn (each leg carries
+  // its own tool calls; the final leg carries the answer). Render the Turn as
+  // one bubble, keyed by its stable turn id.
+  const assistantByTurnId = new Map<string, ChatMessage>();
+  for (const message of messages) {
+    if (message.role === 'tool' && folded.length > 0) {
+      const previous = folded[folded.length - 1];
+      if (previous.role === 'assistant') {
+        const nameMatch = message.content.match(/\*\*(\w+)\*\*/);
+        const existing = previous.toolCalls || [];
+        previous.toolCalls = [...existing, {
+          id: message.id,
+          name: nameMatch?.[1] || 'tool',
+          result: message.content,
+          pending: false,
+        }];
+        continue;
+      }
+    }
+    if (message.role === 'assistant' && message.turnId) {
+      // Defense in depth: a completed tool-call leg cannot establish Turn
+      // terminality even when a list bypasses the persisted-row mapping.
+      if (message.terminalStatus === 'completed' && message.toolCalls?.length) {
+        message.terminalStatus = undefined;
+      }
+      const existing = assistantByTurnId.get(message.turnId);
+      if (existing) {
+        mergeAssistantTurnLegs(existing, message);
+        continue;
+      }
+      assistantByTurnId.set(message.turnId, message);
+      if (message.content && !message.contentMessageId) {
+        message.contentMessageId = message.id;
+      }
+    }
+    folded.push(message);
+  }
+  return folded;
+}
+
+// Terminal assistant nodes whose attribution is still UNAVAILABLE (the
+// context ledger commits a moment after the terminal message). One bounded
+// follow-up authoritative sync per conversation re-requests the projection.
+const attributionFollowUpAt: Record<string, number> = {};
+const ATTRIBUTION_FOLLOW_UP_DELAY_MS = 2_500;
+const ATTRIBUTION_FOLLOW_UP_WINDOW_MS = 15_000;
+
+function reconcileToolMessages(messages: ChatMessage[]): ChatMessage[] {
+  const folded = foldToolMessages(messages);
+  void toolRuntime.reconcileMessages(folded).catch((error) => {
+    log.warn('chat', 'Failed to reconcile ToolCall projections', {
+      error: String(error),
+    });
+  });
+  return folded;
+}
+
+// Terminal reconciliation can arrive without a matching local operation
+// (stream transport handoff, surface remount, parallel-session rekeying).
+// Artifacts are conversation-scoped Station state, so their terminal refresh
+// must not depend on the in-memory operation lookup. The claim commit can race
+// the terminal event by a couple of seconds; follow the immediate load with a
+// settle-delayed refresh so the bar mounts without periodic reconciliation.
+const TERMINAL_ARTIFACT_SETTLE_DELAY_MS = 2_500;
+
+function refreshTerminalTurnArtifacts(conversationId: string): void {
+  void useChatArtifactStore.getState().load(conversationId).catch(() => []);
+  void new Promise<void>((resolve) => {
+    setTimeout(resolve, TERMINAL_ARTIFACT_SETTLE_DELAY_MS);
+  })
+    .then(() => useChatArtifactStore.getState().load(conversationId))
+    .catch(() => undefined);
+}
+
+function isOptimisticMessageId(id: string): boolean {
+  return id.startsWith('temp-');
+}
+
+function isInFlightMessage(message: ChatMessage): boolean {
+  return message.loading === true || Boolean(message.error) || Boolean(message.terminalStatus);
+}
+
+function matchesTurnMessage(
+  message: ChatMessage,
+  role: ChatMessage['role'],
+  messageId: string | undefined,
+  turnId: string | undefined,
+): boolean {
+  return message.role === role && (
+    message.id === messageId || Boolean(turnId && message.turnId === turnId)
+  );
+}
+
+function carryChainOfThoughtFields(target: ChatMessage, source: ChatMessage): ChatMessage {
+  const sourceOwnsNonTerminalLeaseIncident =
+    source.loading === true
+    && source.terminalStatus === undefined
+    && source.typedError?.error_type === 'CLIENT_LEASE_EXPIRED'
+    && source.typedError?.terminal === false;
+  const targetOwnsTerminal =
+    Boolean(target.terminalStatus) && !sourceOwnsNonTerminalLeaseIncident;
+  const terminalStatusMatches = targetOwnsTerminal
+    && target.terminalStatus === source.terminalStatus;
+  const hasLocalProjection = source.toolCalls
+    || source.thinking
+    || source.thinkingDone != null
+    || source.processDuration != null
+    || source.followUpSuggestions?.length
+    || source.lastEventAt != null
+    || source.attachments?.length
+    || source.images?.length
+    || source.operation
+    || source.replacementOf
+    || source.replacedBy
+    || source.typedError
+    || source.errorDetail
+    || source.resolution
+    || source.budgetNotice
+    || source.turnAttribution;
+  const merged = hasLocalProjection ? {
+    ...target,
+    toolCalls: target.toolCalls ?? source.toolCalls,
+    thinking: target.thinking ?? source.thinking,
+    thinkingDone: target.thinkingDone ?? source.thinkingDone,
+    processDuration: target.processDuration ?? source.processDuration,
+    followUpSuggestions: target.followUpSuggestions ?? source.followUpSuggestions,
+    lastEventAt: target.lastEventAt ?? source.lastEventAt,
+    attachments: target.attachments ?? source.attachments,
+    images: target.images ?? source.images,
+    operation: target.operation ?? source.operation,
+    replacementOf: target.replacementOf ?? source.replacementOf,
+    replacedBy: target.replacedBy ?? source.replacedBy,
+    error: targetOwnsTerminal ? target.error : target.error ?? source.error,
+    typedError:
+      targetOwnsTerminal ? target.typedError : target.typedError ?? source.typedError,
+    errorDetail:
+      targetOwnsTerminal
+        ? target.errorDetail ?? (
+          terminalStatusMatches ? source.errorDetail : undefined
+        )
+        : target.errorDetail ?? source.errorDetail,
+    resolution:
+      targetOwnsTerminal ? target.resolution : target.resolution ?? source.resolution,
+    budgetNotice: target.budgetNotice ?? source.budgetNotice,
+    turnAttribution: target.turnAttribution ?? source.turnAttribution,
+  } : target;
+  if (sourceOwnsNonTerminalLeaseIncident) {
+    return {
+      ...merged,
+      error: source.error,
+      typedError: source.typedError,
+      errorDetail: source.errorDetail,
+      resolution: source.resolution,
+      loading: true,
+      cancelled: false,
+      terminalStatus: undefined,
+    };
+  }
+  if (!source.terminalStatus || targetOwnsTerminal) return merged;
+  return {
+    ...merged,
+    loading: false,
+    cancelled: source.terminalStatus === 'cancelled' || source.cancelled === true,
+    terminalStatus: source.terminalStatus,
+    error: merged.error ?? source.error,
+    errorDetail: merged.errorDetail ?? source.errorDetail,
+  };
+}
+
+// turnId -> client idempotency key for live operations. It lets an optimistic
+// row that has not received its turn id yet join a server snapshot of the same
+// turn, which is what keeps the "one turn = one assistant projection"
+// invariant during slow provider connects.
+export interface ServerMessageCorrelation {
+  idempotencyByTurnId?: Map<string, string>;
+}
+
+export function liveTurnCorrelation(
+  operations: Record<string, ChatOperation>,
+  sessionKey?: string,
+): ServerMessageCorrelation {
+  const idempotencyByTurnId = new Map<string, string>();
+  for (const operation of Object.values(operations)) {
+    if (sessionKey && operation.sessionKey !== sessionKey) continue;
+    if (operation.turnId && operation.clientIdempotencyKey) {
+      idempotencyByTurnId.set(operation.turnId, operation.clientIdempotencyKey);
+    }
+  }
+  return { idempotencyByTurnId };
+}
+
+export function mergeServerMessages(
+  currentMessages: ChatMessage[],
+  serverMessages: ChatMessage[],
+  correlation: ServerMessageCorrelation = {},
+): ChatMessage[] {
+  const currentById = new Map<string, ChatMessage>();
+  const currentAssistantByTurnId = new Map<string, ChatMessage>();
+  const currentUserByTurnId = new Map<string, ChatMessage>();
+  for (const message of currentMessages) currentById.set(message.id, message);
+  for (const message of currentMessages) {
+    if (message.role === 'assistant' && message.turnId) {
+      currentAssistantByTurnId.set(message.turnId, message);
+    } else if (message.role === 'user' && message.turnId) {
+      currentUserByTurnId.set(message.turnId, message);
+    }
+  }
+  const matchByIdempotency = (serverMessage: ChatMessage): ChatMessage | undefined => {
+    if (!serverMessage.turnId || !correlation.idempotencyByTurnId) return undefined;
+    const idempotencyKey = correlation.idempotencyByTurnId.get(serverMessage.turnId);
+    if (!idempotencyKey) return undefined;
+    return currentMessages.find((message) => (
+      message.role === serverMessage.role
+      && message.clientIdempotencyKey === idempotencyKey
+    ));
+  };
+
+  // Local optimistic rows absorbed onto a server row through correlation must
+  // not be appended again by the retention pass below.
+  const absorbedLocalIds = new Set<string>();
+
+  const merged: ChatMessage[] = serverMessages.map((serverMessage) => {
+    const correlated = matchByIdempotency(serverMessage);
+    const match = currentById.get(serverMessage.id)
+      ?? (
+        serverMessage.turnId
+          ? serverMessage.role === 'assistant'
+            ? currentAssistantByTurnId.get(serverMessage.turnId)
+            : serverMessage.role === 'user'
+              ? currentUserByTurnId.get(serverMessage.turnId)
+              : undefined
+          : undefined
+      )
+      ?? correlated;
+    if (!match) return serverMessage;
+    if (match.id !== serverMessage.id) absorbedLocalIds.add(match.id);
+    const projected = carryChainOfThoughtFields(serverMessage, match);
+    if (!correlated || correlated === match) return projected;
+    absorbedLocalIds.add(correlated.id);
+    return carryChainOfThoughtFields(projected, correlated);
+  });
+
+  for (const currentMessage of currentMessages) {
+    if (
+      currentMessage.role !== 'assistant'
+      || !currentMessage.turnId
+      || !currentMessage.toolCalls?.length
+      || (!isOptimisticMessageId(currentMessage.id)
+        && !isInFlightMessage(currentMessage))
+      || merged.some(
+        (message) =>
+          message.role === 'assistant'
+          && message.turnId === currentMessage.turnId,
+      )
+    ) {
+      continue;
+    }
+    const unkeyedAssistantIndex = merged.findIndex(
+      (message) =>
+        message.role === 'assistant'
+        && !message.turnId
+        && message.timestamp >= currentMessage.timestamp - 1000,
+    );
+    if (unkeyedAssistantIndex === -1) continue;
+    merged[unkeyedAssistantIndex] = carryChainOfThoughtFields(
+      {
+        ...merged[unkeyedAssistantIndex],
+        turnId: currentMessage.turnId,
+      },
+      currentMessage,
+    );
+  }
+
+  const mergedIds = new Set(merged.map((message) => message.id));
+  const mergedAssistantTurnIds = new Set(
+    merged
+      .filter((message) => message.role === 'assistant' && message.turnId)
+      .map((message) => message.turnId as string),
+  );
+
+  for (const message of currentMessages) {
+    if (mergedIds.has(message.id)) continue;
+    if (absorbedLocalIds.has(message.id)) continue;
+    if (
+      message.role === 'assistant'
+      && message.turnId
+      && mergedAssistantTurnIds.has(message.turnId)
+    ) {
+      continue;
+    }
+    const isLocalOnly = isOptimisticMessageId(message.id) || isInFlightMessage(message);
+    if (!isLocalOnly) continue;
+    if (isSupersededByServer(message, serverMessages, currentMessages)) continue;
+    merged.push(message);
+  }
+
+  // Repeated authoritative snapshots retain unchanged row identity, including
+  // nested tool/artifact projections and the complete no-change timeline.
+  return replaceEqualDeep(currentMessages, merged);
+}
+
+function isSupersededByServer(
+  localMessage: ChatMessage,
+  serverMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+): boolean {
+  if (localMessage.role === 'user') {
+    return serverMessages.some((serverMessage) => {
+      if (serverMessage.role !== 'user') return false;
+      if (localMessage.turnId) {
+        return serverMessage.turnId === localMessage.turnId;
+      }
+      return serverMessage.content === localMessage.content
+        && serverMessage.timestamp >= localMessage.timestamp - 1000;
+    });
+  }
+  if (localMessage.role === 'assistant') {
+    if (
+      localMessage.error
+      || localMessage.typedError
+      || localMessage.terminalStatus
+    ) {
+      return false;
+    }
+    const localIndex = currentMessages.indexOf(localMessage);
+    const pairedUser = localIndex > 0 ? currentMessages[localIndex - 1] : undefined;
+    if (pairedUser?.role === 'user' && isOptimisticMessageId(pairedUser.id)) {
+      const serverUserIndex = serverMessages.findIndex(
+        (serverMessage) => serverMessage.role === 'user'
+          && serverMessage.content === pairedUser.content
+          && serverMessage.timestamp >= pairedUser.timestamp - 1000,
+      );
+      if (serverUserIndex === -1) return false;
+      return serverMessages.slice(serverUserIndex + 1).some(
+        (serverMessage) => serverMessage.role === 'assistant'
+          && !serverMessage.loading
+          && Boolean(serverMessage.content),
+      );
+    }
+    const serverHasCompletedReply = serverMessages.some(
+      (serverMessage) => serverMessage.role === 'assistant'
+        && !serverMessage.loading
+        && Boolean(serverMessage.content)
+        && serverMessage.timestamp >= localMessage.timestamp - 1000,
+    );
+    if (serverHasCompletedReply && (localMessage.loading || !localMessage.content)) return true;
+  }
+  return false;
+}
+
+function normalizeDelegationStatus(value: unknown): DelegationTaskStatus {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'completed' || normalized === 'delegation_status_completed') return 'completed';
+  if (normalized === 'failed' || normalized === 'delegation_status_failed') return 'failed';
+  if (normalized === 'timeout' || normalized === 'delegation_status_timeout') return 'timeout';
+  return 'unknown';
+}
+
+function stringArrayField(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+}
+
+export function parseDelegationResults(value: string): DelegationTaskInfo[] {
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => ({
+      taskId: String(item.TaskID || item.taskId || ''),
+      parentTurnId: String(item.ParentTurnID || item.parentTurnId || ''),
+      taskDescription: String(item.TaskDescription || item.taskDescription || item.Description || item.description || ''),
+      childToolset: stringArrayField(item.ChildToolset || item.childToolset),
+      status: normalizeDelegationStatus(item.Status || item.status),
+      resultSummary: String(item.ResultSummary || item.resultSummary || ''),
+      toolIterations: Number(item.ToolIterations ?? item.toolIterations ?? 0),
+      startedAt: String(item.StartedAt || item.startedAt || ''),
+      endedAt: String(item.EndedAt || item.endedAt || ''),
+    })).filter((item) => item.taskId && item.taskDescription);
+  } catch {
+    return [];
+  }
+}
+
+const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
+const DOCUMENT_HEADING_PATTERN = /(^|\n)#{1,3}\s+\S/;
+const DOCUMENT_TABLE_PATTERN = /(^|\n)\|.+\|\n\|[-:\s|]+\|/;
+
+function artifactKindForLanguage(language: string): MessageArtifactKind {
+  const normalized = language.trim().toLowerCase();
+  if (normalized === 'mermaid' || normalized === 'plantuml' || normalized === 'dot') return 'diagram';
+  if (['json', 'yaml', 'yml', 'toml', 'xml', 'csv'].includes(normalized)) return 'structured';
+  if (['markdown', 'md', 'mdx'].includes(normalized)) return 'document';
+  return 'code';
+}
+
+function sanitizeArtifactLanguage(raw: string): string {
+  return raw.trim().split(/\s+/)[0]?.toLowerCase() || 'text';
+}
+
+function looksLikeDocumentArtifact(content: string): boolean {
+  const trimmed = content.trim();
+  if (trimmed.length < 600) return false;
+  return DOCUMENT_HEADING_PATTERN.test(trimmed) || DOCUMENT_TABLE_PATTERN.test(trimmed);
+}
+
+export function extractMessageArtifacts(message: Pick<ChatMessage, 'id' | 'role' | 'content' | 'timestamp'>): MessageArtifact[] {
+  if (message.role !== 'assistant') return [];
+  const content = message.content.trim();
+  if (!content) return [];
+
+  const artifacts: MessageArtifact[] = [];
+  let match: RegExpExecArray | null;
+  let index = 0;
+  while ((match = FENCE_PATTERN.exec(message.content)) !== null) {
+    const language = sanitizeArtifactLanguage(match[1] || 'text');
+    const artifactContent = (match[2] || '').trim();
+    if (!artifactContent) continue;
+    const kind = artifactKindForLanguage(language);
+    artifacts.push({
+      id: `${message.id}:fence:${index}`,
+      messageId: message.id,
+      kind,
+      title: `${kind}:${language}:${index + 1}`,
+      language,
+      content: artifactContent,
+      createdAt: message.timestamp,
+      sourceRange: {
+        start: match.index,
+        end: match.index + match[0].length,
+      },
+    });
+    index += 1;
+  }
+
+  if (looksLikeDocumentArtifact(content)) {
+    artifacts.unshift({
+      id: `${message.id}:document`,
+      messageId: message.id,
+      kind: 'document',
+      title: 'document:markdown:1',
+      language: 'markdown',
+      content,
+      createdAt: message.timestamp,
+    });
+  }
+
+  return artifacts;
+}
+
+export type ChatOperation = Operation;
+
+export interface AgentRevisionCommandFailure {
+  conversationId: string;
+  resourceId: string;
+  expectedRevision: number;
+  actualRevision: number;
+  typedError: AgentTypedErrorPayload;
+  resolution: AgentErrorResolutionAction & {
+    type: 'reloadLatest';
+    resourceId: string;
+    expectedRevision: number;
+    actualRevision: number;
+  };
+}
+
+interface ChatState {
+  sessions: Session[];
+  currentSessionKey: string;
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  streamingStartedAt: number | null;
+  operations: Record<string, ChatOperation>;
+  turnQueues: Record<string, AgentTurnQueueListOutput>;
+  sessionBuffers: Record<string, ChatMessage[]>;
+  abortController: AbortController | null;
+  memoryDisabledSessions: Record<string, boolean>;
+  draftPromotions: Record<string, string>;
+  composerDrafts: Record<string, string>;
+  // TW-D2: Station-owned attachment references staged for an unsent Turn,
+  // keyed by session key alongside composerDrafts. The binaries live in
+  // Station OSS; this map only keeps the refs so staged material survives
+  // task switches and reloads until sent or explicitly abandoned.
+  composerAttachments: Record<string, AgentAttachmentRefInput[]>;
+  readinessErrorKey: string | null;
+  revisionCommandFailure: AgentRevisionCommandFailure | null;
+  revisionReloadingConversationId: string | null;
+
+
+  wideScreen: boolean;
+
+  // Composer fill channel (I2 follow-up): a one-shot request to populate the ChatInput
+  // draft WITHOUT sending, aligning with LobeHub `fillInputMessage`. ChatInput consumes
+  // the pending value, writes it into its draft, focuses, and clears the request.
+  composerFill: { text: string; nonce: number; append?: boolean; sessionKey: string } | null;
+  composerReferenceRemoval: ComposerReferenceRemovalIntent | null;
+  composerResourceSelection: ComposerResourceSelectionIntent | null;
+  composerModelSelection: { sessionKey: string; nonce: number } | null;
+  composerFocusNonce: number;
+
+  loadSessions: () => Promise<void>;
+  mergeSessions: (sessions: Session[]) => void;
+  selectSession: (key: string, sessionOverride?: Session) => Promise<void>;
+  setComposerDraft: (sessionKey: string, value: string) => void;
+  setComposerAttachments: (sessionKey: string, refs: AgentAttachmentRefInput[]) => void;
+  bootstrapSession: () => Promise<void>;
+  newSession: () => void;
+  deleteSession: (key: string) => Promise<void>;
+  purgeSessions: (keys: string[]) => Promise<void>;
+  sendMessage: (
+    content: string,
+    attachments?: ChatComposerAttachment[],
+    lifecycle?: AgentSendLifecycle,
+  ) => boolean;
+  regenerateMessage: (messageId: string) => Promise<void>;
+  retryMessage: (messageId: string) => Promise<void>;
+  deleteAndRegenerateMessage: (messageId: string) => Promise<void>;
+  branchFromMessage: (messageId: string) => Promise<void>;
+  requestTurnCancellation: (
+    turnId: string,
+    assistantMessageId?: string,
+  ) => Promise<void>;
+  stopStreaming: () => void;
+  stopOperation: (sessionKey: string) => void;
+  continueGeneration: (messageId: string) => void;
+  deleteMessage: (id: string) => Promise<void>;
+  editMessage: (id: string, content: string) => Promise<void>;
+  translateMessage: (id: string) => Promise<void>;
+  reset: () => void;
+
+  syncMessages: () => Promise<void>;
+  applyRecoveredTurnEvent: (
+    conversationId: string,
+    agentId: string,
+    turnId: string,
+    event: StreamEvent,
+  ) => void;
+  reconcileRecoveredTurn: (
+    conversationId: string,
+    turnId: string,
+    terminal: RecoveredTurnTerminal | null,
+  ) => Promise<void>;
+  retryTurnRecovery: (conversationId?: string) => void;
+  reloadTurnSnapshot: (conversationId?: string) => Promise<AgentTurnSnapshotReloadResult>;
+  reloadLatestRevision: (conversationId?: string) => Promise<void>;
+  resetExternalRuntime: (
+    conversationId?: string,
+  ) => Promise<AgentConversationRuntimeResetResult>;
+  rebindConversationRuntime: (
+    conversationId?: string,
+  ) => Promise<AgentConversationRuntimeRebindResult>;
+  reconcileClientLease: (
+    conversationId: string,
+    messageId: string,
+    sessionId: string,
+    leaseId: string,
+    turnId?: string,
+  ) => Promise<void>;
+  syncTurnQueue: (conversationId?: string) => Promise<void>;
+  cancelQueuedTurn: (conversationId: string, queueEntryId: string) => Promise<void>;
+  setWideScreen: (wide: boolean) => void;
+  fillComposer: (text: string) => void;
+  appendComposer: (text: string) => void;
+  consumeComposerFill: () => void;
+  requestComposerReferenceRemoval: (
+    referenceKind: string,
+    referenceHash: string,
+  ) => void;
+  consumeComposerReferenceRemoval: (nonce: number) => void;
+  requestComposerResourceSelection: (
+    resourceKind: string,
+    resourceRefHash: string,
+  ) => void;
+  consumeComposerResourceSelection: (nonce: number) => void;
+  requestComposerModelSelection: (sessionKey: string) => void;
+  consumeComposerModelSelection: (nonce: number) => void;
+  requestComposerFocus: () => void;
+  consumeComposerFocus: () => void;
+  toggleSessionMemory: (sessionKey?: string) => void;
+  isMemoryDisabled: (sessionKey?: string) => boolean;
+  loadPreferences: () => Promise<void>;
+}
+
+let messageCounter = 0;
+let composerReferenceRemovalCounter = 0;
+let composerResourceSelectionCounter = 0;
+const pendingMessageRetries = new Map<string, Promise<void>>();
+
+// D1: one user submission gesture owns exactly one Station Turn. A double
+// Enter/click in the pre-admission window must not create two Turns — the
+// second gesture is suppressed locally while Station admission for the first
+// is still in flight, and both gestures would otherwise carry different
+// idempotency keys. The entry is released once Station admits (non-error
+// stream event), errors before admission (so retry works), or the stream
+// closes. Server-side payload-hash conflict remains the cross-client backstop.
+const inFlightSubmissions = new Map<string, string>();
+
+function submissionGuardKey(
+  sessionKey: string,
+  content: string,
+  attachments: ChatComposerAttachment[],
+): string {
+  const attachmentKey = attachments
+    .map((attachment) => attachment.cid || '')
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  return `${sessionKey}\u0000${content}\u0000${attachmentKey}`;
+}
+
+function releaseInFlightSubmission(guardKey: string, idempotencyKey: string): void {
+  if (inFlightSubmissions.get(guardKey) === idempotencyKey) {
+    inFlightSubmissions.delete(guardKey);
+  }
+}
+
+function tempId() {
+  return `temp-${Date.now()}-${messageCounter++}`;
+}
+
+async function stationConversationVersion(conversationId: string): Promise<number> {
+  const conversation = await api.getAgentConversation(conversationId);
+  return conversation.version;
+}
+
+async function revisionCommandVersion(
+  conversationId: string,
+  sessions: Session[],
+): Promise<number> {
+  const projectedVersion = sessions.find(
+    (session) => session.key === conversationId,
+  )?.version;
+  if (
+    typeof projectedVersion === 'number'
+    && Number.isSafeInteger(projectedVersion)
+    && projectedVersion > 0
+  ) {
+    return projectedVersion;
+  }
+  return stationConversationVersion(conversationId);
+}
+
+export function projectAgentRevisionCommandFailure(
+  error: unknown,
+  conversationId: string,
+): AgentRevisionCommandFailure | null {
+  const normalized = normalizeAgentTurnStreamError(error);
+  const typedError = normalized.typedError;
+  const resolution = normalized.resolution;
+  if (
+    !isAgentLifecycleStaleVersionError(typedError)
+    || resolution?.type !== 'reloadLatest'
+    || resolution.resourceId !== conversationId
+    || resolution.expectedRevision === undefined
+    || resolution.actualRevision === undefined
+  ) {
+    return null;
+  }
+  return {
+    conversationId,
+    resourceId: typedError.details.resource_id,
+    expectedRevision: resolution.expectedRevision,
+    actualRevision: resolution.actualRevision,
+    typedError,
+    resolution: resolution as AgentRevisionCommandFailure['resolution'],
+  };
+}
+
+export function projectAgentTerminalMutationMessage(
+  message: ChatMessage,
+  error: AgentTurnStreamError,
+  turnId: string,
+  assistantMessageId?: string,
+): ChatMessage {
+  const typedError = error.typedError;
+  const resolution = error.resolution;
+  const matchesMessage = (
+    message.role === 'assistant'
+    && (
+      (assistantMessageId !== undefined && message.id === assistantMessageId)
+      || message.turnId === turnId
+    )
+  );
+  if (
+    !matchesMessage
+    || !isAgentLifecycleTerminalMutationError(typedError)
+    || resolution?.type !== 'openResult'
+    || resolution.resourceId !== turnId
+    || resolution.turnId !== turnId
+    || resolution.terminalStatus !== typedError.details.terminal_status
+  ) {
+    return message;
+  }
+  return {
+    ...message,
+    error: typedError.locale_key,
+    typedError,
+    errorDetail: error.errorDetail || message.errorDetail,
+    resolution,
+    loading: false,
+    terminalStatus: resolution.terminalStatus,
+    cancelled: resolution.terminalStatus === 'cancelled',
+  };
+}
+
+function reconcileRevisionSession(
+  sessions: Session[],
+  conversation: AgentConversation,
+): Session[] {
+  const existing = sessions.find(
+    (session) => session.key === conversation.conversation_id,
+  );
+  const reloaded: Session = {
+    id: conversation.conversation_id,
+    key: conversation.conversation_id,
+    agent_name: conversation.agent_id,
+    title: resolveI18nValue(conversation.title) || '',
+    ...(conversation.task_id ? { task_id: conversation.task_id } : {}),
+    message_count: existing?.message_count ?? 0,
+    version: conversation.version,
+    model_override: conversation.model_name,
+    provider_override: conversation.provider_id,
+    created_at: conversation.created_at,
+    updated_at: conversation.updated_at,
+    pinned: existing?.pinned,
+    favorite: existing?.favorite,
+  };
+  return existing
+    ? sessions.map((session) => (
+        session.key === conversation.conversation_id ? reloaded : session
+      ))
+    : [reloaded, ...sessions];
+}
+
+function clearResolvedRuntimeResumeError(message: ChatMessage): ChatMessage {
+  if (message.resolution?.type !== 'confirmReset') return message;
+  return {
+    ...message,
+    resolution: null,
+  };
+}
+
+function presentChatRuntimeError(message: string): string {
+  if (/unknown command|agent_execute_turn_stream|chat_completion_stream|Failed to execute agent turn/.test(message)) {
+    return i18n.t("chat.runtime.unavailable", { ns: "chat", defaultValue: "The selected runtime is not ready. Check model credentials and try again." });
+  }
+  if (/no credentials|credential (not found|missing|invalid)|provider.*not found for actor|record not found/i.test(message)) {
+    return i18n.t("chat.runtime.unavailable", { ns: "chat", defaultValue: "The selected runtime is not ready. Check model credentials and try again." });
+  }
+  return message;
+}
+
+export function applyStreamEvent(msg: ChatMessage, event: StreamEvent): ChatMessage {
+  const reduced = reduceStreamEvent(msg, event as TurnStreamEvent);
+  const toolCalls = toolRuntime.reduceToolCalls(reduced.toolCalls, event);
+  return bindStreamEventTurnIdentity(
+    mergeToolProjection(reduced, toolCalls),
+    event,
+  );
+}
+
+function applyProjectedStreamEvent(msg: ChatMessage, event: StreamEvent): ChatMessage {
+  const reduced = reduceStreamEvent(msg, event as TurnStreamEvent);
+  const toolCalls = toolRuntime.projectToolCalls(reduced.toolCalls, event);
+  return bindStreamEventTurnIdentity(
+    mergeToolProjection(reduced, toolCalls),
+    event,
+  );
+}
+
+export function clearReconciledClientLeaseError(
+  message: ChatMessage,
+  messageId: string,
+  sessionId: string,
+  leaseId: string,
+  turnId?: string,
+): ChatMessage {
+  if (
+    message.id !== messageId
+    || (turnId && message.turnId !== turnId)
+  ) {
+    return message;
+  }
+  if (
+    message.typedError
+    && (
+      message.typedError.error_type !== 'CLIENT_LEASE_EXPIRED'
+      || message.typedError.details.session_id !== sessionId
+      || message.typedError.details.lease_id !== leaseId
+    )
+  ) {
+    return message;
+  }
+  return {
+    ...message,
+    error: undefined,
+    typedError: undefined,
+    errorDetail: undefined,
+    resolution: undefined,
+    loading: true,
+    cancelled: false,
+    terminalStatus: undefined,
+  };
+}
+
+function bindStreamEventTurnIdentity(
+  message: ChatMessage,
+  event: StreamEvent,
+): ChatMessage {
+  const turnId = typeof event.data?.turnId === 'string'
+    ? event.data.turnId
+    : typeof event.data?.turn_id === 'string'
+      ? event.data.turn_id
+      : '';
+  if (!turnId || message.turnId === turnId) return message;
+  return { ...message, turnId };
+}
+
+function mergeToolProjection(
+  reduced: ChatMessage,
+  toolCalls: ToolCallInfo[] | undefined,
+): ChatMessage {
+  const delegationResults = toolCalls
+    ?.flatMap((toolCall) => toolCall.delegationResults || []);
+  return {
+    ...reduced,
+    toolCalls,
+    delegationResults: delegationResults?.length
+      ? delegationResults
+      : reduced.delegationResults,
+  };
+}
+
+function buildAgentTurnInput(
+  conversationId: string,
+  agentId: string,
+  userInput: string,
+  attachments: ChatComposerAttachment[],
+  requestedBudget?: AgentRuntimeBudgetInput,
+  clientIdempotencyKey?: string,
+  topicKey = conversationId,
+) {
+  const agentState = useAgentStore.getState();
+  const topic = useAgentTopicStore.getState().getTopicsForAgent(agentId)
+    .find((item) => item.key === topicKey);
+  const selection = resolveAvailableModelSelection(
+    agentState.availableModels,
+    topic?.model_override || '',
+    topic?.provider_override || '',
+    agentState.defaultModel,
+    agentState.defaultProviderId,
+  );
+  // Pin the live Station session even when the readiness snapshot was computed
+  // against a session that has since been orphaned by a renderer reload; the
+  // station authority independently rejects pins whose parent auth session
+  // was kicked.
+  const readinessSelectedSessionId = useAgentCapabilityStore
+    .getState()
+    .readinessByAgentId[agentId]
+    ?.selectedClientSessionId;
+  const clientCapabilitySessionId = resolvePinnedClientCapabilitySessionId(
+    readinessSelectedSessionId,
+  );
+  return {
+    client_idempotency_key: clientIdempotencyKey || tempId(),
+    conversation_id: conversationId,
+    agent_id: agentId,
+    user_input: userInput,
+    provider: selection.providerId || undefined,
+    model: selection.modelId || undefined,
+    requested_budget: requestedBudget,
+    client_capability_session_id: clientCapabilitySessionId,
+    attachments: attachments
+      .map((item) => item.attachment)
+      .filter((item): item is AgentAttachmentRefInput => Boolean(item)),
+  };
+}
+
+function resolveAgentExecutionID(agentName: string): string | null {
+  const agentState = useAgentStore.getState();
+  const agent = agentState.agents.find((item) => item.name === agentName);
+  return agent?.id || null;
+}
+
+function reconcileTopicsAfterTurn(sessionKey: string): void {
+  const topicStore = useAgentTopicStore.getState();
+  void topicStore.reconcileSelectedAgentTopics('turn-done').then(() => {
+    const topic = topicStore
+      .getTopicsForAgent(topicStore.activeAgentId)
+      .find((item) => item.key === sessionKey);
+    if (topic?.titleState === 'untitled') {
+      void topicStore.smartRenameTopic(sessionKey).catch((error) => {
+        log.warn('chat', 'Auto topic title generation failed', { sessionKey, error: String(error) });
+      });
+    }
+  });
+}
+
+const PARALLEL_OPERATION_SEPARATOR = '::parallel::';
+
+function parallelOperationKey(sessionKey: string, operationId: string): string {
+  return `${sessionKey}${PARALLEL_OPERATION_SEPARATOR}${operationId}`;
+}
+
+function sessionOperationEntries(
+  operations: Record<string, ChatOperation>,
+  sessionKey: string,
+): Array<[string, ChatOperation]> {
+  return Object.entries(operations).filter(([key, operation]) => (
+    operation.sessionKey === sessionKey
+    && (key === sessionKey || key.startsWith(`${sessionKey}${PARALLEL_OPERATION_SEPARATOR}`))
+  ));
+}
+
+function hasActiveSessionOperation(
+  operations: Record<string, ChatOperation>,
+  sessionKey: string,
+): boolean {
+  return sessionOperationEntries(operations, sessionKey)
+    .some(([, operation]) => isActiveOperation(operation));
+}
+
+// Resolve the live operation a recovered turn belongs to. Recovery must bind
+// to the existing optimistic row instead of minting a recovered-* id, otherwise
+// one turn renders as two assistant rows until the next server merge.
+function findRecoverableOperationEntry(
+  operations: Record<string, ChatOperation>,
+  sessionKey: string,
+  turnId: string,
+): [string, ChatOperation] | undefined {
+  const entries = sessionOperationEntries(operations, sessionKey);
+  const byTurn = entries.find(([, operation]) => operation.turnId === turnId);
+  if (byTurn) return byTurn;
+  const unbound = entries.filter(([, operation]) => (
+    !operation.turnId
+    && operation.type === 'sendMessage'
+    && isActiveOperation(operation)
+  ));
+  // An unbound live op is ambiguous while parallel sends run; only claim it
+  // when it is the single candidate for the session.
+  return unbound.length === 1 ? unbound[0] : undefined;
+}
+
+function operationKeyForStreamEvent(
+  operations: Record<string, ChatOperation>,
+  sessionKey: string,
+  event: StreamEvent,
+): string {
+  const streamGeneration = Number(event.data?.streamGeneration || 0);
+  if (streamGeneration > 0) {
+    const match = sessionOperationEntries(operations, sessionKey)
+      .find(([, operation]) => operation.streamGeneration === streamGeneration);
+    if (match) return match[0];
+  }
+  const turnId = typeof event.data?.turnId === 'string' ? event.data.turnId : undefined;
+  if (turnId) {
+    const match = sessionOperationEntries(operations, sessionKey)
+      .find(([, operation]) => operation.turnId === turnId);
+    if (match) return match[0];
+  }
+  return sessionKey;
+}
+
+function completeOperationAtKey(
+  operations: Record<string, ChatOperation>,
+  operationKey: string,
+): Record<string, ChatOperation> {
+  const op = operations[operationKey];
+  if (!op) return operations;
+  if (
+    op.runState === 'failed'
+    || op.runState === 'cancelled'
+    || op.runState === 'interrupted'
+  ) {
+    return operations;
+  }
+  return { ...operations, [operationKey]: completeOperation(op) };
+}
+
+function failOperationAtKey(
+  operations: Record<string, ChatOperation>,
+  operationKey: string,
+  error: string,
+): Record<string, ChatOperation> {
+  const op = operations[operationKey];
+  if (!op) return operations;
+  return { ...operations, [operationKey]: failOperation(op, { message: error }) };
+}
+
+function settleRecoveredOperation(
+  operation: ChatOperation,
+  terminal: RecoveredTurnTerminal,
+): ChatOperation {
+  if (terminal.status === 'completed') return completeOperation(operation);
+  if (terminal.status === 'cancelled') {
+    return {
+      ...cancelOperation(operation),
+      error: terminal.reason ? { message: terminal.reason } : operation.error,
+    };
+  }
+  if (terminal.status === 'interrupted') {
+    return {
+      ...operation,
+      status: 'interrupted',
+      runState: 'interrupted',
+      error: {
+        message: terminal.reason || operation.error?.message || 'agent.error.streamInterrupted',
+      },
+      endedAt: Date.now(),
+    };
+  }
+  return failOperation(operation, {
+    message: terminal.reason || operation.error?.message || 'agent.error.streamFailed',
+  });
+}
+
+function setBuffer(
+  buffers: Record<string, ChatMessage[]>,
+  sessionKey: string,
+  updater: (messages: ChatMessage[]) => ChatMessage[],
+): Record<string, ChatMessage[]> {
+  const current = buffers[sessionKey] || [];
+  return { ...buffers, [sessionKey]: updater(current) };
+}
+
+function clearBuffer(buffers: Record<string, ChatMessage[]>, sessionKey: string): Record<string, ChatMessage[]> {
+  if (!buffers[sessionKey]) return buffers;
+  const next = { ...buffers };
+  delete next[sessionKey];
+  return next;
+}
+
+export function shouldUseSessionBuffer(operation?: ChatOperation): boolean {
+  return isActiveOperation(operation)
+    || isPreAdmissionFailure(operation);
+}
+
+function isPreAdmissionFailure(
+  operation?: ChatOperation,
+): operation is ChatOperation {
+  return operation?.status === 'failed' && !operation.turnId;
+}
+
+function discardPreAdmissionFailureMessages(
+  messages: ChatMessage[],
+  operation?: ChatOperation,
+  targetMessageId?: string,
+): ChatMessage[] {
+  if (!isPreAdmissionFailure(operation)) return messages;
+  const assistantIndex = messages.findIndex(
+    (message) => message.id === operation.assistantMessageId,
+  );
+  if (assistantIndex < 0) return messages;
+  const optimisticIds = new Set([operation.assistantMessageId]);
+  const precedingMessage = messages[assistantIndex - 1];
+  if (
+    precedingMessage?.role === 'user'
+    && isOptimisticMessageId(precedingMessage.id)
+  ) {
+    optimisticIds.add(precedingMessage.id);
+  }
+  if (targetMessageId && !optimisticIds.has(targetMessageId)) return messages;
+  return messages.filter((message) => !optimisticIds.has(message.id));
+}
+
+function removeOperation(
+  operations: Record<string, ChatOperation>,
+  sessionKey: string,
+): Record<string, ChatOperation> {
+  if (!operations[sessionKey]) return operations;
+  const next = { ...operations };
+  delete next[sessionKey];
+  return next;
+}
+
+function operationRecoveryPhase(
+  operation: ChatOperation,
+): AgentTurnRecoveryPhase | undefined {
+  switch (operation.runState) {
+    case 'streaming':
+      return 'CONNECTED';
+    case 'connection_lost':
+      return 'CONNECTION_LOST';
+    case 'reconnecting':
+      return 'RECONNECTING';
+    case 'replaying':
+      return 'REPLAYING';
+    case 'reconciling':
+      return 'RECONCILING';
+    case 'recovery_failed':
+      return 'RECOVERY_FAILED';
+    default:
+      return undefined;
+  }
+}
+
+export function applyOperationEventIdentity(
+  operations: Record<string, ChatOperation>,
+  sessionKey: string,
+  event: StreamEvent,
+  operationKey: string = sessionKey,
+): { operations: Record<string, ChatOperation>; accepted: boolean } {
+  const operation = operations[operationKey];
+  if (!operation) return { operations, accepted: true };
+  const seq = Number(event.data?.seq || 0);
+  const streamGeneration = Number(event.data?.streamGeneration || 0);
+  const currentGeneration = operation.streamGeneration ?? 0;
+  const recoveryPhase = agentTurnRecoveryPhaseForEvent(event.event);
+  const currentRecoveryPhase = operationRecoveryPhase(operation);
+  const sameSequenceRecoveryAdvance =
+    recoveryPhase !== undefined
+    && currentRecoveryPhase !== undefined
+    && seq === (operation.lastEventSeq || 0)
+    && isAgentTurnRecoveryPhaseTransitionAllowed(
+      currentRecoveryPhase,
+      recoveryPhase,
+    );
+  if (
+    streamGeneration > 0
+    && currentGeneration > 0
+    && streamGeneration < currentGeneration
+  ) {
+    return { operations, accepted: false };
+  }
+  if (
+    seq > 0
+    && (operation.lastEventSeq || 0) >= seq
+    && streamGeneration === currentGeneration
+    && !sameSequenceRecoveryAdvance
+    && !(
+      event.event === 'snapshot'
+      && (operation.lastEventSeq || 0) === seq
+    )
+  ) {
+    return { operations, accepted: false };
+  }
+  const turnId =
+    typeof event.data?.turnId === 'string'
+      ? event.data.turnId
+      : typeof event.data?.turn_id === 'string'
+        ? event.data.turn_id
+        : operation.turnId;
+  const conversationId =
+    typeof event.data?.conversationId === 'string'
+      ? event.data.conversationId
+      : typeof event.data?.conversation_id === 'string'
+        ? event.data.conversation_id
+        : operation.conversationId;
+  if (
+    operation.turnId
+    && turnId
+    && operation.turnId !== turnId
+    && streamGeneration <= currentGeneration
+  ) {
+    return { operations, accepted: false };
+  }
+  const snapshotStatus = event.event === 'snapshot'
+    ? String(event.data?.status || '').toLowerCase()
+    : '';
+  const terminalStatus = classifyAgentTurnTerminalEvent(event);
+  const terminalRunState =
+    terminalStatus === 'queued' ? null : terminalStatus;
+  let runState = ({
+    turn_identity: 'streaming',
+    connection_lost: 'connection_lost',
+    reconnecting: 'reconnecting',
+    replaying: 'replaying',
+    reconciling: 'reconciling',
+    connected: 'streaming',
+    recovery_failed: 'recovery_failed',
+  } as const)[event.event]
+    ?? terminalRunState
+    ?? ({
+      completed: 'completed',
+      failed: 'failed',
+      cancelled: 'cancelled',
+      interrupted: 'interrupted',
+    } as const)[snapshotStatus]
+    ?? operation.runState;
+  const awaitingAdmission = event.event === 'queued'
+    ? true
+    : event.event === 'turn_identity'
+      ? false
+      : event.event === 'admission_replayed'
+        ? operation.awaitingAdmission ?? true
+        : terminalStatus === 'queued'
+          ? true
+          : operation.awaitingAdmission;
+  if (awaitingAdmission && runState === 'streaming') {
+    runState = 'reconciling';
+  }
+  const status = runState === 'completed'
+    ? 'completed'
+    : runState === 'failed'
+      ? 'failed'
+      : runState === 'interrupted'
+        ? 'interrupted'
+      : runState === 'cancelled'
+        ? 'cancelled'
+        : operation.status;
+  return {
+    accepted: true,
+    operations: {
+      ...operations,
+      [operationKey]: {
+        ...operation,
+        turnId,
+        conversationId,
+        streamGeneration:
+          streamGeneration > 0 ? streamGeneration : operation.streamGeneration,
+        lastEventSeq: seq > 0 ? seq : operation.lastEventSeq,
+        runState,
+        status,
+        endedAt:
+          status === 'completed'
+          || status === 'failed'
+          || status === 'cancelled'
+          || status === 'interrupted'
+            ? operation.endedAt ?? Date.now()
+            : operation.endedAt,
+        error:
+          status === 'failed' || status === 'interrupted'
+            ? {
+                message: String(
+                  event.data?.terminal_reason
+                  || event.data?.error
+                  || operation.error?.message
+                  || 'agent.error.streamFailed',
+                ),
+              }
+            : operation.error,
+        awaitingAdmission,
+      },
+    },
+  };
+}
+
+export function isMessageRetryBlocked(
+  isStreaming: boolean,
+  operation: ChatOperation | undefined,
+  sourceTurnId: string | undefined,
+  sourceTerminalStatus?: ChatMessage['terminalStatus'],
+): boolean {
+  if (!isStreaming) return false;
+  const matchesActiveTurn = Boolean(
+    sourceTurnId && operation?.turnId === sourceTurnId,
+  );
+  const sourceIsRetryableTerminal =
+    sourceTerminalStatus === 'failed'
+    || sourceTerminalStatus === 'cancelled'
+    || sourceTerminalStatus === 'interrupted';
+  const matchesTerminalOperation =
+    matchesActiveTurn
+    && sourceIsRetryableTerminal
+    && operation?.runState === sourceTerminalStatus;
+  if (matchesTerminalOperation) return false;
+  if (
+    matchesActiveTurn
+    && sourceTerminalStatus === 'interrupted'
+    && operation?.runState === 'replaying'
+  ) {
+    return false;
+  }
+  return (
+    operation?.runState !== 'recovery_failed'
+    || !matchesActiveTurn
+  );
+}
+
+async function loadSessionMessages(
+  key: string,
+  get: () => ChatState,
+  set: (partial: Partial<ChatState>) => void,
+): Promise<void> {
+  try {
+    const cached = await agentChatCache.getMessages(key);
+    if (get().currentSessionKey !== key) return;
+    const cachedMessages = reconcileToolMessages(
+      cached.map(cachedMessageToChatMessage),
+    );
+    const attributedCachedMessages = await projectTurnAttributionsOrKeep(
+      cachedMessages,
+      'cache-read',
+    );
+    if (get().currentSessionKey !== key) return;
+    set({
+      messages: mergeServerMessages(
+        get().messages,
+        attributedCachedMessages,
+        liveTurnCorrelation(get().operations, key),
+      ),
+    });
+    void agentChatCache
+      .syncConversation(key)
+      .then(async (synced) => {
+        if (get().currentSessionKey !== key) return;
+        const serverMessages = reconcileToolMessages(
+          synced.map(cachedMessageToChatMessage),
+        );
+        const attributedServerMessages = await projectTurnAttributionsOrKeep(
+          serverMessages,
+          'background-sync',
+        );
+        if (get().currentSessionKey !== key) return;
+        set({
+          messages: mergeServerMessages(
+            get().messages,
+            attributedServerMessages,
+            liveTurnCorrelation(get().operations, key),
+          ),
+        });
+      })
+      .catch((syncError) => {
+        log.warn('chat', 'Background conversation sync failed; keeping cache', { key, error: String(syncError) });
+      });
+  } catch (error) {
+    log.error('chat', 'Failed to load messages from cache; preserving current view', { key, error: String(error) });
+  }
+}
+
+/**
+ * TW-D2: best-effort reclamation for Station OSS attachment refs that drop
+ * out of the durable composer-draft map because the draft was abandoned
+ * (session purged or agent draft replaced). Sent and still-drafted refs are
+ * never passed here: the Turn owns sent refs, the draft document keeps
+ * switched-away refs and Station OSS TTL sweep is the final backstop.
+ */
+function releaseAbandonedAttachmentRefs(
+  before: Record<string, AgentAttachmentRefInput[]>,
+  after: Record<string, AgentAttachmentRefInput[]>,
+): void {
+  for (const [sessionKey, refs] of Object.entries(before)) {
+    if (after[sessionKey]) continue;
+    for (const ref of refs) {
+      deleteAgentAttachment(ref).catch((error: unknown) => {
+        log.warn('chat', 'abandoned composer attachment cleanup failed', {
+          sessionKey,
+          attachmentId: ref.attachment_id,
+          error: String(error),
+        });
+      });
+    }
+  }
+}
+
+// Hydrate task-level composer drafts once, before the store is created, so
+// the first render already seeds the composer text and staged attachments.
+const durableComposerDrafts = readAgentComposerDraftsSync();
+
+export const useChatStore = createDesktopStore<ChatState>('chat', (set, get) => ({
+  sessions: [],
+  currentSessionKey: 'main',
+  messages: [],
+  isStreaming: false,
+  streamingStartedAt: null,
+  operations: {},
+  turnQueues: {},
+  sessionBuffers: {},
+  abortController: null,
+  memoryDisabledSessions: {},
+  draftPromotions: {},
+  composerDrafts: durableComposerDrafts.texts,
+  composerAttachments: durableComposerDrafts.attachments,
+  readinessErrorKey: null,
+  revisionCommandFailure: null,
+  revisionReloadingConversationId: null,
+
+
+  wideScreen: false,
+  composerFill: null,
+  composerReferenceRemoval: null,
+  composerResourceSelection: null,
+  composerModelSelection: null,
+  composerFocusNonce: 0,
+
+  reset: () => {
+    inFlightSubmissions.clear();
+    for (const operation of Object.values(get().operations)) {
+      if (!operation.abortController.signal.aborted) {
+        operation.abortController.abort();
+      }
+    }
+    set({
+      sessions: [],
+      currentSessionKey: 'main',
+      messages: [],
+      isStreaming: false,
+      streamingStartedAt: null,
+      operations: {},
+      turnQueues: {},
+      sessionBuffers: {},
+      abortController: null,
+      memoryDisabledSessions: {},
+      draftPromotions: {},
+      composerDrafts: {},
+      composerAttachments: {},
+      readinessErrorKey: null,
+      revisionCommandFailure: null,
+      revisionReloadingConversationId: null,
+      composerFill: null,
+      composerReferenceRemoval: null,
+      composerResourceSelection: null,
+      composerModelSelection: null,
+      composerFocusNonce: 0,
+    });
+  },
+
+  loadSessions: async () => {
+    log.info('chat', 'Loading sessions');
+    const agentId = useAgentStore.getState().selectedAgent;
+    if (!agentId) {
+      set({ sessions: [] });
+      return;
+    }
+    try {
+      const conversations = await agentChatCache.listConversations(agentId);
+      const sessions = conversations.map(cachedConversationToSession);
+      log.info('chat', 'Sessions loaded from cache', { count: sessions.length });
+      set({ sessions });
+      const { currentSessionKey, messages, operations } = get();
+      if (
+        !isAgentDraftKey(currentSessionKey) &&
+        messages.length === 0 &&
+        !operations[currentSessionKey] &&
+        sessions.some((s) => s.key === currentSessionKey)
+      ) {
+        log.info('chat', 'Bootstrapping current session after sessions load', { key: currentSessionKey });
+        await loadSessionMessages(currentSessionKey, get, set);
+      }
+    } catch (e) {
+      log.error('chat', 'Failed to load sessions', e);
+    }
+  },
+
+  mergeSessions: (sessions: Session[]) => {
+    set((state) => {
+      const byKey = new Map(state.sessions.map((s) => [s.key, s]));
+      for (const s of sessions) {
+        byKey.set(s.key, s);
+      }
+      return { sessions: replaceEqualDeep(state.sessions, Array.from(byKey.values())) };
+    });
+  },
+
+  selectSession: async (key: string, sessionOverride?: Session) => {
+    log.info('chat', 'Selecting session', { key });
+    if (sessionOverride) {
+      const previousAttachments = get().composerAttachments;
+      set((state) => {
+        const draftAgentId = agentIdFromDraftKey(key);
+        const retained = state.sessions.filter((session) => (
+          session.key !== key
+          && (
+            draftAgentId === null
+            || agentIdFromDraftKey(session.key) !== draftAgentId
+          )
+        ));
+        const filterSameAgentDraft = ([sessionKey]: readonly [string, unknown]) => (
+          sessionKey === key
+          || agentIdFromDraftKey(sessionKey) !== draftAgentId
+        );
+        const composerDrafts = draftAgentId === null
+          ? state.composerDrafts
+          : Object.fromEntries(
+            Object.entries(state.composerDrafts).filter(filterSameAgentDraft),
+          );
+        const composerAttachments = draftAgentId === null
+          ? state.composerAttachments
+          : Object.fromEntries(
+            Object.entries(state.composerAttachments).filter(filterSameAgentDraft),
+          );
+        return {
+          sessions: [sessionOverride, ...retained],
+          composerDrafts,
+          composerAttachments,
+        };
+      });
+      releaseAbandonedAttachmentRefs(previousAttachments, get().composerAttachments);
+    }
+    if (key === get().currentSessionKey) return;
+    const liveOp = get().operations[key];
+    // Adopt active streams and local pre-admission rejections. Rejections have
+    // no Station message to reload, so their recovery surface remains local to
+    // the conversation until the user retries, deletes, or resolves it.
+    const liveBuffer = shouldUseSessionBuffer(liveOp)
+      ? get().sessionBuffers[key]
+      : undefined;
+    set({
+      currentSessionKey: key,
+      messages: liveBuffer ?? [],
+      isStreaming: isActiveOperation(liveOp),
+      streamingStartedAt: liveOp?.startedAt ?? null,
+      abortController: liveOp?.abortController ?? null,
+      readinessErrorKey: null,
+    });
+    if (liveBuffer) return;
+    if (isAgentDraftKey(key)) {
+      set({ messages: [] });
+      return;
+    }
+    await loadSessionMessages(key, get, set);
+  },
+
+  setComposerDraft: (sessionKey: string, value: string) => {
+    if (!sessionKey) return;
+    set((state) => {
+      const composerDrafts = { ...state.composerDrafts };
+      if (value) composerDrafts[sessionKey] = value;
+      else delete composerDrafts[sessionKey];
+      return { composerDrafts };
+    });
+  },
+
+  // TW-D2: mirror of composerDrafts for Station-owned staged attachment
+  // refs. The identity guard makes hook rehydration/notify cycles no-ops.
+  setComposerAttachments: (sessionKey, refs) => {
+    if (!sessionKey) return;
+    const current = get().composerAttachments[sessionKey] ?? [];
+    const unchanged = current.length === refs.length
+      && current.every((ref, index) => (
+        ref.attachment_id === refs[index]?.attachment_id
+        && ref.object_ref === refs[index]?.object_ref
+      ));
+    if (unchanged) return;
+    set((state) => {
+      const composerAttachments = { ...state.composerAttachments };
+      if (refs.length > 0) composerAttachments[sessionKey] = refs;
+      else delete composerAttachments[sessionKey];
+      return { composerAttachments };
+    });
+  },
+
+  bootstrapSession: async () => {
+    const key = get().currentSessionKey;
+    log.info('chat', 'Bootstrapping current session history', { key });
+    if (isAgentDraftKey(key)) {
+      return;
+    }
+    const liveOp = get().operations[key];
+    if (isActiveOperation(liveOp)) return;
+    await loadSessionMessages(key, get, set);
+  },
+
+  newSession: () => {
+    const { selectedAgent, agents } = useAgentStore.getState();
+    const agent = agents.find((item) => item.name === selectedAgent);
+    if (!agent) {
+      log.warn('chat', 'Cannot create Agent draft before Agent projection is ready');
+      return;
+    }
+    const key = createAgentDraftKey(agent.id);
+    const agentName = selectedAgent || 'assistant';
+    const now = new Date().toISOString();
+    const draftSession: Session = {
+      id: key,
+      key,
+      agent_name: agentName,
+      title: '',
+      message_count: 0,
+      created_at: now,
+      updated_at: now,
+    };
+    log.info('chat', 'New draft session created', { key, agentName });
+    const previousAttachments = get().composerAttachments;
+    set((state) => ({
+      currentSessionKey: key,
+      messages: [],
+      readinessErrorKey: null,
+      sessions: [
+        draftSession,
+        ...state.sessions.filter(
+          (session) => agentIdFromDraftKey(session.key) !== agent.id,
+        ),
+      ],
+      composerDrafts: Object.fromEntries(
+        Object.entries(state.composerDrafts).filter(
+          ([sessionKey]) => agentIdFromDraftKey(sessionKey) !== agent.id,
+        ),
+      ),
+      // Starting a fresh draft abandons every older draft of this Agent,
+      // including staged attachments that were never sent.
+      composerAttachments: Object.fromEntries(
+        Object.entries(state.composerAttachments).filter(
+          ([sessionKey]) => agentIdFromDraftKey(sessionKey) !== agent.id,
+        ),
+      ),
+    }));
+    releaseAbandonedAttachmentRefs(previousAttachments, get().composerAttachments);
+  },
+
+  deleteSession: async (key: string) => {
+    log.info('chat', 'Deleting session', { key });
+    if (!isAgentDraftKey(key)) {
+      const version = await stationConversationVersion(key);
+      await api.deleteAgentConversations([{ conversation_id: key, expected_version: version }]);
+    }
+    await get().purgeSessions([key]);
+  },
+
+  purgeSessions: async (keys: string[]) => {
+    const removed = new Set(keys);
+    const retain = <T,>(records: Record<string, T>) => Object.fromEntries(
+      Object.entries(records).filter(([key]) => !removed.has(key)),
+    );
+    const previousAttachments = get().composerAttachments;
+    set((state) => {
+      const currentDeleted = removed.has(state.currentSessionKey);
+      return {
+        sessions: state.sessions.filter((session) => !removed.has(session.key)),
+        sessionBuffers: retain(state.sessionBuffers),
+        turnQueues: retain(state.turnQueues),
+        memoryDisabledSessions: retain(state.memoryDisabledSessions),
+        composerDrafts: retain(state.composerDrafts),
+        composerAttachments: retain(state.composerAttachments),
+        draftPromotions: Object.fromEntries(Object.entries(state.draftPromotions)
+          .filter(([key, promoted]) => !removed.has(key) && !removed.has(promoted))),
+        operations: Object.fromEntries(Object.entries(state.operations)
+          .filter(([, operation]) => !removed.has(operation.sessionKey))),
+        ...(state.revisionCommandFailure && removed.has(state.revisionCommandFailure.conversationId)
+          ? { revisionCommandFailure: null } : {}),
+        ...(state.revisionReloadingConversationId && removed.has(state.revisionReloadingConversationId)
+          ? { revisionReloadingConversationId: null } : {}),
+        ...(currentDeleted ? {
+          currentSessionKey: '',
+          messages: [],
+          composerFill: null,
+          composerReferenceRemoval: null,
+          composerResourceSelection: null,
+          composerModelSelection: null,
+          readinessErrorKey: null,
+          isStreaming: false,
+          streamingStartedAt: null,
+        } : {}),
+      };
+    });
+    releaseAbandonedAttachmentRefs(previousAttachments, get().composerAttachments);
+    await Promise.all(keys.filter((key) => !isAgentDraftKey(key)).map(async (key) => {
+      try {
+        await agentChatCache.clearConversation(key);
+      } catch (error) {
+        log.warn('chat', 'Deleted conversation cache cleanup failed', { key, error: String(error) });
+      }
+    }));
+  },
+
+  syncMessages: async () => {
+    log.debug('chat', 'Syncing messages', { key: get().currentSessionKey });
+    const { currentSessionKey } = get();
+    reportFoundationApprovalReceiverDebug(
+      'authoritative-sync-start',
+      get().messages,
+    );
+
+    try {
+      if (isAgentDraftKey(currentSessionKey)) {
+        return;
+      }
+      const synced = await agentChatCache.refreshConversation(currentSessionKey);
+      if (get().currentSessionKey !== currentSessionKey) return;
+      const serverMessages = reconcileToolMessages(
+        synced.map(cachedMessageToChatMessage),
+      );
+      const attributedServerMessages = await projectTurnAttributionsOrKeep(
+        serverMessages,
+        'authoritative-sync',
+      );
+      if (get().currentSessionKey !== currentSessionKey) return;
+
+      const merged = mergeServerMessages(
+        get().messages,
+        attributedServerMessages,
+        liveTurnCorrelation(get().operations, currentSessionKey),
+      );
+      set({ messages: merged });
+      reportFoundationApprovalReceiverDebug(
+        'authoritative-sync-complete',
+        merged,
+      );
+      const now = Date.now();
+      const lastFollowUp = attributionFollowUpAt[currentSessionKey] ?? 0;
+      const awaitsAttribution = merged.some(
+        (message) =>
+          message.role === 'assistant'
+          && Boolean(message.terminalStatus)
+          && Boolean(message.turnId)
+          && !message.turnAttribution,
+      );
+      if (
+        awaitsAttribution
+        && now - lastFollowUp >= ATTRIBUTION_FOLLOW_UP_WINDOW_MS
+      ) {
+        attributionFollowUpAt[currentSessionKey] = now;
+        setTimeout(() => {
+          if (get().currentSessionKey === currentSessionKey) {
+            void get().syncMessages();
+          }
+        }, ATTRIBUTION_FOLLOW_UP_DELAY_MS);
+      }
+    } catch (error) {
+      log.warn('chat', 'Failed to sync messages; keeping current view', { error: String(error) });
+    }
+  },
+
+  applyRecoveredTurnEvent: (conversationId, _agentId, turnId, event) => {
+    if (event.event === 'tool_result') {
+      void useChatArtifactStore.getState().load(conversationId).catch(() => []);
+    }
+    set((state) => {
+      // Live operations can live under the session key or under a parallel
+      // operation key; recovery must rebind to the optimistic row instead of
+      // minting a second assistant projection with a recovered-* id.
+      const currentEntry = findRecoverableOperationEntry(
+        state.operations,
+        conversationId,
+        turnId,
+      );
+      const currentOperation = currentEntry?.[1];
+      const assistantMessageId =
+        currentOperation?.assistantMessageId || `recovered-${turnId}`;
+      const operation = currentOperation ?? {
+        ...createOperation({
+          sessionKey: conversationId,
+          type: 'sendMessage',
+          assistantMessageId,
+          abortController: new AbortController(),
+        }),
+        conversationId,
+        turnId,
+        streamGeneration: Number(event.data?.streamGeneration || 0) || undefined,
+      };
+      // Preserve the selected operation's key so recovery cannot overwrite a
+      // sibling turn or create a second writable entry for the same operation.
+      const operationKey = currentEntry?.[0] ?? (
+        state.operations[conversationId]
+          ? parallelOperationKey(conversationId, operation.id)
+          : conversationId
+      );
+      const operations = {
+        ...state.operations,
+        [operationKey]: operation,
+      };
+      const recoveredEvent = {
+        ...event,
+        data: {
+          ...event.data,
+          turnId,
+          conversationId,
+        },
+      };
+      const operationEvent = applyOperationEventIdentity(
+        operations,
+        conversationId,
+        recoveredEvent,
+        operationKey,
+      );
+      if (!operationEvent.accepted) return state;
+
+      // Recovery replay owns the stream when the live transport handed off or
+      // the turn was admitted from the queue. Feed its accepted events to the
+      // tool projection too, otherwise approval cards never mount for
+      // queue-admitted turns, their approvals expire, and the batch blocks.
+      toolRuntime.consume(recoveredEvent);
+
+      const applyTo = (messages: ChatMessage[]): ChatMessage[] => {
+        messages = bindTurnMessageIdentity(
+          messages, 'assistant', assistantMessageId, turnId, carryChainOfThoughtFields,
+        );
+        const existingIndex = messages.findIndex(
+          (message) => matchesTurnMessage(message, 'assistant', assistantMessageId, turnId),
+        );
+        const existing: ChatMessage = existingIndex >= 0
+          ? messages[existingIndex]
+          : {
+              id: assistantMessageId,
+              role: 'assistant',
+              content: '',
+              loading: true,
+              timestamp: operation.startedAt,
+              turnId,
+              clientIdempotencyKey: operation.clientIdempotencyKey,
+            };
+        const projected = {
+          ...applyProjectedStreamEvent(existing, event),
+          turnId,
+          clientIdempotencyKey:
+            operation.clientIdempotencyKey ?? existing.clientIdempotencyKey,
+        };
+        if (existingIndex < 0) return [...messages, projected];
+        const next = [...messages];
+        next[existingIndex] = projected;
+        return next;
+      };
+      const isCurrent = state.currentSessionKey === conversationId;
+      const buffered = applyTo(
+        state.sessionBuffers[conversationId] || (isCurrent ? state.messages : []),
+      );
+      return {
+        operations: operationEvent.operations,
+        sessionBuffers: {
+          ...state.sessionBuffers,
+          [conversationId]: buffered,
+        },
+        messages: isCurrent ? applyTo(state.messages) : state.messages,
+        isStreaming: isCurrent ? true : state.isStreaming,
+        streamingStartedAt: isCurrent ? operation.startedAt : state.streamingStartedAt,
+        abortController: isCurrent ? operation.abortController : state.abortController,
+      };
+    });
+  },
+
+  reconcileRecoveredTurn: async (conversationId, turnId, terminal) => {
+    let synced = await agentChatCache.syncConversation(conversationId);
+    if (terminal) {
+      const assistant = [...synced]
+        .reverse()
+        .find((message) => message.role === 'assistant' && message.turnId === turnId);
+      if (assistant) {
+        await agentChatCache.upsertMessage({
+          ...assistant,
+          status: terminal.status,
+          content: terminal.content ?? assistant.content,
+          reconciliationSource: 'station-snapshot',
+          updatedAt: new Date().toISOString(),
+        });
+        synced = await agentChatCache.getMessages(conversationId);
+      }
+    }
+    if (terminal) {
+      // Terminal is an authoritative Station fact even when the local
+      // operation was settled or rekeyed by a transport handoff, surface
+      // remount, or parallel-session key; never gate artifact projection on
+      // the in-memory operation lookup below.
+      refreshTerminalTurnArtifacts(conversationId);
+    }
+    const operation = findRecoverableOperationEntry(
+      get().operations, conversationId, turnId,
+    )?.[1];
+    if (operation?.turnId !== turnId) return;
+    const serverMessages = reconcileToolMessages(
+      synced.map(cachedMessageToChatMessage),
+    );
+    const reconcileMessages = (messages: ChatMessage[]) => {
+      const merged = mergeServerMessages(
+        messages,
+        serverMessages,
+        liveTurnCorrelation(get().operations, conversationId),
+      );
+      if (!terminal) return merged;
+      return merged.map((message) => {
+        if (message.role !== 'assistant' || message.turnId !== turnId) {
+          return message;
+        }
+        return applyProjectedStreamEvent(message, {
+          event: 'snapshot',
+          data: {
+            conversationId,
+            turnId,
+            status: terminal.status,
+            terminal_reason: terminal.reason,
+            ...(terminal.content !== undefined
+              ? { text: terminal.content }
+              : {}),
+          },
+        });
+      });
+    };
+    set((state) => {
+      const entry = findRecoverableOperationEntry(
+        state.operations, conversationId, turnId,
+      );
+      if (!entry || entry[1].turnId !== turnId) return state;
+      const [operationKey, current] = entry;
+      const operations = terminal
+        ? { ...state.operations, [operationKey]: settleRecoveredOperation(current, terminal) }
+        : state.operations;
+      const anotherActive = hasActiveSessionOperation(operations, conversationId);
+      const isCurrent = state.currentSessionKey === conversationId;
+      const reconciledBuffer = reconcileMessages(
+        state.sessionBuffers[conversationId] || [],
+      );
+      return {
+        messages: isCurrent
+          ? reconcileMessages(state.messages)
+          : state.messages,
+        operations,
+        sessionBuffers: terminal && !anotherActive
+          ? clearBuffer(state.sessionBuffers, conversationId)
+          : {
+              ...state.sessionBuffers,
+              [conversationId]: reconciledBuffer,
+            },
+        isStreaming: isCurrent && terminal ? anotherActive : state.isStreaming,
+        streamingStartedAt: isCurrent && terminal && !anotherActive ? null : state.streamingStartedAt,
+        abortController: isCurrent && terminal && !anotherActive ? null : state.abortController,
+      };
+    });
+  },
+
+  retryTurnRecovery: (conversationId) => {
+    const key = conversationId || get().currentSessionKey;
+    eventBus.publish(EVENT.AGENT_TURN_RECOVERY_RETRY_REQUESTED, {
+      conversationId: key,
+    });
+  },
+
+  reloadTurnSnapshot: async (conversationId) => {
+    const key = conversationId || get().currentSessionKey;
+    const { reloadAgentTurnSnapshot } = await import('../runtimes/chatRuntime');
+    return reloadAgentTurnSnapshot(key);
+  },
+
+  reloadLatestRevision: async (conversationId) => {
+    const key = conversationId || get().currentSessionKey;
+    const incident = get().revisionCommandFailure;
+    if (!incident || incident.conversationId !== key) return;
+    set({ revisionReloadingConversationId: key });
+    try {
+      const [conversation, synced] = await Promise.all([
+        api.getAgentConversation(key),
+        agentChatCache.refreshConversation(key),
+      ]);
+      const serverMessages = reconcileToolMessages(
+        synced.map(cachedMessageToChatMessage),
+      );
+      set((state) => {
+        const currentIncident = state.revisionCommandFailure;
+        const isSameIncident = (
+          currentIncident?.conversationId === incident.conversationId
+          && currentIncident.expectedRevision === incident.expectedRevision
+          && currentIncident.actualRevision === incident.actualRevision
+        );
+        return {
+          sessions: reconcileRevisionSession(state.sessions, conversation),
+          messages: state.currentSessionKey === key
+            ? serverMessages
+            : state.messages,
+          revisionCommandFailure: isSameIncident
+            ? null
+            : state.revisionCommandFailure,
+          revisionReloadingConversationId:
+            state.revisionReloadingConversationId === key
+              ? null
+              : state.revisionReloadingConversationId,
+        };
+      });
+    } catch (error) {
+      set((state) => ({
+        revisionReloadingConversationId:
+          state.revisionReloadingConversationId === key
+            ? null
+            : state.revisionReloadingConversationId,
+      }));
+      throw error;
+    }
+  },
+
+  resetExternalRuntime: async (conversationId) => {
+    const key = conversationId || get().currentSessionKey;
+    if (isAgentDraftKey(key)) {
+      throw new Error('agent.errors.resumeUnavailable');
+    }
+    const conversation = await api.getAgentConversation(key);
+    const result = await api.resetAgentConversationRuntime({
+      conversation_id: key,
+      expected_conversation_version: conversation.version,
+      client_idempotency_key: `external-runtime-reset:${key}:${conversation.version}`,
+      destructive_confirmed: true,
+    });
+
+    let refreshedMessages: ChatMessage[] | undefined;
+    try {
+      await agentChatCache.clearConversation(key);
+      const synced = await agentChatCache.refreshConversation(key);
+      refreshedMessages = reconcileToolMessages(
+        synced.map(cachedMessageToChatMessage),
+      ).map(clearResolvedRuntimeResumeError);
+    } catch (error) {
+      log.warn('chat', 'External runtime reset cache reconciliation failed', {
+        conversationId: key,
+        error: String(error),
+      });
+    }
+
+    set((state) => {
+      const clearRecovery = (messages: ChatMessage[]) =>
+        messages.map(clearResolvedRuntimeResumeError);
+      const isCurrent = state.currentSessionKey === key;
+      return {
+        sessions: reconcileRevisionSession(
+          state.sessions,
+          result.conversation,
+        ),
+        messages: isCurrent
+          ? refreshedMessages ?? clearRecovery(state.messages)
+          : state.messages,
+        sessionBuffers: state.sessionBuffers[key]
+          ? {
+              ...state.sessionBuffers,
+              [key]: clearRecovery(state.sessionBuffers[key]),
+            }
+          : state.sessionBuffers,
+      };
+    });
+    return result;
+  },
+
+  // Explicit recovery for RUNTIME_BINDING_STALE: release the conversation-level
+  // runtime pointer (provider/model retired from the catalog) so the next turn
+  // re-admits against the current default runtime. Historical turns keep their
+  // immutable per-turn snapshots; only the conversation version advances.
+  rebindConversationRuntime: async (conversationId) => {
+    const key = conversationId || get().currentSessionKey;
+    if (isAgentDraftKey(key)) {
+      throw new Error('agent.errors.runtimeBindingStale');
+    }
+    const conversation = await api.getAgentConversation(key);
+    const result = await api.rebindAgentConversationRuntime({
+      conversation_id: key,
+      expected_conversation_version: conversation.version,
+    });
+
+    set((state) => ({
+      sessions: reconcileRevisionSession(
+        state.sessions,
+        result.conversation,
+      ),
+    }));
+    return result;
+  },
+
+  reconcileClientLease: async (
+    conversationId,
+    messageId,
+    sessionId,
+    leaseId,
+    turnId,
+  ) => {
+    const result = await get().reloadTurnSnapshot(conversationId);
+    if (turnId && result.turnId !== turnId) {
+      throw new Error('chat.agentTurnRecovery.reloadTargetChanged');
+    }
+    if (result.terminal) return;
+    set((state) => {
+      const clear = (messages: ChatMessage[]) => messages.map((message) =>
+        clearReconciledClientLeaseError(
+          message,
+          messageId,
+          sessionId,
+          leaseId,
+          turnId,
+        ));
+      const isCurrent = state.currentSessionKey === conversationId;
+      return {
+        messages: isCurrent ? clear(state.messages) : state.messages,
+        sessionBuffers: {
+          ...state.sessionBuffers,
+          [conversationId]: clear(
+            state.sessionBuffers[conversationId] ?? [],
+          ),
+        },
+      };
+    });
+  },
+
+  syncTurnQueue: async (conversationId) => {
+    const key = conversationId || get().currentSessionKey;
+    if (isAgentDraftKey(key)) return;
+    try {
+      const queue = await api.listAgentTurnQueue(key);
+      // The Turn identity is pre-bound at enqueue time. The execute stream
+      // closes on the queued event, so tail the FIFO head via its replay
+      // stream now: the stream waits through the queued state and delivers
+      // the first execution event the moment the queue worker admits it,
+      // which keeps approvals and results live without a separate identity
+      // handshake. Only the head is tailed because recovery subscriptions are
+      // keyed per conversation; later entries attach after the head leaves
+      // the queue (periodic sync below and terminal-triggered sync).
+      const headEntry = queue.entries.find((entry) =>
+        Boolean(entry.admitted_turn_id),
+      );
+      if (headEntry?.admitted_turn_id) {
+        eventBus.publish(EVENT.AGENT_TURN_ADMITTED, {
+          conversationId: key,
+          agentId: headEntry.agent_id,
+          turnId: headEntry.admitted_turn_id,
+        });
+      }
+      const pendingIdempotencyKeys = new Set(
+        queue.entries
+          .map((entry) => entry.client_idempotency_key)
+          .filter(Boolean),
+      );
+      // Bind each entry's pre-bound turn id to its optimistic queued
+      // placeholder so the recovery replay stream has a message node to
+      // project its tool calls and approval cards onto.
+      const admittedTurnByQueueEntry = new Map(
+        queue.entries
+          .filter((entry) => Boolean(entry.admitted_turn_id))
+          .map((entry) => [entry.queue_entry_id, entry.admitted_turn_id]),
+      );
+      const bindAdmittedTurn = (message: ChatMessage): ChatMessage => (
+        message.role === 'assistant'
+          && message.queued
+          && message.queueEntryId
+          && !message.turnId
+          && admittedTurnByQueueEntry.has(message.queueEntryId)
+          ? {
+              ...message,
+              turnId: admittedTurnByQueueEntry.get(message.queueEntryId),
+            }
+          : message
+      );
+
+      set((state) => {
+        let operations = state.operations;
+        for (const [operationKey, operation] of sessionOperationEntries(operations, key)) {
+          if (
+            operation.awaitingAdmission
+            && operation.clientIdempotencyKey
+            && !pendingIdempotencyKeys.has(operation.clientIdempotencyKey)
+          ) {
+            operations = completeOperationAtKey(operations, operationKey);
+          }
+        }
+        const anotherActive = hasActiveSessionOperation(operations, key);
+        const sessionBuffer = state.sessionBuffers[key]?.map(bindAdmittedTurn);
+        const messages = state.currentSessionKey === key
+          ? state.messages.map(bindAdmittedTurn)
+          : state.messages;
+        return {
+          turnQueues: {
+            ...state.turnQueues,
+            [key]: queue,
+          },
+          operations,
+          messages,
+          sessionBuffers: sessionBuffer
+            ? { ...state.sessionBuffers, [key]: sessionBuffer }
+            : state.sessionBuffers,
+          isStreaming: state.currentSessionKey === key
+            ? anotherActive || queue.entries.length > 0
+            : state.isStreaming,
+        };
+      });
+    } catch (error) {
+      log.warn('chat', 'Failed to reconcile Agent turn queue', {
+        conversationId: key,
+        error: String(error),
+      });
+    }
+  },
+
+  cancelQueuedTurn: async (conversationId, queueEntryId) => {
+    // Always work from a freshly fetched queue: optimistic 'queued' events can
+    // enqueue multiple entries after the cached snapshot, leaving its
+    // conversation_version stale and the cancel rejected with CONFLICT.
+    const freshQueue = await api.listAgentTurnQueue(conversationId);
+    const entry = freshQueue.entries.find(
+      (candidate) => candidate.queue_entry_id === queueEntryId,
+    );
+    if (!entry) {
+      await get().syncTurnQueue(conversationId);
+      return;
+    }
+    try {
+      await api.cancelQueuedAgentTurn({
+        conversation_id: conversationId,
+        queue_entry_id: queueEntryId,
+        idempotency_key: tempId(),
+        expected_conversation_version: freshQueue.conversation_version,
+      });
+    } catch (firstError) {
+      // Retry once against the latest version; the entry may also have been
+      // admitted in the meantime, in which case the caller keeps streaming it.
+      const retryQueue = await api.listAgentTurnQueue(conversationId);
+      const retryEntry = retryQueue.entries.find(
+        (candidate) => candidate.queue_entry_id === queueEntryId,
+      );
+      if (!retryEntry || retryEntry.status !== 'TURN_QUEUE_STATUS_PENDING') {
+        await get().syncTurnQueue(conversationId);
+        return;
+      }
+      try {
+        await api.cancelQueuedAgentTurn({
+          conversation_id: conversationId,
+          queue_entry_id: queueEntryId,
+          idempotency_key: tempId(),
+          expected_conversation_version: retryQueue.conversation_version,
+        });
+      } catch {
+        throw firstError;
+      }
+    }
+    // The cancelled turn was pre-bound at enqueue and may already have a
+    // waiting replay subscription. Station marks the Turn cancelled without
+    // appending terminal turn events, so the tail cannot observe it; close it
+    // explicitly.
+    if (entry.admitted_turn_id) {
+      eventBus.publish(EVENT.AGENT_TURN_QUEUE_CANCELLED, {
+        conversationId,
+        turnId: entry.admitted_turn_id,
+      });
+    }
+    await get().syncTurnQueue(conversationId);
+    await get().loadSessions();
+
+    // The cancelled turn never leaves the queue, so no stream will ever
+    // project its optimistic nodes. Settle them locally: complete the
+    // awaiting-admission operation and mark the queued assistant placeholder
+    // cancelled instead of leaving a permanent thinking indicator.
+    const cancelledIdempotencyKey = entry.client_idempotency_key;
+
+    set((state) => {
+      let operations = state.operations;
+      for (const [operationKey, operation] of sessionOperationEntries(operations, conversationId)) {
+        if (
+          operation.awaitingAdmission
+          && (
+            !cancelledIdempotencyKey
+            || operation.clientIdempotencyKey === cancelledIdempotencyKey
+          )
+        ) {
+          operations = completeOperationAtKey(operations, operationKey);
+        }
+      }
+      const settleMessage = (message: ChatMessage): ChatMessage => (
+        message.role === 'assistant' && message.queueEntryId === queueEntryId
+          ? {
+              ...message,
+              queued: false,
+              loading: false,
+              terminalStatus: 'cancelled',
+              cancelled: true,
+              lastEventAt: Date.now(),
+            }
+          : message
+      );
+      const sessionBuffer = state.sessionBuffers[conversationId]
+        ?.map(settleMessage);
+      const messages = state.currentSessionKey === conversationId
+        ? state.messages.map(settleMessage)
+        : state.messages;
+      const anotherActive = hasActiveSessionOperation(operations, conversationId);
+      const queueLength = state.turnQueues[conversationId]?.entries.length ?? 0;
+      return {
+        operations,
+        messages,
+        sessionBuffers: sessionBuffer
+          ? { ...state.sessionBuffers, [conversationId]: sessionBuffer }
+          : state.sessionBuffers,
+        abortController: state.currentSessionKey === conversationId && !anotherActive && queueLength === 0
+          ? null
+          : state.abortController,
+        isStreaming: state.currentSessionKey === conversationId
+          ? anotherActive || queueLength > 0
+          : state.isStreaming,
+      };
+    });
+  },
+
+  sendMessage: (
+    content: string,
+    attachments: ChatComposerAttachment[] = [],
+    lifecycle?: AgentSendLifecycle,
+  ) => {
+    log.info('chat', 'Sending message', { sessionKey: get().currentSessionKey, contentLength: content.length });
+    const { currentSessionKey } = get();
+    const isDraft = isAgentDraftKey(currentSessionKey);
+    const effectiveConvId = isDraft
+      ? conversationIdFromAgentDraftKey(currentSessionKey) ?? ''
+      : currentSessionKey;
+    const agentState = useAgentStore.getState();
+    const { selectedAgent } = agentState;
+    const agentName = selectedAgent || 'assistant';
+    const agentId = resolveAgentExecutionID(agentName);
+    if (!agentId) {
+      set({ readinessErrorKey: 'chat.agentReadiness.agentRequired' });
+      return false;
+    }
+    set({ readinessErrorKey: null });
+
+    // Suppress a duplicate submission gesture (double Enter/click) before
+    // Station admits the first one: two in-flight submissions of the same
+    // draft would each mint a different idempotency key and create two Turns.
+    const guardKey = submissionGuardKey(effectiveConvId, content, attachments);
+    if (inFlightSubmissions.has(guardKey)) {
+      log.info('chat', 'Suppressed duplicate in-flight submission', {
+        sessionKey: effectiveConvId,
+        contentLength: content.length,
+      });
+      return false;
+    }
+    // One send owns one correlation key from the optimistic rows through the
+    // Station admission; snapshot merges join on it so a turn never projects
+    // as two assistant messages during the pre-identity connect window.
+    const clientIdempotencyKey = lifecycle?.clientIdempotencyKey || tempId();
+    inFlightSubmissions.set(guardKey, clientIdempotencyKey);
+
+    const userMsg: ChatMessage = {
+      id: tempId(),
+      role: 'user',
+      content,
+      attachments,
+      timestamp: Date.now(),
+      clientIdempotencyKey,
+    };
+
+    const assistantMsg: ChatMessage = {
+      id: tempId(),
+      role: 'assistant',
+      content: '',
+      loading: true,
+      timestamp: Date.now(),
+      clientIdempotencyKey,
+    };
+
+    const startedAt = Date.now();
+    const assistantId = assistantMsg.id;
+    let sendOperation: ChatOperation;
+    let sendOperationKey = currentSessionKey;
+    let resolvedSessionKey = currentSessionKey;
+    let acceptedByStation = false;
+    const attachmentDiagnostic = attachments.length > 0;
+    const notifyAccepted = () => {
+      if (acceptedByStation) return;
+      acceptedByStation = true;
+      lifecycle?.onAccepted?.();
+    };
+    if (attachmentDiagnostic) {
+      reportFoundationAttachmentReceiverDebug('N-P', 'stream-started', {
+        currentSessionPresent: currentSessionKey.length > 0,
+        currentSessionMatches: get().currentSessionKey === currentSessionKey,
+        assistantPresent: get().messages.some(
+          (message) => message.id === assistantId,
+        ),
+        bufferedAssistantPresent: (
+          get().sessionBuffers[currentSessionKey] ?? []
+        ).some((message) => message.id === assistantId),
+      });
+    }
+
+    const controller = agentService.streamTurn(
+      buildAgentTurnInput(
+        effectiveConvId,
+        agentId,
+        content,
+        attachments,
+        lifecycle?.requestedBudget,
+        clientIdempotencyKey,
+        currentSessionKey,
+      ),
+      (event: StreamEvent) => {
+        if (event.event !== 'error') {
+          notifyAccepted();
+          // Station now owns the intent (started or queued); an intentional
+          // identical resend after this point is a new submission.
+          releaseInFlightSubmission(guardKey, clientIdempotencyKey);
+        }
+        if (event.event === 'conversation_created' && typeof event.data?.conversation_id === 'string' && isDraft) {
+          const realConvId = event.data.conversation_id.trim();
+          const topicDraft = useAgentTopicStore.getState()
+            .getTopicsForAgent(agentId).find((topic) => topic.key === currentSessionKey);
+          let promotedSession: Session | undefined;
+          set((state) => {
+            const existingPromotion = state.draftPromotions[currentSessionKey];
+            if (existingPromotion) {
+              if (existingPromotion !== realConvId) {
+                log.error('chat', 'Draft received conflicting conversation promotion', {
+                  draftKey: currentSessionKey,
+                  existingConversationId: existingPromotion,
+                  receivedConversationId: realConvId,
+                });
+              }
+              return state;
+            }
+            const byKey = new Map(state.sessions.map((s) => [s.key, s]));
+            const draft = byKey.get(currentSessionKey);
+            byKey.delete(currentSessionKey);
+            const now = new Date().toISOString();
+            promotedSession = {
+              id: realConvId,
+              key: realConvId,
+              agent_name: draft?.agent_name || agentName,
+              title: draft?.title || '',
+              message_count: draft?.message_count || 0,
+              model_override: topicDraft?.model_override,
+              provider_override: topicDraft?.provider_override,
+              created_at: draft?.created_at || now,
+              updated_at: now,
+            };
+            byKey.set(realConvId, promotedSession);
+            const nextOps = { ...state.operations };
+            for (const [key, operation] of sessionOperationEntries(state.operations, currentSessionKey)) {
+              delete nextOps[key];
+              const nextKey = key === currentSessionKey
+                ? realConvId
+                : parallelOperationKey(realConvId, operation.id);
+              nextOps[nextKey] = { ...operation, sessionKey: realConvId };
+            }
+            const nextBuffers = { ...state.sessionBuffers };
+            const draftBuffer = nextBuffers[currentSessionKey];
+            delete nextBuffers[currentSessionKey];
+            if (draftBuffer) nextBuffers[realConvId] = draftBuffer;
+            const nextComposerDrafts = { ...state.composerDrafts };
+            const composerDraft = nextComposerDrafts[currentSessionKey];
+            delete nextComposerDrafts[currentSessionKey];
+            if (composerDraft) nextComposerDrafts[realConvId] = composerDraft;
+            // TW-D2: staged attachment refs follow the draft when it is
+            // promoted to its canonical conversation; no OSS reclamation.
+            const nextComposerAttachments = { ...state.composerAttachments };
+            const promotedAttachments = nextComposerAttachments[currentSessionKey];
+            delete nextComposerAttachments[currentSessionKey];
+            if (promotedAttachments?.length) {
+              nextComposerAttachments[realConvId] = promotedAttachments;
+            }
+            const isCurrent = state.currentSessionKey === currentSessionKey;
+            return {
+              currentSessionKey: isCurrent ? realConvId : state.currentSessionKey,
+              sessions: Array.from(byKey.values()),
+              operations: nextOps,
+              sessionBuffers: nextBuffers,
+              composerDrafts: nextComposerDrafts,
+              composerAttachments: nextComposerAttachments,
+              draftPromotions: {
+                ...state.draftPromotions,
+                [currentSessionKey]: realConvId,
+              },
+              ...(isCurrent ? { abortController: controller } : {}),
+            };
+          });
+          resolvedSessionKey =
+            get().draftPromotions[currentSessionKey] || resolvedSessionKey;
+          if (promotedSession) {
+            log.info('chat', 'Draft session resolved to real conversation', {
+              draftKey: currentSessionKey,
+              convId: resolvedSessionKey,
+            });
+            useAgentTopicStore
+              .getState()
+              .promoteDraftTopic(agentId, currentSessionKey, promotedSession);
+          }
+        }
+        if (event.event === 'amended') {
+          // TW-D2: the input merged into the still-pre-dispatch Turn. Bind
+          // its user message to that Turn, mark the delivery, and settle
+          // this send's optimistic assistant placeholder (no new Turn was
+          // created). The running Turn's own stream continues independently.
+          const admissionPayload = event.data && typeof event.data.admission === 'object'
+            ? event.data.admission as Record<string, unknown>
+            : {};
+          const amendedTurnId = String(
+            admissionPayload.turnId ?? admissionPayload.turn_id ?? '',
+          );
+          set((state) => {
+            const isCurrent = state.currentSessionKey === resolvedSessionKey;
+            const applyAmendment = (list: ChatMessage[]): ChatMessage[] => list
+              .map((message) => (
+                message.id === userMsg.id
+                  ? {
+                      ...message,
+                      turnId: amendedTurnId || message.turnId,
+                      deliveryStatus: 'amended' as const,
+                    }
+                  : message
+              ))
+              .filter((message) => message.id !== assistantId);
+            return {
+              operations: completeOperationAtKey(state.operations, sendOperationKey),
+              ...(isCurrent ? { messages: applyAmendment(state.messages) } : {}),
+              sessionBuffers: setBuffer(
+                state.sessionBuffers,
+                resolvedSessionKey,
+                applyAmendment,
+              ),
+            };
+          });
+        } else {
+        set((state) => {
+          const selectedOperationKey = operationKeyForStreamEvent(
+            state.operations,
+            resolvedSessionKey,
+            event,
+          );
+          const operationEvent = applyOperationEventIdentity(
+            state.operations,
+            resolvedSessionKey,
+            event,
+            selectedOperationKey,
+          );
+          if (!operationEvent.accepted) return state;
+          toolRuntime.consume(event);
+          const isCurrent = state.currentSessionKey === resolvedSessionKey;
+          const turnId = operationEvent.operations[selectedOperationKey]?.turnId;
+          const applyTo = (list: ChatMessage[]): ChatMessage[] => {
+            list = bindTurnMessageIdentity(
+              list, 'assistant', assistantId, turnId, carryChainOfThoughtFields,
+            );
+            list = bindTurnMessageIdentity(
+              list, 'user', userMsg.id, turnId, carryChainOfThoughtFields,
+            );
+            // Snapshot reconciliation replaces optimistic IDs. The admitted
+            // turn remains the stream's identity after that replacement.
+            const assistantIndex = list.findIndex(
+              (message) => matchesTurnMessage(message, 'assistant', assistantId, turnId),
+            );
+            const userIndex = turnId
+              ? list.findIndex(
+                (message) => matchesTurnMessage(message, 'user', userMsg.id, turnId),
+              )
+              : -1;
+            if (assistantIndex === -1 && userIndex === -1) return list;
+            const next = [...list];
+            if (assistantIndex !== -1) {
+              next[assistantIndex] = applyProjectedStreamEvent(
+                next[assistantIndex],
+                event,
+              );
+            }
+            if (userIndex !== -1 && next[userIndex].turnId !== turnId) {
+              next[userIndex] = { ...next[userIndex], turnId };
+            }
+            return next;
+          };
+          const sessionBuffers = setBuffer(state.sessionBuffers, resolvedSessionKey, applyTo);
+          if (!isCurrent) {
+            return { sessionBuffers, operations: operationEvent.operations };
+          }
+          return {
+            sessionBuffers,
+            operations: operationEvent.operations,
+            messages: applyTo(state.messages),
+          };
+        });
+        if (
+          event.event === 'queued'
+          && !isAgentDraftKey(resolvedSessionKey)
+        ) {
+          void get().syncTurnQueue(resolvedSessionKey);
+        }
+        if (event.event === 'tool_result' && !isAgentDraftKey(resolvedSessionKey)) {
+          void useChatArtifactStore.getState().load(resolvedSessionKey).catch(() => []);
+        }
+        }
+      },
+      () => {
+        notifyAccepted();
+        releaseInFlightSubmission(guardKey, clientIdempotencyKey);
+        log.info('chat', 'Stream complete');
+        set((state) => {
+          const isCurrent = state.currentSessionKey === resolvedSessionKey;
+          const operation = state.operations[sendOperationKey];
+          const stillActive = operation?.awaitingAdmission === true;
+          const nextOperations = stillActive
+            ? state.operations
+            : completeOperationAtKey(state.operations, sendOperationKey);
+          const anotherActive = hasActiveSessionOperation(nextOperations, resolvedSessionKey);
+          const pendingQueue = get().turnQueues[resolvedSessionKey]?.entries.length ?? 0;
+          return {
+            isStreaming: isCurrent ? anotherActive || pendingQueue > 0 : state.isStreaming,
+            streamingStartedAt: isCurrent && !anotherActive && pendingQueue === 0
+              ? null
+              : state.streamingStartedAt,
+            abortController: isCurrent && !anotherActive ? null : state.abortController,
+            operations: nextOperations,
+            sessionBuffers: anotherActive || pendingQueue > 0
+              ? state.sessionBuffers
+              : clearBuffer(state.sessionBuffers, resolvedSessionKey),
+          };
+        });
+        get().loadSessions();
+        if (!isAgentDraftKey(resolvedSessionKey)) {
+          // Final refresh after the stream closes: the tool_result refresh can
+          // race Station artifact-claim commit; reload once and again after the
+          // claim settles instead of waiting for periodic reconciliation.
+          refreshTerminalTurnArtifacts(resolvedSessionKey);
+          void agentChatCache.syncConversation(resolvedSessionKey).catch((syncError) => {
+            log.warn('chat', 'Post-turn cache sync failed', { key: resolvedSessionKey, error: String(syncError) });
+          });
+        }
+        void get().syncMessages();
+        reconcileTopicsAfterTurn(resolvedSessionKey);
+      },
+      (err: AgentTurnStreamError) => {
+        // Release regardless of admission state: post-admission errors are
+        // terminal Turn facts from Station (the gesture itself succeeded),
+        // and pre-admission errors must allow an immediate retry.
+        releaseInFlightSubmission(guardKey, clientIdempotencyKey);
+        const attachmentRejected =
+          err.typedError?.error_type === 'CONTEXT_ATTACHMENT_REJECTED';
+        if (attachmentDiagnostic && attachmentRejected) {
+          const stateBeforeError = get();
+          reportFoundationAttachmentReceiverDebug(
+            'N-P',
+            'error-callback-entered',
+            {
+              acceptedByStation,
+              currentSessionMatches:
+                stateBeforeError.currentSessionKey === resolvedSessionKey,
+              assistantPresent: stateBeforeError.messages.some(
+                (message) => message.id === assistantId,
+              ),
+              bufferedAssistantPresent: (
+                stateBeforeError.sessionBuffers[resolvedSessionKey] ?? []
+              ).some((message) => message.id === assistantId),
+              operationPresent:
+                stateBeforeError.operations[resolvedSessionKey] !== undefined,
+              operationRunState:
+                stateBeforeError.operations[resolvedSessionKey]?.runState
+                ?? null,
+            },
+          );
+        }
+        if (!acceptedByStation) lifecycle?.onRejected?.(err.typedError);
+        log.error('chat', 'Send message failed', { error: err.message });
+        const mappedResolution = resolveAgentTypedErrorAction(err.typedError);
+        const resolution = mappedResolution ?? (
+          err.resolution?.type === 'chooseResourceAgain'
+          || err.resolution?.type === 'removeReference'
+            ? undefined
+            : err.resolution
+        );
+        set((state) => {
+          const isCurrent = state.currentSessionKey === resolvedSessionKey;
+          const turnId = sessionOperationEntries(state.operations, resolvedSessionKey)
+            .find(([, operation]) => operation.clientIdempotencyKey === clientIdempotencyKey)
+            ?.[1].turnId;
+          const applyError = (m: ChatMessage): ChatMessage => {
+            if (!matchesTurnMessage(m, 'assistant', assistantId, turnId)) return m;
+            if (resolution) {
+              return {
+                ...m,
+                error: err.message,
+                typedError: err.typedError ?? m.typedError,
+                errorDetail: err.errorDetail || m.errorDetail,
+                resolution,
+                providerId: err.providerId || m.providerId,
+                loading: false,
+              };
+            }
+            return {
+              ...m,
+              error: presentChatRuntimeError(err.message),
+              typedError: err.typedError ?? m.typedError,
+              resolution: undefined,
+              loading: false,
+            };
+          };
+          const nextOperations = failOperationAtKey(
+            state.operations,
+            sendOperationKey,
+            err.message,
+          );
+          const anotherActive = hasActiveSessionOperation(nextOperations, resolvedSessionKey);
+          return {
+            messages: isCurrent ? state.messages.map(applyError) : state.messages,
+            // Pre-admission rejection has no Station message to reload, so its
+            // editable draft and recovery surface remain conversation-scoped.
+            sessionBuffers: acceptedByStation
+              ? (anotherActive
+                  ? state.sessionBuffers
+                  : clearBuffer(state.sessionBuffers, resolvedSessionKey))
+              : setBuffer(
+                  state.sessionBuffers,
+                  resolvedSessionKey,
+                  (messages) => messages.map(applyError),
+                ),
+            isStreaming: isCurrent ? anotherActive : state.isStreaming,
+            streamingStartedAt: isCurrent && !anotherActive ? null : state.streamingStartedAt,
+            abortController: isCurrent && !anotherActive ? null : state.abortController,
+            operations: nextOperations,
+          };
+        });
+        if (attachmentDiagnostic && attachmentRejected) {
+          const stateAfterError = get();
+          const currentAssistant = stateAfterError.messages.find(
+            (message) => message.id === assistantId,
+          );
+          const bufferedAssistant = (
+            stateAfterError.sessionBuffers[resolvedSessionKey] ?? []
+          ).find((message) => message.id === assistantId);
+          reportFoundationAttachmentReceiverDebug(
+            'N-Q',
+            'error-state-projected',
+            {
+              currentSessionMatches:
+                stateAfterError.currentSessionKey === resolvedSessionKey,
+              assistantPresent: currentAssistant !== undefined,
+              assistantErrorPresent: Boolean(currentAssistant?.error),
+              assistantTypedError:
+                currentAssistant?.typedError?.error_type ?? null,
+              bufferedAssistantPresent: bufferedAssistant !== undefined,
+              bufferedAssistantErrorPresent: Boolean(bufferedAssistant?.error),
+              bufferedAssistantTypedError:
+                bufferedAssistant?.typedError?.error_type ?? null,
+              operationRunState:
+                stateAfterError.operations[resolvedSessionKey]?.runState
+                ?? null,
+              isStreaming: stateAfterError.isStreaming,
+            },
+          );
+        }
+        reconcileTopicsAfterTurn(resolvedSessionKey);
+      },
+      currentAuthenticatedActorPtid() || '',
+    );
+
+    sendOperation = createOperation({
+      sessionKey: currentSessionKey,
+      type: 'sendMessage',
+      assistantMessageId: assistantId,
+      abortController: controller,
+      streamGeneration: controller.streamGeneration,
+      clientIdempotencyKey,
+    });
+    sendOperationKey = hasActiveSessionOperation(
+      get().operations,
+      currentSessionKey,
+    )
+      ? parallelOperationKey(currentSessionKey, sendOperation.id)
+      : currentSessionKey;
+
+    set((state) => {
+      const retainedMessages = discardPreAdmissionFailureMessages(
+        state.messages,
+        state.operations[currentSessionKey],
+      );
+      const baseMessages = [...retainedMessages, userMsg, assistantMsg];
+      return {
+        messages: baseMessages,
+        isStreaming: true,
+        streamingStartedAt: startedAt,
+        abortController: controller,
+        operations: {
+          ...state.operations,
+          [sendOperationKey]: sendOperation,
+        },
+        sessionBuffers: { ...state.sessionBuffers, [currentSessionKey]: baseMessages },
+      };
+    });
+    if (attachmentDiagnostic) {
+      const installedState = get();
+      const currentAssistant = installedState.messages.find(
+        (message) => message.id === assistantId,
+      );
+      const bufferedAssistant = (
+        installedState.sessionBuffers[currentSessionKey] ?? []
+      ).find((message) => message.id === assistantId);
+      reportFoundationAttachmentReceiverDebug(
+        'N-P',
+        'optimistic-state-installed',
+        {
+          currentSessionMatches:
+            installedState.currentSessionKey === currentSessionKey,
+          assistantPresent: currentAssistant !== undefined,
+          assistantErrorPresent: Boolean(currentAssistant?.error),
+          bufferedAssistantPresent: bufferedAssistant !== undefined,
+          bufferedAssistantErrorPresent: Boolean(bufferedAssistant?.error),
+          operationPresent:
+            installedState.operations[currentSessionKey] !== undefined,
+          operationRunState:
+            installedState.operations[currentSessionKey]?.runState ?? null,
+          isStreaming: installedState.isStreaming,
+        },
+      );
+    }
+    return true;
+  },
+
+  regenerateMessage: async (messageId: string) => {
+    const { currentSessionKey, isStreaming } = get();
+    if (isStreaming) return;
+    try {
+      const version = await revisionCommandVersion(
+        currentSessionKey,
+        get().sessions,
+      );
+      await api.regenerateAgentTurn({
+        conversation_id: currentSessionKey,
+        source_assistant_message_id: messageId,
+        client_idempotency_key: tempId(),
+        expected_conversation_version: version,
+      });
+      await agentChatCache.clearConversation(currentSessionKey);
+      await get().syncMessages();
+      await get().loadSessions();
+    } catch (error) {
+      const failure = projectAgentRevisionCommandFailure(
+        error,
+        currentSessionKey,
+      );
+      if (failure) {
+        set({ revisionCommandFailure: failure });
+        return;
+      }
+      throw error;
+    }
+  },
+
+  retryMessage: (messageId: string) => {
+    const { currentSessionKey, messages, isStreaming } = get();
+    const source = messages.find((message) => message.id === messageId);
+    const sourceTurnId = source?.turnId;
+    const operation = get().operations[currentSessionKey];
+    const retryBlocked = isMessageRetryBlocked(
+      isStreaming,
+      operation,
+      sourceTurnId,
+      source?.terminalStatus,
+    );
+    const retryKey = `${currentSessionKey}:${messageId}`;
+    const pending = pendingMessageRetries.get(retryKey);
+
+    // #region debug-point A-B-E:retry-entry
+    reportApprovalExpiryRetryDebug('A-B-E', 'retry-entry', {
+      isStreaming,
+      sourcePresent: Boolean(source),
+      sourceTurnPresent: Boolean(sourceTurnId),
+      sourceTerminalStatus: source?.terminalStatus ?? null,
+      sourceLoading: source?.loading === true,
+      operationPresent: Boolean(operation),
+      operationRunState: operation?.runState ?? null,
+      operationTurnMatchesSource:
+        Boolean(sourceTurnId) && operation?.turnId === sourceTurnId,
+      retryBlocked,
+      pendingRetryPresent: Boolean(pending),
+    });
+    // #endregion
+
+    if (retryBlocked) {
+      // #region debug-point A:streaming-guard
+      reportApprovalExpiryRetryDebug('A', 'retry-skipped-streaming', {});
+      // #endregion
+      return Promise.resolve();
+    }
+    if (!sourceTurnId) {
+      // #region debug-point B:source-guard
+      reportApprovalExpiryRetryDebug('B', 'retry-skipped-source', {
+        sourcePresent: Boolean(source),
+      });
+      // #endregion
+      return Promise.resolve();
+    }
+
+    if (pending) {
+      // #region debug-point E:single-flight
+      reportApprovalExpiryRetryDebug('E', 'retry-single-flight-reused', {});
+      // #endregion
+      return pending;
+    }
+
+    const request = (async () => {
+      try {
+        const version = await revisionCommandVersion(
+          currentSessionKey,
+          get().sessions,
+        );
+        // #region debug-point C:retry-api-start
+        reportApprovalExpiryRetryDebug('C', 'retry-api-start', {
+          conversationVersionPresent: Number.isInteger(version) && version > 0,
+        });
+        // #endregion
+        const response = await api.retryAgentTurn({
+          conversation_id: currentSessionKey,
+          source_turn_id: sourceTurnId,
+          client_idempotency_key: tempId(),
+          expected_conversation_version: version,
+        });
+        // #region debug-point D:retry-api-complete
+        reportApprovalExpiryRetryDebug('D', 'retry-api-complete', {
+          hasTurn: Boolean(response.turn),
+          hasAttempt: Boolean(response.attempt),
+          hasConversation: Boolean(response.conversation),
+          turnStatus: (
+            response.turn && typeof response.turn === 'object'
+              ? String((response.turn as Record<string, unknown>).status ?? '')
+              : ''
+          ),
+        });
+        // #endregion
+        if (get().currentSessionKey === currentSessionKey) {
+          await get().syncMessages();
+        }
+        await get().loadSessions();
+      } catch (error) {
+        const stableCode = String(error).match(/\b(?:AGENT|TOOL|LIFECYCLE)_[A-Z0-9_]+\b/)?.[0] ?? null;
+        // #region debug-point C:retry-api-error
+        reportApprovalExpiryRetryDebug('C', 'retry-api-error', {
+          errorName: error instanceof Error ? error.name : typeof error,
+          stableCode,
+        });
+        // #endregion
+        const failure = projectAgentRevisionCommandFailure(
+          error,
+          currentSessionKey,
+        );
+        if (failure) {
+          set({ revisionCommandFailure: failure });
+          return;
+        }
+        throw error;
+      }
+    })().finally(() => {
+      pendingMessageRetries.delete(retryKey);
+    });
+    pendingMessageRetries.set(retryKey, request);
+    return request;
+  },
+
+  deleteAndRegenerateMessage: async (messageId: string) => {
+    await get().regenerateMessage(messageId);
+  },
+
+  branchFromMessage: async (messageId: string) => {
+    const { currentSessionKey } = get();
+    try {
+      const version = await revisionCommandVersion(
+        currentSessionKey,
+        get().sessions,
+      );
+      await api.selectAgentActiveBranch({
+        conversation_id: currentSessionKey,
+        active_branch_message_id: messageId,
+        client_idempotency_key: tempId(),
+        expected_conversation_version: version,
+      });
+      await agentChatCache.clearConversation(currentSessionKey);
+      await get().syncMessages();
+      await get().loadSessions();
+    } catch (error) {
+      const failure = projectAgentRevisionCommandFailure(
+        error,
+        currentSessionKey,
+      );
+      if (failure) {
+        set({ revisionCommandFailure: failure });
+        return;
+      }
+      throw error;
+    }
+  },
+
+  requestTurnCancellation: async (turnId, assistantMessageId) => {
+    try {
+      const cancellation = await api.cancelAgentTurn(turnId);
+      // A successful request can leave a queued turn unchanged. Only the
+      // matching Station cancellation result authorizes a terminal projection.
+      if (cancellation.turn_id !== turnId || cancellation.status !== 'cancelled') return;
+      // Station accepts the cancel synchronously, but the live SSE transport is
+      // aborted at the same moment and its terminal event often never arrives.
+      // Project the admitted cancel through the same reducer the stream would,
+      // so the turn settles immediately instead of showing an empty ghost row
+      // until the next snapshot reconcile.
+      const cancelEvent: StreamEvent = {
+        event: 'cancelled',
+        // Mirror the Station terminal payload contract.
+        data: {
+          turnId,
+          outcome_error: {
+            error_type: 'LIFECYCLE_CANCELLED',
+            locale_key: 'agent.errors.lifecycleCancelled',
+            retryable: false,
+            terminal: true,
+          },
+        },
+      };
+      const projectCancellation = (messages: ChatMessage[]): ChatMessage[] => messages.map((message) => {
+        if (!matchesTurnMessage(message, 'assistant', assistantMessageId, turnId)) return message;
+        const projected = applyStreamEvent(message, cancelEvent);
+        return projected === message ? message : projected;
+      });
+      set((state) => ({
+        messages: projectCancellation(state.messages),
+        sessionBuffers: Object.fromEntries(
+          Object.entries(state.sessionBuffers).map(([key, buffered]) => [
+            key,
+            projectCancellation(buffered),
+          ]),
+        ),
+      }));
+    } catch (error) {
+      const normalized = normalizeAgentTurnStreamError(error);
+      const typedError = normalized.typedError;
+      const resolution = normalized.resolution;
+      if (
+        !isAgentLifecycleTerminalMutationError(typedError)
+        || resolution?.type !== 'openResult'
+        || resolution.resourceId !== turnId
+        || resolution.turnId !== turnId
+        || resolution.terminalStatus !== typedError.details.terminal_status
+      ) {
+        throw error;
+      }
+
+      let projected = false;
+      const projectMessages = (messages: ChatMessage[]): ChatMessage[] => {
+        let changed = false;
+        const next = messages.map((message) => {
+          const projectedMessage = projectAgentTerminalMutationMessage(
+            message,
+            normalized,
+            turnId,
+            assistantMessageId,
+          );
+          if (projectedMessage !== message) {
+            projected = true;
+            changed = true;
+          }
+          return projectedMessage;
+        });
+        return changed ? next : messages;
+      };
+      set((state) => {
+        const sessionBuffers = Object.fromEntries(
+          Object.entries(state.sessionBuffers).map(([key, messages]) => [
+            key,
+            projectMessages(messages),
+          ]),
+        );
+        return {
+          messages: projectMessages(state.messages),
+          sessionBuffers,
+        };
+      });
+      if (!projected) throw normalized;
+    }
+  },
+
+  stopStreaming: () => {
+    get().stopOperation(get().currentSessionKey);
+  },
+
+  stopOperation: (sessionKey: string) => {
+    const stateBeforeStop = get();
+    const eligible = (operation: ChatOperation | undefined): operation is ChatOperation =>
+      Boolean(operation && isActiveOperation(operation) && !operation.awaitingAdmission);
+    // With FIFO queueing, a queued successor can occupy the session key
+    // while the still-running predecessor lives under a parallel key.
+    // Stop must durably cancel an admitted turn (bound turnId): selecting
+    // the unbound queued op would only tear down the local stream and leave
+    // the running turn orphaned until it completes.
+    const entries = sessionOperationEntries(stateBeforeStop.operations, sessionKey)
+      .filter(([, operation]) => eligible(operation));
+    // Prefer the admitted running turn even when the session key is held by
+    // an unbound queued successor; without a bound turn, stop the first
+    // active operation (pre-admission local cancellation, as before).
+    const bound = entries.find(([, operation]) => Boolean(operation.turnId));
+    const entry = bound ?? entries[0];
+    if (!entry) return;
+    const [operationKey, op] = entry;
+    const conversationKey = op.sessionKey;
+    log.info('chat', 'Streaming stopped', { sessionKey: conversationKey, operationKey });
+    if (op.turnId) {
+      void get().requestTurnCancellation(op.turnId, op.assistantMessageId)
+        .catch((error) => {
+          log.warn('chat', 'Agent turn cancellation failed', {
+            turnId: op.turnId,
+            error: String(error),
+          });
+        });
+    }
+    const cancelled = cancelOperation(op);
+    set((state) => {
+      const isCurrent = state.currentSessionKey === conversationKey;
+      const operations = { ...state.operations, [operationKey]: cancelled };
+      const anotherActive = hasActiveSessionOperation(operations, conversationKey);
+      const pendingQueue = state.turnQueues[conversationKey]?.entries.length ?? 0;
+      const stillStreaming = anotherActive || pendingQueue > 0;
+      const finalizeList = (list: ChatMessage[]): ChatMessage[] =>
+        list.map((m) => (
+          m.loading && matchesTurnMessage(m, 'assistant', op.assistantMessageId, op.turnId)
+            ? { ...m, loading: false }
+            : m
+        ));
+      return {
+        messages: isCurrent ? finalizeList(state.messages) : state.messages,
+        sessionBuffers: setBuffer(state.sessionBuffers, conversationKey, finalizeList),
+        isStreaming: isCurrent ? stillStreaming : state.isStreaming,
+        streamingStartedAt: isCurrent && !stillStreaming ? null : state.streamingStartedAt,
+        abortController: isCurrent && !anotherActive ? null : state.abortController,
+        operations,
+      };
+    });
+  },
+
+  deleteMessage: async (id: string) => {
+    const { currentSessionKey } = get();
+    if (isOptimisticMessageId(id)) {
+      set((state) => {
+        const messages = discardPreAdmissionFailureMessages(
+          state.messages,
+          state.operations[currentSessionKey],
+          id,
+        );
+        if (messages === state.messages) return state;
+        return {
+          messages,
+          operations: removeOperation(state.operations, currentSessionKey),
+          sessionBuffers: clearBuffer(state.sessionBuffers, currentSessionKey),
+        };
+      });
+      return;
+    }
+    try {
+      const version = await revisionCommandVersion(
+        currentSessionKey,
+        get().sessions,
+      );
+      await api.tombstoneAgentMessage({
+        conversation_id: currentSessionKey,
+        message_id: id,
+        client_idempotency_key: tempId(),
+        expected_conversation_version: version,
+        destructive_confirmed: true,
+        reason: 'user_requested',
+      });
+      await agentChatCache.clearConversation(currentSessionKey);
+      await get().syncMessages();
+      await get().loadSessions();
+    } catch (error) {
+      const failure = projectAgentRevisionCommandFailure(
+        error,
+        currentSessionKey,
+      );
+      if (failure) {
+        set({ revisionCommandFailure: failure });
+        return;
+      }
+      throw error;
+    }
+  },
+
+  editMessage: async (id: string, content: string) => {
+    if (id.startsWith('temp-')) return;
+    const { currentSessionKey } = get();
+    try {
+      const version = await revisionCommandVersion(
+        currentSessionKey,
+        get().sessions,
+      );
+      await api.editAndResendAgentMessage({
+        conversation_id: currentSessionKey,
+        source_user_message_id: id,
+        revised_content: content,
+        client_idempotency_key: tempId(),
+        expected_conversation_version: version,
+      });
+      await agentChatCache.clearConversation(currentSessionKey);
+      await get().syncMessages();
+      await get().loadSessions();
+    } catch (error) {
+      const failure = projectAgentRevisionCommandFailure(
+        error,
+        currentSessionKey,
+      );
+      if (failure) {
+        set({ revisionCommandFailure: failure });
+        return;
+      }
+      throw error;
+    }
+  },
+
+  translateMessage: async (id: string) => {
+    const { messages } = get();
+    const target = messages.find((m) => m.id === id);
+    if (!target || !target.content) return;
+    if (target.translation) {
+      set((s) => ({
+        messages: s.messages.map((m) => m.id === id ? { ...m, translation: undefined } : m),
+      }));
+      // Clear the persisted translation (no-op for optimistic temp ids).
+      if (!id.startsWith('temp-')) {
+        try { await api.updateMessageTranslate(id, ''); } catch { /* clear best-effort */ }
+      }
+      return;
+    }
+    const agentId = useAgentStore.getState().selectedAgent;
+    if (!agentId) return;
+    const userLang = navigator.language.startsWith('zh') ? 'English' : '中文';
+    const prompt = `Translate the following text to ${userLang}. Return ONLY the translation, no explanation.\n\n${target.content}`;
+    try {
+      const result = await api.quickCompletion(agentId, prompt);
+      set((s) => ({
+        messages: s.messages.map((m) => m.id === id ? { ...m, translation: result } : m),
+      }));
+      // Persist the translation to Station (metadata_json); skip optimistic temp ids.
+      if (!id.startsWith('temp-')) {
+        try { await api.updateMessageTranslate(id, result); } catch { /* persist best-effort */ }
+      }
+    } catch { /* translation unavailable */ }
+  },
+
+  continueGeneration: (messageId: string) => {
+    const { messages } = get();
+    const target = messages.find((m) => m.id === messageId);
+    if (!target || target.role !== 'assistant') return;
+    // Real continuation: feed the already-generated content back as context so the
+    // model picks up where it stopped, rather than re-prompting a bare "continue".
+    // (Peers turn always appends a user message + loads full history, so the model
+    // sees the prior assistant content; carrying it explicitly makes continuation
+    // reliable and provider-agnostic. Topology differs from LobeHub same-bubble
+    // assistant prefill — accepted as 能力对齐/拓扑不同.)
+    const priorContent = (target.content || '').trim();
+    const prompt = priorContent
+      ? i18n.t('chat.message.continueWithContext', { ns: 'chat', content: priorContent })
+      : i18n.t('chat.message.continuePrompt', { ns: 'chat' });
+    get().sendMessage(prompt);
+  },
+
+
+  setWideScreen: (wide: boolean) => {
+    set({ wideScreen: wide });
+    api.setPreferences({ wide_screen: wide }).catch(() => {});
+  },
+
+  // Request the composer to be filled with `text` without sending. The nonce lets
+  // ChatInput react even when the same suggestion text is chosen twice in a row.
+  fillComposer: (text: string) => {
+    set({ composerFill: { text, nonce: Date.now(), sessionKey: get().currentSessionKey } });
+  },
+
+  appendComposer: (text: string) => {
+    set({ composerFill: { text, nonce: Date.now(), append: true, sessionKey: get().currentSessionKey } });
+  },
+
+  consumeComposerFill: () => {
+    set({ composerFill: null });
+  },
+
+  requestComposerReferenceRemoval: (referenceKind, referenceHash) => {
+    composerReferenceRemovalCounter += 1;
+    set({
+      composerReferenceRemoval: {
+        sessionKey: get().currentSessionKey,
+        referenceKind,
+        referenceHash,
+        nonce: composerReferenceRemovalCounter,
+      },
+    });
+  },
+
+  consumeComposerReferenceRemoval: (nonce) => {
+    set((state) => (
+      state.composerReferenceRemoval?.nonce === nonce
+        ? { composerReferenceRemoval: null }
+        : {}
+    ));
+  },
+
+  requestComposerResourceSelection: (resourceKind, resourceRefHash) => {
+    composerResourceSelectionCounter += 1;
+    set({
+      composerResourceSelection: {
+        sessionKey: get().currentSessionKey,
+        resourceKind,
+        resourceRefHash,
+        nonce: composerResourceSelectionCounter,
+      },
+    });
+  },
+
+  consumeComposerResourceSelection: (nonce) => {
+    set((state) => (
+      state.composerResourceSelection?.nonce === nonce
+        ? { composerResourceSelection: null }
+        : {}
+    ));
+  },
+
+  requestComposerFocus: () => {
+    set((state) => ({
+      composerFocusNonce: state.composerFocusNonce + 1,
+    }));
+  },
+
+  requestComposerModelSelection: (sessionKey) => {
+    if (sessionKey !== get().currentSessionKey) return;
+    composerResourceSelectionCounter += 1;
+    set({
+      composerModelSelection: {
+        sessionKey,
+        nonce: composerResourceSelectionCounter,
+      },
+    });
+  },
+
+  consumeComposerModelSelection: (nonce) => {
+    set((state) => (
+      state.composerModelSelection?.nonce === nonce
+        ? { composerModelSelection: null }
+        : {}
+    ));
+  },
+
+  consumeComposerFocus: () => {
+    set({ composerFocusNonce: 0 });
+  },
+
+  toggleSessionMemory: (sessionKey?: string) => {
+    const key = sessionKey || get().currentSessionKey;
+    const { memoryDisabledSessions } = get();
+    set({
+      memoryDisabledSessions: {
+        ...memoryDisabledSessions,
+        [key]: !memoryDisabledSessions[key],
+      },
+    });
+  },
+
+  isMemoryDisabled: (sessionKey?: string) => {
+    const key = sessionKey || get().currentSessionKey;
+    return get().memoryDisabledSessions[key] || false;
+  },
+
+  loadPreferences: async () => {
+    try {
+      const prefs = await api.getPreferences();
+      set({ wideScreen: prefs.wide_screen || false });
+    } catch {
+      // keep defaults
+    }
+  },
+}));
+
+// TW-D2: mirror the task-level composer draft tables into the durable
+// actor-scoped client-storage owner. Text and staged attachment refs are
+// persisted together as one document; an empty document removes the key.
+let lastDurableComposerSignature = '';
+useChatStore.subscribe((state, previousState) => {
+  if (
+    state.composerDrafts === previousState.composerDrafts
+    && state.composerAttachments === previousState.composerAttachments
+  ) {
+    return;
+  }
+  const signature = JSON.stringify({
+    texts: state.composerDrafts,
+    attachments: state.composerAttachments,
+  });
+  if (signature === lastDurableComposerSignature) return;
+  lastDurableComposerSignature = signature;
+  writeAgentComposerDraftsSync({
+    texts: state.composerDrafts,
+    attachments: state.composerAttachments,
+  });
+});

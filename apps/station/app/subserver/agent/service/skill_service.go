@@ -1,0 +1,1108 @@
+// Changelog:
+// 2026-04-11 — Initial implementation: Skill CRUD service with progressive
+//              disclosure (Tier 1 list / Tier 2 full), security scanning
+//              integration, content validation, fuzzy patch, and conditional
+//              activation index building.
+// 2026-04-11 — Skill Versioning & Rollback: added recordVersion, ListVersions,
+//              and RollbackSkill for "dumbed-down agent" recovery.
+// 2026-04-11 — Growth Metrics Integration: injected GrowthMetricsService dependency,
+//   emit RecordEvent on Create (skill_created), Patch (skill_patched), Delete (skill_deleted).
+
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/domain"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/errcode"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/infrastructure/persistence"
+	"github.com/peers-labs/peers-touch/station/app/subserver/agent/model"
+	"github.com/peers-labs/peers-touch/station/frame/core/logger"
+	"github.com/peers-labs/peers-touch/station/frame/core/store"
+	"gorm.io/gorm"
+)
+
+const (
+	maxDescriptionLen = 1024
+	maxContentLen     = 100000
+)
+
+type SkillService struct {
+	guard         *SkillsGuardService
+	growthMetrics *GrowthMetricsService
+	capabilities  *CapabilityAuthorityService
+	db            *gorm.DB
+}
+
+func NewSkillService(guard *SkillsGuardService, growthMetrics *GrowthMetricsService) *SkillService {
+	return &SkillService{guard: guard, growthMetrics: growthMetrics}
+}
+
+func (s *SkillService) SetCapabilityAuthority(authority *CapabilityAuthorityService) {
+	s.capabilities = authority
+	if authority != nil {
+		s.db = authority.db
+	}
+}
+
+func (s *SkillService) recordGrowthEvent(ctx context.Context, agentID, eventType, target, details string) {
+	if s.growthMetrics == nil {
+		return
+	}
+	s.growthMetrics.RecordEvent(ctx, agentID, eventType, CategorySkill, target, details, "success")
+}
+
+// ListSkills returns Tier 1 progressive disclosure: name + description only,
+// content is cleared from every returned manifest.
+func (s *SkillService) ListSkills(ctx context.Context, agentID string) ([]domain.SkillManifest, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []persistence.Skill
+	if err := db.WithContext(ctx).
+		Where("agent_id = ?", agentID).
+		Order("created_at ASC").
+		Find(&rows).Error; err != nil {
+		logger.Errorf(ctx, "skill list query failed: agent_id=%s, err=%v", agentID, err)
+		return nil, errcode.New(errcode.AgentInternal, 500, "failed to list skills", err)
+	}
+
+	manifests := make([]domain.SkillManifest, 0, len(rows))
+	for _, row := range rows {
+		m := s.toManifest(&row)
+		m.Enabled = s.skillBindingEnabled(ctx, db, &row)
+		m.Content = ""
+		manifests = append(manifests, m)
+	}
+
+	return manifests, nil
+}
+
+// GetSkill returns Tier 2 progressive disclosure: full SKILL.md content.
+func (s *SkillService) GetSkill(ctx context.Context, agentID, name string) (*domain.SkillManifest, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := s.findByName(ctx, db, agentID, name)
+	if err != nil {
+		return nil, err
+	}
+
+	m := s.toManifest(row)
+	m.Enabled = s.skillBindingEnabled(ctx, db, row)
+	return &m, nil
+}
+
+// ListSkillResources returns versioned resource metadata without bytes.
+func (s *SkillService) ListSkillResources(
+	ctx context.Context,
+	agentID, skillID string,
+	version int,
+) ([]*model.SkillResource, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if version <= 0 {
+		row, err := s.findByID(ctx, db, agentID, skillID)
+		if err != nil {
+			return nil, err
+		}
+		version = row.Version
+	}
+	return listSkillResources(ctx, db, skillID, version)
+}
+
+// ReadSkillResource returns one Station-owned immutable resource revision.
+func (s *SkillService) ReadSkillResource(
+	ctx context.Context,
+	agentID, skillID string,
+	version int,
+	resourcePath string,
+) (*model.SkillResource, []byte, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return readSkillResource(ctx, db, agentID, skillID, version, resourcePath)
+}
+
+func (s *SkillService) GetSkillByID(ctx context.Context, agentID, skillID string) (*domain.SkillManifest, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := s.findByID(ctx, db, agentID, skillID)
+	if err != nil {
+		return nil, err
+	}
+
+	m := s.toManifest(row)
+	m.Enabled = s.skillBindingEnabled(ctx, db, row)
+	return &m, nil
+}
+
+func (s *SkillService) GetSkillAtVersion(
+	ctx context.Context,
+	agentID string,
+	skillID string,
+	version int,
+) (*domain.SkillManifest, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row, err := s.findByID(ctx, db, agentID, skillID)
+	if err != nil {
+		return nil, err
+	}
+	manifest := s.toManifest(row)
+	if row.Version == version {
+		manifest.Enabled = s.skillBindingEnabled(ctx, db, row)
+		return &manifest, nil
+	}
+	var historical persistence.SkillVersion
+	if err := db.WithContext(ctx).
+		Where("skill_id = ? AND agent_id = ? AND version = ?", skillID, agentID, version).
+		First(&historical).Error; err != nil {
+		return nil, errcode.New(
+			errcode.AgentInvalidSourceState,
+			http.StatusConflict,
+			fmt.Sprintf("Skill %s version %d is unavailable", skillID, version),
+			err,
+		)
+	}
+	manifest.Content = historical.Content
+	manifest.Version = historical.Version
+	manifest.Enabled = true
+	return &manifest, nil
+}
+
+// CreateSkill validates content, runs security scan, checks install policy,
+// and persists the skill if allowed.
+func (s *SkillService) CreateSkill(
+	ctx context.Context,
+	agentID, name, description, content string,
+	trustLevel domain.TrustLevel,
+	resources ...*model.SkillResourceInput,
+) (*domain.SkillManifest, *domain.ScanResult, error) {
+
+	if err := s.validateContent(description, content); err != nil {
+		return nil, nil, err
+	}
+
+	scanResult := s.guard.ScanContent(name, content, trustLevel)
+
+	policy := domain.ResolveInstallPolicy(trustLevel, scanResult.Verdict)
+	if policy == domain.InstallPolicyBlock {
+		logger.Warnf(ctx, "skill install blocked: name=%s, verdict=%s, trust=%s",
+			name, scanResult.Verdict, trustLevel)
+		return nil, scanResult, errcode.New(
+			errcode.AgentInvalidRequest, 403,
+			fmt.Sprintf("skill '%s' blocked by install policy (verdict=%s)", name, scanResult.Verdict),
+			nil,
+		)
+	}
+
+	if policy == domain.InstallPolicyAsk {
+		logger.Infof(ctx, "skill install requires confirmation: name=%s, verdict=%s", name, scanResult.Verdict)
+	}
+
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, scanResult, err
+	}
+
+	now := time.Now().UTC()
+	verdictStr := string(scanResult.Verdict)
+
+	row := persistence.Skill{
+		ID:          generateID("skill"),
+		AgentID:     agentID,
+		Name:        name,
+		Description: description,
+		Content:     content,
+		TrustLevel:  string(trustLevel),
+		ScanVerdict: &verdictStr,
+		Version:     1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	preparedResources, err := prepareSkillResources(
+		row.ID, agentID, "agent:"+agentID, 1, resources, s.guard, trustLevel, now,
+	)
+	if err != nil {
+		return nil, scanResult, err
+	}
+
+	var registered *model.CapabilityManifest
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		s.recordVersion(ctx, tx, &row, "create")
+		if err := putSkillResourcesTx(tx, "agent:"+agentID, preparedResources, now); err != nil {
+			return err
+		}
+		var err error
+		_, registered, err = s.syncSkillCapabilityTx(
+			tx, nil, &row, "skill_created",
+		)
+		return err
+	}); err != nil {
+		logger.Errorf(ctx, "skill create failed: name=%s, err=%v", name, err)
+		return nil, scanResult, errcode.New(errcode.AgentInternal, 500, "failed to create skill", err)
+	}
+	s.publishSkillCapabilityChanges(ctx, nil, registered)
+
+	logger.Infof(ctx, "skill created: id=%s, name=%s, verdict=%s, policy=%s",
+		row.ID, name, scanResult.Verdict, policy)
+
+	s.recordGrowthEvent(ctx, agentID, EventSkillCreated, name, row.ID)
+
+	m := s.toManifest(&row)
+	return &m, scanResult, nil
+}
+
+// PatchSkill performs a fuzzy find-and-replace in the skill content.
+func (s *SkillService) PatchSkill(ctx context.Context, agentID, name, oldStr, newStr string) (*domain.SkillManifest, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := s.findByName(ctx, db, agentID, name)
+	if err != nil {
+		return nil, err
+	}
+
+	idx := strings.Index(row.Content, oldStr)
+	if idx == -1 {
+		idx = s.fuzzyFind(row.Content, oldStr)
+		if idx == -1 {
+			return nil, errcode.New(errcode.AgentInvalidRequest, 400,
+				fmt.Sprintf("patch target not found in skill '%s'", name), nil)
+		}
+	}
+
+	patched := row.Content[:idx] + newStr + row.Content[idx+len(oldStr):]
+
+	if err := s.validateContent(row.Description, patched); err != nil {
+		return nil, err
+	}
+
+	updated, _, err := s.UpdateSkill(
+		ctx, agentID, row.ID, nil, nil, &patched,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// DeleteSkill removes a skill by agent ID and name.
+func (s *SkillService) DeleteSkill(ctx context.Context, agentID, name string) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	row, err := s.findByName(ctx, db, agentID, name)
+	if err != nil {
+		return err
+	}
+	return s.DeleteSkillByID(ctx, agentID, row.ID)
+}
+
+// UpdateSkill mutates durable skill metadata/content by skill ID and preserves
+// Station scan/version authority for content changes.
+func (s *SkillService) UpdateSkill(
+	ctx context.Context,
+	agentID string,
+	skillID string,
+	name *string,
+	description *string,
+	content *string,
+) (*domain.SkillManifest, *domain.ScanResult, error) {
+	return s.updateSkill(ctx, agentID, skillID, name, description, content, nil, 0)
+}
+
+// UpdateSkillWithResources creates a new Skill version whose resource set is
+// exactly the supplied inputs. An empty slice creates a resource-free version.
+func (s *SkillService) UpdateSkillWithResources(
+	ctx context.Context,
+	agentID string,
+	skillID string,
+	name *string,
+	description *string,
+	content *string,
+	resources []*model.SkillResourceInput,
+) (*domain.SkillManifest, *domain.ScanResult, error) {
+	return s.updateSkill(ctx, agentID, skillID, name, description, content, resources, 0)
+}
+
+func (s *SkillService) updateSkill(
+	ctx context.Context,
+	agentID string,
+	skillID string,
+	name *string,
+	description *string,
+	content *string,
+	resourceInputs []*model.SkillResourceInput,
+	cloneResourcesFromVersion int,
+) (*domain.SkillManifest, *domain.ScanResult, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	row, err := s.findByID(ctx, db, agentID, skillID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nextName := row.Name
+	if name != nil && strings.TrimSpace(*name) != "" {
+		nextName = strings.TrimSpace(*name)
+	}
+	nextDescription := row.Description
+	if description != nil {
+		nextDescription = *description
+	}
+	nextContent := row.Content
+	if content != nil {
+		nextContent = *content
+	}
+	contentChanged := nextContent != row.Content
+	resourcesChanged := resourceInputs != nil
+	changed := nextName != row.Name ||
+		nextDescription != row.Description ||
+		contentChanged ||
+		resourcesChanged
+
+	if err := s.validateContent(nextDescription, nextContent); err != nil {
+		return nil, nil, err
+	}
+	if !changed {
+		current := s.toManifest(row)
+		return &current, nil, nil
+	}
+
+	now := time.Now().UTC()
+	preparedResources := []preparedSkillResource(nil)
+	if resourcesChanged {
+		preparedResources, err = prepareSkillResources(
+			skillID, agentID, "agent:"+agentID, row.Version+1,
+			resourceInputs, s.guard, domain.TrustLevel(row.TrustLevel), now,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	updates := map[string]interface{}{
+		"name":        nextName,
+		"description": nextDescription,
+		"content":     nextContent,
+		"version":     row.Version + 1,
+		"updated_at":  now,
+	}
+	var scanResult *domain.ScanResult
+
+	if contentChanged {
+		trust := domain.TrustLevel(row.TrustLevel)
+		scan := s.guard.ScanContent(nextName, nextContent, trust)
+		policy := domain.ResolveInstallPolicy(trust, scan.Verdict)
+		if policy == domain.InstallPolicyBlock {
+			return nil, scan, errcode.New(
+				errcode.AgentInvalidRequest, 403,
+				fmt.Sprintf("skill '%s' blocked by update policy (verdict=%s)", nextName, scan.Verdict),
+				nil,
+			)
+		}
+		verdictStr := string(scan.Verdict)
+		updates["scan_verdict"] = &verdictStr
+		scanResult = scan
+	}
+
+	updated := *row
+	updated.Name = nextName
+	updated.Description = nextDescription
+	updated.Content = nextContent
+	updated.Version = row.Version + 1
+	updated.UpdatedAt = now
+	if verdict, ok := updates["scan_verdict"].(*string); ok {
+		updated.ScanVerdict = verdict
+	}
+	var retired, registered *model.CapabilityManifest
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if contentChanged {
+			s.recordVersion(ctx, tx, row, "update")
+		}
+		result := tx.Model(&persistence.Skill{}).
+			Where(
+				"id = ? AND agent_id = ? AND version = ?",
+				skillID, agentID, row.Version,
+			).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errcode.New(
+				errcode.AgentVersionConflict, 409,
+				"skill version changed during update", nil,
+			)
+		}
+		if resourcesChanged {
+			if err := putSkillResourcesTx(tx, "agent:"+agentID, preparedResources, now); err != nil {
+				return err
+			}
+		} else {
+			sourceVersion := row.Version
+			if cloneResourcesFromVersion > 0 {
+				sourceVersion = cloneResourcesFromVersion
+			}
+			if err := cloneSkillResourcesTx(
+				tx, skillID, agentID, sourceVersion, updated.Version, now,
+			); err != nil {
+				return err
+			}
+		}
+		var syncErr error
+		retired, registered, syncErr = s.syncSkillCapabilityTx(
+			tx, row, &updated, "skill_revised",
+		)
+		return syncErr
+	})
+	if err != nil {
+		logger.Errorf(ctx, "skill update failed: id=%s, err=%v", skillID, err)
+		return nil, scanResult, errcode.New(errcode.AgentInternal, 500, "failed to update skill", err)
+	}
+	s.publishSkillCapabilityChanges(ctx, retired, registered)
+	m := s.toManifest(&updated)
+	s.recordGrowthEvent(ctx, agentID, EventSkillPatched, updated.Name, updated.ID)
+	return &m, scanResult, nil
+}
+
+// DeleteSkillByID removes a skill by durable ID for Desktop UI callers.
+func (s *SkillService) DeleteSkillByID(ctx context.Context, agentID, skillID string) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+
+	var row persistence.Skill
+	if err := db.WithContext(ctx).
+		Where("id = ? AND agent_id = ?", skillID, agentID).
+		First(&row).Error; err != nil {
+		return errcode.New(errcode.AgentNotFound, 404,
+			fmt.Sprintf("skill %s not found for agent %s", skillID, agentID), err)
+	}
+
+	var retired *model.CapabilityManifest
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var syncErr error
+		retired, _, syncErr = s.syncSkillCapabilityTx(
+			tx, &row, nil, "skill_deleted",
+		)
+		if syncErr != nil {
+			return syncErr
+		}
+		result := tx.Delete(
+			&persistence.Skill{},
+			"id = ? AND agent_id = ? AND version = ?",
+			skillID, agentID, row.Version,
+		)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errcode.New(
+				errcode.AgentVersionConflict, 409,
+				"skill version changed during delete", nil,
+			)
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "skill delete failed: id=%s, err=%v", skillID, err)
+		return errcode.New(errcode.AgentInternal, 500, "failed to delete skill", err)
+	}
+	s.publishSkillCapabilityChanges(ctx, retired, nil)
+
+	logger.Infof(ctx, "skill deleted: agent_id=%s id=%s name=%s", agentID, skillID, row.Name)
+	s.recordGrowthEvent(ctx, agentID, EventSkillDeleted, row.Name, row.ID)
+	return nil
+}
+
+// BuildSkillIndex generates a system prompt skills index block with
+// conditional activation filtering based on platform and tool availability.
+// Returns the formatted index string, the count of activated skills, and any error.
+func (s *SkillService) BuildSkillIndex(ctx context.Context, agentID string, availableTools []string) (string, int, error) {
+	return s.BuildAuthorizedSkillIndex(ctx, agentID, availableTools, nil)
+}
+
+func (s *SkillService) BuildAuthorizedSkillIndex(
+	ctx context.Context,
+	agentID string,
+	availableTools []string,
+	authorized *AuthorizedCapabilitySet,
+) (string, int, error) {
+	if authorized == nil {
+		return "", 0, capabilityStateError(
+			"authorized capability set is required for Skill prompt assembly",
+			nil,
+		)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		logger.Errorf(ctx, "skill index build failed (db): agent_id=%s, err=%v", agentID, err)
+		return "", 0, err
+	}
+
+	authorizedSkills := authorized.Sources(
+		model.CapabilitySourceKind_CAPABILITY_SOURCE_KIND_SKILL,
+	)
+	if len(authorizedSkills) == 0 {
+		return "", 0, nil
+	}
+
+	toolSet := make(map[string]bool, len(availableTools))
+	for _, t := range availableTools {
+		toolSet[t] = true
+	}
+
+	type indexEntry struct {
+		category    string
+		name        string
+		description string
+	}
+
+	var entries []indexEntry
+
+	for _, capability := range authorizedSkills {
+		skillID := strings.TrimPrefix(
+			capability.Manifest.GetCapabilityId(),
+			"skill:",
+		)
+		version, versionErr := strconv.Atoi(capability.Manifest.GetVersion())
+		if skillID == "" || versionErr != nil || version <= 0 {
+			return "", 0, capabilityStateError(
+				"authorized Skill manifest identity is invalid",
+				versionErr,
+			)
+		}
+		var row persistence.Skill
+		if err := db.WithContext(ctx).
+			Where("id = ? AND agent_id = ?", skillID, agentID).
+			First(&row).Error; err != nil {
+			return "", 0, capabilityStateError(
+				"authorized Skill source is unavailable",
+				err,
+			)
+		}
+		manifest := s.toManifest(&row)
+		manifest.Version = version
+		if display := capability.Manifest.GetDisplayMetadata(); display != nil {
+			manifest.Name = display.GetName()
+			manifest.Description = display.GetDescription()
+		}
+
+		if len(manifest.Platforms) > 0 {
+			continue
+		}
+
+		if s.isFallbackSatisfied(manifest.Conditions, toolSet) {
+			continue
+		}
+
+		if !s.hasRequiredTools(manifest.Conditions, toolSet) {
+			continue
+		}
+
+		cat := manifest.Category
+		if cat == "" {
+			cat = "general"
+		}
+
+		entries = append(entries, indexEntry{
+			category:    cat,
+			name:        manifest.Name,
+			description: manifest.Description,
+		})
+	}
+
+	if len(entries) == 0 {
+		return "", 0, nil
+	}
+
+	grouped := map[string][]indexEntry{}
+	for _, e := range entries {
+		grouped[e.category] = append(grouped[e.category], e)
+	}
+
+	categories := make([]string, 0, len(grouped))
+	for cat := range grouped {
+		categories = append(categories, cat)
+	}
+	sort.Strings(categories)
+
+	var sb strings.Builder
+
+	sb.WriteString("## Skills (mandatory)\n")
+	sb.WriteString("Before replying, scan the skills below. If one clearly matches your task,\n")
+	sb.WriteString("load it with skill_view(name) and follow its instructions.\n")
+	sb.WriteString("If a skill has issues, fix it with skill_manage(action='patch').\n\n")
+	sb.WriteString("<available_skills>\n")
+
+	for _, cat := range categories {
+		sb.WriteString(fmt.Sprintf("  %s:\n", cat))
+		for _, e := range grouped[cat] {
+			sb.WriteString(fmt.Sprintf("    - %s: %s\n", e.name, e.description))
+		}
+	}
+
+	sb.WriteString("</available_skills>")
+
+	return sb.String(), len(entries), nil
+}
+
+func (s *SkillService) ToggleSkill(
+	ctx context.Context,
+	agentID string,
+	skillID string,
+	enabled bool,
+) error {
+	if s.capabilities == nil {
+		return capabilityStateError("Skill binding authority is unavailable", nil)
+	}
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+	skill, err := s.findByID(ctx, db, agentID, skillID)
+	if err != nil {
+		return err
+	}
+	var agent persistence.Agent
+	if err := db.WithContext(ctx).Where("id = ?", agentID).First(&agent).Error; err != nil {
+		return capabilityRecordError("Agent", err)
+	}
+	capabilityID := "skill:" + skill.ID
+	capabilityVersion := strconv.Itoa(skill.Version)
+	var binding persistence.AgentCapabilityBinding
+	bindingErr := db.WithContext(ctx).
+		Where(
+			"ptid = ? AND agent_id = ? AND capability_id = ? AND capability_version = ? AND tombstoned_at IS NULL",
+			agent.OwnerActorPTID,
+			agent.ID,
+			capabilityID,
+			capabilityVersion,
+		).
+		Order("revision DESC").
+		First(&binding).Error
+	if errors.Is(bindingErr, gorm.ErrRecordNotFound) {
+		if !enabled {
+			return nil
+		}
+		binding = persistence.AgentCapabilityBinding{}
+	} else if bindingErr != nil {
+		return capabilityInternal("load Skill capability binding", bindingErr)
+	}
+
+	approval := model.CapabilityApprovalPolicy_CAPABILITY_APPROVAL_POLICY_AUTO
+	if binding.BindingID != "" {
+		approval = model.CapabilityApprovalPolicy(binding.ApprovalPolicy)
+	}
+	_, err = s.capabilities.UpsertBinding(
+		ctx,
+		agent.OwnerActorPTID,
+		&model.UpsertAgentCapabilityBindingRequest{
+			Binding: &model.AgentCapabilityBinding{
+				BindingId:            binding.BindingID,
+				AgentId:              agent.ID,
+				CapabilityId:         capabilityID,
+				CapabilityVersion:    capabilityVersion,
+				Enabled:              enabled,
+				ApprovalPolicy:       approval,
+				ExpectedAgentVersion: uint64(agent.Version),
+			},
+			IdempotencyKey:          generateID("skill-binding"),
+			ExpectedBindingRevision: binding.Revision,
+		},
+	)
+	return err
+}
+
+// RecordSkillUsage updates usage statistics for skills that were loaded during
+// a turn. If turnSucceeded is true, ApplyCount is incremented (the skill
+// contributed to a successful turn).
+func (s *SkillService) RecordSkillUsage(ctx context.Context, agentID string, skillNames []string, turnSucceeded bool) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return
+	}
+
+	now := time.Now()
+	for _, name := range skillNames {
+		updates := map[string]interface{}{
+			"view_count":   gorm.Expr("view_count + 1"),
+			"last_used_at": now,
+			"updated_at":   now,
+		}
+		if turnSucceeded {
+			updates["apply_count"] = gorm.Expr("apply_count + 1")
+		}
+		db.WithContext(ctx).
+			Model(&persistence.Skill{}).
+			Where("agent_id = ? AND name = ?", agentID, name).
+			Updates(updates)
+	}
+}
+
+// ── Internal helpers ────────────────────────────────────────────────────────
+
+func (s *SkillService) getDB(ctx context.Context) (*gorm.DB, error) {
+	if s.db != nil {
+		return s.db, nil
+	}
+	db, err := store.GetRDS(ctx, store.WithRDSDBName("agent"))
+	if err != nil {
+		logger.Errorf(ctx, "agent database not available: %v", err)
+		return nil, errcode.New(errcode.AgentInternal, 500, "database unavailable", err)
+	}
+	return db, nil
+}
+
+func (s *SkillService) syncSkillCapabilityTx(
+	tx *gorm.DB,
+	previous *persistence.Skill,
+	current *persistence.Skill,
+	reason string,
+) (*model.CapabilityManifest, *model.CapabilityManifest, error) {
+	if s.capabilities == nil {
+		return nil, nil, nil
+	}
+	var retired *model.CapabilityManifest
+	if previous != nil {
+		retired = capabilitySkillManifestSeed(*previous).manifest
+		result := tx.Model(&persistence.CapabilityManifest{}).
+			Where(
+				"capability_id = ? AND version = ? AND owner_ptid = ? AND retired_at IS NULL",
+				retired.GetCapabilityId(),
+				retired.GetVersion(),
+				retired.GetOwnerPtid(),
+			).
+			Updates(map[string]interface{}{
+				"availability":      int32(model.CapabilityAvailability_CAPABILITY_AVAILABILITY_BLOCKED),
+				"retired_at":        time.Now().UTC(),
+				"retired_by_ptid":   "station:skill-lifecycle",
+				"retirement_reason": reason,
+			})
+		if result.Error != nil {
+			return nil, nil, capabilityInternal("retire Skill capability manifest", result.Error)
+		}
+	}
+	var registered *model.CapabilityManifest
+	if current != nil {
+		var err error
+		registered, _, err = s.capabilities.registerManifestTx(
+			tx,
+			capabilitySkillManifestSeed(*current).manifest,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return retired, registered, nil
+}
+
+func (s *SkillService) publishSkillCapabilityChanges(
+	ctx context.Context,
+	retired *model.CapabilityManifest,
+	registered *model.CapabilityManifest,
+) {
+	if s.capabilities == nil {
+		return
+	}
+	if retired != nil {
+		s.capabilities.publishManifestInvalidations(
+			ctx,
+			domain.AgentAuthorityInvalidationManifestRetired,
+			retired,
+		)
+	}
+	if registered != nil {
+		s.capabilities.publishManifestInvalidations(
+			ctx,
+			domain.AgentAuthorityInvalidationManifestRegistered,
+			registered,
+		)
+	}
+}
+
+func (s *SkillService) findByName(ctx context.Context, db *gorm.DB, agentID, name string) (*persistence.Skill, error) {
+	var row persistence.Skill
+
+	err := db.WithContext(ctx).
+		Where("agent_id = ? AND name = ?", agentID, name).
+		First(&row).Error
+
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errcode.New(errcode.AgentNotFound, 404,
+				fmt.Sprintf("skill '%s' not found for agent '%s'", name, agentID), nil)
+		}
+		logger.Errorf(ctx, "skill lookup failed: name=%s, err=%v", name, err)
+		return nil, errcode.New(errcode.AgentInternal, 500, "failed to find skill", err)
+	}
+
+	return &row, nil
+}
+
+func (s *SkillService) validateContent(description, content string) error {
+	if len(description) > maxDescriptionLen {
+		return errcode.New(errcode.AgentInvalidRequest, 400,
+			fmt.Sprintf("description exceeds %d characters", maxDescriptionLen), nil)
+	}
+
+	if len(content) > maxContentLen {
+		return errcode.New(errcode.AgentInvalidRequest, 400,
+			fmt.Sprintf("content exceeds %d characters", maxContentLen), nil)
+	}
+
+	return nil
+}
+
+func (s *SkillService) toManifest(row *persistence.Skill) domain.SkillManifest {
+	m := domain.SkillManifest{
+		SkillID:     row.ID,
+		AgentID:     row.AgentID,
+		Name:        row.Name,
+		Description: row.Description,
+		Content:     row.Content,
+		TrustLevel:  domain.TrustLevel(row.TrustLevel),
+		Version:     row.Version,
+		CreatedAt:   row.CreatedAt,
+		UpdatedAt:   row.UpdatedAt,
+	}
+
+	if row.Category != nil {
+		m.Category = *row.Category
+	}
+	if row.Source != nil {
+		m.Source = *row.Source
+	}
+	if row.ScanVerdict != nil {
+		m.ScanVerdict = domain.ScanVerdict(*row.ScanVerdict)
+	}
+
+	if len(row.Platforms) > 0 {
+		_ = json.Unmarshal(row.Platforms, &m.Platforms)
+	}
+
+	if len(row.Conditions) > 0 {
+		var cond domain.SkillConditions
+		if err := json.Unmarshal(row.Conditions, &cond); err == nil {
+			m.Conditions = &cond
+		}
+	}
+
+	return m
+}
+
+func (s *SkillService) skillBindingEnabled(
+	ctx context.Context,
+	db *gorm.DB,
+	row *persistence.Skill,
+) bool {
+	if db == nil || row == nil {
+		return false
+	}
+	var count int64
+	if err := db.WithContext(ctx).Model(&persistence.AgentCapabilityBinding{}).
+		Where(
+			"agent_id = ? AND capability_id = ? AND capability_version = ? AND enabled = ? AND tombstoned_at IS NULL",
+			row.AgentID,
+			"skill:"+row.ID,
+			strconv.Itoa(row.Version),
+			true,
+		).
+		Count(&count).Error; err != nil {
+		logger.Warnf(ctx, "failed to project Skill binding state: skill_id=%s err=%v", row.ID, err)
+		return false
+	}
+	return count > 0
+}
+
+func (s *SkillService) findByID(ctx context.Context, db *gorm.DB, agentID, skillID string) (*persistence.Skill, error) {
+	var row persistence.Skill
+	if err := db.WithContext(ctx).
+		Where("id = ? AND agent_id = ?", skillID, agentID).
+		First(&row).Error; err != nil {
+		return nil, errcode.New(errcode.AgentNotFound, 404,
+			fmt.Sprintf("skill %s not found for agent %s", skillID, agentID), err)
+	}
+	return &row, nil
+}
+
+// fuzzyFind performs a whitespace-normalized search as fallback
+// when exact match fails in PatchSkill.
+func (s *SkillService) fuzzyFind(content, target string) int {
+	normalizeWS := func(s string) string {
+		fields := strings.Fields(s)
+		return strings.Join(fields, " ")
+	}
+
+	normContent := normalizeWS(content)
+	normTarget := normalizeWS(target)
+
+	normIdx := strings.Index(normContent, normTarget)
+	if normIdx == -1 {
+		return -1
+	}
+
+	// Map normalized index back to original content position.
+	// Walk through original content, tracking normalized character position.
+	normPos := 0
+	inSpace := false
+
+	for i, r := range content {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !inSpace && normPos > 0 {
+				normPos++
+				inSpace = true
+			}
+			continue
+		}
+
+		inSpace = false
+		if normPos == normIdx {
+			return i
+		}
+		normPos++
+	}
+
+	return -1
+}
+
+// isFallbackSatisfied returns true if all fallback tools are already available,
+// meaning this fallback skill is not needed.
+func (s *SkillService) isFallbackSatisfied(cond *domain.SkillConditions, toolSet map[string]bool) bool {
+	if cond == nil || len(cond.FallbackForToolsets) == 0 {
+		return false
+	}
+
+	for _, tool := range cond.FallbackForToolsets {
+		if !toolSet[tool] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Skill Versioning & Rollback — "dumbed-down agent" recovery path
+// ---------------------------------------------------------------------------
+
+// recordVersion saves the current skill content as a version record before mutation.
+// Errors are logged but never propagated so that the parent operation is not failed.
+func (s *SkillService) recordVersion(ctx context.Context, db *gorm.DB, skill *persistence.Skill, trigger string) {
+	version := persistence.SkillVersion{
+		ID:        generateID("sv"),
+		SkillID:   skill.ID,
+		AgentID:   skill.AgentID,
+		Version:   skill.Version,
+		Content:   skill.Content,
+		Trigger:   trigger,
+		CreatedAt: time.Now(),
+	}
+
+	if err := db.WithContext(ctx).Create(&version).Error; err != nil {
+		logger.Warnf(ctx, "skill version: failed to record version for skill %s: %v", skill.ID, err)
+	}
+}
+
+// ListVersions returns version history for a skill, newest first.
+func (s *SkillService) ListVersions(ctx context.Context, agentID, skillID string, limit, offset int) ([]persistence.SkillVersion, int64, error) {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var total int64
+	db.Model(&persistence.SkillVersion{}).
+		Where("skill_id = ? AND agent_id = ?", skillID, agentID).
+		Count(&total)
+
+	var versions []persistence.SkillVersion
+	err = db.WithContext(ctx).
+		Where("skill_id = ? AND agent_id = ?", skillID, agentID).
+		Order("created_at DESC").
+		Limit(limit).Offset(offset).
+		Find(&versions).Error
+
+	return versions, total, err
+}
+
+// RollbackSkill restores a skill to a specific version.
+// Records the current state as a "rollback" version before overwriting, so
+// the rollback itself is reversible.
+func (s *SkillService) RollbackSkill(ctx context.Context, agentID, skillID string, targetVersion int) error {
+	db, err := s.getDB(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Find the target version record.
+	var version persistence.SkillVersion
+	if err := db.WithContext(ctx).
+		Where("skill_id = ? AND agent_id = ? AND version = ?", skillID, agentID, targetVersion).
+		First(&version).Error; err != nil {
+		return errcode.New(errcode.AgentNotFound, 404,
+			fmt.Sprintf("version %d not found for skill %s", targetVersion, skillID), err)
+	}
+
+	updated, _, err := s.updateSkill(
+		ctx, agentID, skillID, nil, nil, &version.Content, nil, targetVersion,
+	)
+	if err != nil {
+		return err
+	}
+	logger.Infof(
+		ctx,
+		"skill rolled back: id=%s target_version=%d new_version=%d",
+		skillID, targetVersion, updated.Version,
+	)
+	return nil
+}
+
+// hasRequiredTools returns true if all required tools are available.
+// Returns true if no requirements are specified.
+func (s *SkillService) hasRequiredTools(cond *domain.SkillConditions, toolSet map[string]bool) bool {
+	if cond == nil || len(cond.RequiresTools) == 0 {
+		return true
+	}
+
+	for _, tool := range cond.RequiresTools {
+		if !toolSet[tool] {
+			return false
+		}
+	}
+
+	return true
+}

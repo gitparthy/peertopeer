@@ -1,0 +1,1626 @@
+from __future__ import annotations
+
+import ast
+import contextlib
+import io
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from selenium.common.exceptions import WebDriverException
+
+from tooling.acceptance.core import GateError
+from tooling.acceptance.core import EvidenceStore
+from tooling.acceptance.core.errors import EphemeralLaunchTimeout
+from tooling.acceptance.core.evidence import new_report
+from tooling.acceptance.core.launch_context import GateLaunchSpec, GateProcessLauncher
+from tooling.acceptance.gates.chat import native_support
+from tooling.acceptance.gates.chat.native_support import (
+    NativeClientLifecycleLedger,
+    cleanup_preserving_primary_failure,
+    is_native_tauri_url,
+    is_station_authorization_rejection,
+    shared_federation_id,
+    wait_for_peer_key_bundle,
+)
+from tooling.acceptance.gates.chat.native_multi_device_runner import (
+    NativeMultiDeviceGate,
+)
+from tooling.acceptance.gates.chat.native_typing_runner import NativeTypingGate
+
+
+ROOT = Path(__file__).resolve().parents[4]
+RUNNERS = {
+    "typing": ROOT
+    / "tooling/acceptance/gates/chat/native_typing_runner.py",
+    "multi-device": ROOT
+    / "tooling/acceptance/gates/chat/native_multi_device_runner.py",
+}
+ALL_MIGRATED_RUNNERS = (
+    "contact_message_resilience_runner.py",
+    "native_group_mls_runner.py",
+    "native_interactions_runner.py",
+    "native_multi_device_runner.py",
+    "native_recovery_runner.py",
+    "native_typing_runner.py",
+)
+TRACEABLE_GATE_CLASSES = {
+    "contact_message_resilience_runner.py": "ContactMessageResilienceGate",
+    "native_group_mls_runner.py": "NativeGroupMlsGate",
+    "native_interactions_runner.py": "NativeInteractionsGate",
+    "native_multi_device_runner.py": "NativeMultiDeviceGate",
+    "native_product_closure_runner.py": "NativeProductClosureGate",
+    "native_recovery_runner.py": "NativeRecoveryGate",
+    "native_typing_runner.py": "NativeTypingGate",
+}
+
+
+class NativeRuntimeCellRunnerContractTest(unittest.TestCase):
+    def test_nested_interaction_steps_emit_unique_supporting_observations(self) -> None:
+        from tooling.acceptance.gates.chat.native_interactions_runner import NativeInteractionsGate
+
+        gate = NativeInteractionsGate.__new__(NativeInteractionsGate)
+        gate.steps = []
+        gate._step_observation_sequence = 0
+        gate.tested_commit = "synthetic"
+        gate.workspace_digest = "clean"
+        gate.report = new_report(gate.gate_id)
+        with tempfile.TemporaryDirectory() as directory:
+            store = EvidenceStore(Path(directory), worktree=ROOT)
+            with store.begin_run(gate.gate_id, source={"commit": "synthetic"}) as run:
+                with patch.dict(os.environ, run.subprocess_environment()), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gate.step("outer", lambda: gate.step("inner", lambda: 7)), 7)
+                observations = [
+                    json.loads(store.resolve(ref).read_text())
+                    for ref in run.collect_existing_artifacts().values()
+                ]
+                self.assertEqual([item["sequence"] for item in observations], [1, 2, 3, 4])
+                self.assertEqual([item["state"] for item in observations],
+                                 ["STARTED", "STARTED", "COMPLETED", "COMPLETED"])
+                self.assertTrue(all(item["proofStatus"] == "NOT_APPLICABLE" for item in observations))
+                run.finalize(result={"status": "failed", "proofStatus": "UNPROVEN"})
+
+    def test_interaction_step_start_survives_real_command_termination(self) -> None:
+        command = """
+import time
+from tooling.acceptance.core.evidence import new_report
+from tooling.acceptance.gates.chat.native_interactions_runner import NativeInteractionsGate
+gate = NativeInteractionsGate.__new__(NativeInteractionsGate)
+gate.steps = []
+gate._step_observation_sequence = 0
+gate._predicate_probes = []
+gate.tested_commit = "synthetic"
+gate.workspace_digest = "clean"
+gate.report = new_report(gate.gate_id)
+gate.wait_step(
+    "synthetic.pending",
+    lambda: {"replyCount": 1},
+    "synthetic-actor",
+    expected={"replyCount": 2},
+    ready=lambda value: value["replyCount"] == 2,
+)
+"""
+        gate_id = "chat-native-interactions-e2e"
+        with tempfile.TemporaryDirectory() as directory:
+            store = EvidenceStore(Path(directory), worktree=ROOT)
+            with store.begin_run(gate_id, source={"commit": "synthetic"}) as run:
+                launcher = GateProcessLauncher(
+                    cwd=str(ROOT), environment=run.subprocess_environment(),
+                    termination_timeout_seconds=0.2,
+                )
+                with self.assertRaises(EphemeralLaunchTimeout):
+                    launcher.run(
+                        GateLaunchSpec(argv=(sys.executable, "-c", command),
+                                       timeout_seconds=2, required_capabilities=()), None,
+                    )
+                observations = [
+                    json.loads(store.resolve(ref).read_text())
+                    for ref in run.collect_existing_artifacts().values()
+                ]
+                self.assertEqual(len(observations), 2)
+                self.assertEqual(observations[0]["state"], "STARTED")
+                self.assertEqual(observations[0]["step"], "synthetic.pending")
+                self.assertEqual(observations[0]["proofStatus"], "NOT_APPLICABLE")
+                self.assertEqual(observations[1]["state"], "PREDICATE")
+                self.assertEqual(observations[1]["predicate"], {
+                    "expected": {"replyCount": 2},
+                    "observed": {"replyCount": 1},
+                    "accepted": False,
+                })
+                run.finalize(result={"status": "failed", "proofStatus": "UNPROVEN"})
+
+    def source(self, runner: str) -> str:
+        return RUNNERS[runner].read_text(encoding="utf-8")
+
+    def function_source(self, path: Path, name: str) -> str:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        )
+        return ast.get_source_segment(source, function) or ""
+
+    def assignment(self, runner: str, name: str):
+        tree = ast.parse(self.source(runner))
+        return next(
+            ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+        )
+
+    def test_prepared_fixture_authority_is_mode_specific(self) -> None:
+        for ready, authorized, verified in (
+            (True, True, True),
+            (False, True, True),
+            (True, False, True),
+            (True, True, False),
+        ):
+            with self.subTest(ready=ready, authorized=authorized, verified=verified):
+                manifest = {"state": "FIXTURE_READY" if ready else "PREPARING"}
+                actors = {"reset": {
+                    "authorized": authorized, "targetVerified": verified,
+                }}
+                if ready and authorized and verified:
+                    native_support.verify_runtime_fixture_ready(manifest, actors)
+                else:
+                    with self.assertRaises(GateError):
+                        native_support.verify_runtime_fixture_ready(manifest, actors)
+
+    def test_product_closure_checks_fixture_before_source_and_product_actions(self) -> None:
+        from tooling.acceptance.gates.chat.native_product_closure_runner import (
+            NativeProductClosureGate,
+        )
+
+        for authorized, verified in ((True, True), (False, True), (True, False)):
+            with self.subTest(authorized=authorized, verified=verified):
+                gate = NativeProductClosureGate.__new__(NativeProductClosureGate)
+                gate.manifest = {"state": "FIXTURE_READY"}
+                gate.actor_manifest = {"reset": {
+                    "authorized": authorized, "targetVerified": verified,
+                }}
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch.object(
+                        gate, "source_identity",
+                        side_effect=RuntimeError("source probe reached"),
+                    ) as source_probe,
+                ):
+                    if authorized and verified:
+                        with self.assertRaisesRegex(RuntimeError, "source probe reached"):
+                            gate.run()
+                        source_probe.assert_called_once_with()
+                    else:
+                        with self.assertRaises(GateError):
+                            gate.run()
+                        source_probe.assert_not_called()
+
+    def test_native_run_entries_have_no_second_boolean_reset_authority(self) -> None:
+        paths = (
+            *ALL_MIGRATED_RUNNERS,
+            "native_two_client_runner.py",
+            "native_product_closure_runner.py",
+            "lifecycle_group_live.py",
+        )
+        for name in paths:
+            with self.subTest(runner=name):
+                path = ROOT / "tooling/acceptance/gates/chat" / name
+                self.assertNotIn(
+                    "CHAT_ACCEPTANCE_RESET",
+                    self.function_source(path, "run"),
+                )
+
+    def test_enter_chat_page_retries_webdriver_script_timeout(self) -> None:
+        class Driver:
+            clicked = False
+            click_attempts = 0
+
+            def execute_script(self, script: str) -> bool:
+                if "const target" in script:
+                    self.click_attempts += 1
+                    if self.click_attempts == 1:
+                        raise WebDriverException("script timeout")
+                    self.clicked = True
+                    return True
+                return self.clicked
+
+        driver = Driver()
+        native_support.enter_chat_page(SimpleNamespace(driver=driver))
+
+        self.assertTrue(driver.clicked)
+        self.assertEqual(driver.click_attempts, 2)
+
+    def test_native_tauri_origin_accepts_platform_owned_origins_only(
+        self,
+    ) -> None:
+        self.assertTrue(is_native_tauri_url("tauri://localhost"))
+        self.assertTrue(
+            is_native_tauri_url("http://tauri.localhost/chat#direct")
+        )
+        for url in (
+            "http://localhost:3210",
+            "http://127.0.0.1:3410/#/chat",
+            "http://[::1]:3410/#/chat",
+            "https://tauri.localhost",
+            "http://tauri.localhost:3210",
+            "http://user@tauri.localhost",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(is_native_tauri_url(url))
+        with patch.dict(
+            os.environ,
+            {"PT_ACCEPTANCE_NATIVE_DEV": "1"},
+        ):
+            self.assertTrue(
+                is_native_tauri_url("http://localhost:3410/#/chat")
+            )
+            self.assertTrue(
+                is_native_tauri_url("http://127.0.0.1:3410/#/chat")
+            )
+            self.assertTrue(
+                is_native_tauri_url("http://[::1]:3410/#/chat")
+            )
+            self.assertFalse(
+                is_native_tauri_url("https://localhost:3410/#/chat")
+            )
+            self.assertFalse(
+                is_native_tauri_url("http://192.0.2.1:3410/#/chat")
+            )
+
+    def test_selected_runtime_fails_closed_and_uses_binding(self) -> None:
+        support = (
+            ROOT / "tooling/acceptance/gates/chat/native_support.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PT_ACCEPTANCE_RUNTIME_MANIFEST", support)
+        self.assertIn("load_runtime_manifest(Path(raw_path), gate_id)", support)
+        self.assertIn("ArtifactRef.from_dict(actor_ref)", support)
+        self.assertIn("resolve_native_desktop_runtime(", support)
+        for runner in RUNNERS:
+            with self.subTest(runner=runner):
+                source = self.source(runner)
+                self.assertIn("selected_native_runtime(GATE_ID)", source)
+                self.assertIn(
+                    "runtime_binding: NativeDesktopRuntimeBinding | None",
+                    source,
+                )
+                self.assertIn(
+                    "if selected_cell and runtime_binding is None:",
+                    source,
+                )
+                self.assertIn(
+                    "runtime_binding.cell_id != selected_cell",
+                    source,
+                )
+                self.assertIn("self.runtime_binding.create_bound_session(", source)
+                self.assertIn("self.report.manifest = manifest", source)
+                self.assertIn("native_runtime_source_identity(", source)
+                self.assertIn(
+                    "self.runtime_binding.finalize_cleanup(",
+                    source,
+                )
+
+    def test_selected_runtime_does_not_use_local_launch_fallback(self) -> None:
+        for runner in RUNNERS:
+            with self.subTest(runner=runner):
+                source = self.source(runner)
+                start = source.index("    def start_client(")
+                injected = source.index("    def start_injected_client(", start)
+                dispatch = source[start:injected]
+                self.assertIn("self.start_injected_client(actor)", dispatch)
+                self.assertNotIn("start_authenticated_client(", dispatch)
+                self.assertNotIn("if self.runtime_binding is not None:", dispatch)
+
+    def test_native_restart_preserves_and_restores_session(self) -> None:
+        contracts = {
+            "native_interactions_runner.py": (
+                "self.create_authenticated_client(\n"
+                "            actor,\n"
+                "            restore_session=self.runtime_binding is not None,",
+                "    def create_authenticated_client(",
+                "stop_preserving_session(client)",
+            ),
+            "native_typing_runner.py": (
+                "restored_from=self.clients[actor]",
+                "    def start_injected_client(",
+                "stop_preserving_session(client)",
+            ),
+        }
+        for runner, (restore_call, initial_start, stop_call) in contracts.items():
+            with self.subTest(runner=runner):
+                source = (
+                    ROOT / "tooling/acceptance/gates/chat" / runner
+                ).read_text(encoding="utf-8")
+                stop_start = source.index("    def stop_client_for_restart(")
+                stop_end = source.index("\n    def ", stop_start + 8)
+                stop_source = source[stop_start:stop_end]
+                self.assertIn(stop_call, stop_source)
+                self.assertNotIn("auth_logout", stop_source)
+                self.assertIn(restore_call, source)
+                self.assertIn("def wait_for_realtime_device(", source)
+                initial_start_index = source.index(initial_start)
+                initial_end_index = source.index(
+                    "\n    def ",
+                    initial_start_index + len(initial_start),
+                )
+                initial_source = source[initial_start_index:initial_end_index]
+                self.assertNotIn("station.auth_logout()", initial_source)
+
+    def test_revoke_current_device_uses_messaging_endpoint_identity(self) -> None:
+        harness = (
+            ROOT / "apps/desktop/src/acceptance/chat/harness.ts"
+        ).read_text(encoding="utf-8")
+        get_device = harness[
+            harness.index("    async getRealtimeDevice() {"):
+            harness.index("    async revokeCurrentDevice() {")
+        ]
+        revoke_device = harness[
+            harness.index("    async revokeCurrentDevice() {"):
+            harness.index("    async dispatchRealtimeFrame(", harness.index(
+                "    async revokeCurrentDevice() {"
+            ))
+        ]
+        for source in (get_device, revoke_device):
+            self.assertIn("messagingAcceptanceCurrentEndpoint", source)
+            self.assertNotIn("accountGetDeviceId", source)
+        self.assertIn("imServiceV1.device.list()", revoke_device)
+        self.assertIn("current.profileVersion", revoke_device)
+        self.assertIn(
+            "imServiceV1.device.revoke(deviceId, current.profileVersion)",
+            revoke_device,
+        )
+        rust_commands = (
+            ROOT
+            / "apps/desktop/src-tauri/src/interface/tauri_commands/messaging.rs"
+        ).read_text(encoding="utf-8")
+        endpoint_start = rust_commands.index(
+            "pub fn messaging_acceptance_current_endpoint("
+        )
+        endpoint_end = rust_commands.index(
+            "\n#[cfg(feature = \"acceptance-webdriver\")]",
+            endpoint_start,
+        )
+        endpoint_source = rust_commands[endpoint_start:endpoint_end]
+        self.assertIn("engine.endpoint().device_id.as_str()", endpoint_source)
+        self.assertIn("engine.endpoint().ptid != actor_ptid", endpoint_source)
+        conversation_commands = (
+            ROOT
+            / "apps/desktop/src-tauri/src/interface/tauri_commands/conversation.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"observed_profile_version": input.observed_profile_version',
+            conversation_commands,
+        )
+        revoke_start = conversation_commands.index("pub fn device_revoke(")
+        revoke_end = conversation_commands.index(
+            "\n// --- Direct Key Exchange",
+            revoke_start,
+        )
+        revoke_source = conversation_commands[revoke_start:revoke_end]
+        self.assertIn(
+            "request_json_auth_with_device_id(",
+            revoke_source,
+        )
+        self.assertIn(
+            "active_key_exchange_context::<Value>",
+            revoke_source,
+        )
+        self.assertIn(
+            "input.device_id != context.device_id",
+            revoke_source,
+        )
+        self.assertIn("&input.device_id", revoke_source)
+
+    def test_mls_keypackage_commands_bind_window_endpoint_identity(self) -> None:
+        conversation_commands = (
+            ROOT
+            / "apps/desktop/src-tauri/src/interface/tauri_commands/conversation.rs"
+        ).read_text(encoding="utf-8")
+        key_exchange_commands = (
+            ROOT
+            / "apps/desktop/src-tauri/src/interface/tauri_commands/key_exchange.rs"
+        ).read_text(encoding="utf-8")
+        main = (
+            ROOT / "apps/desktop/src-tauri/src/main.rs"
+        ).read_text(encoding="utf-8")
+        gateway = (
+            ROOT
+            / "apps/desktop/src-tauri/src/interface/http_gateway/mod.rs"
+        ).read_text(encoding="utf-8")
+
+        for command in (
+            "keypackage_upload",
+            "keypackage_fetch",
+            "keypackage_count",
+        ):
+            self.assertNotIn(f"pub fn {command}(", conversation_commands)
+            self.assertIn(f"pub fn {command}(", key_exchange_commands)
+            self.assertIn(f"key_exchange::{command}", main)
+        self.assertIn(
+            "active_key_exchange_context_for_account",
+            key_exchange_commands,
+        )
+        self.assertIn(
+            "kemodel::CountMlsKeyPackagesRequest",
+            key_exchange_commands,
+        )
+        self.assertIn(
+            "request_proto_for_device::<",
+            key_exchange_commands,
+        )
+        self.assertIn(
+            "gateway_key_exchange_context(state)",
+            gateway,
+        )
+        self.assertIn("execute_keypackage_count(", gateway)
+        self.assertIn("state.station.client(),", gateway)
+
+    def test_native_acceptance_commands_are_registered_with_tauri(self) -> None:
+        main = (
+            ROOT / "apps/desktop/src-tauri/src/main.rs"
+        ).read_text(encoding="utf-8")
+        for command in (
+            "auth::acceptance_logout_window_session",
+            "capability_authority::agent_capability_acceptance_scenario_prepare",
+            "capability_authority::agent_capability_acceptance_scenario_arm",
+            "capability_authority::agent_capability_acceptance_scenario_wait",
+            "capability_authority::agent_capability_acceptance_scenario_release",
+            "capability_authority::agent_capability_acceptance_scenario_clock_advance",
+            "capability_authority::agent_capability_acceptance_scenario_interrupt",
+            "capability_authority::agent_capability_acceptance_scenario_cleanup",
+            "messaging_commands::messaging_acceptance_current_endpoint",
+            "messaging_commands::messaging_acceptance_prepare_submitted_command",
+            "messaging_commands::messaging_acceptance_resume_lifecycle",
+            "messaging_commands::messaging_acceptance_interaction_snapshot",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, main)
+
+    def test_only_ordinary_client_federation_commands_are_registered(self) -> None:
+        main = (
+            ROOT / "apps/desktop/src-tauri/src/main.rs"
+        ).read_text(encoding="utf-8")
+        allowed_commands = (
+            "federation_resolve",
+            "federation_catalog_search",
+            "federation_list_contexts",
+        )
+        for command in allowed_commands:
+            with self.subTest(command=command):
+                self.assertIn(f"federation::{command}", main)
+        forbidden_commands = (
+            "federation_get_self",
+            "federation_update_visibility",
+            "federation_health",
+            "federation_list_federations",
+            "federation_create",
+            "federation_join",
+            "federation_leave",
+            "federation_delete",
+            "federation_list_member_stations",
+        )
+        for command in forbidden_commands:
+            with self.subTest(command=command):
+                self.assertNotIn(f"federation::{command}", main)
+
+    def test_account_device_identity_comes_from_the_active_engine(self) -> None:
+        source = (
+            ROOT
+            / "apps/desktop/src-tauri/src/interface/tauri_commands/account.rs"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("state.messaging_engines.get(&session.account_id)", source)
+        self.assertIn("engine.endpoint().device_id.clone()", source)
+        self.assertNotIn("device_install::get_or_create_device_id", source)
+
+    def test_acceptance_window_is_positioned_before_it_is_shown(self) -> None:
+        main = (
+            ROOT / "apps/desktop/src-tauri/src/main.rs"
+        ).read_text(encoding="utf-8")
+        start = main.index("fn configure_acceptance_window(")
+        end = main.index(
+            "\n#[cfg(all(test, feature = \"acceptance-webdriver\"))]",
+            start,
+        )
+        function = main[start:end]
+        resize = function.rindex(".set_size(")
+        direct_position = function.rindex("position_acceptance_window(")
+        show = function.rindex(".show()")
+
+        self.assertLess(resize, direct_position)
+        self.assertLess(direct_position, show)
+
+    def test_initial_authentication_never_logs_out(self) -> None:
+        runner_functions = {
+            "contact_message_resilience_runner.py": "start_client",
+            "native_group_mls_runner.py": "start_injected_client",
+            "native_interactions_runner.py": "create_authenticated_client",
+            "native_multi_device_runner.py": "start_injected_client",
+            "native_product_closure_runner.py": "launch_actor",
+            "native_recovery_runner.py": "start_injected_client",
+            "native_two_client_runner.py": "start_client",
+            "native_typing_runner.py": "start_injected_client",
+        }
+        for runner, function_name in runner_functions.items():
+            with self.subTest(runner=runner):
+                path = ROOT / "tooling/acceptance/gates/chat" / runner
+                source = self.function_source(path, function_name)
+                self.assertIn("loginWithPassword", source)
+                self.assertNotIn("station.auth_logout()", source)
+        support = (
+            ROOT / "tooling/acceptance/gates/chat/native_support.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("def start_authenticated_client(", support)
+
+    def test_native_cleanup_uses_window_owned_lifecycle(self) -> None:
+        cleanup_functions = {
+            "contact_message_resilience_runner.py": "cleanup_runtime",
+            "native_group_mls_runner.py": "stop_authenticated_client",
+            "native_interactions_runner.py": "cleanup_clients",
+            "native_multi_device_runner.py": "cleanup_runtime",
+            "native_product_closure_runner.py": "cleanup_clients",
+            "native_recovery_runner.py": "stop_authenticated_client",
+            "native_two_client_runner.py": "cleanup_clients",
+            "native_typing_runner.py": "cleanup_runtime",
+        }
+        for runner, function_name in cleanup_functions.items():
+            with self.subTest(runner=runner):
+                path = ROOT / "tooling/acceptance/gates/chat" / runner
+                source = self.function_source(path, function_name)
+                if runner == "native_product_closure_runner.py":
+                    self.assertIn("self._cleanup_clients(cleanup_end)", source)
+                    source += self.function_source(path, "_cleanup_clients")
+                self.assertIn("client_lifecycles", source)
+                self.assertNotIn("station.auth_logout()", source)
+
+        support = (
+            ROOT / "tooling/acceptance/gates/chat/native_support.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"logout"', self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_support.py",
+            "logout_native_client",
+        ))
+        self.assertIn('"actorPtid": actor_ptid', support)
+
+    def test_corrected_native_runners_register_authenticated_windows(self) -> None:
+        start_functions = {
+            "contact_message_resilience_runner.py": "start_client",
+            "native_interactions_runner.py": "create_authenticated_client",
+            "native_product_closure_runner.py": "launch_actor",
+        }
+        for runner, function_name in start_functions.items():
+            with self.subTest(runner=runner):
+                source = self.function_source(
+                    ROOT / "tooling/acceptance/gates/chat" / runner,
+                    function_name,
+                )
+                self.assertIn("self.client_lifecycles.register(", source)
+                self.assertIn("self.client_lifecycles.mark_live(", source)
+                self.assertIn(
+                    "self.client_lifecycles.mark_authenticated(",
+                    source,
+                )
+                self.assertIn("self.client_lifecycles.release(", source)
+
+    def test_corrected_restart_paths_transfer_preserved_sessions(self) -> None:
+        runners = (
+            "native_interactions_runner.py",
+            "native_product_closure_runner.py",
+        )
+        for runner in runners:
+            with self.subTest(runner=runner):
+                source = (
+                    ROOT / "tooling/acceptance/gates/chat" / runner
+                ).read_text(encoding="utf-8")
+                self.assertIn(
+                    "self.client_lifecycles.stop_preserving_session(",
+                    source,
+                )
+                self.assertIn(
+                    "self.client_lifecycles.transfer_preserved_session(",
+                    source,
+                )
+
+    def test_offline_metadata_mutations_wait_for_their_authority_dependency(
+        self,
+    ) -> None:
+        source = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_interactions_runner.py",
+            "prove_offline_recovery",
+        )
+        edit_commit = source.index("offline edit commit")
+        reaction_submit = source.index('"interaction": "reaction"')
+        reaction_commit = source.index("offline reaction commit")
+        pin_submit = source.index('"interaction": "pin"')
+        self.assertLess(edit_commit, reaction_submit)
+        self.assertLess(reaction_commit, pin_submit)
+        self.assertIn(
+            '(snapshot.get("intent") or {}).get("state") == "committed"',
+            source,
+        )
+
+    def test_nested_thread_waits_for_authority_projection(self) -> None:
+        source = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_interactions_runner.py",
+            "prove_lifecycle",
+        )
+        reply_projection = source.index(f'{{claim_kind}}.reply.authority-projection')
+        thread_submit = source.index(f'{{claim_kind}}.thread.send')
+        thread_projection = source.index(f'{{claim_kind}}.thread.authority-projection')
+        nested_submit = source.index(f'{{claim_kind}}.thread.nested.send')
+        self.assertLess(reply_projection, thread_submit)
+        self.assertLess(thread_projection, nested_submit)
+
+    def test_revoked_typing_is_submitted_and_receiver_stays_inactive(self) -> None:
+        source = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py",
+            "prove_revoked_device",
+        )
+        self.assertIn('"submitTyping"', source)
+        self.assertIn('self.clients["bob"]', source)
+        self.assertIn("except GateError as error:", source)
+        self.assertIn("is_station_authorization_rejection(rejection)", source)
+        self.assertIn("self.assert_typing_inactive_for(", source)
+        self.assertIn('"alice"', source)
+        self.assertNotIn(
+            'self.assert_condition("typing_revoked_device_rejected", True)',
+            source,
+        )
+
+    def test_station_authorization_rejection_is_explicit(self) -> None:
+        for error in (
+            "endpoint is not active",
+            "sender unauthorized",
+            "Forbidden",
+            "request failed status 403",
+            "station returned 403 :",
+        ):
+            with self.subTest(error=error):
+                self.assertTrue(is_station_authorization_rejection(error))
+        for error in (
+            "",
+            "station returned 404 :",
+            "request timed out",
+            "connection refused",
+        ):
+            with self.subTest(error=error):
+                self.assertFalse(is_station_authorization_rejection(error))
+
+    def test_revoked_metadata_interaction_requires_rejection_and_no_event(self) -> None:
+        source = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_interactions_runner.py",
+            "prove_revoked_device",
+        )
+        self.assertIn('"submitMetadataInteraction"', source)
+        self.assertIn('self.clients["bob"]', source)
+        self.assertIn("except GateError as error:", source)
+        self.assertIn("is_station_authorization_rejection(rejection)", source)
+        self.assertIn(
+            "authority_event_count_after == authority_event_count_before",
+            source,
+        )
+        self.assertNotIn('self.clients["alice"]', source)
+        self.assertNotIn(
+            'self.assert_condition("revoked_device_denied", True)',
+            source,
+        )
+
+    def test_native_lifecycle_logs_out_device_revoked_window(self) -> None:
+        client = Mock(profile="acceptance-bob")
+        client.is_alive.return_value = True
+        lifecycle = NativeClientLifecycleLedger()
+        lifecycle.register(client, "ptid:v1:actor:bob")
+        lifecycle.mark_live(client)
+        lifecycle.mark_authenticated(client)
+        lifecycle.mark_device_revoked(client)
+
+        with patch(
+            "tooling.acceptance.gates.chat.native_support."
+            "logout_native_client",
+            return_value={
+                "actorPtid": "ptid:v1:actor:bob",
+                "status": "logged_out",
+            },
+        ) as logout:
+            self.assertEqual(lifecycle.release(client), [])
+
+        logout.assert_called_once_with(client, "ptid:v1:actor:bob")
+        client.stop.assert_called_once_with()
+
+    def test_native_lifecycle_skips_auth_revoked_window_logout(self) -> None:
+        client = Mock(profile="acceptance-bob1")
+        client.is_alive.return_value = True
+        lifecycle = NativeClientLifecycleLedger()
+        lifecycle.register(client, "ptid:v1:actor:bob")
+        lifecycle.mark_live(client)
+        lifecycle.mark_authenticated(client)
+        lifecycle.mark_auth_revoked(client)
+
+        with patch(
+            "tooling.acceptance.gates.chat.native_support."
+            "logout_native_client",
+        ) as logout:
+            self.assertEqual(lifecycle.release(client), [])
+
+        logout.assert_not_called()
+        client.stop.assert_called_once_with()
+
+    def test_native_lifecycle_reports_dead_authenticated_window(self) -> None:
+        client = Mock(profile="acceptance-alice")
+        client.is_alive.return_value = False
+        lifecycle = NativeClientLifecycleLedger()
+        lifecycle.register(client, "ptid:v1:actor:alice")
+        lifecycle.mark_live(client)
+        lifecycle.mark_authenticated(client)
+
+        errors = lifecycle.release(client)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("terminated before logout", errors[0]["error"])
+        client.stop.assert_called_once_with()
+
+    def test_native_lifecycle_retains_logout_and_stop_failures(self) -> None:
+        client = Mock(profile="acceptance-alice")
+        client.is_alive.return_value = True
+        client.stop.side_effect = RuntimeError("stop failed")
+        lifecycle = NativeClientLifecycleLedger()
+        lifecycle.register(client, "ptid:v1:actor:alice")
+        lifecycle.mark_live(client)
+        lifecycle.mark_authenticated(client)
+
+        with patch(
+            "tooling.acceptance.gates.chat.native_support."
+            "logout_native_client",
+            side_effect=RuntimeError("logout failed"),
+        ):
+            errors = lifecycle.release(client)
+
+        self.assertEqual(
+            [error["error"] for error in errors],
+            ["logout failed", "stop failed"],
+        )
+
+    def test_native_lifecycle_requires_preserved_session_successor(self) -> None:
+        client = Mock(profile="acceptance-alice")
+        lifecycle = NativeClientLifecycleLedger()
+        lifecycle.register(client, "ptid:v1:actor:alice")
+        lifecycle.mark_live(client)
+        lifecycle.mark_authenticated(client)
+        lifecycle.stop_preserving_session(client)
+
+        errors = lifecycle.release(client)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no verified successor", errors[0]["error"])
+        self.assertEqual(client.stop.call_count, 2)
+        self.assertEqual(client.stop.call_args.kwargs, {})
+        self.assertEqual(lifecycle.release(client), errors)
+        self.assertEqual(client.stop.call_count, 2)
+
+    def test_native_lifecycle_transfers_preserved_session_ownership(self) -> None:
+        predecessor = Mock(profile="acceptance-alice-old")
+        successor = Mock(profile="acceptance-alice-new")
+        successor.is_alive.return_value = True
+        lifecycle = NativeClientLifecycleLedger()
+        lifecycle.register(predecessor, "ptid:v1:actor:alice")
+        lifecycle.mark_live(predecessor)
+        lifecycle.mark_authenticated(predecessor)
+        lifecycle.stop_preserving_session(predecessor)
+        lifecycle.register(successor, "ptid:v1:actor:alice")
+        lifecycle.transfer_preserved_session(predecessor, successor)
+        lifecycle.mark_live(successor)
+        lifecycle.mark_authenticated(successor)
+
+        with patch(
+            "tooling.acceptance.gates.chat.native_support."
+            "logout_native_client",
+            return_value={
+                "actorPtid": "ptid:v1:actor:alice",
+                "status": "logged_out",
+            },
+        ):
+            self.assertEqual(lifecycle.release_all(), [])
+
+        successor.stop.assert_called_once_with()
+
+    def test_selected_runtime_rejects_uninjected_gate_construction(self) -> None:
+        previous = os.environ.get("PT_ACCEPTANCE_RUNTIME_CELL")
+        os.environ["PT_ACCEPTANCE_RUNTIME_CELL"] = "desktop-linux-native"
+        try:
+            for gate in (NativeTypingGate, NativeMultiDeviceGate):
+                with self.subTest(gate=gate.__name__):
+                    with self.assertRaisesRegex(
+                        GateError,
+                        "requires injected runtime resources",
+                    ):
+                        gate()
+        finally:
+            if previous is None:
+                os.environ.pop("PT_ACCEPTANCE_RUNTIME_CELL", None)
+            else:
+                os.environ["PT_ACCEPTANCE_RUNTIME_CELL"] = previous
+
+    def test_runtime_identity_is_snapshot_source_bound(self) -> None:
+        support = (
+            ROOT / "tooling/acceptance/gates/chat/native_support.py"
+        ).read_text(encoding="utf-8")
+        for contract in (
+            "runtime_source_matches(",
+            'station.get("workspaceDigest") == "clean"',
+            'runtime_cell.get("state") == "LEASED"',
+            'cell_source.get("remoteCheckoutClean") is True',
+            'cell_source.get("binarySha256") == binary_sha256',
+            'platform.get("imageDigest")',
+            'transport.get("hostIdentitySha256")',
+            'transport.get("hostKeySha256")',
+        ):
+            self.assertIn(contract, support)
+        for runner in RUNNERS:
+            with self.subTest(runner=runner):
+                source = self.source(runner)
+                identity_start = source.index("    def validate_source_identity(")
+                identity_end = source.index(
+                    "\n    def ",
+                    identity_start + 8,
+                )
+                identity = source[identity_start:identity_end]
+                self.assertIn("native_runtime_source_identity(", identity)
+
+    def test_gate_catalog_routes_all_native_runners_through_cells(self) -> None:
+        gates = json.loads(
+            (ROOT / "tooling/acceptance/gates.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["gates"]
+        expected_cells = [
+            "desktop-macos-native",
+            "desktop-linux-native",
+            "desktop-windows-native",
+        ]
+        for gate_id in (
+            "chat-native-interactions-e2e",
+            "chat-contact-message-resilience-e2e",
+            "chat-native-typing-e2e",
+            "chat-native-multi-device-e2e",
+            "chat-native-recovery-e2e",
+            "chat-native-group-mls-e2e",
+        ):
+            with self.subTest(gate=gate_id):
+                gate = gates[gate_id]
+                self.assertEqual(
+                    gate["environment"],
+                    "native-tauri-embedded-webdriver",
+                )
+                self.assertEqual(
+                    gate["provisioner"],
+                    "native-tauri-embedded-webdriver",
+                )
+                self.assertEqual(
+                    gate["requiredRuntimeCells"],
+                    expected_cells,
+                )
+
+    def test_multi_device_clones_identity_inside_runtime_owner(self) -> None:
+        source = self.source("multi-device")
+        self.assertIn(
+            "self.runtime_binding.clone_actor_storage(",
+            source,
+        )
+        # Same-device session revocation depends on the installation device
+        # id; the replacement login must clone it together with actor keys and
+        # remap the source launch profile segment onto the target profile.
+        self.assertIn("ACTOR_IDENTITY_KEYS_RELATIVE", source)
+        self.assertIn("install_device_id_relative", source)
+        self.assertIn("CloneStorageEntry(", source)
+        self.assertIn('INSTALL_DEVICE_ID_NAME', source)
+
+    def test_make_entries_forward_the_selected_runtime_cell(self) -> None:
+        makefile = (
+            ROOT / "tooling/make/acceptance.mk"
+        ).read_text(encoding="utf-8")
+        targets = (
+            "acceptance-chat-native-interactions",
+            "acceptance-chat-native-typing",
+            "acceptance-chat-native-multi-device",
+            "acceptance-chat-native-recovery",
+            "acceptance-chat-native-group-mls",
+            "acceptance-chat-contact-message-resilience",
+        )
+        for target in targets:
+            with self.subTest(target=target):
+                start = makefile.index(f"{target}:")
+                next_target = makefile.find("\nacceptance-", start + 1)
+                body = makefile[
+                    start : next_target if next_target >= 0 else None
+                ]
+                self.assertIn(
+                    'PT_ACCEPTANCE_RUNTIME_CELL="$(RUNTIME_CELL)"',
+                    body,
+                )
+                self.assertIn(
+                    '--runtime-cell "$(RUNTIME_CELL)"',
+                    body,
+                )
+
+    def test_fixed_w11_plan_preserves_runtime_cell_contracts(self) -> None:
+        plan = json.loads(
+            (
+                ROOT / "tooling/acceptance/plans/chat-w11-closure.json"
+            ).read_text(encoding="utf-8")
+        )
+        selected = {
+            gate["id"]: gate
+            for gate in plan["selected_gates"]
+        }
+        catalog = json.loads((ROOT / "tooling/acceptance/gates.yaml").read_text())
+        definitions = catalog["gates"]
+        for gate_id in (
+            "chat-native-two-client-e2e",
+            "chat-native-interactions-e2e",
+            "chat-native-typing-e2e",
+            "chat-native-multi-device-e2e",
+            "chat-native-recovery-e2e",
+            "chat-native-group-mls-e2e",
+        ):
+            with self.subTest(gate=gate_id):
+                self.assertEqual(
+                    selected[gate_id].get(
+                        "requiredRuntimeCells", definitions[gate_id]["requiredRuntimeCells"],
+                    ),
+                    [
+                        "desktop-macos-native",
+                        "desktop-linux-native",
+                        "desktop-windows-native",
+                    ],
+                )
+
+    def test_migrated_runners_default_to_current_evidence_store_run(self) -> None:
+        for filename in ALL_MIGRATED_RUNNERS:
+            with self.subTest(runner=filename):
+                source = (
+                    ROOT / "tooling/acceptance/gates/chat" / filename
+                ).read_text(encoding="utf-8")
+                self.assertIn("REPORT_PATH = None", source)
+                self.assertNotIn("REPORT_OVERRIDE", source)
+                self.assertNotIn("REPORTS_DIR", source)
+
+    def test_cleanup_failure_preserves_first_product_failure(self) -> None:
+        report = new_report("synthetic-native-gate")
+
+        def cleanup() -> dict[str, Any]:
+            report.runtime["cleanup"] = {
+                "cleanupErrors": [{"error": "cleanup failed"}],
+            }
+            raise GateError("cleanup failed")
+
+        with self.assertRaisesRegex(
+            GateError,
+            "product failed",
+        ) as raised:
+            try:
+                raise GateError("product failed")
+            finally:
+                cleanup_preserving_primary_failure(
+                    cleanup,
+                    report,
+                    "Synthetic native gate",
+                )
+
+        self.assertIn("cleanupFailure", report.runtime)
+        self.assertEqual(
+            report.runtime["cleanupFailure"]["error"],
+            "cleanup failed",
+        )
+
+    def test_runner_log_failure_does_not_replace_product_failure(self) -> None:
+        for gate_class in (NativeTypingGate, NativeMultiDeviceGate):
+            with self.subTest(gate=gate_class.gate_id):
+                client = Mock(
+                    profile="acceptance-alice",
+                    gateway_port=3030,
+                )
+                client.is_alive.return_value = False
+                binding = Mock()
+                binding.finalize_cleanup.return_value = {
+                    "portsReleased": True,
+                    "processesReleased": True,
+                    "storageReleased": True,
+                    "logsReleased": True,
+                    "cleanupErrors": [],
+                }
+                gate = object.__new__(gate_class)
+                gate.runtime_binding = binding
+                gate.clients = {"alice": client}
+                gate.runtime_instances = [client]
+                gate.client_lifecycles = NativeClientLifecycleLedger()
+                gate.client_specs = {"alice": {}}
+                gate.steps = []
+                gate.cleanup_evidence = {}
+                gate.report = new_report(gate_class.gate_id)
+                gate.save_app_log = Mock(
+                    side_effect=RuntimeError("log export failed")
+                )
+
+                with self.assertRaisesRegex(
+                    GateError,
+                    "product failed",
+                ):
+                    try:
+                        raise GateError("product failed")
+                    finally:
+                        cleanup_preserving_primary_failure(
+                            gate.cleanup_runtime,
+                            gate.report,
+                            gate_class.gate_id,
+                        )
+
+                self.assertEqual(
+                    gate.report.runtime["cleanupFailure"]["resource"],
+                    "cleanup",
+                )
+                self.assertEqual(
+                    gate.report.runtime["cleanup"]["cleanupErrors"][0][
+                        "error"
+                    ],
+                    "log export failed",
+                )
+
+    def test_static_gate_runs_runtime_cell_regressions(self) -> None:
+        gates = json.loads(
+            (ROOT / "tooling/acceptance/gates.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["gates"]
+        command = gates["chat-native-visible-static"]["command"]
+        self.assertIn(
+            "src/acceptance/chat/passwordLogin.test.ts",
+            command,
+        )
+        for suite in (
+            "native_runtime_cell_runner_test",
+            "native_recovery_runner_test",
+            "native_group_mls_runner_test",
+        ):
+            with self.subTest(suite=suite):
+                self.assertIn(suite, command)
+
+    def test_environment_gate_classes_declare_traceability(self) -> None:
+        runner_root = ROOT / "tooling/acceptance/gates/chat"
+        for filename, class_name in TRACEABLE_GATE_CLASSES.items():
+            with self.subTest(runner=filename):
+                tree = ast.parse(
+                    (runner_root / filename).read_text(encoding="utf-8")
+                )
+                gate_class = next(
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.ClassDef)
+                    and node.name == class_name
+                )
+                assignments = {
+                    target.id: ast.literal_eval(node.value)
+                    for node in gate_class.body
+                    if isinstance(node, ast.Assign)
+                    for target in node.targets
+                    if isinstance(target, ast.Name)
+                    and target.id in {"phase", "bom", "spec"}
+                }
+                self.assertTrue(assignments.get("phase"))
+                self.assertTrue(assignments.get("bom"))
+                self.assertTrue(assignments.get("spec"))
+
+    def test_native_chat_gates_use_canonical_actor_ptid(self) -> None:
+        runner_root = ROOT / "tooling/acceptance/gates/chat"
+        runner_names = (
+            "contact_message_resilience_runner.py",
+            "native_group_mls_runner.py",
+            "native_interactions_runner.py",
+            "native_multi_device_runner.py",
+            "native_product_closure_runner.py",
+            "native_recovery_runner.py",
+            "native_support.py",
+            "native_two_client_runner.py",
+            "native_typing_runner.py",
+        )
+
+        for runner_name in runner_names:
+            with self.subTest(runner=runner_name):
+                source = (runner_root / runner_name).read_text(
+                    encoding="utf-8"
+                )
+                self.assertNotIn('.get("actorId")', source)
+                self.assertIn('.get("actorPtid")', source)
+
+    def test_station_readback_uses_strict_shared_ssh_transport(self) -> None:
+        support = (
+            ROOT / "tooling/acceptance/gates/chat/native_support.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("SshTransport(", support)
+        self.assertIn("SshTarget(", support)
+        self.assertIn("'readerPtid', ptid", support)
+        self.assertIn("ORDER BY ptid", support)
+        self.assertIn("SELECT ptid AS reader_ptid", support)
+        self.assertNotIn("StrictHostKeyChecking=no", support)
+
+    def test_shared_federation_requires_one_id_for_every_actor(self) -> None:
+        clients = {
+            "alice": object(),
+            "bob": object(),
+            "charlie": object(),
+        }
+        contexts = {
+            clients["alice"]: {
+                "federations": [
+                    {
+                        "federationId": "fed-stale",
+                        "name": "Legacy Federation",
+                    },
+                    {
+                        "federationId": "fed-shared",
+                        "name": "chat-native-acceptance",
+                    },
+                ]
+            },
+            clients["bob"]: {
+                "federations": [
+                    {
+                        "federationId": "fed-stale",
+                        "name": "Legacy Federation",
+                    },
+                    {
+                        "federationId": "fed-shared",
+                        "name": "chat-native-acceptance",
+                    },
+                ]
+            },
+            clients["charlie"]: {
+                "federations": [
+                    {
+                        "federationId": "fed-stale",
+                        "name": "Legacy Federation",
+                    },
+                    {
+                        "federationId": "fed-shared",
+                        "name": "chat-native-acceptance",
+                    },
+                ]
+            },
+        }
+        with patch(
+            "tooling.acceptance.gates.chat.native_support.async_harness",
+            side_effect=lambda client, *_args, **_kwargs: contexts[client],
+        ):
+            self.assertEqual(
+                shared_federation_id(
+                    clients,  # type: ignore[arg-type]
+                    ("alice", "bob", "charlie"),
+                ),
+                "fed-shared",
+            )
+
+    def test_peer_key_readiness_waits_for_positive_bundle_count(self) -> None:
+        with patch(
+            "tooling.acceptance.gates.chat.native_support.async_harness",
+            side_effect=(
+                {"peerPtid": "ptid:bob", "bundleCount": 0},
+                {
+                    "peerPtid": "ptid:bob",
+                    "bundleCount": 1,
+                    "deviceIds": ["bob-device"],
+                },
+            ),
+        ) as harness, patch(
+            "tooling.acceptance.gates.chat.native_support.time.sleep",
+        ):
+            result = wait_for_peer_key_bundle(
+                object(),  # type: ignore[arg-type]
+                "ptid:bob",
+                "station-five",
+                timeout=1,
+            )
+
+        self.assertEqual(result["deviceIds"], ["bob-device"])
+        self.assertEqual(harness.call_count, 2)
+        self.assertEqual(
+            harness.call_args.args[2],
+            {
+                "peerPtid": "ptid:bob",
+                "homeStationPeerId": "station-five",
+            },
+        )
+
+    def test_station_readback_supports_bound_local_source_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "station.db"
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+CREATE TABLE conversation_events (
+  event_id TEXT, conversation_id TEXT, sequence INTEGER,
+  command_id TEXT, message_id TEXT, event_hash BLOB
+);
+CREATE TABLE device_queue_items (
+  item_id TEXT, event_id TEXT, conversation_id TEXT,
+  recipient_ptid TEXT, recipient_device_id TEXT,
+  lane_sequence INTEGER, state TEXT, attempt_count INTEGER,
+  payload_sha256 BLOB
+);
+CREATE TABLE conversation_read_cursors (
+  conversation_id TEXT, ptid TEXT, last_read_sequence INTEGER
+);
+INSERT INTO conversation_events VALUES
+  ('event-1', 'conversation-1', 1, 'command-1', 'message-1', x'0102');
+INSERT INTO device_queue_items VALUES
+  ('item-1', 'event-1', 'conversation-1', 'ptid:bob', 'device-1',
+   1, 'pending', 0, x'0a0b');
+INSERT INTO conversation_read_cursors VALUES
+  ('conversation-1', 'ptid:bob', 1);
+"""
+                )
+            finally:
+                connection.close()
+            with patch.object(
+                native_support,
+                "acceptance_station_environment",
+                return_value={
+                    "PT_ACCEPTANCE_RUNTIME_KIND": "local-source",
+                    "PT_ACCEPTANCE_LOCAL_DATABASE": str(database),
+                },
+            ) as resolve_environment:
+                result = native_support.station_readback(
+                    "conversation-1",
+                    "message-1",
+                    station_url="http://127.0.0.1:18080",
+                    deployment_environment="chat-native-five",
+                )
+
+        resolve_environment.assert_called_once_with(
+            "http://127.0.0.1:18080",
+            "chat-native-five",
+        )
+        self.assertEqual(result["events"][0]["hashBytes"], 2)
+        self.assertEqual(result["queue"][0]["payloadSha256"], "0a0b")
+        self.assertEqual(result["readCursors"][0]["lastReadSequence"], 1)
+
+    def test_typing_start_client_does_not_reference_unbound_client(self) -> None:
+        start_client = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py",
+            "start_client",
+        )
+        self.assertEqual(
+            start_client.count("self.start_injected_client(actor)"),
+            1,
+        )
+        self.assertNotIn("enter_chat_page(client)", start_client)
+
+    def test_windows_storage_clone_is_scoped_by_runtime_run(self) -> None:
+        clone = self.function_source(
+            ROOT
+            / "tooling/acceptance/provisioners/native_desktop_windows.py",
+            "clone_actor_storage",
+        )
+        self.assertGreaterEqual(clone.count('str(state["runId"])'), 2)
+        self.assertGreaterEqual(clone.count("_windows_verbatim_path("), 2)
+
+    def test_recovery_exports_each_current_log_once_during_cleanup(self) -> None:
+        runners = {
+            "recovery": "native_recovery_runner.py",
+            "typing": "native_typing_runner.py",
+            "multi-device": "native_multi_device_runner.py",
+            "group-mls": "native_group_mls_runner.py",
+        }
+        for name, filename in runners.items():
+            with self.subTest(runner=name):
+                source = (
+                    ROOT / "tooling/acceptance/gates/chat" / filename
+                ).read_text(encoding="utf-8")
+                self.assertEqual(
+                    source.count("self.save_app_log(client, actor)"),
+                    1,
+                )
+
+    def test_group_mls_start_client_launches_injected_runtime(self) -> None:
+        start_client = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_group_mls_runner.py",
+            "start_client",
+        )
+        self.assertIn("self.start_injected_client(actor)", start_client)
+
+    def test_typing_contract_is_unchanged(self) -> None:
+        self.assertEqual(
+            self.assignment("typing", "ACTORS"),
+            ("alice", "bob", "charlie"),
+        )
+        self.assertEqual(
+            self.assignment("typing", "CLIENT_PORTS"),
+            {"alice": 4461, "bob": 4462, "charlie": 4463},
+        )
+        self.assertEqual(
+            self.assignment("typing", "REQUIRED_ASSERTIONS"),
+            {
+                "native_runtime",
+                "actor_isolation",
+                "direct_typing_start_stop",
+                "direct_typing_send_clear",
+                "direct_typing_blur_clear",
+                "direct_typing_switch_clear",
+                "direct_typing_disconnect_ttl_clear",
+                "group_typing_start_stop",
+                "group_typing_send_clear",
+                "group_typing_blur_clear",
+                "group_typing_switch_clear",
+                "group_typing_disconnect_ttl_clear",
+                "group_removed_member_rejected",
+                "typing_revoked_device_rejected",
+                "typing_has_zero_durable_writes",
+                "resources_released",
+            },
+        )
+        tree = ast.parse(self.source("typing"))
+        create_direct_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "async_harness"
+            and len(node.args) >= 3
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "createDirectConversation"
+        ]
+        self.assertEqual(len(create_direct_calls), 1)
+        for call in create_direct_calls:
+            payload = call.args[2]
+            self.assertIsInstance(payload, ast.Dict)
+            payload_keys = [ast.literal_eval(key) for key in payload.keys]
+            # Direct scope is derived server-side; the client sends no federation.
+            self.assertIn("peerPtid", payload_keys)
+            self.assertNotIn("federationId", payload_keys)
+
+    def test_group_creation_uses_current_production_harness_contract(
+        self,
+    ) -> None:
+        for filename in (
+            "native_interactions_runner.py",
+            "native_typing_runner.py",
+        ):
+            with self.subTest(runner=filename):
+                source = (
+                    ROOT / "tooling/acceptance/gates/chat" / filename
+                ).read_text(encoding="utf-8")
+                tree = ast.parse(source)
+                create_group_call = next(
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "async_harness"
+                        or filename == "native_interactions_runner.py"
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"
+                        and node.func.attr == "harness"
+                    )
+                    and len(node.args) >= 3
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == "createGroup"
+                )
+                payload = create_group_call.args[2]
+                self.assertIsInstance(payload, ast.Dict)
+                self.assertIn(
+                    "memberPtids",
+                    [ast.literal_eval(key) for key in payload.keys],
+                )
+                self.assertIn(
+                    "federationId",
+                    [ast.literal_eval(key) for key in payload.keys],
+                )
+                self.assertNotIn(
+                    "memberDids",
+                    [ast.literal_eval(key) for key in payload.keys],
+                )
+
+                group_id_assignment = next(
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id == "group_id"
+                        for target in node.targets
+                    )
+                )
+                group_id_getters = [
+                    node
+                    for node in ast.walk(group_id_assignment.value)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "groupUlid"
+                ]
+                self.assertEqual(
+                    len(group_id_getters),
+                    1,
+                )
+
+        group_runner = (
+            ROOT
+            / "tooling/acceptance/gates/chat/native_group_mls_runner.py"
+        ).read_text(encoding="utf-8")
+        group_create = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_group_mls_runner.py",
+            "create_group",
+        )
+        self.assertIn('SELECTORS["create_group_contact"]', group_create)
+        self.assertIn('SELECTORS["create_group_submit"]', group_create)
+        self.assertIn("data-chat-create-group-state", group_create)
+        self.assertNotIn('"createGroup"', group_create)
+        self.assertIn('"memberPtid": self.ptids["charlie"]', group_runner)
+        self.assertNotIn('"memberDid":', group_runner)
+
+    def test_typing_group_sync_waits_for_exact_member_projection(self) -> None:
+        sync = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py",
+            "sync",
+        )
+        self.assertIn("expected_members = sorted(self.ptids.values())", sync)
+        self.assertIn('result.get("memberPtids", [])', sync)
+        self.assertIn("return wait_until(", sync)
+        self.assertIn("STEP_TIMEOUT", sync)
+
+    def test_direct_creation_uses_current_production_harness_contract(
+        self,
+    ) -> None:
+        for filename in (
+            "native_interactions_runner.py",
+            "native_multi_device_runner.py",
+            "native_recovery_runner.py",
+            "native_typing_runner.py",
+            "native_two_client_runner.py",
+        ):
+            with self.subTest(runner=filename):
+                source = (
+                    ROOT / "tooling/acceptance/gates/chat" / filename
+                ).read_text(encoding="utf-8")
+                tree = ast.parse(source)
+                create_direct_calls = [
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "async_harness"
+                        or filename == "native_interactions_runner.py"
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"
+                        and node.func.attr == "harness"
+                    )
+                    and len(node.args) >= 3
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == "createDirectConversation"
+                ]
+                self.assertTrue(create_direct_calls)
+                for call in create_direct_calls:
+                    payload = call.args[2]
+                    self.assertIsInstance(payload, ast.Dict)
+                    payload_keys = [
+                        ast.literal_eval(key) for key in payload.keys
+                    ]
+                    # Direct scope is derived server-side from the Home Stations;
+                    # the client sends only the peer identity, never federation.
+                    self.assertIn("peerPtid", payload_keys)
+                    self.assertNotIn("federationId", payload_keys)
+
+    def test_typing_lifecycle_uses_native_surface_events(self) -> None:
+        source = (
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py"
+        ).read_text(encoding="utf-8")
+        start_client = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py",
+            "start_client",
+        )
+        prove_direct = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py",
+            "prove_direct",
+        )
+        prove_group = self.function_source(
+            ROOT / "tooling/acceptance/gates/chat/native_typing_runner.py",
+            "prove_group",
+        )
+
+        self.assertIn("self.start_injected_client(actor)", start_client)
+        self.assertNotIn("enter_chat_page(client)", start_client)
+        self.assertNotIn("def submit_typing_and_wait(", source)
+        for lifecycle in (prove_direct, prove_group):
+            self.assertIn("set_composer(", lifecycle)
+            self.assertIn('"[data-chat-send]"', lifecycle)
+            self.assertIn('"arguments[0].blur()"', lifecycle)
+            self.assertIn("select_conversation(", lifecycle)
+        self.assertIn('"group",\n            alternate_group_id', prove_direct)
+        self.assertNotIn('"submitTyping"', prove_direct)
+        self.assertLess(
+            source.index('"createGroup"'),
+            source.index("self.prove_direct("),
+        )
+        self.assertEqual(
+            prove_group.count('"submitTyping"'),
+            1,
+            "only the removed-member rejection may submit typing directly",
+        )
+
+    def test_multi_device_contract_is_unchanged(self) -> None:
+        self.assertEqual(
+            self.assignment("multi-device", "CLIENT_PORTS"),
+            {"alice": 4447, "bob1": 4448, "bob2": 4449},
+        )
+        self.assertEqual(
+            self.assignment("multi-device", "REQUIRED_ASSERTIONS"),
+            {
+                "native_runtime",
+                "actor_isolation",
+                "bob1_initial_delivery",
+                "session_handoff",
+                "bob2_enrollment_operational",
+            },
+        )
+        source = self.source("multi-device")
+        self.assertLess(
+            source.index('for actor in ("alice", "bob1")'),
+            source.index('self.start_client("bob2")'),
+        )
+        self.assertLess(
+            source.index('"bob1_initial_delivery"'),
+            source.index('"session_handoff"'),
+        )
+        self.assertLess(
+            source.index('"session_handoff"'),
+            source.index('"bob2_enrollment_operational"'),
+        )
+        revoked_wait = source.index('self.wait_for_revoked_identity("bob1")')
+        revoked_mark = source.index(
+            "self.client_lifecycles.mark_auth_revoked(bob1)"
+        )
+        self.assertLess(
+            source.index('self.start_client("bob2")'),
+            revoked_wait,
+        )
+        self.assertLess(revoked_wait, revoked_mark)
+        self.assertLess(revoked_mark, source.index('"session_handoff"', revoked_mark))
+
+    def test_platform_and_transport_details_stay_out_of_business_runners(
+        self,
+    ) -> None:
+        for runner in RUNNERS:
+            with self.subTest(runner=runner):
+                source = self.source(runner)
+                for forbidden in (
+                    "LinuxNativeDesktopRuntimeBinding",
+                    "LocalTauriLauncher",
+                    "MacOSNativeDesktopAdapter",
+                    "SshTransport",
+                    "docker exec",
+                    "XTest",
+                    "AppKit",
+                    "Win32",
+                ):
+                    self.assertNotIn(forbidden, source)
+
+
+if __name__ == "__main__":
+    unittest.main()

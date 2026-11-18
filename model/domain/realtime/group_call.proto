@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package peers_touch.model.realtime.v1;
+
+option go_package = "github.com/peers-labs/peers-touch/station/frame/touch/model/realtime;realtime";
+
+// GroupCallAuthorityJoinRequest carries one authenticated Home Station request
+// to the Conversation Authority Station.
+message GroupCallAuthorityJoinRequest {
+  string conversation_id = 1;
+  string actor_ptid = 2;
+  string source_home_station_peer_id = 3;
+  string federation_id = 4;
+  uint64 authority_epoch = 5;
+  GroupCallEndpointGrant endpoint_grant = 6;
+  string actor_device_id = 7;
+}
+
+enum GroupCallAuthorityJoinDecision {
+  GROUP_CALL_AUTHORITY_JOIN_DECISION_UNSPECIFIED = 0;
+  GROUP_CALL_AUTHORITY_JOIN_DECISION_AUTHORIZED = 1;
+  GROUP_CALL_AUTHORITY_JOIN_DECISION_NOT_MEMBER = 2;
+}
+
+message GroupCallAuthorityJoinResponse {
+  GroupCallAuthorityJoinDecision decision = 1;
+  string url = 2;
+  string token = 3;
+  string room_name = 4;
+  string grant_id = 5;
+  string participant_identity = 6;
+}
+
+// The Home resolves the endpoint from Session and commits this authorization
+// while the Session and Actor Device mutation fences remain held.
+message GroupCallEndpointGrant {
+  string grant_id = 1;
+  string conversation_id = 2;
+  string actor_ptid = 3;
+  string actor_device_id = 4;
+  string session_id = 5;
+  string home_station_peer_id = 6;
+  string authority_station_peer_id = 7;
+  string federation_id = 8;
+  uint64 authority_epoch = 9;
+  int64 expires_at_unix_ms = 10;
+}
+
+enum GroupCallEndpointControlKind {
+  GROUP_CALL_ENDPOINT_CONTROL_KIND_UNSPECIFIED = 0;
+  GROUP_CALL_ENDPOINT_CONTROL_KIND_CHECK_HOME = 1;
+  GROUP_CALL_ENDPOINT_CONTROL_KIND_REVOKE_AUTHORITY = 2;
+  GROUP_CALL_ENDPOINT_CONTROL_KIND_ROOM_STATUS = 3;
+  GROUP_CALL_ENDPOINT_CONTROL_KIND_DECLINE_INVITATION = 4;
+}
+
+message GroupCallEndpointControlRequest {
+  GroupCallEndpointControlKind kind = 1;
+  GroupCallEndpointGrant grant = 2;
+  GroupCallAuthorityJoinRequest room_query = 3;
+  string room_sid = 4;
+}
+
+message GroupCallEndpointControlResponse {
+  bool allowed = 1;
+  bool ejected = 2;
+  bool room_active = 3;
+  string room_name = 4;
+  string room_sid = 5;
+  repeated string declined_actor_ptids = 6;
+}

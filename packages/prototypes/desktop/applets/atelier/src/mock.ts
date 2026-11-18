@@ -1,0 +1,401 @@
+/**
+ * Atelier prototype — mock conversation data (SOLO-style).
+ *
+ * Tasks are grouped by project folder (like SOLO's "Your Task List").
+ * One task's chat stream shows the full Atelier loop in conversation form:
+ * user goal -> agent restated plan -> a folded multi-agent negotiation ->
+ * an inline decision the user must make -> execution + diff + artifact,
+ * each finished reply carrying a Completed marker + feedback bar.
+ */
+import type { AtelierState } from './types';
+import type { CollaborationInput } from './engine';
+import { ATELIER_DEFAULT_DIRECT_RUN_MODEL } from './projection.contract.generated';
+
+/**
+ * Shared, engine-INDEPENDENT position pool for a task's negotiation. The same
+ * pool is fed to whichever EnginePolicy the user picks; each engine arranges
+ * these positions into a different round structure (see engine.ts). This is
+ * what makes "switch engine → visibly different negotiation" real instead of
+ * cosmetic: the raw material is fixed, only the orchestration changes.
+ */
+export const COLLAB_INPUTS: Record<string, CollaborationInput> = {
+  't-data': {
+    goal: '为平台选定并接入稳定的行情 DataProvider，统一到 Provider 接口',
+    authority: 'GoalOwner',
+    positions: [
+      { role: 'Planner', stance: 'proposal', text: '建议 vendor-A：延迟最低、文档完整、改造成本小。', evidenceRef: 'bench/latency.csv' },
+      { role: 'Executor', stance: 'proposal', text: '可先用 vendor-C：免费额度大，能快速跑通端到端。', evidenceRef: 'vendor-C/free-tier.md' },
+      { role: 'Risk', stance: 'objection', text: '反对裸接 vendor-A：限频 50 req/s 且无官方降级 SLA，高峰会被拖垮。', evidenceRef: 'vendor-A/ratelimit.md' },
+      { role: 'Architect', stance: 'counter', text: '折中：选 vendor-A，但适配层加本地缓存 + 退避，规避限频。', evidenceRef: 'rfc/adapter-cache.md' },
+    ],
+  },
+};
+
+export const MOCK: AtelierState = {
+  budgetSpent: 2.1,
+  budgetCap: 5,
+  budget: {
+    status: 'warning',
+    summary: '$2.1 / $5',
+    decisionHint: 'Station will raise a budget DecisionCard before halt/resume.',
+    dimensions: [
+      { id: 'money', label: 'Money', used: 2.1, cap: 5, unit: '$', percent: 42, status: 'ok' },
+      { id: 'tokens', label: 'Tokens', used: 78000, cap: 100000, unit: 'tok', percent: 78, status: 'warning' },
+      { id: 'time', label: 'Time', used: 46, cap: 60, unit: 'min', percent: 77, status: 'warning' },
+      { id: 'cap', label: 'Cap', used: 3, cap: 4, unit: 'runs', percent: 75, status: 'warning' },
+    ],
+  },
+  model: ATELIER_DEFAULT_DIRECT_RUN_MODEL,
+
+  tasks: [
+    {
+      id: 't-data',
+      project: 'peers-touch',
+      projectId: 'proj-data-provider',
+      title: '接入行情 DataProvider',
+      status: 'active',
+      running: true,
+      branch: 'feat/data-provider',
+      workspaceOpenTarget: {
+        workspaceId: 'peers-touch',
+        workspaceUri: 'pt-workspace://task/t-data?workspace=peers-touch',
+        label: 'peers-touch',
+        ideHint: 'vscode',
+      },
+    },
+    { id: 't-stock', project: 'peers-touch', title: '选股研究报告', status: 'active' },
+    { id: 't-arch', project: 'peers-touch', title: '架构重构 PoC', status: 'archived', branch: 'poc/3-layer' },
+    { id: 't-social', project: 'peers-social', title: '酷炫网络实体介绍动画', status: 'active' },
+    { id: 't-feed', project: 'peers-social', title: '优化按钮和新帖子交互', status: 'active' },
+    { id: 't-brief', project: 'peers-ai-agent', title: '每日简报（每天 8:00）', status: 'active' },
+    { id: 't-old', project: 'peers-social', title: '旧版登录页改版（废弃）', status: 'deleted' },
+  ],
+
+  selectedTaskId: 't-data',
+
+  projects: [
+    {
+      id: 'proj-data-provider',
+      goal: '为平台选定并接入稳定的行情 DataProvider，统一到 Provider 接口',
+      title: '行情 DataProvider 接入',
+      state: 'running',
+      workspaceRef: 'workspace://peers-touch',
+      goalOwnerSignoff: false,
+      residualRisks: [],
+      openBlockers: [],
+      memoryCandidates: [],
+      completion: {
+        noOpenBlockers: true,
+        l0L1AcceptancePassed: false,
+        l2HumanSignoffComplete: false,
+        residualRisksLogged: false,
+        memoryCandidatesGenerated: false,
+      },
+      milestoneTree: {
+        rootId: 'ms-data-root',
+        milestones: [
+          {
+            id: 'ms-data-root',
+            title: 'DataProvider adapter accepted',
+            state: 'running',
+            taskIds: ['t-data'],
+            acceptancePredicateIds: ['gate.contract.passed', 'goal_owner_signoff'],
+            openBlockers: [],
+          },
+        ],
+        edges: [],
+      },
+      taskGraph: {
+        rootTaskIds: ['tg-select-provider'],
+        parallelPolicy: 'serial_only',
+        tasks: [
+          {
+            id: 'tg-select-provider',
+            title: 'Compare provider candidates',
+            state: 'done',
+            agentRole: 'Planner',
+            artifactIds: ['art-rfc'],
+            gateIds: ['gate-provider-contract'],
+          },
+          {
+            id: 't-data',
+            title: 'Implement selected adapter',
+            state: 'running',
+            agentRole: 'Executor',
+            artifactIds: ['art-diff'],
+            gateIds: ['gate-provider-contract'],
+          },
+          {
+            id: 'tg-verify-provider',
+            title: 'Verify contract and smoke coverage',
+            state: 'pending',
+            agentRole: 'Verifier',
+            artifactIds: [],
+            gateIds: ['gate-smoke'],
+          },
+        ],
+        edges: [
+          { from: 'tg-select-provider', to: 't-data', type: 'blocks' },
+          { from: 't-data', to: 'tg-verify-provider', type: 'blocks' },
+        ],
+      },
+      defects: [],
+    },
+  ],
+
+  stream: {
+    't-data': [
+      {
+        kind: 'user',
+        id: 'u1',
+        text: '帮我给平台接入一个稳定的行情 DataProvider，统一到我们的 `Provider` 接口，别动上层业务。',
+        at: '09:02',
+      },
+      {
+        kind: 'agent',
+        id: 'a1',
+        text: '收到。我把目标复述如下，确认无误就开干：',
+        bullets: [
+          '对比 3 家 DataProvider，按延迟 / 限频 / 文档质量打分',
+          '选定后写适配层，统一到现有 `Provider` 接口',
+          '跑冒烟 + 接口契约测试，不改动上层业务逻辑',
+        ],
+        at: '09:02',
+        done: true,
+      },
+      {
+        kind: 'nego',
+        id: 'n1',
+        summary: '3 个 Agent 协商了选型，已收敛到 vendor-A',
+        agentCount: 3,
+        converged: true,
+        voices: [
+          { role: 'Planner', stance: 'proposal', text: '建议 vendor-A：延迟最低、文档完整、改造成本小。', evidenceRef: 'bench/latency.csv' },
+          { role: 'Risk', stance: 'objection', text: '反对裸接 vendor-A：限频 50 req/s 且无官方降级 SLA，高峰会被拖垮。', evidenceRef: 'vendor-A/ratelimit.md' },
+          { role: 'Architect', stance: 'counter', text: '折中：选 vendor-A，但适配层加本地缓存 + 退避，规避限频。', evidenceRef: 'rfc/adapter-cache.md' },
+        ],
+        consensus: '共识：选 vendor-A + 适配层缓存退避。但「降级策略」涉及成本与可用性，超出 Agent 权限，升级给你拍板。',
+      },
+      {
+        kind: 'decision',
+        id: 'd1',
+        question: 'vendor-A 限频 50 req/s 且无降级 SLA，降级策略怎么定？',
+        spentSoFar: '$1.3 / 预算 $5',
+        options: [
+          { text: '缓存 + 指数退避（推荐，成本最低）', recommended: true },
+          { text: '改选 vendor-B（贵但有 SLA）' },
+          { text: '暂停，等商务谈下 SLA' },
+        ],
+        rollbackImpact: '适配层独立成分支，回退只丢弃 adapter 分支，不影响上层业务。',
+      },
+    ],
+
+    't-stock': [
+      {
+        kind: 'user',
+        id: 'su1',
+        text: '出一份 A 股新能源板块的选股研究报告，要能复算。',
+        at: '昨天',
+      },
+      {
+        kind: 'agent',
+        id: 'sa1',
+        text: '已生成目标卡，验收口径如下（标注是否可自动判定）：',
+        bullets: [
+          '`result.json` 通过 schema 校验（自动）',
+          '回测脚本在沙箱内一键复算（自动）',
+          '报告结论与数据一致（需你签字）',
+        ],
+        at: '昨天',
+        done: true,
+      },
+    ],
+
+    't-social': [
+      {
+        kind: 'user',
+        id: 'soc1',
+        text: '首页加一个酷炫的网络实体介绍动画，参考下图风格。',
+        at: '10:20',
+        image: { name: 'ref-style.png', size: '576.5 KB' },
+      },
+      {
+        kind: 'agent',
+        id: 'soc2',
+        text: '已实现 Canvas 粒子网络动画并接入首页 Hero 区，提交如下变更：',
+        at: '10:41',
+        done: true,
+      },
+      {
+        kind: 'diff',
+        id: 'soc-diff',
+        files: 4,
+        added: 346,
+        removed: 44,
+        paths: [
+          'src/components/NetworkHero.tsx',
+          'src/components/NetworkHero.css',
+          'src/pages/Home.tsx',
+          'src/assets/particles.ts',
+        ],
+      },
+    ],
+
+    't-feed': [
+      {
+        kind: 'user',
+        id: 'f1',
+        text: '帖子流的点赞按钮交互太生硬，优化一下手感。',
+        at: '14:05',
+      },
+    ],
+
+    't-brief': [
+      {
+        kind: 'agent',
+        id: 'ba1',
+        text: '每天 08:00 自动跑（复用框架定时能力）。今天已完成，产物如下：',
+        at: '08:00',
+        done: true,
+      },
+      {
+        kind: 'artifact',
+        id: 'bf1',
+        name: 'daily-brief-0621.pdf',
+        fileKind: 'pdf',
+        producedBy: '排版并推送 · Executor',
+      },
+    ],
+
+    't-arch': [
+      {
+        kind: 'user',
+        id: 'ku1',
+        text: '把核心模块重构成三层，做个 PoC。',
+        at: '2 天前',
+      },
+      {
+        kind: 'nego',
+        id: 'kn1',
+        summary: '2 个 Agent 复核了验收，已收敛',
+        agentCount: 2,
+        converged: true,
+        voices: [
+          { role: 'Verifier', stance: 'signoff', text: '基准回归通过，无退化（-0.3%）。', evidenceRef: 'bench #481' },
+          { role: 'Risk', stance: 'objection', text: '担心新分层长期维护成本——但无量化证据，降级为疑虑。' },
+        ],
+        consensus: '共识：L0/L1 自动通过；「是否值得长期维护」是 L2 主观项，待你签字即收敛。',
+      },
+      {
+        kind: 'agent',
+        id: 'ka1',
+        text: '编译通过、基准无退化。只剩一条 L2 主观项等你签字，签了就收尾。',
+        at: '1 天前',
+        done: true,
+      },
+      {
+        kind: 'artifact',
+        id: 'kf1',
+        name: 'arch-3layer.rfc.md',
+        fileKind: 'report',
+        producedBy: '选型 · Architect',
+      },
+    ],
+  },
+
+  todos: {
+    't-data': [],
+  },
+
+  context: {
+    't-data': {
+      usedPct: 45,
+      files: [
+        { name: 'src/providers/Provider.ts', group: 'files' },
+        { name: 'src/providers/vendor-a.adapter.ts', group: 'files' },
+        { name: 'bench/latency.csv', group: 'other' },
+        { name: 'rfc/adapter-cache.md', group: 'other' },
+      ],
+    },
+    't-social': {
+      usedPct: 28,
+      files: [
+        { name: 'src/components/NetworkHero.tsx', group: 'files' },
+        { name: 'ref-style.png', group: 'other' },
+      ],
+    },
+  },
+
+  artifacts: {
+    't-data': [
+      {
+        id: 'art-rfc',
+        name: 'adapter-cache.rfc.md',
+        kind: 'markdown',
+        meta: 'Markdown · 来自 Architect',
+      },
+      {
+        id: 'art-bench',
+        name: 'latency.csv',
+        kind: 'diff',
+        meta: 'Data · 来自 Planner',
+        paths: ['bench/latency.csv', 'bench/summary.md'],
+      },
+    ],
+    't-social': [
+      {
+        id: 'art-web',
+        name: 'NetworkHero 预览',
+        kind: 'web',
+        meta: 'Web · 来自 Executor',
+        logs: [
+          { level: 'info', text: '[vite] connecting...' },
+          { level: 'info', text: '[vite] connected.' },
+          { level: 'log', text: 'NetworkHero: spawned 120 particles' },
+          { level: 'log', text: 'NetworkHero: animation loop @60fps' },
+          { level: 'warn', text: 'prefers-reduced-motion not handled yet' },
+        ],
+      },
+      {
+        id: 'art-img',
+        name: 'image.png',
+        kind: 'image',
+        meta: 'PNG · 846.2 KB',
+        size: '846.2 KB',
+      },
+    ],
+    't-brief': [
+      {
+        id: 'art-pdf',
+        name: 'daily-brief-0621.pdf',
+        kind: 'markdown',
+        meta: 'PDF · 来自 Executor',
+      },
+    ],
+    't-arch': [
+      {
+        id: 'art-arch',
+        name: 'arch-3layer.rfc.md',
+        kind: 'markdown',
+        meta: 'Report · 来自 Architect',
+      },
+    ],
+  },
+
+  gates: {
+    't-arch': [
+      {
+        id: 'gate-arch-regression',
+        name: 'Regression Gate',
+        status: 'passed',
+        summary: '编译通过，基准回归无退化。',
+        checks: [
+          { name: 'TypeScript build', status: 'passed' },
+          { name: 'Benchmark delta', status: 'passed', detail: '-0.3%' },
+        ],
+        artifactIds: ['art-arch'],
+        at: '16:42',
+      },
+    ],
+  },
+};

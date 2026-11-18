@@ -1,0 +1,2187 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Mapping, NamedTuple, Protocol, Sequence, cast
+from urllib.parse import urlsplit
+
+from tooling.acceptance.core._paths import REPO_ROOT
+from tooling.acceptance.core.evidence_store import ArtifactRef, EvidenceStore, source_identity
+from tooling.acceptance.core.errors import (
+    BlockedError, ClientBindingError, DriverError, ProvisioningError,
+)
+from tooling.acceptance.core.execution_budget import ExecutionDeadline, deadline
+from tooling.acceptance.core.resource_diagnostic import ResourceDiagnostic
+from tooling.acceptance.core.provisioning import (
+    BindingProofRecord,
+    ClientRuntimeIdentity,
+    load_json_artifact,
+    persist_client_binding_observation,
+    require_runtime_client_service,
+    validate_binding_proof_closure,
+)
+from tooling.acceptance.core.runtime_cell import (
+    CellFileChooserIdentity, RuntimeCellLifecycle, runtime_source_matches,
+)
+from tooling.acceptance.drivers.native.base import (
+    MouseAction,
+    NativeControlSnapshot,
+    NativeDesktopAdapter,
+    NativeInputIsolation,
+    NativeInputMode,
+    NativeKey,
+    NativeModifier,
+    NativeOperatorObservation,
+    NativeWindowBounds,
+    NativeWindowSnapshot,
+    NativeWindowStack,
+    admit_local_native_input_mode,
+)
+from tooling.acceptance.drivers.tauri import (
+    LocalTauriLauncher,
+    MakeDesktopLauncher,
+    TauriSession,
+)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class CloneStorageEntry(NamedTuple):
+    """One clone subtree with independent source and target relative paths.
+
+    Profile-scoped storage (such as the installation device id) lives under
+    the actor's profile segment, so handing an install from bob1 to bob2 must
+    remap ``peers-touch/<source profile>/...`` onto the target profile while
+    profile-independent roots such as the actor identity keys stay symmetric.
+    """
+
+    source: str
+    target: str
+
+
+CloneStorageRoot = CloneStorageEntry | str
+CloneStorageRoots = CloneStorageRoot | Sequence[CloneStorageRoot]
+
+
+def normalize_clone_paths(relative_path: CloneStorageRoots) -> tuple[CloneStorageEntry, ...]:
+    """Normalize the actor-storage clone argument to validated entry pairs.
+
+    A single clone call may copy several relative subtrees (for example the
+    actor identity keys together with the installation device id) while the
+    target actor storage itself is still created at most once. A plain string
+    clones the same relative root on both sides; a ``CloneStorageEntry``
+    declares an explicit source-to-target remap.
+    """
+    if isinstance(relative_path, (str, CloneStorageEntry)):
+        candidates = (relative_path,)
+    else:
+        candidates = tuple(relative_path)
+    if not candidates:
+        raise DriverError("Native actor storage clone requires at least one path")
+    normalized: list[CloneStorageEntry] = []
+    seen_sources: set[str] = set()
+    seen_targets: set[str] = set()
+    for candidate in candidates:
+        if isinstance(candidate, CloneStorageEntry):
+            entry = CloneStorageEntry(str(candidate.source), str(candidate.target))
+        else:
+            path = str(candidate)
+            entry = CloneStorageEntry(path, path)
+        # pathlib collapses "." segments out of ``parts``, so the raw path
+        # string must be checked explicitly to keep every clone root inside
+        # the actor storage root on both POSIX and Windows.
+        for label, path in (("source", entry.source), ("target", entry.target)):
+            segments = path.replace("\\", "/").split("/")
+            windows = PureWindowsPath(path)
+            if (
+                not path
+                or PurePosixPath(path).is_absolute()
+                or windows.is_absolute()
+                or bool(windows.drive)
+                or any(segment in {"", ".", ".."} for segment in segments)
+            ):
+                raise DriverError(
+                    f"Native actor storage clone {label} path must be relative: {path!r}"
+                )
+        if entry.source in seen_sources:
+            raise DriverError(
+                f"Native actor storage clone source path duplicated: {entry.source!r}"
+            )
+        if entry.target in seen_targets:
+            raise DriverError(
+                f"Native actor storage clone target path duplicated: {entry.target!r}"
+            )
+        seen_sources.add(entry.source)
+        seen_targets.add(entry.target)
+        normalized.append(entry)
+    return tuple(normalized)
+
+
+class RemoteNativeRuntimeCellLifecycle(RuntimeCellLifecycle, Protocol):
+    """Runtime-cell operations required by a remote Native Desktop binding."""
+
+    def validate_binding(
+        self,
+        gate_id: str,
+        source_commit: str,
+    ) -> None:
+        ...
+
+    def launch_actor(
+        self,
+        actor: str,
+        client_spec: dict[str, Any],
+        environment: dict[str, str],
+    ) -> Any:
+        ...
+
+    def expose_orchestrator_endpoint(
+        self,
+        endpoint_id: str,
+        url: str,
+    ) -> dict[str, Any]:
+        ...
+
+    def release_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        ...
+
+    def endpoint_cleanup_audit(self) -> dict[str, Any]:
+        ...
+
+    def binary_identity(self) -> dict[str, str]:
+        ...
+
+    def runtime_identity(self) -> dict[str, Any]:
+        ...
+
+    def stage_actor_file(
+        self,
+        actor: str,
+        source: Path,
+    ) -> str:
+        ...
+
+    def import_actor_storage_file(
+        self, actor: str, source: Path, relative_path: str, sha256: str,
+    ) -> None:
+        ...
+
+    def actor_file_sha256(
+        self,
+        actor: str,
+        path: str,
+    ) -> str:
+        ...
+
+    def clone_actor_storage(
+        self,
+        source_actor: str,
+        target_actor: str,
+        relative_path: CloneStorageRoots,
+    ) -> None:
+        ...
+
+    def execute_adapter(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        ...
+
+    def actor_cleanup_audit(self) -> dict[str, Any]:
+        ...
+
+
+@dataclass(frozen=True)
+class NativeStorageFixture:
+    source: Path
+    relative_path: str
+    sha256: str
+
+    def validate(self) -> None:
+        relative = PurePosixPath(self.relative_path)
+        if (
+            not self.relative_path
+            or relative.is_absolute()
+            or "\\" in self.relative_path
+            or any(part in {"", ".", ".."} for part in self.relative_path.split("/"))
+        ):
+            raise DriverError("Native storage fixture path is invalid")
+        if self.source.is_symlink() or not self.source.is_file():
+            raise DriverError("Native storage fixture source is invalid")
+        if _file_sha256(self.source) != self.sha256:
+            raise DriverError("Native storage fixture source digest mismatch")
+
+
+@dataclass(frozen=True)
+class NativeLaunchOptions:
+    window_slot: int = 0
+    window_count: int = 1
+    restore_session: bool = False
+    storage_fixtures: tuple[NativeStorageFixture, ...] = ()
+
+
+@dataclass(frozen=True)
+class TransportOverrideHandle:
+    _token: str
+
+
+@dataclass(frozen=True)
+class _TransportOverride:
+    client_id: str
+    binding_role: str
+    service_id: str
+    endpoint: str
+    endpoint_lease_id: str
+
+
+def _route_matches_bound_service(
+    service_id: str,
+    expected_url: str,
+    route: Mapping[str, Any],
+) -> bool:
+    endpoint = str(route.get("endpoint_origin") or "").rstrip("/")
+    if service_id != "station-via-relay":
+        return (
+            route.get("route_type") == "direct"
+            and endpoint == expected_url
+        )
+
+    locator = urlsplit(expected_url)
+    transport = urlsplit(endpoint)
+    return (
+        route.get("route_type") == "relay"
+        and transport.scheme == "https"
+        and bool(locator.hostname)
+        and transport.hostname == locator.hostname
+        and transport.port is not None
+    )
+
+
+class NativeDesktopRuntimeBinding(ABC):
+    """Injects platform-owned Desktop launch and native-control behavior."""
+
+    def __init__(self) -> None:
+        self._generation_counters: dict[str, int] = {}
+        self._proof_refs: list[dict[str, Any]] = []
+        self._proof_records: list[BindingProofRecord] = []
+        self._runtime_manifest: dict[str, Any] | None = None
+        self._sessions_by_client: dict[str, TauriSession] = {}
+        self._transport_overrides: dict[str, _TransportOverride] = {}
+
+    def set_runtime_manifest(self, manifest: dict[str, Any]) -> None:
+        if self._runtime_manifest is not None:
+            raise DriverError("Runtime Binding manifest is already set")
+        self._runtime_manifest = manifest
+
+    def proof_refs(self) -> tuple[dict[str, Any], ...]:
+        return tuple(self._proof_refs)
+
+    @property
+    def input_mode(self) -> NativeInputMode:
+        return self.native_adapter.input_mode
+
+    def begin_file_chooser(self) -> NativeOperatorObservation | None:
+        self.native_adapter.require_exclusive_input("select file through native chooser")
+        return None
+
+    def binding_proof_evidence(self) -> dict[str, Any]:
+        if self._runtime_manifest is None:
+            raise DriverError("Runtime Binding manifest is not set")
+        validate_binding_proof_closure(
+            self._runtime_manifest,
+            allocated_generations=dict(self._generation_counters),
+            proofs=tuple(self._proof_records),
+        )
+        return {
+            "proofRefs": list(self._proof_refs),
+            "allocatedGenerations": dict(self._generation_counters),
+            "proofCount": len(self._proof_records),
+        }
+
+    def create_bound_session(
+        self,
+        client_id: str,
+        launch_options: NativeLaunchOptions | None = None,
+    ) -> TauriSession:
+        if self._runtime_manifest is None:
+            raise DriverError(
+                "Runtime Binding requires a manifest before create_bound_session"
+            )
+        options = launch_options or NativeLaunchOptions()
+        clients = self._runtime_manifest.get("clients") or []
+        client_spec: dict[str, Any] = {}
+        for raw_client in clients:
+            if isinstance(raw_client, dict) and raw_client.get("id") == client_id:
+                client_spec = raw_client
+                break
+        if not client_spec:
+            raise DriverError(
+                f"client {client_id!r} not found in runtime manifest"
+            )
+        required_roles = client_spec.get("required_service_roles")
+        if not isinstance(required_roles, list):
+            raise DriverError(
+                f"client {client_id!r} has no required service roles"
+            )
+        station_service_id, station_service = require_runtime_client_service(
+            self._runtime_manifest,
+            client_id,
+            "station",
+        )
+        station_url = str(station_service.get("endpoint") or "").rstrip("/")
+        if not station_url:
+            raise DriverError(
+                f"bound service {station_service_id!r} has no endpoint"
+            )
+
+        environment = {
+            "PT_ACCEPTANCE_WINDOW_SLOT": str(options.window_slot),
+            "PT_ACCEPTANCE_WINDOW_COUNT": str(options.window_count),
+            "PT_ACCEPTANCE_DESKTOP_INPUT_MODE": self.input_mode.value,
+            "PT_STATION_URL": station_url,
+            "PT_STATION_HEALTH_URL": f"{station_url}/sub-oss/healthz",
+        }
+        if self.input_mode is NativeInputMode.EXCLUSIVE_NATIVE_INPUT:
+            environment["PT_ACCEPTANCE_DESKTOP_INPUT_ISOLATION"] = (
+                NativeInputIsolation.ISOLATED_GUI_SESSION.value
+            )
+        relay_trust_service_id = station_service_id
+        if station_service_id != "station-via-relay":
+            services = self._runtime_manifest.get("services")
+            relay_route = (
+                services.get("station-via-relay")
+                if isinstance(services, dict)
+                else None
+            )
+            if (
+                isinstance(relay_route, dict)
+                and relay_route.get("runtimeIdentity")
+                == station_service.get("runtimeIdentity")
+            ):
+                relay_trust_service_id = "station-via-relay"
+        trust_anchor = self._relay_tls_trust_anchor(
+            relay_trust_service_id
+        )
+        if trust_anchor is not None:
+            source_path, expected_sha256 = trust_anchor
+            staged_path = self.stage_native_file(client_id, source_path)
+            observed_sha256 = self.native_file_sha256(
+                client_id,
+                staged_path,
+            )
+            if observed_sha256 != expected_sha256:
+                raise DriverError(
+                    "Native Relay trust anchor staging changed its content"
+                )
+            environment["PT_ACCEPTANCE_RELAY_TLS_CA_FILE"] = str(
+                staged_path
+            )
+
+        if options.restore_session and options.storage_fixtures:
+            raise DriverError("Native restore cannot import storage fixtures")
+        destinations = [fixture.relative_path for fixture in options.storage_fixtures]
+        if len(set(destinations)) != len(destinations):
+            raise DriverError("Native storage fixture destinations are duplicated")
+        for fixture in options.storage_fixtures:
+            fixture.validate()
+        for fixture in options.storage_fixtures:
+            self._import_storage_fixture(client_id, client_spec, fixture)
+        session = self._create_session(
+            client_id,
+            client_spec,
+            environment,
+        )
+        generation = self._generation_counters.get(client_id, 0) + 1
+        self._generation_counters[client_id] = generation
+        try:
+            session.start()
+            session.wait_for_acceptance_harness(30)
+            if not options.restore_session:
+                self._configure_session_station(
+                    session,
+                    station_url,
+                    station_service_id,
+                    str(station_service.get("runtimeIdentity") or ""),
+                )
+            runtime_identity = self._client_runtime_identity(
+                client_id,
+                generation,
+                session,
+            )
+            for binding_role in required_roles:
+                observed_identity = self._observe_live_service_identity(
+                    session,
+                    client_id=client_id,
+                    binding_role=str(binding_role),
+                )
+                proof, reference = persist_client_binding_observation(
+                    self._runtime_manifest,
+                    evidence_run_id=os.environ.get(
+                        "PT_ACCEPTANCE_RUN_ID",
+                        "",
+                    ),
+                    client_id=client_id,
+                    binding_role=str(binding_role),
+                    launch_generation=generation,
+                    client_runtime_identity=runtime_identity,
+                    observed_runtime_identity=observed_identity,
+                    proof_mechanism="native-tauri-peer-id-check",
+                    registered_mechanisms=frozenset(
+                        {"native-tauri-peer-id-check"}
+                    ),
+                    verifier_id="core-client-binding",
+                    verifier_source_digest=_file_sha256(
+                        REPO_ROOT
+                        / "tooling"
+                        / "acceptance"
+                        / "core"
+                        / "provisioning.py"
+                    ),
+                )
+                self._proof_records.append(proof)
+                self._proof_refs.append(reference)
+            self._sessions_by_client[client_id] = session
+            return session
+        except Exception:
+            session.stop()
+            raise
+
+    def _relay_tls_trust_anchor(
+        self,
+        station_service_id: str,
+    ) -> tuple[Path, str] | None:
+        if station_service_id != "station-via-relay":
+            return None
+        if self._runtime_manifest is None:
+            raise DriverError("Runtime Binding manifest is not set")
+        services = self._runtime_manifest.get("services")
+        station_service = (
+            services.get(station_service_id)
+            if isinstance(services, dict)
+            else None
+        )
+        relay_service = (
+            services.get("relay")
+            if isinstance(services, dict)
+            else None
+        )
+        if not isinstance(station_service, dict) or not isinstance(
+            relay_service,
+            dict,
+        ):
+            raise DriverError(
+                "Relay-bound Native client has incomplete service topology"
+            )
+        try:
+            store = EvidenceStore.from_environment(
+                repo_root=REPO_ROOT,
+                worktree=REPO_ROOT,
+            )
+            route_reference = ArtifactRef.from_dict(
+                station_service["attestationArtifact"]
+            )
+            route_attestation = store.read_json(route_reference)
+            route = route_attestation["route"]
+            expected_relay_peer_id = str(
+                relay_service.get("runtimeIdentity") or ""
+            )
+            if (
+                not isinstance(route, dict)
+                or route.get("relayServiceId") != "relay"
+                or not expected_relay_peer_id
+                or route.get("relayPeerId") != expected_relay_peer_id
+            ):
+                raise DriverError(
+                    "Relay route attestation has no canonical Relay binding"
+                )
+            relay_reference = ArtifactRef.from_dict(
+                route["relayAttestationRef"]
+            )
+            if (
+                relay_reference.to_dict()
+                != relay_service.get("attestationArtifact")
+            ):
+                raise DriverError(
+                    "Relay route attestation does not match runtime topology"
+                )
+            relay_attestation = store.read_json(relay_reference)
+            if (
+                relay_attestation.get("runtimeIdentity")
+                != expected_relay_peer_id
+            ):
+                raise DriverError(
+                    "Relay service attestation identity does not match route"
+                )
+            runtime_security = relay_attestation["runtimeSecurity"]
+            trust = runtime_security["tlsTrustAnchor"]
+            trust_reference = ArtifactRef.from_dict(trust["artifact"])
+            expected_sha256 = str(trust.get("sha256") or "").removeprefix(
+                "sha256:"
+            )
+            if (
+                expected_sha256 != trust_reference.sha256
+                or trust_reference.media_type
+                != "application/x-pem-file"
+            ):
+                raise DriverError(
+                    "Relay trust anchor attestation is inconsistent"
+                )
+            trust_path = store.resolve(trust_reference)
+        except DriverError:
+            raise
+        except Exception as error:
+            raise DriverError(
+                f"Relay trust anchor evidence is invalid: {error}"
+            ) from error
+        return trust_path, expected_sha256
+
+    def create_transport_override(
+        self,
+        client_id: str,
+        binding_role: str,
+        local_endpoint: str,
+    ) -> TransportOverrideHandle:
+        if self._runtime_manifest is None:
+            raise DriverError("Runtime Binding manifest is not set")
+        service_id, service = require_runtime_client_service(
+            self._runtime_manifest,
+            client_id,
+            binding_role,
+        )
+        endpoint, endpoint_lease_id = self._expose_transport_endpoint(
+            local_endpoint
+        )
+        token = secrets.token_hex(32)
+        self._transport_overrides[token] = _TransportOverride(
+            client_id=client_id,
+            binding_role=binding_role,
+            service_id=service_id,
+            endpoint=endpoint,
+            endpoint_lease_id=endpoint_lease_id,
+        )
+        return TransportOverrideHandle(token)
+
+    def transport_override_endpoint(
+        self,
+        client_id: str,
+        binding_role: str,
+        handle: TransportOverrideHandle,
+    ) -> str:
+        return self._require_transport_override(
+            client_id, binding_role, handle,
+        ).endpoint
+
+    def apply_verified_direct_route_override(
+        self,
+        client_id: str,
+        binding_role: str,
+        handle: TransportOverrideHandle,
+    ) -> None:
+        override = self._require_transport_override(
+            client_id,
+            binding_role,
+            handle,
+        )
+        session = self._sessions_by_client.get(client_id)
+        if session is None or not session.is_alive():
+            raise self._transport_override_error(
+                client_id,
+                binding_role,
+                "bound client session is not live",
+            )
+        session.invoke_app_result(
+            "acceptance_station_direct_route_override",
+            {
+                "input": {
+                    "dial_multiaddr": override.endpoint,
+                }
+            },
+        )
+
+    def clear_verified_direct_route_override(
+        self,
+        client_id: str,
+        binding_role: str,
+        handle: TransportOverrideHandle,
+    ) -> None:
+        override = self._require_transport_override(
+            client_id,
+            binding_role,
+            handle,
+        )
+        session = self._sessions_by_client.get(client_id)
+        command_error: Exception | None = None
+        if session is not None and session.is_alive():
+            try:
+                session.invoke_app_result(
+                    "acceptance_station_direct_route_override",
+                    {"input": {"dial_multiaddr": None}},
+                )
+            except Exception as error:
+                command_error = error
+        self._transport_overrides.pop(handle._token, None)
+        self._release_transport_endpoint(override.endpoint_lease_id)
+        if command_error is not None:
+            raise command_error
+
+    def _require_transport_override(
+        self,
+        client_id: str,
+        binding_role: str,
+        handle: TransportOverrideHandle,
+    ) -> _TransportOverride:
+        if not isinstance(handle, TransportOverrideHandle):
+            raise self._transport_override_error(
+                client_id,
+                binding_role,
+                "transport override handle has invalid type",
+            )
+        override = self._transport_overrides.get(handle._token)
+        if override is None:
+            raise self._transport_override_error(
+                client_id,
+                binding_role,
+                "transport override handle is unknown or released",
+            )
+        if self._runtime_manifest is None:
+            raise DriverError("Runtime Binding manifest is not set")
+        service_id, _ = require_runtime_client_service(
+            self._runtime_manifest,
+            client_id,
+            binding_role,
+        )
+        if (
+            override.client_id != client_id
+            or override.binding_role != binding_role
+            or override.service_id != service_id
+        ):
+            raise self._transport_override_error(
+                client_id,
+                binding_role,
+                "transport override scope does not match client binding",
+            )
+        return override
+
+    @staticmethod
+    def _transport_override_error(
+        client_id: str,
+        binding_role: str,
+        detail: str,
+    ) -> ClientBindingError:
+        return ClientBindingError(
+            code="TRANSPORT_OVERRIDE_MISMATCH",
+            numeric_code=20107,
+            stage="runtime",
+            client_id=client_id,
+            binding_role=binding_role,
+            detail=detail,
+            result="BLOCKED",
+        )
+
+    @staticmethod
+    def _configure_session_station(
+        session: TauriSession,
+        station_url: str,
+        station_service_id: str,
+        expected_station_peer_id: str,
+    ) -> None:
+        if not station_url:
+            raise DriverError("Runtime Binding Station endpoint is empty")
+        expected_station_peer_id = expected_station_peer_id.strip()
+        if not expected_station_peer_id:
+            raise DriverError("Runtime Binding Station identity is empty")
+        discovery = session.invoke_app_result(
+            "station_add",
+            {"input": {"input": station_url}},
+        )
+        data = discovery.get("data") if isinstance(discovery, dict) else None
+        status = data.get("status") if isinstance(data, dict) else None
+        try:
+            payload = json.loads(status) if isinstance(status, str) else {}
+        except json.JSONDecodeError as error:
+            raise DriverError(
+                "Runtime Binding Station discovery returned invalid status"
+            ) from error
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise DriverError(
+                "Runtime Binding Station discovery returned no entries"
+            )
+        expected_url = station_url.rstrip("/")
+        fallback: tuple[str, str] | None = None
+        matches: list[tuple[tuple[int, str, int, str], str, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            station_peer_id = str(entry.get("station_peer_id") or "").strip()
+            routes = entry.get("routes")
+            if (
+                station_peer_id != expected_station_peer_id
+                or not isinstance(routes, list)
+            ):
+                continue
+            refreshes = entry.get("candidate_route_refreshes")
+            candidates = [
+                *routes,
+                *(
+                    refreshes
+                    if isinstance(refreshes, list)
+                    else []
+                ),
+            ]
+            if (
+                len(entries) == 1
+                and len(candidates) == 1
+                and isinstance(candidates[0], dict)
+                and _route_matches_bound_service(
+                    station_service_id,
+                    expected_url,
+                    candidates[0],
+                )
+                and candidates[0].get("health") != "unavailable"
+            ):
+                route_id = str(
+                    candidates[0].get("route_id") or ""
+                ).strip()
+                if route_id:
+                    fallback = (station_peer_id, route_id)
+            for route in candidates:
+                if (
+                    isinstance(route, dict)
+                    and _route_matches_bound_service(
+                        station_service_id,
+                        expected_url,
+                        route,
+                    )
+                ):
+                    route_id = str(route.get("route_id") or "").strip()
+                    health = str(route.get("health") or "")
+                    if route_id and health != "unavailable":
+                        expiry = route.get("attestation_expires_at_unix_ms")
+                        generation = route.get("route_generation")
+                        matches.append(
+                            (
+                                (
+                                    (
+                                        int(expiry)
+                                        if isinstance(expiry, int)
+                                        and not isinstance(expiry, bool)
+                                        else 0
+                                    ),
+                                    str(route.get("last_verified_at") or ""),
+                                    (
+                                        int(generation)
+                                        if isinstance(generation, int)
+                                        and not isinstance(generation, bool)
+                                        else 0
+                                    ),
+                                    route_id,
+                                ),
+                                station_peer_id,
+                                route_id,
+                            )
+                        )
+        if matches:
+            _, station_peer_id, route_id = max(matches)
+            session.invoke_app_result(
+                "station_set_active",
+                {
+                    "input": {
+                        "station_peer_id": station_peer_id,
+                        "route_id": route_id,
+                    }
+                },
+            )
+            return
+        if fallback is not None:
+            session.invoke_app_result(
+                "station_set_active",
+                {
+                    "input": {
+                        "station_peer_id": fallback[0],
+                        "route_id": fallback[1],
+                    }
+                },
+            )
+            return
+        raise DriverError(
+            "Runtime Binding Station discovery did not return the requested route"
+        )
+
+    def _observe_live_service_identity(
+        self,
+        session: TauriSession,
+        *,
+        client_id: str,
+        binding_role: str,
+    ) -> str:
+        if self._runtime_manifest is None:
+            raise DriverError("Runtime Binding manifest is not set")
+        service_id, service = require_runtime_client_service(
+            self._runtime_manifest,
+            client_id,
+            binding_role,
+        )
+        expected_url = str(service.get("endpoint") or "").rstrip("/")
+        expected_peer_id = str(service.get("runtimeIdentity") or "").strip()
+        deadline = time.monotonic() + 30
+        latest: Any = None
+        while time.monotonic() < deadline:
+            latest = session.invoke_app_result("station_list")
+            data = latest.get("data") if isinstance(latest, dict) else None
+            status = data.get("status") if isinstance(data, dict) else None
+            try:
+                state = json.loads(status) if isinstance(status, str) else {}
+            except json.JSONDecodeError:
+                state = {}
+            active_peer_id = str(
+                state.get("active_station_peer_id") or ""
+            ).strip()
+            entries = state.get("entries")
+            if (
+                active_peer_id == expected_peer_id
+                and isinstance(entries, list)
+            ):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    peer_id = str(
+                        entry.get("station_peer_id") or ""
+                    ).strip()
+                    active_route_id = str(
+                        entry.get("active_route_id") or ""
+                    ).strip()
+                    routes = entry.get("routes")
+                    if (
+                        peer_id != expected_peer_id
+                        or not active_route_id
+                        or not isinstance(routes, list)
+                    ):
+                        continue
+                    for route in routes:
+                        if (
+                            isinstance(route, dict)
+                            and route.get("route_id") == active_route_id
+                            and _route_matches_bound_service(
+                                service_id,
+                                expected_url,
+                                route,
+                            )
+                            and route.get("health") == "available"
+                        ):
+                            return peer_id
+            time.sleep(0.1)
+        raise ClientBindingError(
+            code="BINDING_PROOF_ABSENT",
+            numeric_code=20201,
+            stage="post-launch",
+            client_id=client_id,
+            binding_role=binding_role,
+            detail=(
+                "running client did not expose a live bound Station identity; "
+                f"last station_list={latest!r}"
+            ),
+            result="UNPROVEN",
+        )
+
+    def _client_runtime_identity(
+        self,
+        client_id: str,
+        generation: int,
+        session: TauriSession,
+    ) -> ClientRuntimeIdentity:
+        payload = {
+            "cellId": self.cell_id,
+            "clientId": client_id,
+            "launchGeneration": generation,
+            "processId": session.process_id,
+            "webdriverPort": session.port,
+            "gatewayPort": session.gateway_port,
+            "profile": session.profile,
+            "storageRoot": session.storage_root,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return ClientRuntimeIdentity(
+            runtime="native-tauri",
+            instance_id=f"{client_id}-generation-{generation}",
+            identity_digest=digest,
+        )
+
+    @property
+    @abstractmethod
+    def cell_id(self) -> str:
+        ...
+
+    @property
+    @abstractmethod
+    def native_adapter(self) -> NativeDesktopAdapter:
+        ...
+
+    def _import_storage_fixture(
+        self,
+        client_id: str,
+        client_spec: Mapping[str, Any],
+        fixture: NativeStorageFixture,
+    ) -> None:
+        if client_id in self._sessions_by_client:
+            raise DriverError("Native storage import requires an unlaunched client")
+        root = Path(str(client_spec["storage_root"])).resolve()
+        destination = root / fixture.relative_path
+        if not destination.resolve().is_relative_to(root):
+            raise DriverError("Native storage fixture escapes client storage")
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with destination.open("xb") as stream:
+            stream.write(fixture.source.read_bytes())
+        destination.chmod(0o600)
+        if _file_sha256(destination) != fixture.sha256:
+            raise DriverError("Native storage import digest mismatch")
+
+    @abstractmethod
+    def _create_session(
+        self,
+        client_role: str,
+        client_spec: Mapping[str, Any],
+        environment: Mapping[str, str],
+    ) -> TauriSession:
+        ...
+
+    @abstractmethod
+    def _expose_transport_endpoint(self, url: str) -> tuple[str, str]:
+        ...
+
+    @abstractmethod
+    def _release_transport_endpoint(self, endpoint_lease_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def stage_native_file(
+        self,
+        actor: str,
+        source: Path,
+    ) -> Path:
+        ...
+
+    @abstractmethod
+    def native_file_sha256(
+        self,
+        actor: str,
+        path: Path,
+    ) -> str:
+        ...
+
+    @abstractmethod
+    def clone_actor_storage(
+        self,
+        source_actor: str,
+        source_spec: Mapping[str, Any],
+        target_actor: str,
+        target_spec: Mapping[str, Any],
+        relative_path: CloneStorageRoots,
+    ) -> None:
+        ...
+
+    @abstractmethod
+    def request_cooperative_activation(
+        self,
+        target: TauriSession,
+        sessions: Sequence[TauriSession],
+    ) -> bool:
+        ...
+
+    @abstractmethod
+    def binary_identity(self) -> dict[str, str]:
+        ...
+
+    @abstractmethod
+    def runtime_identity(self) -> dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def finalize_cleanup(
+        self,
+        sessions: Sequence[TauriSession],
+        client_specs: Mapping[str, Mapping[str, Any]],
+        *,
+        timeout_seconds: float = 30,
+    ) -> dict[str, Any]:
+        ...
+
+
+class RemoteNativeDesktopAdapter(NativeDesktopAdapter):
+    def __init__(
+        self,
+        cell: RemoteNativeRuntimeCellLifecycle,
+        platform: str,
+    ) -> None:
+        self._cell = cell
+        self._platform = platform
+
+    @property
+    def platform(self) -> str:
+        return self._platform
+
+    def activate_process(self, process_id: int) -> None:
+        self._execute("activate_process", {"processId": process_id})
+
+    def post_mouse(
+        self,
+        actions: tuple[MouseAction, ...],
+        point: tuple[float, float],
+    ) -> None:
+        self._execute(
+            "post_mouse",
+            {
+                "actions": [action.value for action in actions],
+                "point": list(point),
+            },
+        )
+
+    def post_mouse_to_process(
+        self,
+        process_id: int,
+        actions: tuple[MouseAction, ...],
+        point: tuple[float, float],
+    ) -> None:
+        if self._platform != "win32":
+            super().post_mouse_to_process(process_id, actions, point)
+            return
+        self._execute(
+            "post_mouse_to_process",
+            {
+                "processId": process_id,
+                "actions": [action.value for action in actions],
+                "point": list(point),
+            },
+        )
+
+    def post_key(
+        self,
+        key: NativeKey,
+        *,
+        modifiers: tuple[NativeModifier, ...] = (),
+        text: str = "",
+        private_source: bool = False,
+    ) -> None:
+        self._execute(
+            "post_key",
+            {
+                "key": key.value,
+                "modifiers": [modifier.value for modifier in modifiers],
+                "text": text,
+                "privateSource": private_source,
+            },
+        )
+
+    def post_key_to_process(
+        self,
+        process_id: int,
+        key: NativeKey,
+        *,
+        modifiers: tuple[NativeModifier, ...] = (),
+        text: str = "",
+        private_source: bool = False,
+    ) -> None:
+        if self._platform != "win32":
+            super().post_key_to_process(
+                process_id,
+                key,
+                modifiers=modifiers,
+                text=text,
+                private_source=private_source,
+            )
+            return
+        self._execute(
+            "post_key_to_process",
+            {
+                "processId": process_id,
+                "key": key.value,
+                "modifiers": [modifier.value for modifier in modifiers],
+                "text": text,
+                "privateSource": private_source,
+            },
+        )
+
+    def post_key_sequence_to_process(
+        self,
+        process_id: int,
+        keys: tuple[NativeKey, ...],
+        *,
+        interval_seconds: float = 0.1,
+        private_source: bool = False,
+    ) -> None:
+        if self._platform != "win32":
+            super().post_key_sequence_to_process(
+                process_id,
+                keys,
+                interval_seconds=interval_seconds,
+                private_source=private_source,
+            )
+            return
+        self._execute(
+            "post_key_sequence_to_process",
+            {
+                "processId": process_id,
+                "keys": [key.value for key in keys],
+                "intervalSeconds": interval_seconds,
+                "privateSource": private_source,
+            },
+        )
+
+    def reveal_file_chooser_location(self) -> None:
+        self._execute("reveal_file_chooser_location", {})
+
+    def reveal_file_chooser_location_to_process(
+        self,
+        process_id: int,
+    ) -> NativeControlSnapshot | None:
+        if self._platform != "win32":
+            return super().reveal_file_chooser_location_to_process(process_id)
+        return self._control_snapshot(
+            self._execute(
+                "reveal_file_chooser_location_to_process",
+                {"processId": process_id},
+            )
+        )
+
+    def select_file_chooser_path_to_process(
+        self,
+        process_id: int,
+        path: str,
+    ) -> NativeControlSnapshot | None:
+        if self._platform != "win32":
+            return super().select_file_chooser_path_to_process(process_id, path)
+        return self._control_snapshot(
+            self._execute(
+                "select_file_chooser_path_to_process",
+                {"processId": process_id, "path": path},
+            )
+        )
+
+    def verify_focused_text(
+        self,
+        expected: str,
+        *,
+        timeout_seconds: float,
+    ) -> bool | None:
+        if self._platform != "linux":
+            return super().verify_focused_text(
+                expected,
+                timeout_seconds=timeout_seconds,
+            )
+        return bool(
+            self._execute(
+                "verify_focused_text",
+                {
+                    "expected": expected,
+                    "timeoutSeconds": timeout_seconds,
+                },
+            ).get("verified")
+        )
+
+    @staticmethod
+    def _control_snapshot(payload: dict[str, Any]) -> NativeControlSnapshot:
+        return NativeControlSnapshot(
+            kind=str(payload.get("kind") or "unknown"),
+            title=str(payload.get("title") or ""),
+            value=str(payload.get("value") or ""),
+            window_count=int(payload.get("windowCount") or 0),
+            dialog_count=int(payload.get("dialogCount") or 0),
+            frontmost=bool(payload.get("frontmost")),
+            main_window=bool(payload.get("mainWindow")),
+            focused_window=bool(payload.get("focusedWindow")),
+            actual_frontmost_pid=int(
+                payload.get("actualFrontmostPid") or -1
+            ),
+            platform_role=str(payload.get("platformRole") or ""),
+            platform_subrole=str(payload.get("platformSubrole") or ""),
+            error=str(payload.get("error") or ""),
+        )
+
+    def focused_control(self, process_id: int) -> NativeControlSnapshot:
+        payload = self._execute(
+            "focused_control",
+            {"processId": process_id},
+        )
+        return self._control_snapshot(payload)
+
+    def activate_and_focused_control(
+        self,
+        process_id: int,
+    ) -> NativeControlSnapshot:
+        if self._platform != "win32":
+            return super().activate_and_focused_control(process_id)
+        return self._control_snapshot(
+            self._execute(
+                "activate_process",
+                {"processId": process_id},
+            )
+        )
+
+    def window_stack_at_point(
+        self,
+        point: tuple[float, float],
+    ) -> NativeWindowStack:
+        payload = self._execute(
+            "window_stack_at_point",
+            {"point": list(point)},
+        )
+        windows = payload.get("windows")
+        if not isinstance(windows, list):
+            windows = []
+        return NativeWindowStack(
+            windows=tuple(
+                NativeWindowSnapshot(
+                    index=int(window.get("index") or 0),
+                    owner_pid=int(window.get("ownerPid") or -1),
+                    owner_name=str(window.get("ownerName") or ""),
+                    window_name=str(window.get("windowName") or ""),
+                    layer=int(window.get("layer") or 0),
+                    alpha=float(window.get("alpha") or 0),
+                    bounds=NativeWindowBounds(
+                        left=float(
+                            (window.get("bounds") or {}).get("left") or 0
+                        ),
+                        top=float(
+                            (window.get("bounds") or {}).get("top") or 0
+                        ),
+                        width=float(
+                            (window.get("bounds") or {}).get("width") or 0
+                        ),
+                        height=float(
+                            (window.get("bounds") or {}).get("height") or 0
+                        ),
+                    ),
+                )
+                for window in windows
+                if isinstance(window, dict)
+                and isinstance(window.get("bounds"), dict)
+            ),
+            error=str(payload.get("error") or ""),
+        )
+
+    def content_origin(
+        self,
+        process_id: int,
+    ) -> tuple[float, float]:
+        payload = self._execute(
+            "content_origin",
+            {"processId": process_id},
+        )
+        return float(payload["x"]), float(payload["y"])
+
+    def mouse_button_down(self) -> bool:
+        return bool(self._execute("mouse_button_down", {}).get("down"))
+
+    def capture_screenshot(self, path: Path) -> None:
+        content = self._content("capture_screenshot", {})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        if not content:
+            raise DriverError(
+                f"remote {self._platform} Native screenshot returned empty content"
+            )
+
+    def read_clipboard(self) -> bytes:
+        return self._content("read_clipboard", {})
+
+    def write_clipboard(self, value: bytes) -> None:
+        payload = {"content": base64.b64encode(value).decode("ascii")}
+        attempts = 2 if self._platform == "win32" else 1
+        for attempt in range(attempts):
+            try:
+                self._execute("write_clipboard", payload)
+                return
+            except DriverError:
+                if attempt + 1 == attempts:
+                    raise
+
+    def _content(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> bytes:
+        encoded = self._execute(operation, payload).get("content")
+        if not isinstance(encoded, str):
+            raise DriverError(
+                f"remote {self._platform} Native {operation} omitted content"
+            )
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except ValueError as error:
+            raise DriverError(
+                f"remote {self._platform} Native {operation} returned invalid content"
+            ) from error
+
+    def _execute(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self._cell.execute_adapter(operation, payload)
+        except DriverError:
+            raise
+        except Exception as error:
+            raise DriverError(
+                f"remote {self._platform} Native {operation} failed: {error}"
+            ) from error
+
+
+class RemoteNativeDesktopRuntimeBinding(NativeDesktopRuntimeBinding):
+    def __init__(
+        self,
+        cell_id: str,
+        adapter_platform: str,
+        gate_id: str,
+        source_commit: str,
+        cell: RemoteNativeRuntimeCellLifecycle | None = None,
+    ) -> None:
+        super().__init__()
+        if cell is None:
+            from tooling.acceptance.provisioners import (
+                get_runtime_cell_lifecycle,
+            )
+
+            cell = cast(
+                RemoteNativeRuntimeCellLifecycle,
+                get_runtime_cell_lifecycle(cell_id),
+            )
+        cell.validate_binding(gate_id, source_commit)
+        self._cell_id = cell_id
+        self._adapter_platform = adapter_platform
+        self._cell = cell
+        self._native_adapter = RemoteNativeDesktopAdapter(
+            cell,
+            adapter_platform,
+        )
+        self._endpoint_ids: list[str] = []
+
+    @property
+    def cell_id(self) -> str:
+        return self._cell_id
+
+    @property
+    def native_adapter(self) -> NativeDesktopAdapter:
+        return self._native_adapter
+
+    def _import_storage_fixture(
+        self,
+        client_id: str,
+        client_spec: Mapping[str, Any],
+        fixture: NativeStorageFixture,
+    ) -> None:
+        del client_spec
+        self._cell.import_actor_storage_file(
+            client_id, fixture.source, fixture.relative_path, fixture.sha256,
+        )
+
+    def _create_session(
+        self,
+        client_role: str,
+        client_spec: Mapping[str, Any],
+        environment: Mapping[str, str],
+    ) -> TauriSession:
+        launcher = self._cell.launch_actor(
+            client_role,
+            dict(client_spec),
+            dict(environment),
+        )
+        return TauriSession(launcher)
+
+    def _expose_transport_endpoint(self, url: str) -> tuple[str, str]:
+        endpoint_id = f"orchestrator-endpoint-{len(self._endpoint_ids) + 1}"
+        exposed = self._cell.expose_orchestrator_endpoint(endpoint_id, url)
+        exposed_id = str(exposed.get("endpointId") or "")
+        exposed_url = str(exposed.get("url") or "")
+        if exposed_id != endpoint_id or not exposed_url:
+            raise DriverError(
+                f"{self.cell_id} returned an invalid endpoint lease"
+            )
+        self._endpoint_ids.append(endpoint_id)
+        return exposed_url, endpoint_id
+
+    def _release_transport_endpoint(self, endpoint_lease_id: str) -> None:
+        self._cell.release_endpoint(endpoint_lease_id)
+        if endpoint_lease_id in self._endpoint_ids:
+            self._endpoint_ids.remove(endpoint_lease_id)
+
+    def stage_native_file(
+        self,
+        actor: str,
+        source: Path,
+    ) -> Path:
+        staged = self._cell.stage_actor_file(actor, source)
+        path = Path(staged)
+        is_absolute = (
+            PureWindowsPath(staged).is_absolute()
+            if self._adapter_platform == "win32"
+            else path.is_absolute()
+        )
+        if not is_absolute:
+            raise DriverError(
+                f"{self.cell_id} returned a relative staged file path"
+            )
+        return path
+
+    def native_file_sha256(
+        self,
+        actor: str,
+        path: Path,
+    ) -> str:
+        return self._cell.actor_file_sha256(actor, str(path))
+
+    def clone_actor_storage(
+        self,
+        source_actor: str,
+        source_spec: Mapping[str, Any],
+        target_actor: str,
+        target_spec: Mapping[str, Any],
+        relative_path: CloneStorageRoots,
+    ) -> None:
+        del source_spec, target_spec
+        self._cell.clone_actor_storage(
+            source_actor,
+            target_actor,
+            normalize_clone_paths(relative_path),
+        )
+
+    def request_cooperative_activation(
+        self,
+        target: TauriSession,
+        sessions: Sequence[TauriSession],
+    ) -> bool:
+        del target, sessions
+        return False
+
+    def binary_identity(self) -> dict[str, str]:
+        return self._cell.binary_identity()
+
+    def runtime_identity(self) -> dict[str, Any]:
+        return self._cell.runtime_identity()
+
+    def finalize_cleanup(
+        self,
+        sessions: Sequence[TauriSession],
+        client_specs: Mapping[str, Mapping[str, Any]],
+        *,
+        timeout_seconds: float = 30,
+    ) -> dict[str, Any]:
+        if timeout_seconds <= 0:
+            raise ExecutionDeadline(self.cell_id, "native-resource-cleanup", "cleanup")
+        with deadline(
+            timeout_seconds,
+            ExecutionDeadline(self.cell_id, "native-resource-cleanup", "cleanup"),
+        ):
+            return self._finalize_cleanup(sessions, client_specs)
+
+    def _finalize_cleanup(
+        self,
+        sessions: Sequence[TauriSession],
+        client_specs: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        del client_specs
+        self._transport_overrides.clear()
+        self._sessions_by_client.clear()
+        endpoint_releases: list[dict[str, Any]] = []
+        endpoint_errors: list[dict[str, str]] = []
+        for endpoint_id in reversed(self._endpoint_ids):
+            try:
+                endpoint_releases.append(
+                    self._cell.release_endpoint(endpoint_id)
+                )
+            except Exception as error:
+                endpoint_errors.append(
+                    {
+                        "resource": f"endpoint:{endpoint_id}",
+                        "error": str(error),
+                    }
+                )
+        if not endpoint_errors:
+            self._endpoint_ids.clear()
+        audit = self._cell.actor_cleanup_audit()
+        endpoint_audit = self._cell.endpoint_cleanup_audit()
+        log_paths = tuple(
+            session.log_path
+            for session in sessions
+            if session.log_path is not None
+        )
+        cleanup_errors = _remove_paths(log_paths)
+        return {
+            **audit,
+            **endpoint_audit,
+            "endpointReleases": endpoint_releases,
+            "storageRoots": [
+                session.storage_root
+                for session in sessions
+            ],
+            "logs": [str(path) for path in log_paths],
+            "logsReleased": (
+                not cleanup_errors
+                and all(not path.exists() for path in log_paths)
+            ),
+            "cleanupErrors": [*endpoint_errors, *cleanup_errors],
+        }
+
+
+class LinuxNativeDesktopRuntimeBinding(RemoteNativeDesktopRuntimeBinding):
+    def __init__(
+        self,
+        gate_id: str,
+        source_commit: str,
+        cell: RemoteNativeRuntimeCellLifecycle | None = None,
+    ) -> None:
+        super().__init__(
+            "desktop-linux-native",
+            "linux",
+            gate_id,
+            source_commit,
+            cell,
+        )
+
+
+class WindowsNativeDesktopRuntimeBinding(RemoteNativeDesktopRuntimeBinding):
+    def __init__(
+        self,
+        gate_id: str,
+        source_commit: str,
+        cell: RemoteNativeRuntimeCellLifecycle | None = None,
+    ) -> None:
+        super().__init__(
+            "desktop-windows-native",
+            "win32",
+            gate_id,
+            source_commit,
+            cell,
+        )
+
+
+class LocalMacOSRuntimeBinding(NativeDesktopRuntimeBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        if sys.platform != "darwin":
+            raise DriverError(
+                "desktop-macos-native requires a macOS orchestrator"
+            )
+        from tooling.acceptance.drivers.native.macos import (
+            MacOSNativeDesktopAdapter,
+        )
+
+        self._use_make = os.environ.get(
+            "PT_ACCEPTANCE_NATIVE_DEV",
+            "",
+        ) == "1"
+        self._source_snapshot = source_identity(REPO_ROOT)
+        self._binary: Path | None = None
+        self._binary_sha256: str | None = None
+        self._prepared_cell: dict[str, Any] | None = None
+        self._make_binary_hashes: dict[str, str] = {}
+        requested_input_mode = os.environ.get(
+            "PT_ACCEPTANCE_DESKTOP_INPUT_MODE"
+        )
+        self._native_adapter = MacOSNativeDesktopAdapter(
+            admit_local_native_input_mode(
+                requested_input_mode,
+                os.environ.get("PT_ACCEPTANCE_DESKTOP_INPUT_ISOLATION"),
+            )
+        )
+        self._native_file_staging: tempfile.TemporaryDirectory[str] | None = None
+        if not self._use_make:
+            self._consume_prepared_binary()
+
+    @property
+    def cell_id(self) -> str:
+        return "desktop-macos-native"
+
+    @property
+    def native_adapter(self) -> NativeDesktopAdapter:
+        return self._native_adapter
+
+    def begin_file_chooser(self) -> NativeOperatorObservation | None:
+        if self.input_mode is NativeInputMode.EXCLUSIVE_NATIVE_INPUT:
+            return super().begin_file_chooser()
+        self._verify_source_snapshot()
+        cell = self._prepared_cell
+        try:
+            if cell is None:
+                raise ProvisioningError("prepared Cell is missing")
+            qualifier = CellFileChooserIdentity.from_dict(
+                cell["nativeAdapter"].get("fileChooser"),
+            )
+            qualifier.validate(
+                cell_id=self.cell_id, run_id=cell["runId"], source=cell["source"],
+            )
+            if qualifier.backend != "macos-accessibility":
+                raise ProvisioningError("file chooser backend differs from this Driver")
+            if self._binary is None or _file_sha256(self._binary) != self._binary_sha256:
+                raise ProvisioningError("qualified executable changed")
+        except ProvisioningError as error:
+            raise BlockedError(
+                reason=f"Process-scoped native file chooser is unqualified: {error}",
+                resource="runtime-cell-file-chooser",
+                diagnostic=ResourceDiagnostic.observed(
+                    owner="local-macos-runtime-binding",
+                    resource="runtime-cell-file-chooser",
+                    expected={"capability": "process-scoped-file-chooser", "cellId": self.cell_id},
+                    observed={
+                        "inputMode": self.input_mode.value,
+                        "preparedCellPresent": cell is not None,
+                        "qualificationError": str(error),
+                    },
+                    recovery_action=(
+                        "Equip and qualify the real chooser in the current parent "
+                        "Runtime Cell. Do not infer this capability from a Profile "
+                        "or input-mode flag, or substitute physical input."
+                    ),
+                ),
+            ) from error
+        try:
+            expires_at = datetime.fromisoformat(cell["lease"]["expiresAt"])
+            if expires_at.tzinfo is None:
+                raise ValueError("Cell lease expiration has no timezone")
+            remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if remaining <= 0:
+                raise ValueError("Cell lease expired")
+        except (KeyError, TypeError, ValueError) as error:
+            raise DriverError("Qualified Native Cell has no current lease lifetime") from error
+        return self.native_adapter.observe_operator(
+            deadline_monotonic=time.monotonic() + remaining,
+        )
+
+    def _create_session(
+        self,
+        client_role: str,
+        client_spec: Mapping[str, Any],
+        environment: Mapping[str, str],
+    ) -> TauriSession:
+        self._verify_source_snapshot()
+        if Path(str(client_spec["worktree"])).resolve() != REPO_ROOT.resolve():
+            raise DriverError("Native clients must use the selected candidate worktree")
+        environment = dict(environment)
+        actor_identity_root = str(
+            client_spec.get("actor_identity_root") or ""
+        ).strip()
+        if actor_identity_root:
+            identity_root = Path(actor_identity_root).expanduser()
+            if not identity_root.is_absolute() or not identity_root.is_dir():
+                raise DriverError(
+                    f"client {client_role!r} actor identity root is invalid"
+                )
+            environment["PEERS_ACTOR_IDENTITY_ROOT"] = str(identity_root)
+        if self._use_make:
+            return TauriSession(
+                MakeDesktopLauncher(
+                    worktree=str(client_spec["worktree"]),
+                    port=int(client_spec["webdriver_port"]),
+                    gateway_port=int(client_spec["gateway_port"]),
+                    renderer_port=int(client_spec["renderer_port"]),
+                    profile=str(client_spec["profile"]),
+                    storage_root=str(client_spec["storage_root"]),
+                    environment=environment,
+                )
+            )
+        if _file_sha256(self._binary) != self._binary_sha256:
+            raise DriverError("Native Acceptance binary changed after preparation")
+        return TauriSession(
+            LocalTauriLauncher(
+                app_binary=str(self._binary),
+                port=int(client_spec["webdriver_port"]),
+                gateway_port=int(client_spec["gateway_port"]),
+                profile=str(client_spec["profile"]),
+                storage_root=str(client_spec["storage_root"]),
+                environment=environment,
+            )
+        )
+
+    def _consume_prepared_binary(self) -> None:
+        raw_path = os.environ.get("PT_ACCEPTANCE_RUNTIME_CELL_MANIFEST", "").strip()
+        if not raw_path:
+            raise DriverError("Native launch requires its prepared Runtime Cell manifest")
+        cell = load_json_artifact(Path(raw_path), "acceptance-runtime-cell-manifest")
+        source = cell.get("source")
+        lease = cell.get("lease")
+        platform = cell.get("platform")
+        adapter = cell.get("nativeAdapter")
+        gate_id = os.environ.get("PT_ACCEPTANCE_GATE_ID", "")
+        if (
+            not gate_id or cell.get("gateId") != gate_id
+            or cell.get("cellId") != self.cell_id or cell.get("state") != "LEASED"
+            or not isinstance(lease, dict) or not cell.get("runId")
+            or lease.get("ownerRunId") != cell["runId"]
+            or not isinstance(platform, dict) or platform.get("os") != "macos"
+            or not isinstance(adapter, dict) or adapter.get("inputMode") != self.input_mode.value
+            or not runtime_source_matches(self._source_snapshot, source)
+            or source.get("mode") != "local-worktree"
+            or source.get("artifactKind") != "acceptance-binary"
+            or source.get("canonicalRoot") != str(REPO_ROOT.resolve())
+        ):
+            raise DriverError("Prepared Native Runtime Cell identity differs from the candidate")
+        raw_binary = source.get("binaryPath")
+        if not isinstance(raw_binary, str) or not raw_binary:
+            raise DriverError("Prepared Native Runtime Cell has no executable")
+        binary = Path(raw_binary)
+        if (
+            not binary.is_absolute() or binary.is_symlink()
+            or not binary.resolve().is_relative_to((REPO_ROOT / ".local").resolve())
+            or not binary.is_file() or not os.access(binary, os.X_OK)
+            or _file_sha256(binary) != source.get("binarySha256")
+        ):
+            raise DriverError("Prepared Native executable identity is invalid")
+        self._verify_source_snapshot()
+        if adapter.get("fileChooser") is not None:
+            try:
+                CellFileChooserIdentity.from_dict(adapter["fileChooser"]).validate(
+                    cell_id=self.cell_id, run_id=cell["runId"], source=source,
+                )
+            except ProvisioningError as error:
+                raise DriverError("Prepared file chooser qualification is invalid") from error
+        self._binary = binary.resolve()
+        self._binary_sha256 = source["binarySha256"]
+        self._prepared_cell = cell
+
+    def _expose_transport_endpoint(self, url: str) -> tuple[str, str]:
+        return url, f"local-direct-{secrets.token_hex(8)}"
+
+    def _release_transport_endpoint(self, endpoint_lease_id: str) -> None:
+        del endpoint_lease_id
+
+    def stage_native_file(
+        self,
+        actor: str,
+        source: Path,
+    ) -> Path:
+        resolved = source.expanduser().resolve()
+        if not resolved.is_file():
+            raise DriverError(
+                f"Native file selection source is missing: {resolved}"
+            )
+        actor_directory = "".join(
+            character
+            if character.isalnum() or character in {"-", "_"}
+            else "_"
+            for character in actor
+        )
+        if not actor_directory:
+            raise DriverError("Native file staging actor is invalid")
+        if self._native_file_staging is None:
+            self._native_file_staging = tempfile.TemporaryDirectory(
+                prefix="PeersTouchAcceptance-",
+                dir=Path.home(),
+            )
+        staging_root = Path(self._native_file_staging.name).resolve()
+        actor_root = staging_root / actor_directory
+        actor_root.mkdir(mode=0o700, exist_ok=True)
+        target = actor_root / resolved.name
+        if target.is_symlink():
+            raise DriverError(
+                f"Native file staging target must not be a symlink: {target}"
+            )
+        shutil.copy2(resolved, target)
+        return target.resolve()
+
+    def native_file_sha256(
+        self,
+        actor: str,
+        path: Path,
+    ) -> str:
+        del actor
+        resolved = path.expanduser().resolve()
+        if not resolved.is_file():
+            raise DriverError(f"Native file is missing: {resolved}")
+        return _file_sha256(resolved)
+
+    def clone_actor_storage(
+        self,
+        source_actor: str,
+        source_spec: Mapping[str, Any],
+        target_actor: str,
+        target_spec: Mapping[str, Any],
+        relative_path: CloneStorageRoots,
+    ) -> None:
+        del source_actor, target_actor
+        entries = normalize_clone_paths(relative_path)
+        source_root = Path(str(source_spec["storage_root"]))
+        target_root = Path(str(target_spec["storage_root"]))
+        sources = [source_root / entry.source for entry in entries]
+        missing = [
+            str(source) for source in sources
+            if not source.is_dir() and not source.is_file()
+        ]
+        if missing:
+            raise DriverError(
+                "Native actor storage source is missing: "
+                + ", ".join(missing)
+            )
+        if target_root.exists():
+            raise DriverError(
+                f"Native actor storage target already exists: {target_root}"
+            )
+        temporary_root = target_root.with_name(
+            f".{target_root.name}.clone-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            for entry, source in zip(entries, sources):
+                temporary = temporary_root / entry.target
+                temporary.parent.mkdir(parents=True, exist_ok=True)
+                if source.is_dir():
+                    shutil.copytree(source, temporary)
+                else:
+                    shutil.copy2(source, temporary)
+            os.replace(temporary_root, target_root)
+        except Exception as error:
+            try:
+                shutil.rmtree(temporary_root)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                raise DriverError(
+                    "Native actor storage clone failed and temporary "
+                    f"cleanup failed: {cleanup_error}"
+                ) from error
+            raise DriverError("Native actor storage clone failed") from error
+
+    def request_cooperative_activation(
+        self,
+        target: TauriSession,
+        sessions: Sequence[TauriSession],
+    ) -> bool:
+        self.native_adapter.require_exclusive_input(
+            "request cooperative macOS activation"
+        )
+        if target.process_id is None:
+            raise DriverError(
+                "Native activation target process is unavailable"
+            )
+        source = next(
+            (
+                session
+                for session in sessions
+                if session.process_id not in (None, target.process_id)
+                and bool(
+                    session.driver.execute_script(
+                        "return document.hasFocus()"
+                    )
+                )
+            ),
+            None,
+        )
+        if source is not None:
+            source.invoke_app_result(
+                "acceptance_yield_activation",
+                {"targetPid": target.process_id},
+            )
+        target.invoke_app_result("acceptance_request_activation")
+        return True
+
+    def _verify_source_snapshot(self) -> None:
+        if source_identity(REPO_ROOT) != self._source_snapshot:
+            raise DriverError("Native candidate source changed after runtime preparation")
+
+    def binary_identity(self) -> dict[str, str]:
+        self._verify_source_snapshot()
+        if self._use_make:
+            binaries: dict[str, str] = {}
+            for session in self._sessions_by_client.values():
+                launcher = session.launcher
+                if not isinstance(launcher, MakeDesktopLauncher):
+                    raise DriverError(
+                        "development Native session is not owned by make desktop"
+                    )
+                binary = launcher.runtime_binary_path()
+                path = str(binary)
+                value = _file_sha256(binary)
+                previous = self._make_binary_hashes.setdefault(path, value)
+                if previous != value:
+                    raise DriverError("Running Make binary changed after attestation")
+                binaries[path] = value
+            if not binaries:
+                raise DriverError(
+                    "make Desktop runtime binary identity is unavailable"
+                )
+            canonical = json.dumps(
+                [
+                    {"path": path, "sha256": digest}
+                    for path, digest in sorted(binaries.items())
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return {
+                "path": ",".join(sorted(binaries)),
+                "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                "instances": canonical,
+                "sourceCommit": self._source_snapshot["commit"],
+                "workspaceDigest": self._source_snapshot["workspaceDigest"],
+            }
+        if self._binary is None:
+            raise DriverError("Native Acceptance binary is unavailable")
+        if _file_sha256(self._binary) != self._binary_sha256:
+            raise DriverError("Native Acceptance binary changed after preparation")
+        return {
+            "path": str(self._binary),
+            "sha256": self._binary_sha256,
+            "sourceCommit": self._source_snapshot["commit"],
+            "workspaceDigest": self._source_snapshot["workspaceDigest"],
+        }
+
+    def runtime_identity(self) -> dict[str, Any]:
+        self._verify_source_snapshot()
+        source = self._source_snapshot
+        binary = self.binary_identity()
+        if not self._use_make:
+            if self._prepared_cell is None:
+                raise DriverError("Prepared Native Runtime Cell is unavailable")
+            return dict(self._prepared_cell)
+        return {
+            "artifactKind": "acceptance-runtime-cell-manifest",
+            "cellId": self.cell_id,
+            "gateId": os.environ.get("PT_ACCEPTANCE_GATE_ID", ""),
+            "runId": os.environ.get("PT_ACCEPTANCE_RUN_ID", ""),
+            "state": "LEASED",
+            "platform": {
+                "os": "macos",
+                "isolationKind": "local-process",
+            },
+            "source": {
+                **source,
+                "remoteSourceDigest": source["workspaceDigest"],
+                "remoteCheckoutClean": (
+                    source["workspaceDigest"] == "clean"
+                ),
+                "binarySha256": binary["sha256"],
+            },
+        }
+
+    def finalize_cleanup(
+        self,
+        sessions: Sequence[TauriSession],
+        client_specs: Mapping[str, Mapping[str, Any]],
+        *,
+        timeout_seconds: float = 30,
+    ) -> dict[str, Any]:
+        self._transport_overrides.clear()
+        self._sessions_by_client.clear()
+        ports = sorted(
+            {
+                int(spec[field])
+                for spec in client_specs.values()
+                for field in (
+                    "webdriver_port",
+                    "gateway_port",
+                    "renderer_port",
+                )
+            }
+        )
+        process_ids = sorted(
+            {
+                int(session.process_id)
+                for session in sessions
+                if session.process_id
+            }
+        )
+        ephemeral_storage_roots: set[Path] = set()
+        persistent_storage_roots: set[Path] = set()
+        storage_policy_errors: list[dict[str, str]] = []
+        for client_id, spec in client_specs.items():
+            storage_root = Path(str(spec["storage_root"]))
+            storage_lifecycle = str(
+                spec.get("storage_lifecycle", "ephemeral")
+            )
+            if storage_lifecycle == "ephemeral":
+                ephemeral_storage_roots.add(storage_root)
+            elif storage_lifecycle == "persistent":
+                persistent_storage_roots.add(storage_root)
+            else:
+                storage_policy_errors.append(
+                    {
+                        "path": str(storage_root),
+                        "error": (
+                            "invalid runtime client storage_lifecycle "
+                            f"{storage_lifecycle!r} for {client_id}"
+                        ),
+                    }
+                )
+        storage_roots = sorted(
+            ephemeral_storage_roots | persistent_storage_roots
+        )
+        released_storage_roots = sorted(ephemeral_storage_roots)
+        retained_storage_roots = sorted(persistent_storage_roots)
+        log_paths = tuple(
+            session.log_path
+            for session in sessions
+            if session.log_path is not None
+        )
+        release_state = {
+            "portsReleased": False,
+            "processesReleased": False,
+        }
+
+        def resources_released() -> bool:
+            release_state["portsReleased"] = all(_port_is_free(port) for port in ports)
+            release_state["processesReleased"] = all(
+                _pid_is_stopped(pid) for pid in process_ids
+            )
+            return all(release_state.values())
+
+        if not resources_released():
+            _wait_for(resources_released, timeout=max(0.0, timeout_seconds))
+        processes_stopped = release_state["processesReleased"]
+        storage_errors = (
+            _remove_paths(released_storage_roots)
+            if processes_stopped
+            else [{"resource": "native-processes", "error": "owned processes remain live"}]
+        )
+        storage_errors.extend(storage_policy_errors)
+        for path in retained_storage_roots:
+            if not path.is_dir() or path.is_symlink():
+                storage_errors.append(
+                    {
+                        "path": str(path),
+                        "error": (
+                            "persistent runtime client storage is missing "
+                            "or symlinked after shutdown"
+                        ),
+                    }
+                )
+        staging_roots = (
+            [Path(self._native_file_staging.name)]
+            if self._native_file_staging is not None
+            else []
+        )
+        staging_errors: list[dict[str, str]] = []
+        if self._native_file_staging is not None and processes_stopped:
+            try:
+                self._native_file_staging.cleanup()
+            except OSError as error:
+                staging_errors.append(
+                    {
+                        "path": self._native_file_staging.name,
+                        "error": str(error),
+                    }
+                )
+            finally:
+                self._native_file_staging = None
+        log_errors = _remove_paths(log_paths) if processes_stopped else []
+        return {
+            "ports": ports,
+            "pids": process_ids,
+            "storageRoots": [str(path) for path in storage_roots],
+            "releasedStorageRoots": [
+                str(path) for path in released_storage_roots
+            ],
+            "persistentStorageRoots": [
+                str(path) for path in retained_storage_roots
+            ],
+            "nativeFileStagingRoots": [
+                str(path) for path in staging_roots
+            ],
+            "storageErrors": storage_errors,
+            "cleanupErrors": [
+                *storage_errors,
+                *staging_errors,
+                *log_errors,
+            ],
+            "logs": [str(path) for path in log_paths],
+            **release_state,
+            "storageReleased": (
+                not storage_errors
+                and all(not path.exists() for path in released_storage_roots)
+                and all(path.is_dir() for path in retained_storage_roots)
+                and not staging_errors
+                and all(not path.exists() for path in staging_roots)
+            ),
+            "persistentStorageRetained": all(
+                path.is_dir() and not path.is_symlink()
+                for path in retained_storage_roots
+            ),
+            "logsReleased": (
+                processes_stopped
+                and not log_errors
+                and all(not path.exists() for path in log_paths)
+            ),
+        }
+
+
+def _remove_paths(paths: Sequence[Path]) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as error:
+            errors.append({"path": str(path), "error": str(error)})
+    return errors
+
+
+def _wait_for(predicate: Any, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return bool(predicate())
+
+
+def _port_is_free(port: int) -> bool:
+    with socket.socket() as probe:
+        return probe.connect_ex(("127.0.0.1", port)) != 0
+
+
+def _pid_is_stopped(pid: int) -> bool:
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def resolve_native_desktop_runtime(
+    cell_id: str,
+    *,
+    gate_id: str,
+    source_commit: str,
+) -> NativeDesktopRuntimeBinding:
+    if cell_id == "desktop-macos-native":
+        return LocalMacOSRuntimeBinding()
+    if cell_id == "desktop-linux-native":
+        return LinuxNativeDesktopRuntimeBinding(
+            gate_id,
+            source_commit,
+        )
+    if cell_id == "desktop-windows-native":
+        return WindowsNativeDesktopRuntimeBinding(
+            gate_id,
+            source_commit,
+        )
+    raise DriverError(f"unknown Native Desktop runtime cell {cell_id!r}")

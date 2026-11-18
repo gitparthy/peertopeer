@@ -1,0 +1,54 @@
+{
+  "id": "agent-core-lifecycle",
+  "status": "active",
+  "product_area": "agent",
+  "owners": [
+    "apps/station/app/subserver/agent/handler/agent_handler.go",
+    "apps/desktop/src/store/agent.ts",
+    "apps/desktop/src/components/agent/workbench/TopicRail.tsx"
+  ],
+  "truth_sources": [
+    "Station agent CRUD API",
+    "Desktop agent store",
+    "Station /sub-agent/agent/create + list + update + delete",
+    "Station Agent conversation list"
+  ],
+  "visible_surfaces": [
+    {"type": "api", "route": "/sub-agent/agent/create"},
+    {"type": "api", "route": "/sub-agent/agent/list"},
+    {"type": "api", "route": "/sub-agent/agent/update"},
+    {"type": "api", "route": "/sub-agent/agent/delete"},
+    {"type": "ui", "surface": "Native Desktop Agent workbench roster and actions"},
+    {"type": "ui", "surface": "Native Desktop Agent profile editor"},
+    {"type": "ui", "surface": "Native Desktop Agent session composer"}
+  ],
+  "required_gates": ["agent-core-lifecycle-native-e2e"],
+  "acceptance": {
+    "service": [
+      "the Native create control persists one new Agent and returns it in Station-backed list readback",
+      "selecting an Agent changes the active Agent and loads its native chat composer",
+      "editing the Agent title persists a higher Station version and refreshes the profile",
+      "repeated Create actions persist distinct Agents with deterministic unique names and immediately open each Profile",
+      "the retired Duplicate and Set default actions remain absent from the Native product surface",
+      "starting a new empty session changes the client session without persisting a phantom Station conversation",
+      "a failed Station topic refresh preserves accepted topics and exposes retry; retry converges after transport recovery",
+      "deleting both disposable Agents removes them from the Station-backed roster and restores the original Agent selection"
+    ],
+    "visible": [
+      "the create control opens the newly persisted Agent profile",
+      "each created Agent row is visible with a stable, distinct Agent ID",
+      "selecting an Agent shows the native composer",
+      "the edited title is visible after authoritative Profile readback",
+      "new session shows an empty composer with a distinct session key",
+      "topic refresh failure stays visible until retry succeeds",
+      "deleted Agent rows disappear"
+    ]
+  },
+  "negative": [
+    "repeated Create actions must never create ambiguous Agent names or selection targets",
+    "Duplicate and Set default must not reappear as compatibility actions",
+    "an empty session start must not create a Station conversation",
+    "a deleted Agent ID must no longer be selectable from the native roster",
+    "missing lifecycle selectors or incomplete Station readback must fail the Gate closed"
+  ]
+}

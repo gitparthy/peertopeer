@@ -1,0 +1,45 @@
+{
+  "id": "home-station",
+  "profile": {
+    "required": true,
+    "identity_match": true
+  },
+  "services": {
+    "station": {
+      "kind": "station",
+      "required": true,
+      "ready_action": "station",
+      "health_action": "station-check",
+      "status_action": "station-status",
+      "attestation_producer": "station-deployment"
+    },
+    "relay": {
+      "kind": "relay",
+      "required": false,
+      "attestation_producer": "station-relay-role-attachment"
+    },
+    "station-via-relay": {
+      "kind": "station",
+      "required": false,
+      "attestation_producer": "station-relay-role-attachment"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "chat-native-actors",
+      "authorization_required": true,
+      "authorization_ref": "station.reset:chat-native-actors"
+    }
+  ],
+  "credentials": [
+    {
+      "id": "evidence-leak-canary",
+      "source_ref": "auto:uuid",
+      "required": true,
+      "generated_if_missing": true
+    }
+  ],
+  "cleanup": {
+    "resources": ["processes", "ports", "storage", "sessions"]
+  }
+}

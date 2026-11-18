@@ -1,0 +1,57 @@
+peers:
+  logger:
+    name: slogrus
+    level: info
+    caller-skip-count: 0
+    # Package path prefix replacements (longest match first)
+    # Simplifies pkg_path field in logs for better readability
+    pkg-path-replacer:
+      "github.com/peers-labs/peers-touch/station/frame": "@frame"
+      "github.com/peers-labs/peers-touch/station/app": "@app"
+      "github.com/peers-labs/peers-touch": "@touch"
+    persistence:
+       enable: false
+       dir: /var/logs/peers-touch
+       back-dir: /var/logs/peers-touch/backup
+       max-file-size: 50
+       max-backup-size: 700
+       max-backup-keep-days: 14
+       file-name-pattern: app.log
+       backup-file-name-pattern: app-%Y%m%d-%H.zip
+    slogrus:
+      formatter: text
+      # When false: no caller info, no pkg/pkg_path fields (better performance)
+      # When true: includes file:line, pkg/pkg_path fields (~10-20% overhead)
+      report-caller: true
+      split-level: false
+      without-key: false
+      without-quote: false
+      timestamp-format: "2006-01-02 15:04:05.999"
+      include-packages: []
+      exclude-packages: []
+      # Log sampling configuration for high-frequency repeated logs
+      # Only applies to Debug and Info levels; Warn/Error/Fatal are never sampled
+      sampling:
+        enable: false
+        # First N logs are always recorded
+        initial: 100
+        # After initial, record 1 out of every M logs
+        thereafter: 100
+        # Time window for resetting counters (e.g., "1m", "5m", "1h")
+        window: 1m
+        # When true, sampling is applied per package+message; requires report-caller: true
+        # When false, sampling is applied globally per message
+        per-package: false
+      # Per-package sampling rules (recommended for targeted log control)
+      # Each rule applies only to the specified package, other packages are unaffected
+      package-sampling:
+        # Example: Control high-frequency health check logs
+        - package: "plugin/native/registry"
+          initial: 5           # First 5 logs always recorded
+          thereafter: 20       # Then 1 out of 20
+          window: "1m"         # Reset every minute
+        # Example: Control mDNS discovery logs
+        # - package: "plugin/native/mdns"
+        #   initial: 10
+        #   thereafter: 50
+        #   window: "1m"

@@ -1,0 +1,195 @@
+import { readFileSync } from 'node:fs';
+import { describe, expect, it } from 'vitest';
+
+describe('ToolCallsBlock approval visibility', () => {
+  it('automatically exposes a persisted actionable approval', () => {
+    const source = readFileSync(
+      new URL('./ToolCallCard.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain(
+      "status === 'approval_required'",
+    );
+    expect(source).toContain(
+      'Boolean(toolCall.approvalId)',
+    );
+    // TW-D4: fenced file/command cards carry auditable change facts and
+    // must be expanded by default once settled; other cards still rely on
+    // the explicit expansion/actionable/pending union.
+    expect(source).toContain(
+      "sourceTool.name === 'local_file_write'",
+    );
+    expect(source).toContain(
+      "sourceTool.name === 'local_file_edit'",
+    );
+    expect(source).toContain(
+      "sourceTool.name === 'local_shell_exec'",
+    );
+    expect(source).toContain(
+      'expanded || actionableToolState || pendingCount > 0',
+    );
+
+    const approveDecision = source.indexOf(
+      'submitAgentToolDecision(tool.id, true)',
+    );
+    const recoverySelector = source.indexOf(
+      'data-pt-agent-tool-recovery="continue-without-tool"',
+    );
+    const denyDecision = source.indexOf(
+      'submitAgentToolDecision(tool.id, false)',
+    );
+    expect(approveDecision).toBeGreaterThan(-1);
+    expect(recoverySelector).toBeGreaterThan(approveDecision);
+    expect(recoverySelector).toBeLessThan(denyDecision);
+  });
+
+  it('exposes expired approval recovery without resubmitting the old decision', () => {
+    const source = readFileSync(
+      new URL('./ToolCallCard.tsx', import.meta.url),
+      'utf8',
+    );
+    const runtimeSource = readFileSync(
+      new URL('../../runtimes/toolRuntime.ts', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain(
+      "tool.error === 'agent.errors.toolApprovalExpired'",
+    );
+    expect(source).toContain(
+      'data-pt-agent-tool-recovery="request-again"',
+    );
+    expect(source).toContain(
+      "t('agent.recovery.requestAgain', { ns: 'agent' })",
+    );
+    expect(source).toContain('void onRequestAgain()');
+    expect(source).toContain('resolveToolCallProjection');
+    expect(source).toContain(
+      'const pendingCount = projectedToolCalls.filter',
+    );
+    expect(runtimeSource).toContain('projectionAddsTypedTerminalOutcome');
+    expect(runtimeSource).toContain(
+      "(source.status === projection.status || source.status === 'error')",
+    );
+
+    const requestAgain = source.indexOf(
+      'data-pt-agent-tool-recovery="request-again"',
+    );
+    const decisionSubmission = source.indexOf(
+      'submitAgentToolDecision(tool.id',
+      requestAgain,
+    );
+    expect(decisionSubmission).toBe(-1);
+  });
+
+  it('keeps a denied approval error visible after the ToolCall remounts', () => {
+    const source = readFileSync(
+      new URL('./ToolCallCard.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain(
+      "tool.status === 'denied'",
+    );
+    expect(source).toContain(
+      "tool.error === 'agent.errors.toolApprovalDenied'",
+    );
+    expect(source).toContain(
+      'expanded\n    || approvalRequired\n    || approvalDenied',
+    );
+    expect(source).toContain(
+      "status === 'denied'\n      && error === 'agent.errors.toolApprovalDenied'",
+    );
+  });
+
+  it('renders executor-unavailable recovery without claiming or executing the ToolCall', () => {
+    const source = readFileSync(
+      new URL('./ToolCallCard.tsx', import.meta.url),
+      'utf8',
+    );
+    const runtimeSource = readFileSync(
+      new URL('../../runtimes/toolRuntime.ts', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain(
+      "tool.error === 'agent.errors.executorUnavailable'",
+    );
+    expect(source).toContain(
+      'data-pt-agent-tool-decision="approve"',
+    );
+    expect(source).toContain('disabled={!canApprove}');
+    expect(source).toContain(
+      'data-pt-agent-tool-recovery="reconnect-executor"',
+    );
+    expect(source).toContain(
+      "t('agent.recovery.reconnectExecutor', { ns: 'agent' })",
+    );
+    expect(source).toContain('void reconnectAgentToolExecutor(tool.id)');
+    expect(source).not.toContain('fetch(');
+    expect(runtimeSource).toContain('api.startAgentClientExecutorSupervisor()');
+    expect(runtimeSource).toContain('api.listAgentCapabilitySessions()');
+    expect(runtimeSource).not.toContain('claimAgentTool');
+    expect(runtimeSource).not.toContain('executeAgentTool');
+  });
+
+  it('projects governed invocation metadata from Station diagnostics', () => {
+    const source = readFileSync(
+      new URL('./ToolCallCard.tsx', import.meta.url),
+      'utf8',
+    );
+    const runtimeSource = readFileSync(
+      new URL('../../runtimes/toolRuntime.ts', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('data-pt-agent-tool-call-group');
+    expect(source).toContain('data-pt-agent-tool-call-group-toggle');
+    expect(source).toContain('data-pt-agent-tool-governance');
+    expect(source).toContain('data-pt-agent-tool-turn');
+    expect(source).toContain('tool.manifestId');
+    expect(source).toContain('manifest?.riskClass');
+    expect(source).toContain('tool.executionOwner');
+    expect(source).toContain('tool.targetDeviceId');
+    expect(source).toContain('tool.readinessSnapshotId');
+    expect(runtimeSource).toContain('executionOwner: fact.executionOwner');
+    expect(runtimeSource).toContain('approvalPolicy: fact.approvalPolicy');
+    expect(runtimeSource).toContain('manifestId: fact.manifestId');
+    expect(runtimeSource).toContain('targetDeviceId: fact.targetDeviceId');
+  });
+
+  it('keeps unknown side effects visible without an automatic retry action', () => {
+    const source = readFileSync(
+      new URL('./ToolCallCard.tsx', import.meta.url),
+      'utf8',
+    );
+    const runtimeSource = readFileSync(
+      new URL('../../runtimes/toolRuntime.ts', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain(
+      "const unknownSideEffect = tool.status === 'unknown_side_effect'",
+    );
+    expect(source).toContain(
+      'expanded\n'
+      + '    || approvalRequired\n'
+      + '    || approvalDenied\n'
+      + '    || approvalExpired\n'
+      + '    || unknownSideEffect',
+    );
+    expect(source).toContain(
+      "status === 'unknown_side_effect'",
+    );
+    expect(runtimeSource).toContain(
+      "return 'unknown_side_effect'",
+    );
+    expect(runtimeSource).toContain(
+      "return 'agent.errors.toolUnknownSideEffect'",
+    );
+    expect(source).toContain(
+      'approvalExpired && onRequestAgain',
+    );
+  });
+});

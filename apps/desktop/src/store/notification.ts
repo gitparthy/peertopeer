@@ -1,0 +1,276 @@
+import { createDesktopStore } from './createDesktopStore';
+import {
+  applyAllChatNotificationsRead,
+  applyChatNotificationsRead,
+  deleteChatNotifications,
+  mergeChatNotifications,
+} from '@peers-touch/client-chat-core';
+
+import { api, isUnauthorizedError, type NotificationData, type NotificationUnreadCountsResponse } from '../services/desktop_api';
+import { isDocumentHidden, onDocumentForeground } from '../kernel/documentVisibility';
+import { currentAuthenticatedActorPtid } from './session';
+import { log } from '../utils/logger';
+
+// Unread counts are also pushed by the realtime channel; the poll is only a
+// safety net, so 60s is enough. At 15s this timer alone produced ~4 bridge
+// calls/min and woke every badge subscriber even when nothing changed.
+const POLL_INTERVAL = 60_000;
+const MAX_ITEMS = 200;
+const NOTIFICATION_STATUS_UNREAD = 1;
+const NOTIFICATION_STATUS_READ = 2;
+
+// Lifetime matches polling: skip background-tab polls and catch up on return.
+let foregroundUnlisten: (() => void) | null = null;
+
+/** Shallow equality for the small per-category unread map (keys are numeric). */
+function shallowCategoryEqual(
+  a: Record<number, number>,
+  b: Record<number, number>,
+): boolean {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((key) => a[Number(key)] === b[Number(key)]);
+}
+
+interface NotificationStore {
+  notifications: NotificationData[];
+  unreadTotal: number;
+  unreadByCategory: Record<number, number>;
+  loading: boolean;
+  hasMore: boolean;
+  nextCursor: string;
+  pollTimer: ReturnType<typeof setInterval> | null;
+
+  reset: () => void;
+  loadNotifications: () => Promise<void>;
+  loadMore: () => Promise<void>;
+  refreshUnreadCounts: () => Promise<void>;
+  markRead: (ids: string[]) => Promise<void>;
+  markAllRead: (category?: number) => Promise<void>;
+  deleteNotifications: (ids: string[]) => Promise<void>;
+  startPolling: () => void;
+  stopPolling: () => void;
+}
+
+const initialNotificationState = {
+  notifications: [] as NotificationData[],
+  unreadTotal: 0,
+  unreadByCategory: {} as Record<number, number>,
+  loading: false,
+  hasMore: false,
+  nextCursor: '',
+  pollTimer: null as ReturnType<typeof setInterval> | null,
+};
+
+export const useNotificationStore = createDesktopStore<NotificationStore>('notification', (set, get) => ({
+  ...initialNotificationState,
+
+  reset: () => {
+    const { pollTimer } = get();
+    if (pollTimer) clearInterval(pollTimer);
+    foregroundUnlisten?.();
+    foregroundUnlisten = null;
+    set({ ...initialNotificationState });
+  },
+
+  loadNotifications: async () => {
+    const actorPtid = currentAuthenticatedActorPtid();
+    if (!actorPtid) {
+      set({ loading: false });
+      return;
+    }
+    set({ loading: true });
+    try {
+      const resp = await api.notificationList(undefined, undefined, undefined, 20);
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+
+      set({
+        notifications: (resp.notifications || []).slice(0, MAX_ITEMS),
+        unreadTotal: resp.unreadCount || 0,
+        hasMore: !!resp.nextCursor,
+        nextCursor: resp.nextCursor || '',
+        loading: false,
+      });
+    } catch (err) {
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+      if (isUnauthorizedError(err)) {
+        set({ loading: false });
+        return;
+      }
+      log.error('notification', 'Failed to load notifications', err);
+      set({ loading: false });
+    }
+  },
+
+  loadMore: async () => {
+    const actorPtid = currentAuthenticatedActorPtid();
+    if (!actorPtid) return;
+    const { nextCursor, loading, hasMore } = get();
+    if (loading || !hasMore || !nextCursor) return;
+
+    set({ loading: true });
+    try {
+      const resp = await api.notificationList(undefined, undefined, nextCursor, 20);
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+
+      set((prev) => ({
+        notifications: mergeChatNotifications(prev.notifications, resp.notifications || [], {
+          resolveCreatedAt: notificationCreatedAtMs,
+          limit: MAX_ITEMS,
+        }),
+        hasMore: !!resp.nextCursor,
+        nextCursor: resp.nextCursor || '',
+        loading: false,
+      }));
+    } catch (err) {
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+      if (isUnauthorizedError(err)) {
+        set({ loading: false });
+        return;
+      }
+      log.error('notification', 'Failed to load more notifications', err);
+      set({ loading: false });
+    }
+  },
+
+  refreshUnreadCounts: async () => {
+    const actorPtid = currentAuthenticatedActorPtid();
+    if (!actorPtid) {
+      set({ unreadTotal: 0, unreadByCategory: {} });
+      return;
+    }
+    try {
+      const resp: NotificationUnreadCountsResponse = await api.notificationUnreadCounts();
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+
+      const nextTotal = resp.total || 0;
+      const nextByCategory = resp.byCategory || {};
+      const prev = get();
+      // Skip the store write entirely when nothing changed: an unconditional
+      // set() notifies every badge subscriber on every poll, turning an idle
+      // safety-net poll into a periodic re-render.
+      if (
+        prev.unreadTotal === nextTotal
+        && shallowCategoryEqual(prev.unreadByCategory, nextByCategory)
+      ) {
+        return;
+      }
+      set({
+        unreadTotal: nextTotal,
+        unreadByCategory: nextByCategory,
+      });
+    } catch (err) {
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+      if (isUnauthorizedError(err)) return;
+      // Silently ignore — will retry on next poll
+    }
+  },
+
+  markRead: async (ids: string[]) => {
+    const actorPtid = currentAuthenticatedActorPtid();
+    if (!actorPtid) return;
+    try {
+      await api.notificationMarkRead(ids);
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+
+      set((prev) => ({
+        notifications: applyChatNotificationsRead(prev.notifications, ids, NOTIFICATION_STATUS_READ, new Date().toISOString()),
+        unreadTotal: Math.max(0, prev.unreadTotal - countUnreadTargets(prev.notifications, ids)),
+      }));
+    } catch (err) {
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+      if (isUnauthorizedError(err)) return;
+      log.error('notification', 'Failed to mark notifications read', err);
+    }
+  },
+
+  markAllRead: async (category?: number) => {
+    const actorPtid = currentAuthenticatedActorPtid();
+    if (!actorPtid) return;
+    try {
+      await api.notificationMarkAllRead(category);
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+
+      set((prev) => ({
+        notifications: applyAllChatNotificationsRead(
+          prev.notifications,
+          NOTIFICATION_STATUS_READ,
+          new Date().toISOString(),
+          category || undefined,
+        ),
+        unreadTotal: category ? prev.unreadTotal : 0,
+        unreadByCategory: category
+          ? { ...prev.unreadByCategory, [category]: 0 }
+          : {},
+      }));
+    } catch (err) {
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+      if (isUnauthorizedError(err)) return;
+      log.error('notification', 'Failed to mark all notifications read', err);
+    }
+  },
+
+  deleteNotifications: async (ids: string[]) => {
+    const actorPtid = currentAuthenticatedActorPtid();
+    if (!actorPtid) return;
+    try {
+      await api.notificationDelete(ids);
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+
+      set((prev) => ({
+        notifications: deleteChatNotifications(prev.notifications, ids),
+      }));
+      void get().refreshUnreadCounts();
+    } catch (err) {
+      if (currentAuthenticatedActorPtid() !== actorPtid) return;
+      if (isUnauthorizedError(err)) return;
+      log.error('notification', 'Failed to delete notifications', err);
+    }
+  },
+
+  startPolling: () => {
+    if (!currentAuthenticatedActorPtid()) {
+      get().stopPolling();
+      set({ notifications: [], unreadTotal: 0, unreadByCategory: {}, loading: false });
+      return;
+    }
+    const { pollTimer } = get();
+    if (pollTimer) return;
+
+    get().loadNotifications();
+    get().refreshUnreadCounts();
+
+    const timer = setInterval(() => {
+      if (isDocumentHidden()) return;
+      get().refreshUnreadCounts();
+    }, POLL_INTERVAL);
+    set({ pollTimer: timer });
+    foregroundUnlisten = onDocumentForeground(() => {
+      void get().loadNotifications();
+      void get().refreshUnreadCounts();
+    });
+  },
+
+  stopPolling: () => {
+    const { pollTimer } = get();
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      set({ pollTimer: null });
+    }
+    foregroundUnlisten?.();
+    foregroundUnlisten = null;
+  },
+}));
+
+function notificationCreatedAtMs(notification: NotificationData): number {
+  const parsed = Date.parse(notification.createdAt);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function countUnreadTargets(notifications: NotificationData[], ids: string[]): number {
+  const targetIds = new Set(ids);
+  return notifications.filter((notification) =>
+    targetIds.has(notification.id) && notification.status === NOTIFICATION_STATUS_UNREAD,
+  ).length;
+}

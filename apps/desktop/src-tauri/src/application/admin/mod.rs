@@ -1,0 +1,110 @@
+use crate::contracts::{AdminExecuteActionInput, AdminNetworkProbeInput, StubPayload};
+use crate::domain::admin::{
+    authorize, build_request_id, emit_audit, validate_action, validate_probe_target, AccessContext,
+    AdminCapability,
+};
+use crate::error::{AppResult, ErrorCode};
+
+fn ensure_admin(
+    context: &AccessContext,
+    capability: AdminCapability,
+    request_id: &str,
+) -> Result<(), AppResult<StubPayload>> {
+    if authorize(context, capability) {
+        return Ok(());
+    }
+    emit_audit(
+        request_id,
+        capability,
+        context.actor_ptid.as_deref(),
+        "forbidden",
+    );
+    Err(AppResult::fail(
+        ErrorCode::Forbidden,
+        "Admin capability required",
+        None,
+    ))
+}
+
+pub fn admin_health(context: AccessContext) -> AppResult<StubPayload> {
+    let request_id = build_request_id();
+    if let Err(error) = ensure_admin(&context, AdminCapability::Health, &request_id) {
+        return error;
+    }
+    emit_audit(
+        &request_id,
+        AdminCapability::Health,
+        context.actor_ptid.as_deref(),
+        "ok",
+    );
+    AppResult::success(StubPayload {
+        command: "admin_health".to_string(),
+        status: "ok".to_string(),
+    })
+}
+
+pub fn admin_network_probe(
+    context: AccessContext,
+    input: AdminNetworkProbeInput,
+) -> AppResult<StubPayload> {
+    let request_id = build_request_id();
+    if let Err(error) = ensure_admin(&context, AdminCapability::NetworkProbe, &request_id) {
+        return error;
+    }
+    if let Err(message) = validate_probe_target(&input.target) {
+        emit_audit(
+            &request_id,
+            AdminCapability::NetworkProbe,
+            context.actor_ptid.as_deref(),
+            "invalid_argument",
+        );
+        return AppResult::fail(
+            ErrorCode::InvalidArgument,
+            format!("Invalid admin probe target: {}", message),
+            None,
+        );
+    }
+    emit_audit(
+        &request_id,
+        AdminCapability::NetworkProbe,
+        context.actor_ptid.as_deref(),
+        "ok",
+    );
+    AppResult::success(StubPayload {
+        command: "admin_network_probe".to_string(),
+        status: format!("reachable:{}", input.target.trim()),
+    })
+}
+
+pub fn admin_execute_action(
+    context: AccessContext,
+    input: AdminExecuteActionInput,
+) -> AppResult<StubPayload> {
+    let request_id = build_request_id();
+    if let Err(error) = ensure_admin(&context, AdminCapability::ExecuteAction, &request_id) {
+        return error;
+    }
+    if let Err(message) = validate_action(&input.action) {
+        emit_audit(
+            &request_id,
+            AdminCapability::ExecuteAction,
+            context.actor_ptid.as_deref(),
+            "invalid_argument",
+        );
+        return AppResult::fail(
+            ErrorCode::InvalidArgument,
+            format!("Invalid admin action: {}", message),
+            None,
+        );
+    }
+    emit_audit(
+        &request_id,
+        AdminCapability::ExecuteAction,
+        context.actor_ptid.as_deref(),
+        "ok",
+    );
+    AppResult::success(StubPayload {
+        command: "admin_execute_action".to_string(),
+        status: format!("executed:{}", input.action.trim()),
+    })
+}

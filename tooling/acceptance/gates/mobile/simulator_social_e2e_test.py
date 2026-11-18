@@ -1,0 +1,3081 @@
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import inspect
+import signal
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from tooling.acceptance.core import (
+    DriverError,
+    GateError,
+    SuiteRuntimeAction,
+    SuiteRuntimeLedger,
+)
+from tooling.acceptance.gates.mobile.simulator_social_e2e import (
+    ENVIRONMENT_ID,
+    IOS_SOCIAL_ENVIRONMENT_ID,
+    IOS_SOCIAL_PARITY_SCENARIOS,
+    IOS_SOCIAL_RUNTIME_REUSE,
+    RECOVERY_RELAUNCH_ACTIONS,
+    SCENARIO_GATES,
+    SimulatorSocialGate,
+)
+from tooling.acceptance.core.proof import assertions_pass
+from tooling.acceptance.gates.mobile.simulator_e2e import SimulatorGateBlocked
+from tooling.acceptance.gates.mobile.messaging_journey import MessagingActor
+from tooling.acceptance.provisioners.mobile_simulator import (
+    MobileSocialIOSSimulatorProvisioner,
+)
+
+
+class Artifacts:
+    run_id = "20260904T120000000000Z-" + ("1" * 32)
+
+    class Store:
+        workspace_id = "a" * 16
+
+    store = Store()
+
+    def __init__(self) -> None:
+        self.completed: dict[str, object] = {}
+        self.writes: list[tuple[str, object, str | None]] = []
+
+    def __enter__(self) -> "Artifacts":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def write_json(
+        self,
+        path: str,
+        value: object,
+        *,
+        role: str | None = None,
+    ) -> None:
+        self.writes.append((path, value, role))
+
+    def complete(self, **values: object) -> None:
+        self.completed = values
+
+
+class SimulatorSocialGateTests(unittest.TestCase):
+    def test_search_selects_bound_federation_before_submitting(self) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+        session = Mock()
+        receiver = self._actor("sim-ios-peer", "bob")
+        selected = False
+
+        def select_radio(
+            _session: object,
+            control_selector: str,
+            selector: str,
+            enabled_selector: str,
+            _label: str,
+        ) -> int:
+            nonlocal selected
+            self.assertIn("label.pt-check-label:has(", control_selector)
+            self.assertIn(f'value="{receiver.federation_id}"', selector)
+            self.assertIn(
+                '[data-action-id="social-search-run"]',
+                enabled_selector,
+            )
+            selected = True
+            return 7
+
+        def click(_session: object, selector: str, _label: str) -> None:
+            if 'data-action-id="social-search-run"' in selector:
+                self.assertTrue(selected, "search cannot submit without a Federation")
+
+        def set_value(
+            _session: object,
+            selector: str,
+            value: str,
+            _label: str,
+        ) -> None:
+            if "social-search-input" in selector:
+                self.assertEqual(value, receiver.role)
+
+        with (
+            patch.object(gate, "_wait_ui"),
+            patch.object(gate, "_set_ui_value", side_effect=set_value),
+            patch.object(gate, "_select_radio", side_effect=select_radio),
+            patch.object(gate, "_click_ui", side_effect=click),
+        ):
+            result = gate._run_ios_search_profile(session, receiver)
+        self.assertTrue(selected)
+        self.assertEqual(result["receiverAssertion"], f"profile-visible:{receiver.ptid}")
+
+    def test_select_radio_operates_visible_control_and_waits_for_checked(self) -> None:
+        session = Mock()
+        session.execute_script.side_effect = [None, {"index": 3}]
+
+        index = SimulatorSocialGate._select_radio(
+            session,
+            'label.pt-check-label:has(input[value="federation-1"])',
+            'input[type="radio"][value="federation-1"]',
+            ".search-submit",
+            "Federation",
+        )
+
+        self.assertEqual(session.execute_script.call_count, 2)
+        script = session.execute_script.call_args_list[0].args[0]
+        self.assertIn("input.click()", script)
+        self.assertIn("input.checked !== true", script)
+        self.assertIn(
+            "getAttribute('aria-disabled') === 'true'",
+            script,
+        )
+        self.assertEqual(index, 3)
+
+    def test_select_antd_option_opens_current_root_control(self) -> None:
+        session = Mock()
+        # First poll opens the trigger, second poll selects the option.
+        session.execute_script.side_effect = [None, True]
+        gate = SimulatorSocialGate("ios-social-parity")
+
+        gate._select_antd_option(
+            session,
+            '[data-acceptance-id="picker"] .pt-select',
+            3,
+            "Federation",
+        )
+
+        self.assertEqual(session.execute_script.call_count, 2)
+        first = session.execute_script.call_args_list[0]
+        self.assertEqual(
+            first.args[1],
+            '[data-acceptance-id="picker"] .pt-select',
+        )
+        self.assertEqual(first.args[2], 3)
+        self.assertIn(".pt-select-trigger", first.args[0])
+        session.find_element.assert_not_called()
+        session.click_element.assert_not_called()
+
+    def test_post_action_uses_webdriver_element_click(self) -> None:
+        session = Mock()
+        session.find_element.return_value = "post-action"
+
+        SimulatorSocialGate._click_ui_for_post(
+            session,
+            "01M59ASBXMEH91RATX66HFYMEZ",
+            "social-thread-open",
+            "Moment thread",
+        )
+
+        session.find_element.assert_called_once_with(
+            "css selector",
+            (
+                '[data-acceptance-id="social-moment-card"]'
+                '[data-post-id="01M59ASBXMEH91RATX66HFYMEZ"] '
+                '[data-acceptance-id="social-thread-open"]'
+            ),
+        )
+        session.click_element.assert_called_once_with("post-action")
+        session.execute_script.assert_not_called()
+
+    def test_ios_reuses_the_open_product_reaction_picker(self) -> None:
+        source = inspect.getsource(
+            SimulatorSocialGate._run_ios_thread_reaction
+        )
+
+        self.assertLess(
+            IOS_SOCIAL_PARITY_SCENARIOS.index("rc01-thread-reaction"),
+            IOS_SOCIAL_PARITY_SCENARIOS.index("rc01-circles-publish"),
+        )
+        self.assertEqual(source.count('"social-reaction-open"'), 1)
+        self.assertIn('state.get("privatePostId")', source)
+        self.assertIn('"moments.comment"', source)
+        self.assertIn("data-reaction-picker-item", source)
+        self.assertNotIn("moments.private.comment.submit", source)
+        self.assertNotIn("social-reaction-choice", source)
+
+    def test_moment_thread_diagnostic_exposes_only_structural_counts(self) -> None:
+        session = Mock()
+        session.execute_script.return_value = {
+            "momentsPages": 1,
+            "cards": 1,
+            "actions": 1,
+            "threads": 0,
+            "rootError": "TypeError: render failed",
+        }
+
+        state = SimulatorSocialGate._moment_thread_state(
+            session,
+            "01M59ASBXMEH91RATX66HFYMEZ",
+        )
+
+        self.assertEqual(
+            state,
+            {
+                "momentsPages": 1,
+                "cards": 1,
+                "actions": 1,
+                "threads": 0,
+                "rootError": "TypeError: render failed",
+            },
+        )
+        self.assertNotIn(
+            "01M59ASBXMEH91RATX66HFYMEZ",
+            str(state),
+        )
+
+    def test_circle_audience_selects_the_created_circle_row(self) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+        sender_session = Mock()
+        sender_session.call_action.return_value = {"publish": []}
+        receiver_session = Mock()
+        receiver = self._actor("sim-ios-peer", "bob")
+
+        with (
+            patch.object(gate, "_wait_ui"),
+            patch.object(gate, "_set_ui_value"),
+            patch.object(gate, "_select_antd_option"),
+            patch.object(
+                gate,
+                "_wait_ui_attribute_value",
+                return_value="circle-42",
+            ),
+            patch.object(gate, "_wait_ui_text"),
+            patch.object(
+                gate,
+                "_wait_ui_attribute",
+                side_effect=RuntimeError("stop after circle target"),
+            ),
+            patch.object(gate, "_click_ui") as click,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after circle target"):
+                gate._run_ios_circles_publish(
+                    sender_session,
+                    receiver_session,
+                    receiver,
+                    "journey-1",
+                    {},
+                )
+
+        clicked_selectors = [call.args[1] for call in click.call_args_list]
+        self.assertIn(
+            (
+                '[data-acceptance-id="social-audience-circle"]'
+                '[data-circle-id="circle-42"]'
+            ),
+            clicked_selectors,
+        )
+        self.assertNotIn(
+            '[data-acceptance-id="social-audience-target-done"]',
+            clicked_selectors,
+        )
+
+    def test_private_key_fixture_prepares_and_reconciles_each_inventory(self) -> None:
+        session = Mock(client_id="sim-ios")
+        session.call_action.side_effect = [
+            {
+                "endpointPrekeysAvailable": 100,
+                "recoveryPrekeysAvailable": 16,
+            },
+            {
+                "report": {
+                    "endpointPrekeysAvailable": 100,
+                    "recoveryPrekeysAvailable": 16,
+                },
+            },
+        ]
+
+        inventory = SimulatorSocialGate._prepare_private_keys(session)
+
+        self.assertEqual(
+            [item.args[0] for item in session.call_action.call_args_list],
+            [
+                "moments.private.acceptance.prepareKeys",
+                "moments.private.reconcile",
+            ],
+        )
+        self.assertEqual(
+            inventory,
+            {
+                "endpointPrekeysAvailable": 100,
+                "recoveryPrekeysAvailable": 16,
+            },
+        )
+
+    def test_identity_preparation_reuses_one_channel_for_all_actors(self) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+        client = Mock()
+        client.invoke.return_value = {"prepared": True}
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e."
+            "EphemeralGateClient.from_environment",
+            return_value=client,
+        ) as bind:
+            for client_id, role in (
+                ("sim-ios", "alice"),
+                ("sim-ios-peer", "bob"),
+                ("sim-ios", "eve"),
+            ):
+                session = Mock(client_id=client_id, session_id="owned-session")
+                gate._prepare_actor_identity(session, role)
+        bind.assert_called_once_with()
+        self.assertEqual(
+            [call.args[2]["role"] for call in client.invoke.call_args_list],
+            ["alice", "bob", "eve"],
+        )
+        client.close.assert_not_called()
+
+    def test_capability_channel_closes_after_failed_journey_cleanup(self) -> None:
+        artifacts = Artifacts()
+        gate = SimulatorSocialGate("ios-social-parity")
+        client = Mock()
+        gate.capability_client = client
+        order = []
+        client.close.side_effect = lambda: order.append("channel")
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "ArtifactSession", return_value=artifacts,
+            ),
+            patch.object(gate, "_load_social_manifest", return_value={}),
+            patch.object(
+                gate, "_run_social_journey", side_effect=GateError("journey failed"),
+            ),
+            patch.object(gate, "_capture_runtime_failure", return_value=[]),
+            patch.object(
+                gate, "_cleanup_sessions",
+                side_effect=lambda _: order.append("sessions"),
+            ),
+        ):
+            self.assertEqual(gate.execute(), 1)
+        self.assertEqual(order, ["sessions", "channel"])
+        client.close.assert_called_once_with()
+        self.assertIsNone(gate.capability_client)
+        self.assertEqual(gate.cleanup[-1]["status"], "passed")
+
+    @staticmethod
+    def _actor(client_id: str, role: str) -> MessagingActor:
+        return MessagingActor(
+            client_id=client_id,
+            role=role,
+            station_url="https://station.example.test",
+            station_peer_id="station-peer",
+            ptid=f"ptid:{role}",
+            account_ref=f"station-account:{role}",
+            federated_handle=f"@{role}@station.example.test",
+            federation_id="federation-1",
+        )
+
+    def test_capture_rejects_chat_render_error_after_preserving_evidence(self) -> None:
+        artifacts = Mock()
+        artifact_ref = Mock()
+        artifact_ref.to_dict.return_value = {"path": "captured"}
+        artifacts.write_bytes.return_value = artifact_ref
+        session = Mock()
+        session.screenshot_bytes.return_value = b"png"
+        session.get_page_source.return_value = (
+            '<section data-testid="chat-render-error">'
+            "Chat could not be displayed.</section>"
+        )
+
+        with self.assertRaisesRegex(
+            GateError,
+            "sim-ios rendered the Mobile Chat error boundary",
+        ):
+            SimulatorSocialGate("chat-contacts")._capture_client(
+                artifacts,
+                session,
+                "sim-ios",
+            )
+
+        self.assertEqual(artifacts.write_bytes.call_count, 2)
+
+    def test_failure_diagnostics_exclude_actor_and_cursor_state(self) -> None:
+        artifacts = Mock()
+        artifacts.write_json.return_value.to_dict.return_value = {
+            "path": "failure-runtime.json",
+        }
+        session = Mock(client_id="sim-ios")
+        session.call_action.side_effect = [
+            {
+                "phase": "ACTIVE",
+                "generation": 3,
+                "runtimes": [
+                    {"id": "messaging", "status": "failed"},
+                ],
+                "runtimeErrors": [
+                    {
+                        "runtimeId": "messaging",
+                        "error": "ACTOR_IDENTITY_CONTINUITY_CONFLICT",
+                    },
+                ],
+                "activeActorPtid": "private-actor",
+            },
+            {
+                "active": False,
+                "activeSessionUlid": "private-session",
+                "friendRequests": [{"senderPtid": "private-actor"}],
+                "ingress": {
+                    "lifecycle": "active",
+                    "writeAdmissionOpen": False,
+                    "streamCursor": "private-cursor",
+                },
+            },
+            {
+                "actorPtid": "private-actor",
+                "publish": [
+                    {
+                        "draftId": "private-draft",
+                        "audienceKind": "CIRCLE",
+                        "state": "PUBLISH_FAILED",
+                        "errorCode": "SOCIAL_20008",
+                    },
+                ],
+                "publishStateHistory": [
+                    "CHECKING_PRIVATE_READINESS",
+                    "PUBLISH_FAILED",
+                ],
+                "report": {
+                    "submissionsProcessed": 0,
+                    "submissionsUnknown": 0,
+                    "submissionsTerminal": 1,
+                },
+                "errorPresent": True,
+            },
+        ]
+        gate = SimulatorSocialGate("ios-social-parity")
+        gate.sessions.append(session)
+
+        result = gate._capture_runtime_failure(artifacts)
+
+        self.assertEqual(result[0]["clientId"], "sim-ios")
+        value = artifacts.write_json.call_args.args[1]
+        self.assertNotIn("activeActorPtid", value["lifecycle"])
+        self.assertNotIn("activeSessionUlid", value["social"])
+        self.assertNotIn("friendRequests", value["social"])
+        self.assertNotIn("streamCursor", value["social"]["ingress"])
+        self.assertNotIn("actorPtid", value["privateSocial"])
+        self.assertNotIn("draftId", value["privateSocial"]["publish"][0])
+        self.assertEqual(
+            value["privateSocial"]["publish"][0],
+            {
+                "audienceKind": "CIRCLE",
+                "state": "PUBLISH_FAILED",
+                "errorCode": "SOCIAL_20008",
+            },
+        )
+        self.assertEqual(
+            value["lifecycle"]["runtimeErrors"][0]["error"],
+            "ACTOR_IDENTITY_CONTINUITY_CONFLICT",
+        )
+
+    def test_each_client_failure_has_one_distinct_evidence_role(self) -> None:
+        artifacts = Mock()
+        gate = SimulatorSocialGate("ios-social-parity")
+        for client_id in ("sim-ios", "sim-ios-peer"):
+            session = Mock(client_id=client_id)
+            session.call_action.side_effect = [
+                {"phase": "ACTIVE", "runtimes": [], "runtimeErrors": []},
+                {"active": False, "ingress": None},
+                {
+                    "publish": [],
+                    "publishStateHistory": [],
+                    "report": None,
+                    "errorPresent": False,
+                },
+            ]
+            gate.sessions.append(session)
+
+        diagnostics = gate._capture_runtime_failure(artifacts)
+
+        roles = [
+            call.kwargs["role"]
+            for call in artifacts.write_json.call_args_list
+        ]
+        self.assertEqual(len(set(roles)), 2)
+        self.assertTrue(all("artifact" in item for item in diagnostics))
+
+    def test_failure_diagnostic_error_remains_supporting_only(self) -> None:
+        artifacts = Mock()
+        session = Mock(client_id="sim-ios")
+        session.call_action.side_effect = DriverError("session closed")
+        gate = SimulatorSocialGate("ios-social-parity")
+        gate.sessions.append(session)
+
+        self.assertEqual(
+            gate._capture_runtime_failure(artifacts),
+            [{"clientId": "sim-ios", "captureErrorType": "DriverError"}],
+        )
+        artifacts.write_json.assert_not_called()
+
+    def test_chat_failure_preserves_native_surface_before_runtime_diagnostics(self) -> None:
+        artifacts = Mock()
+        artifacts.write_bytes.return_value.to_dict.return_value = {"path": "native-ax.xml"}
+        session = Mock(client_id="sim-ios")
+        session.get_page_source.return_value = "<App><Image label='photo.png'/></App>"
+        session.call_action.side_effect = DriverError("runtime snapshot unavailable")
+        gate = SimulatorSocialGate("chat")
+        gate.sessions.append(session)
+        captured = {"screenshot": {"path": "screenshot.png"}, "dom": {"path": "web-dom.html"}}
+        with patch.object(gate, "_capture_client", return_value=captured) as capture:
+            diagnostics = gate._capture_runtime_failure(artifacts)
+        capture.assert_called_once_with(artifacts, session, "sim-ios/failure")
+        self.assertEqual(diagnostics[0]["captureErrorType"], "DriverError")
+        self.assertEqual(diagnostics[0]["chatSurface"]["dom"], captured["dom"])
+        self.assertEqual(diagnostics[0]["chatSurface"]["nativeAccessibility"], {"path": "native-ax.xml"})
+        self.assertIn("/failure/native-ax.xml", artifacts.write_bytes.call_args.args[0])
+        artifacts.write_json.assert_not_called()
+
+    def test_canonical_simulator_gate_claims_declared_proof(self) -> None:
+        artifacts = Artifacts()
+        gate = SimulatorSocialGate("social-convergence")
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "ArtifactSession",
+                return_value=artifacts,
+            ),
+            patch.object(
+                gate,
+                "_load_social_manifest",
+                return_value={"environmentId": ENVIRONMENT_ID},
+            ),
+            patch.object(
+                gate,
+                "_run_social_journey",
+                return_value=gate._result_base("PASS"),
+            ),
+            patch.object(gate, "_cleanup_sessions"),
+        ):
+            exit_code = gate.execute()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(artifacts.completed["status"], "PASS")
+        self.assertEqual(artifacts.completed["completion_status"], "DONE")
+        self.assertEqual(artifacts.completed["proof_status"], "PROVEN")
+        result = next(
+            value
+            for path, value, _role in artifacts.writes
+            if path.endswith("/result.json")
+        )
+        self.assertEqual(
+            result["artifactKind"],
+            "acceptance-gate-evidence-report",
+        )
+        self.assertEqual(result["gateId"], gate.gate_id)
+        self.assertEqual(result["phase"], "W5 Simulator Social Convergence")
+        self.assertEqual(result["bom"], ["W5", "W5-OWNER"])
+        self.assertEqual(result["spec"], ["MS-AG06"])
+        self.assertEqual(result["gate"], gate.gate_id)
+        self.assertFalse(result["physicalDeviceClaimed"])
+        self.assertIn(
+            "physical-device hardware behavior",
+            result["unprovenScope"],
+        )
+
+    @staticmethod
+    def _social_evidence(**overrides: object) -> dict[str, object]:
+        ref = {"path": "captured/path", "sha256": "0" * 64}
+        evidence: dict[str, object] = {
+            "source_identity": {
+                "commit": "a" * 40,
+                "workspaceDigest": "clean",
+                "canonicalWorktreeHash": "w" * 16,
+            },
+            "runtime_identity": {"appium": {"serverVersion": "verified"}},
+            "authentication": {
+                "sim-ios": {"ptid": "ptid:alice"},
+                "sim-ios-peer": {"ptid": "ptid:bob"},
+            },
+            "actor_identity_preparation": {
+                "sim-ios": {"scope": "station-peer|ptid:alice"},
+                "sim-ios-peer": {"scope": "station-peer|ptid:bob"},
+            },
+            "captures": {
+                "sim-ios": {
+                    "clientId": "sim-ios",
+                    "screenshot": dict(ref),
+                    "dom": dict(ref),
+                },
+                "sim-ios-peer": {
+                    "clientId": "sim-ios-peer",
+                    "screenshot": dict(ref),
+                    "dom": dict(ref),
+                },
+            },
+            "journey_result": {"conversationId": "conv-1"},
+        }
+        evidence.update(overrides)
+        return evidence
+
+    def test_social_evidence_assertions_satisfy_core_proof_contract(self) -> None:
+        gate = SimulatorSocialGate("chat-contacts")
+        evidence = self._social_evidence(journey_result={
+            "conversationId": "conv-1", "nativeText": self._native_chat_text(),
+        })
+        assertions = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"),
+            source_identity=evidence["source_identity"],
+            runtime_identity=evidence["runtime_identity"],
+            authentication=evidence["authentication"],
+            actor_identity_preparation=evidence["actor_identity_preparation"],
+            captures=evidence["captures"],
+            journey_result=evidence["journey_result"],
+        )
+
+        self.assertTrue(assertions_pass(assertions))
+        self.assertTrue(assertions)
+        self.assertEqual(
+            len(assertions), len({item["name"] for item in assertions})
+        )
+        names = {item["name"] for item in assertions}
+        self.assertIn(
+            "chat-contacts:sim-ios:production-authentication-observed",
+            names,
+        )
+        self.assertIn(
+            "chat-contacts:sim-ios-peer:"
+            "dom-and-screenshot-captured-without-error-boundary",
+            names,
+        )
+
+    def test_social_convergence_emits_local_direct_scope_assertion(self) -> None:
+        gate = SimulatorSocialGate("social-convergence")
+
+        local = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"),
+            **self._social_evidence(
+                journey_result={"directScope": "local"},
+            ),
+        )
+        scope_assertion = next(
+            item
+            for item in local
+            if item["name"] == "social-convergence:local-direct-scope-proven"
+        )
+        self.assertTrue(scope_assertion["passed"])
+        self.assertTrue(assertions_pass(local))
+
+        federated = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"),
+            **self._social_evidence(
+                journey_result={"directScope": "federation"},
+            ),
+        )
+        self.assertFalse(assertions_pass(federated))
+
+    def test_social_evidence_assertions_fail_closed_on_missing_observation(
+        self,
+    ) -> None:
+        gate = SimulatorSocialGate("chat-contacts")
+
+        unknown_source = self._social_evidence(
+            source_identity={"commit": "unknown", "workspaceDigest": "unknown"},
+        )
+        source_assertions = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"), **unknown_source
+        )
+        self.assertFalse(assertions_pass(source_assertions))
+
+        missing_auth = self._social_evidence(
+            authentication={"sim-ios": {"ptid": "ptid:alice"}},
+        )
+        auth_assertions = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"), **missing_auth
+        )
+        failed_auth = next(
+            item
+            for item in auth_assertions
+            if item["name"]
+            == "chat-contacts:sim-ios-peer:production-authentication-observed"
+        )
+        self.assertFalse(failed_auth["passed"])
+
+        broken_capture = self._social_evidence()
+        broken_capture["captures"] = {
+            "sim-ios": {"clientId": "sim-ios", "screenshot": {"path": "x"}},
+            "sim-ios-peer": {
+                "clientId": "sim-ios-peer",
+                "screenshot": {"path": "x"},
+                "dom": {"path": "x"},
+            },
+        }
+        capture_assertions = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"), **broken_capture
+        )
+        self.assertFalse(assertions_pass(capture_assertions))
+
+    def test_cleanup_failure_does_not_hide_primary_failure(self) -> None:
+        artifacts = Artifacts()
+        gate = SimulatorSocialGate("social-convergence")
+
+        def record_cleanup_failure(_artifacts: Artifacts) -> None:
+            gate.cleanup.append(
+                {
+                    "clientId": "sim-ios",
+                    "resource": "product-harness",
+                    "status": "failed",
+                    "errorType": "DriverError",
+                }
+            )
+
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "ArtifactSession",
+                return_value=artifacts,
+            ),
+            patch.object(
+                gate,
+                "_load_social_manifest",
+                return_value={"environmentId": ENVIRONMENT_ID},
+            ),
+            patch.object(
+                gate,
+                "_run_social_journey",
+                side_effect=DriverError("station.add failed"),
+            ),
+            patch.object(
+                gate,
+                "_cleanup_sessions",
+                side_effect=record_cleanup_failure,
+            ),
+        ):
+            exit_code = gate.execute()
+
+        result = next(
+            value
+            for path, value, _role in artifacts.writes
+            if path.endswith("/result.json")
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(result["reason"], "station.add failed")
+        self.assertEqual(
+            result["cleanupReason"],
+            "simulator social cleanup was incomplete",
+        )
+
+    def test_gate_ids_are_stable_and_scenario_specific(self) -> None:
+        self.assertEqual(
+            SCENARIO_GATES,
+            {
+                "ios-social-parity": "mobile-social-ios-native",
+                "social-convergence": (
+                    "mobile-simulator-social-convergence-e2e"
+                ),
+                "chat": "mobile-simulator-chat-e2e",
+                "chat-contacts": "mobile-simulator-chat-contacts-e2e",
+                "recovery": "mobile-simulator-recovery-e2e",
+                "recovery-ui": "mobile-simulator-recovery-ui-e2e",
+                "moments": "mobile-simulator-moments-e2e",
+                "storage-cache-cleanup": "chat-storage-cache-clear-e2e",
+                "storage-batch-clear": (
+                    "chat-storage-mobile-batch-clear-e2e"
+                ),
+                "storage-conversation-clear": (
+                    "chat-storage-delete-reclaim-e2e"
+                ),
+                "storage-retention": "chat-storage-retention-e2e",
+            },
+        )
+        self.assertNotEqual(
+            SimulatorSocialGate("social-convergence").gate_id,
+            SimulatorSocialGate("chat-contacts").gate_id,
+        )
+
+    def test_ios_social_parity_declares_one_reusable_runtime(self) -> None:
+        self.assertEqual(
+            IOS_SOCIAL_RUNTIME_REUSE.scenario_ids,
+            IOS_SOCIAL_PARITY_SCENARIOS,
+        )
+        self.assertEqual(
+            IOS_SOCIAL_RUNTIME_REUSE.max_provisioning_runs,
+            1,
+        )
+        self.assertEqual(
+            IOS_SOCIAL_RUNTIME_REUSE.max_client_launches,
+            2,
+        )
+        self.assertGreaterEqual(
+            IOS_SOCIAL_RUNTIME_REUSE.min_warm_reuse_rate,
+            0.8,
+        )
+        self.assertEqual(
+            MobileSocialIOSSimulatorProvisioner
+            .additional_fixture_roles_by_gate["mobile-social-ios-native"],
+            ("eve",),
+        )
+        self.assertTrue(
+            MobileSocialIOSSimulatorProvisioner.requires_actor_reset,
+        )
+        self.assertEqual(
+            SimulatorSocialGate("ios-social-parity").environment_id,
+            IOS_SOCIAL_ENVIRONMENT_ID,
+        )
+
+    def test_active_scenario_cleanup_preserves_failed_suite_report(self) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+        ledger = SuiteRuntimeLedger(
+            IOS_SOCIAL_RUNTIME_REUSE,
+            suite_runtime_id="mps-09-test",
+            source_digest="a" * 40,
+            fixture_epoch="fixture-test",
+        )
+        ledger.record(
+            SuiteRuntimeAction.PROVISION,
+            resource_id="mobile-social-ios-simulator:test",
+        )
+        ledger.record(
+            SuiteRuntimeAction.SCENARIO_START,
+            scenario_id=IOS_SOCIAL_PARITY_SCENARIOS[0],
+        )
+        gate.suite_runtime_ledger = ledger
+
+        report, cleanup_error = gate._finalize_suite_runtime(
+            cleanup_failed=False,
+        )
+
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertEqual(report["result"], "FAIL")
+        self.assertEqual(
+            report["events"][-1]["action"],
+            SuiteRuntimeAction.SCENARIO_START.value,
+        )
+        self.assertIn("SUITE_RUNTIME_CLEANUP_INVALID", cleanup_error)
+        self.assertEqual(
+            report["findings"][-1]["code"],
+            "SUITE_CLEANUP_INCOMPLETE",
+        )
+
+    def test_ios_social_parity_records_each_scenario_once(self) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+        result = {
+            "uiAction": "ui",
+            "receiverAssertion": "receiver",
+            "supportingObservation": "supporting",
+        }
+        with (
+            patch.object(
+                gate,
+                "_run_ios_home_explore",
+                return_value=result,
+            ),
+            patch.object(
+                gate,
+                "_run_ios_search_profile",
+                return_value=result,
+            ),
+            patch.object(
+                gate,
+                "_run_ios_circles_publish",
+                return_value=result,
+            ),
+            patch.object(
+                gate,
+                "_run_ios_thread_reaction",
+                return_value=result,
+            ),
+            patch.object(
+                gate,
+                "_run_ios_recovery_lifecycle",
+                return_value=result,
+            ),
+            patch.object(
+                gate,
+                "_run_ios_native_quality",
+                return_value=result,
+            ),
+            patch.object(
+                gate,
+                "_prepare_private_keys",
+                return_value={
+                    "endpointPrekeysAvailable": 100,
+                    "recoveryPrekeysAvailable": 16,
+                },
+            ),
+        ):
+            suite = gate._run_ios_social_parity_suite(
+                manifest={"runId": "fixture-epoch"},
+                source_identity={"commit": "a" * 40},
+                sessions={
+                    "sim-ios": object(),
+                    "sim-ios-peer": object(),
+                },
+                actors={
+                    "sim-ios": self._actor("sim-ios", "alice"),
+                    "sim-ios-peer": self._actor(
+                        "sim-ios-peer",
+                        "bob",
+                    ),
+                    "fixture-eve": self._actor("sim-ios", "eve"),
+                },
+                journey=object(),  # type: ignore[arg-type]
+                journey_id="journey",
+            )
+
+        self.assertEqual(
+            [entry["scenarioId"] for entry in suite["scenarios"]],
+            list(IOS_SOCIAL_PARITY_SCENARIOS),
+        )
+        self.assertIsNotNone(gate.suite_runtime_ledger)
+        gate.suite_runtime_ledger.record(
+            SuiteRuntimeAction.CLEANUP_COMPLETE,
+        )
+        report = gate.suite_runtime_ledger.require_valid()
+        self.assertEqual(report["metrics"]["provisioningRuns"], 1)
+        self.assertEqual(report["metrics"]["clientLaunches"], 2)
+        self.assertEqual(report["metrics"]["completedScenarios"], 6)
+
+    def test_explore_sort_requires_the_visible_sheet_before_selection(self) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+        sender = Mock()
+        sender.call_action.return_value = {"postId": "private-post"}
+        receiver = Mock()
+        sort_sheet_open = False
+        hot_selected = False
+
+        def click_visible(_script: str, selector: str) -> bool:
+            nonlocal sort_sheet_open, hot_selected
+            if selector.endswith('social-explore-sort-open"]'):
+                sort_sheet_open = True
+            elif selector.endswith('social-explore-sort-hot"]'):
+                if not sort_sheet_open:
+                    raise GateError("sort option is not on the visible surface")
+                hot_selected = True
+                sort_sheet_open = False
+            return True
+
+        receiver.execute_script.side_effect = click_visible
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e.assert_public_composer_denial",
+                return_value={"publicWriteRejected": True, "composerDraftRetained": True},
+            ),
+            patch.object(gate, "_wait_ui"),
+            patch.object(gate, "_wait_ui_attribute"),
+            patch.object(gate, "_wait_for_moment", return_value={"found": True}),
+            patch.object(gate, "_wait_post_visible"),
+        ):
+            result = gate._run_ios_home_explore(
+                sender,
+                receiver,
+                self._actor("sim-ios", "alice"),
+                self._actor("sim-ios-peer", "bob"),
+                "journey",
+                {},
+            )
+
+        self.assertTrue(hot_selected)
+        self.assertFalse(sort_sheet_open)
+        self.assertEqual(
+            result["receiverAssertion"],
+            "receiver-post:private-post",
+        )
+
+    def test_missing_runtime_manifest_blocks_before_journey(self) -> None:
+        artifacts = Artifacts()
+        gate = SimulatorSocialGate("social-convergence")
+
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "ArtifactSession",
+                return_value=artifacts,
+            ),
+            patch.object(
+                gate,
+                "_load_social_manifest",
+                side_effect=SimulatorGateBlocked(
+                    "runtime manifest missing",
+                    f"{ENVIRONMENT_ID}:manifest",
+                ),
+            ) as load_manifest,
+            patch.object(gate, "_run_social_journey") as run_journey,
+            patch.object(gate, "_cleanup_sessions"),
+        ):
+            exit_code = gate.execute()
+
+        self.assertEqual(exit_code, 2)
+        load_manifest.assert_called_once()
+        run_journey.assert_not_called()
+        result = next(
+            value
+            for path, value, _role in artifacts.writes
+            if path.endswith("/result.json")
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(
+            result["blockedResource"],
+            f"{ENVIRONMENT_ID}:manifest",
+        )
+
+    def test_runtime_manifest_requires_only_same_station_service(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_RUNTIME_MANIFEST": "/tmp/direct.json"},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "load_runtime_manifest",
+                return_value={"environmentId": ENVIRONMENT_ID},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "require_runtime_service",
+            ) as require_service,
+        ):
+            manifest = gate._load_social_manifest()
+
+        self.assertEqual(manifest["environmentId"], ENVIRONMENT_ID)
+        require_service.assert_called_once_with(
+            manifest,
+            "station",
+            "station",
+        )
+
+    def test_cross_station_manifest_cannot_satisfy_direct_gate(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_RUNTIME_MANIFEST": "/tmp/social.json"},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "load_runtime_manifest",
+                return_value={"environmentId": "mobile-social-simulator"},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "require_runtime_service",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                SimulatorGateBlocked,
+                ENVIRONMENT_ID,
+            ):
+                gate._load_social_manifest()
+
+    def test_ios_social_parity_requires_non_destructive_environment(
+        self,
+    ) -> None:
+        gate = SimulatorSocialGate("ios-social-parity")
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"PT_ACCEPTANCE_RUNTIME_MANIFEST": "/tmp/ios-social.json"},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "load_runtime_manifest",
+                return_value={"environmentId": IOS_SOCIAL_ENVIRONMENT_ID},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "require_runtime_service",
+            ) as require_service,
+        ):
+            manifest = gate._load_social_manifest()
+
+        self.assertEqual(
+            manifest["environmentId"],
+            IOS_SOCIAL_ENVIRONMENT_ID,
+        )
+        require_service.assert_called_once_with(
+            manifest,
+            "station",
+            "station",
+        )
+
+    def test_unknown_scenario_fails_before_runtime_allocation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            SimulatorSocialGate("unknown")
+
+    def test_request_preflight_uses_selected_scenario_before_initialization(self) -> None:
+        with patch("tooling.acceptance.core.gate.preflight_gate_entry") as preflight:
+            for scenario, gate_id in SCENARIO_GATES.items():
+                with self.subTest(scenario=scenario):
+                    preflight.reset_mock()
+                    gate = SimulatorSocialGate(scenario)
+                    preflight.assert_called_once_with(gate_id)
+                    self.assertEqual(gate.gate_id, gate_id)
+
+    def test_chat_scope_reuses_full_messaging_and_preserves_contact_extensions(
+        self,
+    ) -> None:
+        for scenario in ("chat", "chat-contacts"):
+            with self.subTest(scenario=scenario):
+                gate = SimulatorSocialGate(scenario)
+                artifacts = Artifacts()
+                sessions = [Mock(), Mock()]
+                actors = {
+                    "sim-ios": self._actor("sim-ios", "alice"),
+                    "sim-ios-peer": self._actor("sim-ios-peer", "bob"),
+                }
+                journey = Mock()
+                journey.authenticate.return_value = {"authenticated": True}
+                journey.run_chat_contacts.return_value = {
+                    "scenario": "chat-contacts",
+                    "direct": {"messageId": "direct-message"},
+                    "group": {"messageId": "group-message"},
+                }
+                manifest = {
+                    "mobileSimulator": {
+                        "applications": {"ios": {"buildIdentity": {}}},
+                        "appium": {"serverUrl": "http://127.0.0.1:4723"},
+                    },
+                }
+                module = "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                with (
+                    patch(module + "_validate_source_identity", return_value={
+                        "commit": "a" * 40, "workspaceDigest": "clean",
+                    }),
+                    patch(module + "_validate_runtime_identity", return_value={
+                        "appium": "verified",
+                    }),
+                    patch(module + "MobileMessagingJourney", return_value=journey),
+                    patch.object(gate, "_reject_credentials"),
+                    patch.object(gate, "_client_specs", return_value=(
+                        SimpleNamespace(client_id="sim-ios"),
+                        SimpleNamespace(client_id="sim-ios-peer"),
+                    )),
+                    patch.object(gate, "_start_social_session", side_effect=sessions),
+                    patch.object(gate, "_load_actors", return_value=actors),
+                    patch.object(gate, "_prepare_fresh_actor_identity", return_value={
+                        "prepared": True,
+                    }),
+                    patch.object(gate, "_capture_client", return_value={
+                        "screenshot": {"path": "screenshot.png"},
+                        "dom": {"path": "dom.html"},
+                    }),
+                    patch.object(gate, "_run_contact_preferences_and_clipboard") as contacts,
+                    patch.object(gate, "_run_native_profile_images") as profile,
+                    patch.object(gate, "_run_chat_native_media", return_value=self._native_chat_media()) as media,
+                    patch.object(gate, "run_chat_native_text", return_value=self._native_chat_text()) as text,
+                ):
+                    result = gate._run_social_journey(artifacts, manifest)
+
+                journey.run_chat_contacts.assert_called_once_with(
+                    sender_session=sessions[0],
+                    receiver_session=sessions[1],
+                    sender=actors["sim-ios"],
+                    receiver=actors["sim-ios-peer"],
+                    journey_id=artifacts.run_id[-12:],
+                )
+                self.assertEqual(result["scenario"], scenario)
+                self.assertEqual(result["journey"]["scenario"], scenario)
+                self.assertIn("direct", result["journey"])
+                self.assertIn("group", result["journey"])
+                self.assertEqual(contacts.call_count, int(scenario == "chat-contacts"))
+                self.assertEqual(profile.call_count, int(scenario == "chat-contacts"))
+                self.assertEqual(media.call_count, int(scenario == "chat"))
+                text.assert_called_once()
+
+    @staticmethod
+    def _native_chat_text() -> dict[str, object]:
+        return {
+            kind: {
+                direction: {
+                    "messageId": f"{kind}-{direction}",
+                    "harnessSendUsed": False,
+                    "senderUi": {"messageVisible": True, "draftVisible": True},
+                    "receiverUi": {"messageVisible": True, "draftVisible": True},
+                    "senderReceipt": "read",
+                    "receiverCapture": {
+                        "dom": {"path": f"{kind}-{direction}.html"},
+                        "screenshot": {"path": f"{kind}-{direction}.png"},
+                    },
+                }
+                for direction in ("forward", "reverse")
+            }
+            for kind in ("direct", "group")
+        }
+
+    def test_native_text_uses_four_ui_sends_with_same_id_receiver_and_draft(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        sender, receiver = Mock(platform="ios"), Mock(platform="ios")
+        sender.execute_script.side_effect = [
+            [{"messageId": "direct-forward"}], "read",
+            [{"messageId": "group-forward"}], "delivered",
+        ]
+        receiver.execute_script.side_effect = [
+            [{"messageId": "direct-reverse"}], "delivered",
+            [{"messageId": "group-reverse"}], "read",
+        ]
+        with (
+            patch.object(gate, "_open_chat_conversation") as navigate,
+            patch.object(gate, "_write_chat_composer_draft"),
+            patch.object(gate, "_click_ui") as click,
+            patch.object(gate, "_wait_for_chat_ui_state", return_value={
+                "messageVisible": True, "draftVisible": True,
+            }) as visible,
+            patch.object(gate, "_capture_client", return_value={
+                "dom": {"path": "text.html"}, "screenshot": {"path": "text.png"},
+            }),
+        ):
+            result = gate.run_chat_native_text(
+                artifacts=Artifacts(), sender_session=sender, receiver_session=receiver,
+                conversations={
+                    "direct": {"conversationId": "direct-id"},
+                    "group": {"conversationId": "group-id"},
+                },
+                journey_id="text-run",
+            )
+        self.assertEqual(navigate.call_count, 4)
+        self.assertEqual(click.call_count, 4)
+        self.assertEqual(visible.call_count, 8)
+        for index, (kind, direction) in enumerate(
+            (kind, direction) for kind in ("direct", "group")
+            for direction in ("forward", "reverse")
+        ):
+            message_id = f"{kind}-{direction}"
+            sender_check, receiver_check = visible.call_args_list[index * 2:index * 2 + 2]
+            self.assertEqual(sender_check.kwargs["message_id"], message_id)
+            self.assertEqual(receiver_check.kwargs["message_id"], message_id)
+            self.assertEqual(sender_check.kwargs["draft_text"], "")
+            self.assertEqual(
+                receiver_check.kwargs["draft_text"], f"unsent-text-run-{kind}-{direction}",
+            )
+            self.assertFalse(result[kind][direction]["harnessSendUsed"])
+        sender.call_action.assert_not_called()
+        receiver.call_action.assert_not_called()
+
+    @staticmethod
+    def _native_chat_media() -> dict[str, object]:
+        return {
+            kind: {
+                "image": {
+                    "fixturePickerResultInjected": False,
+                    "cancelled": {
+                        "draftPreserved": True, "attachmentCount": 0, "editableFocus": False,
+                    },
+                    "receiverDecoded": {"decoded": True},
+                    "nativeAccessibility": {"path": f"{kind}/picker.xml"},
+                    "nativeScreenshot": {"path": f"{kind}/picker.png"},
+                },
+                "voice": {
+                    "syntheticAudioInjected": False,
+                    "receiverBytesOpened": True,
+                    "receiverDecoded": {"decoded": True},
+                    "receiverPlayback": {"played": True},
+                },
+            }
+            for kind in ("direct", "group")
+        }
+
+    def test_chat_media_reuses_two_clients_for_both_conversation_kinds(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        sender = Mock(platform="ios")
+        receiver = Mock(platform="ios")
+        sender.device.identifier = "owned-sender"
+        conversations = {
+            "direct": {"conversationId": "direct-id"},
+            "group": {"conversationId": "group-id"},
+        }
+        journey = Mock()
+        with (
+            patch("tooling.acceptance.gates.mobile.simulator_social_e2e.subprocess.run",
+                  return_value=SimpleNamespace(returncode=0)) as seed,
+            patch.object(gate, "_open_chat_conversation") as navigate,
+            patch.object(gate, "_run_native_chat_image", return_value={"selected": True}) as image,
+            patch.object(gate, "_run_recorded_voice", return_value={"played": True}) as voice,
+            patch.object(gate, "_capture_client", return_value={"path": "receiver"}),
+        ):
+            result = gate._run_chat_native_media(
+                artifacts=Artifacts(), sender_session=sender, receiver_session=receiver,
+                conversations=conversations, journey=journey, journey_id="media-run",
+            )
+        seed.assert_called_once()
+        self.assertEqual(set(result), {"direct", "group"})
+        for index, kind in enumerate(("direct", "group")):
+            conversation_id = conversations[kind]["conversationId"]
+            self.assertEqual(navigate.call_args_list[index * 2].args, (sender, conversation_id))
+            self.assertEqual(navigate.call_args_list[index * 2 + 1].args, (receiver, conversation_id))
+            self.assertEqual(navigate.call_args_list[index * 2].kwargs, {"kind": kind})
+            for action in (image, voice):
+                call = action.call_args_list[index]
+                self.assertIs(call.kwargs["sender_session"], sender)
+                self.assertIs(call.kwargs["receiver_session"], receiver)
+                self.assertEqual(call.kwargs["conversation_id"], conversation_id)
+                self.assertEqual(call.kwargs["journey_id"], f"media-run-{kind}")
+
+    def test_recorded_voice_uses_live_permission_prompt_without_simctl_mutation(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        sender, receiver, journey, artifacts = Mock(), Mock(), Mock(), Mock()
+        sender.get_page_source.return_value = "<App/>"
+        sender.screenshot_bytes.return_value = b"png"
+        sender.execute_script.side_effect = [
+            None,
+            DriverError("An attempt was made to operate on a modal dialog when one was not open"),
+            False,
+            ["Don't Allow", "Allow"], None, True,
+            {"events": [{"type": "click", "trusted": True, "reachedVoice": True}]},
+            {"filename": "voice.m4a", "durationSeconds": 2.5},
+        ]
+        receiver.execute_async_script.return_value = {"started": True}
+        receiver.execute_script.side_effect = [
+            {"played": True, "currentTimeSeconds": 0.2}, None,
+        ]
+        journey._attachment_available.return_value = True
+        message = {
+            "messageId": "voice-message",
+            "attachments": [{
+                "attachmentId": "voice-attachment", "filename": "voice.m4a",
+                "mimeType": "audio/mp4", "voiceNote": {"durationMs": 2500},
+            }],
+        }
+
+        def wait(probe: object, _label: str) -> object:
+            for _ in range(3):
+                value = probe()
+                if value is not None:
+                    return value
+            raise GateError("recording state did not converge")
+
+        with (
+            patch("tooling.acceptance.gates.mobile.simulator_social_e2e.subprocess.run",
+                  side_effect=AssertionError("Live recorder must not change Simulator permissions")),
+            patch("tooling.acceptance.gates.mobile.simulator_social_e2e.time.monotonic",
+                  side_effect=[0, 3]),
+            patch.object(gate, "_write_chat_composer_draft"),
+            patch.object(gate, "_wait_ui"),
+            patch.object(gate, "_click_ui") as click,
+            patch.object(gate, "_find_native_element_or_none", return_value="voice-button"),
+            patch.object(gate, "_wait_for_value", side_effect=wait),
+            patch.object(gate, "_wait_received_media_message", return_value=message),
+            patch.object(gate, "_wait_chat_media", return_value={"decoded": True}),
+        ):
+            result = gate._run_recorded_voice(
+                artifacts=artifacts,
+                sender_session=sender, receiver_session=receiver,
+                conversation_id="direct-id", journey_id="live-voice", journey=journey,
+            )
+        self.assertEqual(sender.switch_to_native.call_count, 3)
+        sender.click_element.assert_called_once_with("voice-button")
+        sender.execute_script.assert_any_call(
+            "mobile: alert", {"action": "accept", "buttonLabel": "Allow"},
+        )
+        self.assertEqual(sender.switch_to_app_webview.call_count, 3)
+        self.assertEqual(artifacts.write_bytes.call_count, 2)
+        self.assertEqual(artifacts.write_json.call_args.kwargs["role"],
+                         "mobile-chat-native-voice-activation/live-voice")
+        self.assertEqual([call.args[1] for call in click.call_args_list], [
+            '[data-action-id="chat.voice.finish"]',
+            '[data-action-id="chat.send-message"]',
+        ])
+        self.assertEqual(result["receiverPlayback"]["played"], True)
+        self.assertFalse(result["syntheticAudioInjected"])
+
+    def test_native_microphone_permission_keeps_absence_and_driver_failures_distinct(self) -> None:
+        session = Mock()
+        for reason in (
+            "no such alert",
+            "no alert is present",
+            "Appium POST /session/native/execute/sync failed with HTTP 404: "
+            "An attempt was made to operate on a modal dialog when one was not open",
+        ):
+            with self.subTest(reason=reason):
+                session.reset_mock()
+                session.execute_script.side_effect = DriverError(reason)
+                SimulatorSocialGate._accept_native_microphone_permission(session)
+                session.execute_script.assert_called_once_with("mobile: alert", {"action": "getButtons"})
+        session.reset_mock()
+        session.execute_script.side_effect = DriverError("native transport unavailable")
+        with self.assertRaisesRegex(DriverError, "native transport unavailable"):
+            SimulatorSocialGate._accept_native_microphone_permission(session)
+        session.execute_script.assert_called_once()
+        session.reset_mock()
+        session.execute_script.side_effect = None
+        session.execute_script.return_value = ["Cancel", "Delete"]
+        with self.assertRaisesRegex(GateError, "Unexpected system alert"):
+            SimulatorSocialGate._accept_native_microphone_permission(session)
+        session.execute_script.assert_called_once()
+
+    def test_chat_media_proof_rejects_bytes_only_and_injected_capture(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        for missing in (None, "photo", "playback", "microphone"):
+            with self.subTest(missing=missing):
+                media = self._native_chat_media()
+                if missing == "photo":
+                    media["group"]["image"]["receiverDecoded"] = {}
+                elif missing == "playback":
+                    media["direct"]["voice"]["receiverPlayback"] = {}
+                elif missing == "microphone":
+                    media["group"]["voice"]["syntheticAudioInjected"] = True
+                evidence = self._social_evidence(journey_result={
+                    "nativeMedia": media, "nativeText": self._native_chat_text(),
+                })
+                assertions = gate._assertions_from_social_evidence(
+                    report_base=gate._result_base("PASS"), **evidence,
+                )
+                self.assertEqual(assertions_pass(assertions), missing is None)
+        assertions = gate._assertions_from_social_evidence(
+            report_base=gate._result_base("PASS"), **self._social_evidence(),
+        )
+        self.assertFalse(assertions_pass(assertions))
+
+    def test_native_text_proof_rejects_projection_only_missing_reverse_and_draft_loss(self) -> None:
+        for scenario in ("chat", "chat-contacts"):
+            gate = SimulatorSocialGate(scenario)
+            for missing in ("receiver-dom", "reverse", "draft", "receipt", "harness-send"):
+                with self.subTest(scenario=scenario, missing=missing):
+                    text = self._native_chat_text()
+                    row = text["group"]["reverse"]
+                    if missing == "receiver-dom":
+                        row["receiverCapture"] = {}
+                    elif missing == "reverse":
+                        del text["group"]["reverse"]
+                    elif missing == "draft":
+                        row["receiverUi"]["draftVisible"] = False
+                    elif missing == "receipt":
+                        row["senderReceipt"] = "sent"
+                    else:
+                        row["harnessSendUsed"] = True
+                    assertions = gate._assertions_from_social_evidence(
+                        report_base=gate._result_base("PASS"),
+                        **self._social_evidence(journey_result={
+                            "nativeMedia": self._native_chat_media(), "nativeText": text,
+                        }),
+                    )
+                    self.assertFalse(assertions_pass(assertions))
+
+    def test_chat_group_route_uses_the_group_conversation_descriptor(self) -> None:
+        session = Mock()
+        SimulatorSocialGate._open_chat_conversation(session, "group-id", kind="group")
+        self.assertEqual(session.call_action.call_args.args, (
+            "navigation.apply",
+            {"kind": "detail.push", "route": {
+                "routeId": "detail:group-conversation", "groupUlid": "group-id",
+            }},
+        ))
+
+    def test_native_chat_file_action_excludes_same_label_toolbar_and_preserves_failed_entry(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        session = Mock()
+        session.get_page_source.return_value = "<App><Button label='File'/></App>"
+        session.screenshot_bytes.return_value = b"png"
+        artifacts = Mock()
+        predicates: list[str] = []
+
+        def find(_session: object, predicate: str) -> str | None:
+            predicates.append(predicate)
+            if "label == 'File'" not in predicate:
+                return None
+            return (
+                "native-file-menu-item"
+                if "type == 'XCUIElementTypeButton'" in predicate
+                and "type == 'XCUIElementTypeMenuItem'" in predicate
+                else "same-label-toolbar-trigger"
+            )
+
+        def wait(read: object, label: str) -> object:
+            value = read()
+            if value is None:
+                raise GateError("picker unavailable")
+            return value
+
+        with (
+            patch.object(gate, "_write_chat_composer_draft"),
+            patch.object(gate, "_click_ui"),
+            patch.object(gate, "_wait_ui"),
+            patch.object(gate, "_find_native_element_or_none", side_effect=find),
+            patch.object(gate, "_wait_for_value", side_effect=wait),
+        ):
+            with self.assertRaisesRegex(GateError, "picker unavailable"):
+                gate._run_native_chat_image(
+                    artifacts=artifacts, sender_session=session, receiver_session=Mock(),
+                    conversation_id="direct", journey_id="media", journey=Mock(),
+                )
+        session.switch_to_native.assert_called_once()
+        session.click_element.assert_called_once_with("native-file-menu-item")
+        session.find_element.assert_not_called()
+        self.assertIn("visible == true", predicates[0])
+        self.assertEqual(artifacts.write_bytes.call_count, 4)
+        self.assertTrue(all("menu-1" in call.args[0] for call in artifacts.write_bytes.call_args_list[:2]))
+        self.assertTrue(all("entry-1" in call.args[0] for call in artifacts.write_bytes.call_args_list[2:]))
+
+    def test_native_photo_selection_taps_virtual_item_and_waits_for_enabled_confirm_and_closure(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        session = Mock()
+        session.get_page_source.return_value = (
+            '<App><XCUIElementTypeImage type="XCUIElementTypeImage" name="PXGGridLayout-Info" '
+            'label="Photo, seeded" visible="false" x="0" y="312" width="133" height="133"/></App>'
+        )
+        predicates: list[str] = []
+        replies = iter(("photo", None, "confirm", "confirm", None))
+
+        def find(_session: object, predicate: str) -> str | None:
+            predicates.append(predicate)
+            return next(replies)
+
+        def wait(read: object, _label: str) -> object:
+            for _ in range(3):
+                value = read()
+                if value is not None:
+                    return value
+            raise GateError("native state did not converge")
+
+        with (
+            patch.object(gate, "_find_native_element_or_none", side_effect=find),
+            patch.object(gate, "_wait_for_value", side_effect=wait),
+        ):
+            result = gate._select_native_chat_photo(session)
+        session.execute_script.assert_called_once_with(
+            "mobile: tap", {"elementId": "photo", "x": 66.5, "y": 66.5},
+        )
+        session.click_element.assert_called_once_with("confirm")
+        self.assertTrue(all("enabled == true" in p for p in predicates[1:3]))
+        self.assertTrue(all("visible == true" in p for p in predicates[3:]))
+        self.assertTrue(result["selectionConfirmed"])
+        self.assertTrue(result["pickerClosed"])
+
+    def test_native_photo_evidence_roles_are_unique_across_direct_and_group_and_picker_attempts(self) -> None:
+        gate = SimulatorSocialGate("chat")
+        sender, receiver, journey, artifacts = Mock(), Mock(), Mock(), Mock()
+        sender.get_page_source.return_value = "<App/>"
+        sender.screenshot_bytes.return_value = b"png"
+        sender.execute_script.side_effect = [
+            value for _ in ("direct", "group") for value in (
+                {"attachmentCount": 0, "editableFocus": False},
+                {"filename": "icon.png", "naturalWidth": 512, "naturalHeight": 512},
+            )
+        ]
+        journey._attachment_available.return_value = True
+        roles: set[str] = set()
+
+        def write(_path: str, _value: bytes, *, media_type: str, role: str) -> object:
+            self.assertNotIn(role, roles, "Direct and Group evidence cannot share an immutable role")
+            roles.add(role)
+            return SimpleNamespace(to_dict=lambda: {"role": role})
+
+        artifacts.write_bytes.side_effect = write
+        with (
+            patch.object(gate, "_write_chat_composer_draft"),
+            patch.object(gate, "_click_ui"),
+            patch.object(gate, "_wait_ui"),
+            patch.object(gate, "_find_native_element_or_none", return_value="native-element"),
+            patch.object(gate, "_wait_for_value", side_effect=lambda probe, _: probe()),
+            patch.object(gate, "_select_native_chat_photo", return_value={"selectionConfirmed": True}),
+            patch.object(gate, "_wait_received_media_message", return_value={
+                "messageId": "image-message",
+                "attachments": [{
+                    "attachmentId": "image-attachment", "filename": "icon.png", "mimeType": "image/png",
+                }],
+            }),
+            patch.object(gate, "_wait_chat_media", return_value={
+                "decoded": True, "naturalWidth": 512, "naturalHeight": 512,
+            }),
+        ):
+            for kind in ("direct", "group"):
+                gate._run_native_chat_image(
+                    artifacts=artifacts, sender_session=sender, receiver_session=receiver,
+                    conversation_id=kind, journey_id=f"media-{kind}", journey=journey,
+                )
+        self.assertEqual(len(roles), 20)
+        for kind in ("direct", "group"):
+            self.assertEqual(sum(f"/media-{kind}" in role for role in roles), 10)
+
+    def test_build_identity_must_match_web_rust_and_provisioned_build(
+        self,
+    ) -> None:
+        expected = {
+            "schema": "peers-mobile-build-identity",
+            "buildId": "build-ios",
+            "platform": "ios",
+        }
+        session = Mock()
+        session.call_action.return_value = {
+            "identity": dict(expected),
+            "embeddedIdentitySha256": "sha256:" + ("a" * 64),
+        }
+
+        observed = SimulatorSocialGate._verify_build_identity(
+            session,
+            expected,
+            "installed build",
+        )
+
+        self.assertEqual(observed["identity"], expected)
+        session.call_action.assert_called_once_with("build.identity")
+        session.call_action.return_value = {
+            "identity": {**expected, "buildId": "other"},
+            "embeddedIdentitySha256": "sha256:" + ("a" * 64),
+        }
+        with self.assertRaisesRegex(GateError, "provisioned build"):
+            SimulatorSocialGate._verify_build_identity(
+                session,
+                expected,
+                "installed build",
+            )
+
+    def test_recovery_restore_decision_releases_modal_and_preserves_drafts(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+        session = Mock()
+        drafts = (
+            {"kind": "moments", "targetId": "moment", "payloadSha256": "a" * 64},
+            {"kind": "chat", "targetId": "conversation", "payloadSha256": "b" * 64},
+        )
+        restored = False
+
+        def click(_session: object, selector: str, _label: str) -> None:
+            nonlocal restored
+            self.assertEqual(selector, '[data-acceptance-id="recovery-draft-restore-action"]')
+            restored = True
+
+        def absent(_session: object, selector: str, _label: str) -> None:
+            self.assertTrue(restored, "Chat cannot resume behind the draft decision")
+            self.assertEqual(selector, '[data-acceptance-id="recovery-draft-restore"]')
+
+        with (
+            patch.object(gate, "_wait_for_recovery_kind") as pending,
+            patch.object(gate, "_click_ui", side_effect=click),
+            patch.object(gate, "_wait_ui_absent", side_effect=absent),
+            patch.object(gate, "_wait_for_reliability_snapshot",
+                         return_value={"drafts": list(drafts)}),
+        ):
+            result = gate._restore_recovery_drafts(session, drafts)
+
+        pending.assert_called_once_with(session, "draft-restore-pending")
+        session.call_action.assert_not_called()
+        self.assertEqual(result, {"action": "restore", "durableDraftsPreserved": True})
+
+    def test_recovery_restore_decision_rejects_unclosed_modal_and_lost_drafts(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+        session = Mock()
+        draft = {"kind": "moments", "targetId": "moment", "payloadSha256": "a" * 64}
+        with (
+            patch.object(gate, "_wait_for_recovery_kind"),
+            patch.object(gate, "_click_ui"),
+            patch.object(gate, "_wait_ui_absent", side_effect=GateError("modal still open")),
+            patch.object(gate, "_wait_for_reliability_snapshot") as snapshot,
+        ):
+            with self.assertRaisesRegex(GateError, "modal still open"):
+                gate._restore_recovery_drafts(session, (draft,))
+            snapshot.assert_not_called()
+        with (
+            patch.object(gate, "_wait_for_recovery_kind"),
+            patch.object(gate, "_click_ui"),
+            patch.object(gate, "_wait_ui_absent"),
+            patch.object(gate, "_wait_for_reliability_snapshot", return_value={"drafts": []}),
+        ):
+            with self.assertRaisesRegex(GateError, "drafts changed identity"):
+                gate._restore_recovery_drafts(session, (draft,))
+        session.call_action.assert_not_called()
+
+    def test_recovery_dispatch_receives_journey_and_build_identity(
+        self,
+    ) -> None:
+        gate = SimulatorSocialGate("recovery")
+        artifacts = Artifacts()
+        expected_identity = {
+            "schema": "peers-mobile-build-identity",
+            "buildId": "build-ios",
+        }
+        sender_session = Mock()
+        receiver_session = Mock()
+        journey = Mock()
+        journey.authenticate.side_effect = [
+            {"actor": "alice"},
+            {"actor": "bob"},
+        ]
+        actors = {
+            "sim-ios": self._actor("sim-ios", "alice"),
+            "sim-ios-peer": self._actor("sim-ios-peer", "bob"),
+        }
+        manifest = {
+            "mobileSimulator": {
+                "applications": {
+                    "ios": {"buildIdentity": expected_identity},
+                },
+                "appium": {"serverUrl": "http://127.0.0.1:4723"},
+            },
+        }
+
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "_validate_source_identity",
+                return_value={
+                    "commit": "a" * 40,
+                    "workspaceDigest": "clean",
+                },
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "_validate_runtime_identity",
+                return_value={"appium": "verified"},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "MobileMessagingJourney",
+                return_value=journey,
+            ),
+            patch.object(gate, "_reject_credentials"),
+            patch.object(
+                gate,
+                "_client_specs",
+                return_value=(
+                    SimpleNamespace(client_id="sim-ios"),
+                    SimpleNamespace(client_id="sim-ios-peer"),
+                ),
+            ),
+            patch.object(
+                gate,
+                "_start_social_session",
+                side_effect=[sender_session, receiver_session],
+            ),
+            patch.object(
+                gate,
+                "_verify_build_identity",
+                side_effect=[
+                    {"identity": expected_identity},
+                    {"identity": expected_identity},
+                ],
+            ),
+            patch.object(gate, "_load_actors", return_value=actors),
+            patch.object(
+                gate,
+                "_prepare_fresh_actor_identity",
+                side_effect=[
+                    {"clientId": "sim-ios", "prepared": True},
+                    {"clientId": "sim-ios-peer", "prepared": True},
+                ],
+            ),
+            patch.object(
+                gate,
+                "_run_recovery_journey",
+                autospec=True,
+                return_value={"scenario": "recovery"},
+            ) as run_recovery,
+            patch.object(
+                gate,
+                "_capture_client",
+                return_value={
+                    "screenshot": {"path": "screenshot.png"},
+                    "dom": {"path": "web-dom.html"},
+                },
+            ),
+        ):
+            gate._run_social_journey(artifacts, manifest)
+
+        run_recovery.assert_called_once_with(
+            artifacts=artifacts,
+            sender_session=sender_session,
+            receiver_session=receiver_session,
+            sender=actors["sim-ios"],
+            receiver=actors["sim-ios-peer"],
+            journey=journey,
+            journey_id=artifacts.run_id[-12:],
+            expected_build_identity=expected_identity,
+        )
+
+    def _patch_social_convergence_dispatch(
+        self,
+        gate: SimulatorSocialGate,
+        journey: Mock,
+        actors: dict[str, MessagingActor],
+        expected_identity: dict[str, str],
+    ):
+        sender_session = Mock()
+        receiver_session = Mock()
+        patches = (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "_validate_source_identity",
+                return_value={
+                    "commit": "a" * 40,
+                    "workspaceDigest": "clean",
+                },
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "_validate_runtime_identity",
+                return_value={"appium": "verified"},
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "MobileMessagingJourney",
+                return_value=journey,
+            ),
+            patch.object(gate, "_reject_credentials"),
+            patch.object(
+                gate,
+                "_client_specs",
+                return_value=(
+                    SimpleNamespace(client_id="sim-ios"),
+                    SimpleNamespace(client_id="sim-ios-peer"),
+                ),
+            ),
+            patch.object(
+                gate,
+                "_start_social_session",
+                side_effect=[sender_session, receiver_session],
+            ),
+            patch.object(gate, "_load_actors", return_value=actors),
+            patch.object(
+                gate,
+                "_prepare_fresh_actor_identity",
+                side_effect=[
+                    {"clientId": "sim-ios", "prepared": True},
+                    {"clientId": "sim-ios-peer", "prepared": True},
+                ],
+            ),
+            patch.object(
+                gate,
+                "_capture_client",
+                return_value={
+                    "screenshot": {"path": "screenshot.png"},
+                    "dom": {"path": "web-dom.html"},
+                },
+            ),
+        )
+        manifest = {
+            "mobileSimulator": {
+                "applications": {
+                    "ios": {"buildIdentity": expected_identity},
+                },
+                "appium": {"serverUrl": "http://127.0.0.1:4723"},
+            },
+        }
+        return sender_session, receiver_session, manifest, patches
+
+    def test_social_convergence_dispatches_peer_only_and_accepts_local_scope(
+        self,
+    ) -> None:
+        gate = SimulatorSocialGate("social-convergence")
+        artifacts = Artifacts()
+        expected_identity = {
+            "schema": "peers-mobile-build-identity",
+            "buildId": "build-ios",
+        }
+        actors = {
+            "sim-ios": self._actor("sim-ios", "alice"),
+            "sim-ios-peer": self._actor("sim-ios-peer", "bob"),
+        }
+        journey = Mock()
+        journey.authenticate.side_effect = [
+            {"actor": "alice"},
+            {"actor": "bob"},
+        ]
+        journey.run_social_convergence.return_value = {
+            "scenario": "social-convergence",
+            "directScope": "local",
+        }
+        sender_session, receiver_session, manifest, patches = (
+            self._patch_social_convergence_dispatch(
+                gate, journey, actors, expected_identity
+            )
+        )
+
+        with contextlib.ExitStack() as stack:
+            for manager in patches:
+                stack.enter_context(manager)
+            gate._run_social_journey(artifacts, manifest)
+
+        journey.run_social_convergence.assert_called_once_with(
+            sender_session=sender_session,
+            receiver_session=receiver_session,
+            sender=actors["sim-ios"],
+            receiver=actors["sim-ios-peer"],
+            journey_id=artifacts.run_id[-12:],
+        )
+
+    def test_social_convergence_rejects_federation_scope(self) -> None:
+        gate = SimulatorSocialGate("social-convergence")
+        artifacts = Artifacts()
+        expected_identity = {
+            "schema": "peers-mobile-build-identity",
+            "buildId": "build-ios",
+        }
+        actors = {
+            "sim-ios": self._actor("sim-ios", "alice"),
+            "sim-ios-peer": self._actor("sim-ios-peer", "bob"),
+        }
+        journey = Mock()
+        journey.authenticate.side_effect = [
+            {"actor": "alice"},
+            {"actor": "bob"},
+        ]
+        journey.run_social_convergence.return_value = {
+            "scenario": "social-convergence",
+            "directScope": "federation",
+        }
+        _, _, manifest, patches = self._patch_social_convergence_dispatch(
+            gate, journey, actors, expected_identity
+        )
+
+        with contextlib.ExitStack() as stack:
+            for manager in patches:
+                stack.enter_context(manager)
+            with self.assertRaises(GateError):
+                gate._run_social_journey(artifacts, manifest)
+
+        journey.run_social_convergence.assert_called_once()
+
+    def test_fresh_actor_identity_is_prepared_without_exposing_seed(
+        self,
+    ) -> None:
+        actor = self._actor("sim-ios", "alice")
+        session = Mock()
+        session.call_action.return_value = {"prepared": True}
+
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e."
+            "secrets.token_bytes",
+            return_value=b"a" * 32,
+        ):
+            result = SimulatorSocialGate._prepare_fresh_actor_identity(
+                session,
+                actor,
+            )
+
+        user_scope = f"{actor.station_peer_id}|{actor.ptid}"
+        expected_digest = hashlib.sha256(
+            user_scope.encode("utf-8")
+            + b"\x1f"
+            + actor.ptid.encode("utf-8")
+        ).digest()[:16].hex()
+        session.call_action.assert_called_once_with(
+            "runtime.prepareActorIdentity",
+            {
+                "storageKey": (
+                    "mobile-crypto-identity.v1.identity."
+                    + expected_digest
+                ),
+                "seedBase64": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
+            },
+        )
+        self.assertEqual(
+            result,
+            {
+                "clientId": "sim-ios",
+                "devicePolicy": "fresh",
+                "prepared": True,
+            },
+        )
+        self.assertNotIn("seedBase64", result)
+        self.assertNotIn("storageKey", result)
+
+    def test_recovery_command_diagnostics_distinguish_identity_and_state(
+        self,
+    ) -> None:
+        gate = SimulatorSocialGate("recovery")
+        with self.assertRaisesRegex(
+            GateError,
+            "missing from durable snapshot",
+        ):
+            gate._require_command(
+                {"commands": []},
+                "command-1",
+                "a" * 64,
+                {"unknown-outcome"},
+            )
+        with self.assertRaisesRegex(
+            GateError,
+            "payload identity changed",
+        ):
+            gate._require_command(
+                {
+                    "commands": [{
+                        "commandId": "command-1",
+                        "payloadSha256": "b" * 64,
+                        "state": "unknown-outcome",
+                    }],
+                },
+                "command-1",
+                "a" * 64,
+                {"unknown-outcome"},
+            )
+        with self.assertRaisesRegex(
+            GateError,
+            "state left the expected recovery set: committed",
+        ):
+            gate._require_command(
+                {
+                    "commands": [{
+                        "commandId": "command-1",
+                        "payloadSha256": "a" * 64,
+                        "state": "committed",
+                    }],
+                },
+                "command-1",
+                "a" * 64,
+                {"unknown-outcome"},
+            )
+
+    def test_reliability_snapshot_waits_for_command_runtime_scope(
+        self,
+    ) -> None:
+        session = Mock()
+        session.call_action.side_effect = [
+            DriverError("acceptance.mobile.reliabilityScopeUnavailable"),
+            {
+                "runtime": {"active": True},
+                "commands": [],
+                "drafts": [],
+                "checkpoints": [],
+            },
+        ]
+
+        result = SimulatorSocialGate(
+            "recovery"
+        )._wait_for_reliability_snapshot(
+            session,
+            "restored reliability snapshot",
+        )
+
+        self.assertEqual(result["runtime"], {"active": True})
+        self.assertEqual(session.call_action.call_count, 2)
+
+    def test_recovery_waits_for_actor_device_enrollment(
+        self,
+    ) -> None:
+        actor = self._actor("sim-ios", "alice")
+        session = Mock()
+        session.call_action.side_effect = [
+            {
+                "actorPtid": actor.ptid,
+                "deviceId": "device-alice",
+                "active": False,
+            },
+            {
+                "actorPtid": actor.ptid,
+                "deviceId": "device-alice",
+                "active": True,
+            },
+        ]
+
+        result = SimulatorSocialGate("recovery")._wait_for_enrolled_device(
+            session,
+            actor,
+            "recovery device enrollment",
+        )
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["actorPtid"], actor.ptid)
+        self.assertEqual(session.call_action.call_count, 2)
+
+    def test_device_enrollment_timeout_reports_deferred_runtime_ids(
+        self,
+    ) -> None:
+        actor = self._actor("sim-ios", "alice")
+        session = Mock()
+        session.call_action.return_value = {
+            "states": [{
+                "kind": "deferred-capability",
+                "detail": {"runtimeIds": ["messaging", "command"]},
+            }],
+        }
+        gate = SimulatorSocialGate("recovery")
+
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "time.monotonic",
+                side_effect=[0.0, 31.0],
+            ),
+            self.assertRaisesRegex(
+                GateError,
+                r"recoveryStates=deferred-capability\(command,messaging\)",
+            ),
+        ):
+            gate._wait_for_enrolled_device(
+                session,
+                actor,
+                "recovery device enrollment",
+            )
+
+    def test_runtime_graph_readiness_rejects_failed_runtime(
+        self,
+    ) -> None:
+        session = Mock()
+        session.call_action.return_value = {
+            "generation": 3,
+            "phase": "ACTIVE",
+            "runtimes": [
+                {"id": "session", "status": "ready"},
+                {"id": "native-event-bridge", "status": "failed"},
+            ],
+            "runtimeErrors": [{
+                "runtimeId": "native-event-bridge",
+                "error": "native bridge unavailable",
+            }],
+        }
+
+        with self.assertRaisesRegex(
+            GateError,
+            "runtime graph failed: native-event-bridge",
+        ):
+            SimulatorSocialGate("recovery")._require_runtime_graph_ready(
+                session,
+                "normal process restart",
+            )
+
+    def test_ios_process_restart_distinguishes_terminate_and_sigkill(
+        self,
+    ) -> None:
+        class Session:
+            platform = "ios"
+            device = SimpleNamespace(identifier="simulator-id")
+            build = SimpleNamespace(
+                application_id="com.peers.touch.mobile"
+            )
+
+            def __init__(self, before_pid: int, after_pid: int) -> None:
+                self.pids = [before_pid, after_pid]
+                self.scripts: list[tuple[str, object]] = []
+                self.required_actions: list[str] = []
+
+            def switch_to_native(self) -> None:
+                return None
+
+            def execute_script(
+                self,
+                script: str,
+                payload: object = None,
+            ) -> object:
+                self.scripts.append((script, payload))
+                if script == "mobile: activeAppInfo":
+                    return {"pid": self.pids.pop(0)}
+                return None
+
+            def reconnect_after_runtime_relaunch(self) -> None:
+                return None
+
+            def wait_for_ready(self) -> None:
+                return None
+
+            def switch_to_app_webview(self) -> None:
+                return None
+
+            def require_harness(self, actions: list[str]) -> None:
+                self.required_actions = actions
+
+        normal = Session(101, 102)
+        forced = Session(201, 202)
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "time.sleep",
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "os.kill",
+            ) as kill,
+        ):
+            normal_result = SimulatorSocialGate._restart_ios_application(
+                normal,
+                force_kill=False,
+            )
+            forced_result = SimulatorSocialGate._restart_ios_application(
+                forced,
+                force_kill=True,
+            )
+
+        self.assertEqual(normal_result["mode"], "terminate")
+        self.assertEqual(forced_result["mode"], "sigkill")
+        self.assertEqual(forced_result["signal"], "SIGKILL")
+        self.assertIn(
+            (
+                "mobile: terminateApp",
+                {"bundleId": "com.peers.touch.mobile"},
+            ),
+            normal.scripts,
+        )
+        kill.assert_called_once_with(201, signal.SIGKILL)
+        self.assertEqual(
+            forced.required_actions,
+            list(RECOVERY_RELAUNCH_ACTIONS),
+        )
+
+    def test_route_renewal_crosses_prior_expiry_without_generation_change(
+        self,
+    ) -> None:
+        before = {
+            "activeStationPeerId": "station-1",
+            "entries": [{
+                "stationPeerId": "station-1",
+                "activeRouteId": "route-1",
+                "routeRevision": 4,
+                "routes": [{
+                    "routeId": "route-1",
+                    "routeGeneration": 7,
+                    "attestationExpiresAtUnixMs": 2_000,
+                    "health": "available",
+                }],
+            }],
+        }
+        after = {
+            "activeStationPeerId": "station-1",
+            "entries": [{
+                "stationPeerId": "station-1",
+                "activeRouteId": "route-1",
+                "routeRevision": 4,
+                "routes": [{
+                    "routeId": "route-1",
+                    "routeGeneration": 7,
+                    "attestationExpiresAtUnixMs": 8_000,
+                    "health": "available",
+                }],
+            }],
+        }
+        session = Mock()
+        session.call_action.side_effect = [before, after]
+        gate = SimulatorSocialGate("recovery")
+        with (
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "time.time",
+                side_effect=[1.0, 3.0],
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "time.monotonic",
+                side_effect=[0.0, 1.0, 2.0],
+            ),
+        ):
+            result = gate._await_route_attestation_renewal(session)
+
+        self.assertTrue(result["crossedPriorExpiry"])
+        self.assertEqual(result["routeGeneration"], 7)
+        # Same-route renewal preserves routeRevision by contract; only the
+        # attestation expiry advances while route identity stays stable.
+        self.assertEqual(result["beforeRouteRevision"], 4)
+        self.assertEqual(result["afterRouteRevision"], 4)
+        self.assertTrue(result["routeRevisionStable"])
+        observations = result["routeObservations"]
+        self.assertTrue(observations)
+        self.assertEqual(observations[0]["routeRevision"], 4)
+        self.assertEqual(observations[-1]["routeRevision"], 4)
+        self.assertIn(
+            "attestationExpiresAtUnixMs", observations[0]
+        )
+
+    def test_route_retry_after_outage_returns_control_when_present(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+        session = Mock()
+        with (
+            patch.object(
+                gate,
+                "_find_element_or_none",
+                return_value="retry-element",
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep"
+            ),
+        ):
+            element = gate._find_route_retry_after_outage(session)
+        self.assertEqual(element, "retry-element")
+        session.call_action.assert_not_called()
+
+    def test_route_retry_after_outage_accepts_auto_recovery(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+        session = Mock()
+        session.call_action.return_value = {
+            "phase": "ACTIVE",
+            "runtimes": [
+                {"id": "station", "status": "ready"},
+                {"id": "messaging", "status": "ready"},
+            ],
+        }
+        monotonic = iter([0.0, 31.0])
+        with (
+            patch.object(
+                gate, "_find_element_or_none", return_value=None
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "time.monotonic",
+                side_effect=lambda: next(monotonic),
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep"
+            ),
+        ):
+            self.assertIsNone(
+                gate._find_route_retry_after_outage(session)
+            )
+
+    def test_route_retry_after_outage_fails_when_not_recovered(self) -> None:
+        gate = SimulatorSocialGate("recovery")
+        session = Mock()
+        session.call_action.return_value = {
+            "phase": "ACTIVE",
+            "runtimes": [
+                {"id": "station", "status": "failed"},
+            ],
+        }
+        monotonic = iter([0.0, 31.0])
+        with (
+            patch.object(
+                gate, "_find_element_or_none", return_value=None
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e."
+                "time.monotonic",
+                side_effect=lambda: next(monotonic),
+            ),
+            patch(
+                "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep"
+            ),
+            self.assertRaises(GateError),
+        ):
+            gate._find_route_retry_after_outage(session)
+
+    def test_station_outage_restores_same_source_bound_container(
+        self,
+    ) -> None:
+        stopped = {
+            "stopped": True,
+            "deploymentEnvironment": "profile-three",
+            "runtimeOwner": "docker-compose:test/station",
+            "containerId": "station-container",
+            "beforeProcessIds": [101],
+            "sourceCommit": "a" * 40,
+            "buildCommit": "a" * 40,
+        }
+        restored = {
+            "restored": True,
+            "deploymentEnvironment": "profile-three",
+            "runtimeOwner": "docker-compose:test/station",
+            "containerId": "station-container",
+            "beforeProcessIds": [101],
+            "afterProcessIds": [202],
+            "sourceCommit": "a" * 40,
+            "buildCommit": "a" * 40,
+        }
+        capability = Mock()
+        capability.invoke.side_effect = [stopped, restored]
+        outage_observed: list[str] = []
+
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e."
+            "EphemeralGateClient.from_environment",
+            return_value=capability,
+        ):
+            result = SimulatorSocialGate._restart_source_bound_station(
+                during_outage=lambda: outage_observed.append("stopped"),
+            )
+
+        self.assertEqual(outage_observed, ["stopped"])
+        self.assertEqual(result["beforeProcessIds"], [101])
+        self.assertEqual(result["afterProcessIds"], [202])
+        self.assertEqual(capability.invoke.call_count, 2)
+        capability.close.assert_called_once_with()
+
+    def test_recovery_ui_uses_restart_and_authoritative_draft_readback(
+        self,
+    ) -> None:
+        draft = {
+            "kind": "chat",
+            "targetId": "recovery-ui-run",
+            "payloadSha256": "a" * 64,
+        }
+
+        class Session:
+            def call_action(
+                self,
+                action: str,
+                _payload: object = None,
+            ) -> object:
+                if action == "reliability.draft.write":
+                    return draft
+                if action == "lifecycle.restart":
+                    return {"requested": True, "scope": "webview"}
+                if action == "recovery.snapshot":
+                    return {
+                        "states": [{
+                            "kind": "draft-restore-pending",
+                            "actions": ["restore", "discard"],
+                        }],
+                    }
+                if action == "reliability.snapshot":
+                    return {
+                        "runtime": {},
+                        "commands": [],
+                        "drafts": [draft],
+                        "checkpoints": [],
+                    }
+                raise AssertionError(action)
+
+        result = SimulatorSocialGate(
+            "recovery-ui"
+        )._run_recovery_ui_journey(
+            session=Session(),
+            journey_id="run",
+        )
+
+        self.assertEqual(result["visibleState"], "draft-restore-pending")
+        self.assertEqual(result["actions"], ["restore", "discard"])
+
+    def test_ios_waits_for_durable_moment_draft_before_restart(self) -> None:
+        source = inspect.getsource(
+            SimulatorSocialGate._run_ios_recovery_lifecycle
+        )
+
+        self.assertIn('"data-draft-persisted"', source)
+        self.assertIn('"true"', source)
+        restart = source.index('"lifecycle.restart"')
+        restore = source.index('"recovery-draft-restore-action"')
+        renavigate = source.index('"navigation.apply"', restore)
+        reopen = source.index('"social-composer-open"', restore)
+        restored_text = source.index('"Restored Moment draft"')
+        self.assertLess(restart, restore)
+        self.assertLess(restore, renavigate)
+        self.assertLess(renavigate, reopen)
+        self.assertLess(reopen, restored_text)
+        self.assertNotIn("time.sleep", source)
+
+    def test_storage_cache_cleanup_requires_physical_release_and_preserves_draft(
+        self,
+    ) -> None:
+        draft = {
+            "kind": "chat",
+            "targetId": "storage-run-draft",
+            "payloadSha256": "c" * 64,
+        }
+
+        class Session:
+            def __init__(self) -> None:
+                self.refresh_attempts = 0
+                self.snapshots = [
+                    {
+                        "physicalTotalBytes": 3_000_000,
+                        "cacheBytes": 2_100_000,
+                        "confirmVisible": False,
+                        "resultState": "",
+                        "releasedBytes": 0,
+                    },
+                    {
+                        "physicalTotalBytes": 3_000_000,
+                        "cacheBytes": 2_100_000,
+                        "confirmVisible": True,
+                        "resultState": "",
+                        "releasedBytes": 0,
+                    },
+                    {
+                        "physicalTotalBytes": 800_000,
+                        "cacheBytes": 0,
+                        "confirmVisible": False,
+                        "resultState": "succeeded",
+                        "releasedBytes": 2_200_000,
+                    },
+                ]
+
+            def call_action(
+                self,
+                action: str,
+                _payload: object = None,
+            ) -> object:
+                if action == "storage.cache.seed":
+                    return {"sizeBytes": 2 * 1024 * 1024}
+                if action == "reliability.draft.write":
+                    return draft
+                if action == "reliability.draft.read":
+                    return [draft]
+                if action == "reliability.draft.action":
+                    return {"drafts": []}
+                if action == "getRealtimeDevice":
+                    return {
+                        "actorPtid": "ptid:alice",
+                        "deviceId": "device-one",
+                        "active": True,
+                    }
+                if action == "navigation.apply":
+                    return {}
+                raise AssertionError(action)
+
+            def execute_script(self, script: str) -> object:
+                if "data-chat-storage-refresh" in script:
+                    self.refresh_attempts += 1
+                    return self.refresh_attempts >= 3
+                if "data-chat-storage-summary" in script:
+                    return self.snapshots.pop(0)
+                return True
+
+        session = Session()
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep",
+        ):
+            result = SimulatorSocialGate(
+                "storage-cache-cleanup"
+            )._run_storage_cache_cleanup_journey(
+                session=session,
+                journey_id="run",
+            )
+
+        self.assertEqual(session.refresh_attempts, 3)
+        self.assertEqual(result["releasedBytes"], 2_200_000)
+        self.assertTrue(result["draftPreserved"])
+        self.assertTrue(result["messagingIdentityPreserved"])
+        self.assertTrue(result["confirmationObserved"])
+
+    def test_storage_conversation_clear_requires_reclaim_and_restart_absence(
+        self,
+    ) -> None:
+        fixture = {
+            "conversationId": "conversation-clear",
+            "messageId": "message-clear",
+        }
+
+        class Session:
+            def __init__(self) -> None:
+                self.projection_reads = 0
+                self.snapshots = [
+                    {
+                        "physicalTotalBytes": 4_000_000,
+                        "messageBytes": 2_100_000,
+                        "conversationIds": ["conversation-clear"],
+                    },
+                    {
+                        "physicalTotalBytes": 1_500_000,
+                        "messageBytes": 0,
+                        "conversationIds": [],
+                    },
+                ]
+
+            def call_action(self, action: str, payload: object = None) -> object:
+                if action == "storage.conversation-clear.seed":
+                    return fixture
+                if action == "getRealtimeDevice":
+                    return {
+                        "actorPtid": "ptid:alice",
+                        "deviceId": "device-one",
+                        "active": True,
+                    }
+                if action in {"navigation.apply", "messaging.reconcile"}:
+                    return {}
+                if action == "messaging.projection.read":
+                    self.projection_reads += 1
+                    messages = (
+                        [{"messageId": "message-clear"}]
+                        if self.projection_reads == 1
+                        else []
+                    )
+                    return {
+                        "messages": {"conversation-clear": messages},
+                    }
+                if action == "messaging.search":
+                    return []
+                if action == "lifecycle.restart":
+                    return {"requested": True, "scope": "webview"}
+                raise AssertionError((action, payload))
+
+            def execute_script(self, script: str) -> object:
+                if "data-chat-storage-summary" in script:
+                    return self.snapshots.pop(0)
+                if "data-chat-conversation-clear-result" in script:
+                    return {"releasedBytes": 2_500_000}
+                return True
+
+        session = Session()
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep",
+        ):
+            result = SimulatorSocialGate(
+                "storage-conversation-clear"
+            )._run_storage_conversation_clear_journey(
+                session=session,
+                journey_id="run",
+            )
+
+        self.assertEqual(result["releasedBytes"], 2_500_000)
+        self.assertTrue(result["plaintextAbsent"])
+        self.assertTrue(result["searchEntryAbsent"])
+        self.assertTrue(result["restartStable"])
+        self.assertTrue(result["messagingIdentityPreserved"])
+
+    def test_storage_batch_clear_requires_two_selected_restart_stable_items(
+        self,
+    ) -> None:
+        fixtures = [
+            {
+                "conversationId": f"conversation-clear-{suffix}",
+                "messageId": f"message-clear-{suffix}",
+            }
+            for suffix in ("a", "b", "c", "d", "e", "f", "g")
+        ]
+
+        class Session:
+            def __init__(self) -> None:
+                self.seed_index = 0
+                self.success_result_index = 0
+                self.progress_index = 0
+                self.search_query = ""
+                self.selected: set[str] = set()
+                self.snapshots = [
+                    {
+                        "physicalTotalBytes": 10_000_000,
+                        "messageBytes": 6_300_000,
+                        "conversationIds": [
+                            "conversation-clear-a",
+                            "conversation-clear-b",
+                            "conversation-clear-c",
+                        ],
+                        "conversationReclaimableBytes": {
+                            "conversation-clear-a": 2_100_000,
+                            "conversation-clear-b": 2_100_000,
+                            "conversation-clear-c": 2_100_000,
+                        },
+                    },
+                    {
+                        "physicalTotalBytes": 8_000_000,
+                        "messageBytes": 6_300_000,
+                        "conversationIds": [
+                            "conversation-clear-c",
+                            "conversation-clear-d",
+                            "conversation-clear-e",
+                        ],
+                        "conversationReclaimableBytes": {
+                            "conversation-clear-c": 2_100_000,
+                            "conversation-clear-d": 2_100_000,
+                            "conversation-clear-e": 2_100_000,
+                        },
+                    },
+                    {
+                        "physicalTotalBytes": 6_000_000,
+                        "messageBytes": 6_300_000,
+                        "conversationIds": [
+                            "conversation-clear-c",
+                            "conversation-clear-f",
+                            "conversation-clear-g",
+                        ],
+                        "conversationReclaimableBytes": {
+                            "conversation-clear-c": 2_100_000,
+                            "conversation-clear-f": 2_100_000,
+                            "conversation-clear-g": 2_100_000,
+                        },
+                    },
+                    {
+                        "physicalTotalBytes": 4_000_000,
+                        "messageBytes": 4_200_000,
+                        "conversationIds": [
+                            "conversation-clear-c",
+                            "conversation-clear-f",
+                            "conversation-clear-g",
+                        ],
+                        "conversationReclaimableBytes": {
+                            "conversation-clear-c": 2_100_000,
+                            "conversation-clear-f": 0,
+                            "conversation-clear-g": 2_100_000,
+                        },
+                    },
+                    {
+                        "physicalTotalBytes": 3_000_000,
+                        "messageBytes": 2_100_000,
+                        "conversationIds": ["conversation-clear-c"],
+                        "conversationReclaimableBytes": {
+                            "conversation-clear-c": 2_100_000,
+                        },
+                    },
+                ]
+
+            def call_action(self, action: str, payload: object = None) -> object:
+                if action == "storage.conversation-clear.seed":
+                    fixture = fixtures[self.seed_index]
+                    self.seed_index += 1
+                    return fixture
+                if action == "getRealtimeDevice":
+                    return {
+                        "actorPtid": "ptid:alice",
+                        "deviceId": "device-one",
+                        "active": True,
+                    }
+                if action in {
+                    "navigation.apply",
+                    "messaging.reconcile",
+                }:
+                    return {}
+                if action == "storage.batch.scenario":
+                    return {"configured": True}
+                if action == "messaging.projection.read":
+                    conversation_id = payload["conversationId"]
+                    messages = (
+                        [{"messageId": "message-clear-c"}]
+                        if conversation_id == "conversation-clear-c"
+                        else []
+                    )
+                    return {"messages": {conversation_id: messages}}
+                if action == "messaging.search":
+                    return (
+                        [{"messageId": "message-clear-c"}]
+                        if payload["conversationId"] == "conversation-clear-c"
+                        else []
+                    )
+                if action == "lifecycle.restart":
+                    return {"requested": True, "scope": "webview"}
+                raise AssertionError((action, payload))
+
+            def execute_script(self, script: str, *args: object) -> object:
+                if "actions: Boolean" in script:
+                    return {
+                        "actions": False,
+                        "result": False,
+                        "summary": False,
+                    }
+                if "data-chat-storage-summary" in script:
+                    return self.snapshots.pop(0)
+                if (
+                    "data-chat-storage-search" in script
+                    and "dispatchEvent" in script
+                ):
+                    self.search_query = str(args[0])
+                    return True
+                if (
+                    "data-chat-storage-batch-select-all" in script
+                    and "checkbox.click()" in script
+                ):
+                    self.selected.add("conversation-clear-a")
+                    return True
+                if "visibleIds:" in script:
+                    visible_ids = (
+                        ["conversation-clear-a"]
+                        if self.search_query
+                        else [
+                            "conversation-clear-a",
+                            "conversation-clear-b",
+                            "conversation-clear-c",
+                        ]
+                    )
+                    return {
+                        "visibleIds": visible_ids,
+                        "selectedIds": [
+                            conversation_id
+                            for conversation_id in visible_ids
+                            if conversation_id in self.selected
+                        ],
+                        "additionalSelected": (
+                            "conversation-clear-b" in self.selected
+                        ),
+                        "controlSelected": (
+                            "conversation-clear-c" in self.selected
+                        ),
+                        "clearEnabled": bool(self.selected),
+                    }
+                if "data-chat-storage-batch-result" in script:
+                    status = args[0]
+                    if status == "partial_failure":
+                        self.selected = {"conversation-clear-e"}
+                        return {
+                            "succeeded": 1,
+                            "failed": 1,
+                            "releasedBytes": 2_100_000,
+                            "retryVisible": True,
+                            "selected": ["conversation-clear-e"],
+                        }
+                    succeeded = (2, 1, 1)[self.success_result_index]
+                    self.success_result_index += 1
+                    self.selected = set()
+                    return {
+                        "succeeded": succeeded,
+                        "failed": 0,
+                        "releasedBytes": 4_200_000,
+                        "retryVisible": False,
+                        "selected": [],
+                    }
+                if "return window.__PT_CHAT_STORAGE_BATCH_PROGRESS__" in script:
+                    values = (
+                        [{"completed": 0, "total": 2, "text": "0 / 2"}],
+                        [{"completed": 1, "total": 2, "text": "1 / 2"}],
+                        [{"completed": 1, "total": 2, "text": "1 / 2"}],
+                    )[self.progress_index]
+                    self.progress_index += 1
+                    return values
+                if "data-chat-storage-batch-confirm" in script:
+                    selected_count = len(self.selected)
+                    return {
+                        "estimatedBytes": 4_200_000,
+                        "selectedCount": selected_count,
+                        "scope": "current-device",
+                        "text": f"Clear {selected_count} on this device",
+                    }
+                if "checkbox.click()" in script and args:
+                    self.selected.add(str(args[0]))
+                    return True
+                if "data-chat-storage-selected" in script:
+                    if args:
+                        return str(args[0]) in self.selected
+                    return sorted(self.selected)
+                if "data-chat-storage-batch-manage" in script:
+                    self.search_query = ""
+                    self.selected = set()
+                return True
+
+        session = Session()
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep",
+        ):
+            result = SimulatorSocialGate(
+                "storage-batch-clear"
+            )._run_storage_batch_clear_journey(
+                session=session,
+                journey_id="run",
+            )
+
+        self.assertEqual(len(result["conversationIds"]), 6)
+        self.assertEqual(result["succeeded"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["releasedBytes"], 4_200_000)
+        self.assertEqual(result["estimatedReclaimableBytes"], 4_200_000)
+        self.assertEqual(
+            result["filteredSelection"]["filteredVisibleIds"],
+            ["conversation-clear-a"],
+        )
+        self.assertEqual(
+            result["filteredSelection"]["selectedAfterQueryClear"],
+            ["conversation-clear-a"],
+        )
+        self.assertEqual(
+            set(result["filteredSelection"]["selectedIds"]),
+            {"conversation-clear-a", "conversation-clear-b"},
+        )
+        self.assertFalse(result["filteredSelection"]["controlSelected"])
+        self.assertEqual(
+            result["unselectedControl"]["afterRestart"]["messageId"],
+            "message-clear-c",
+        )
+        self.assertTrue(result["unselectedPreserved"])
+        self.assertEqual(result["partialFailure"]["failed"], 1)
+        self.assertEqual(result["partialRetry"]["succeeded"], 1)
+        self.assertEqual(result["scopeChange"]["completed"], 1)
+        self.assertEqual(
+            result["scopeChange"]["remainingConversationIds"],
+            ["conversation-clear-g"],
+        )
+        self.assertTrue(result["restartStable"])
+        self.assertTrue(result["messagingIdentityPreserved"])
+
+    def test_storage_retention_journey_requires_prune_protection_and_restart(self) -> None:
+        fixture = {
+            "conversationId": "conversation-retention",
+            "prunedMessageId": "message-pruned",
+            "protectedMessageId": "message-protected",
+            "recentMessageId": "message-recent",
+        }
+
+        class Session:
+            def __init__(self) -> None:
+                self.snapshots = [
+                    {
+                        "physicalTotalBytes": 4_000_000,
+                        "messageBytes": 2_100_000,
+                        "conversationIds": ["conversation-retention"],
+                    },
+                    {
+                        "physicalTotalBytes": 1_500_000,
+                        "retentionPreset": "4",
+                        "retentionResultState": "succeeded",
+                        "retentionReleasedBytes": 2_500_000,
+                    },
+                    {
+                        "physicalTotalBytes": 1_500_000,
+                        "retentionPreset": "4",
+                    },
+                ]
+
+            def call_action(self, action: str, payload: object = None) -> object:
+                if action == "storage.retention.seed":
+                    return fixture
+                if action == "getRealtimeDevice":
+                    return {
+                        "actorPtid": "ptid:alice",
+                        "deviceId": "device-one",
+                        "active": True,
+                    }
+                if action == "navigation.apply":
+                    return {}
+                if action == "lifecycle.restart":
+                    return {"requested": True, "scope": "webview"}
+                if action == "messaging.projection.read":
+                    return {
+                        "messages": {
+                            "conversation-retention": [
+                                {"messageId": "message-protected"},
+                                {"messageId": "message-recent"},
+                            ]
+                        }
+                    }
+                raise AssertionError(action)
+
+            def execute_script(self, script: str) -> object:
+                if "data-chat-storage-summary" in script:
+                    return self.snapshots.pop(0)
+                return True
+
+        with patch(
+            "tooling.acceptance.gates.mobile.simulator_social_e2e.time.sleep",
+        ):
+            result = SimulatorSocialGate(
+                "storage-retention"
+            )._run_storage_retention_journey(
+                session=Session(),
+                journey_id="run",
+            )
+
+        self.assertEqual(result["retentionPreset"], "4")
+        self.assertEqual(result["releasedBytes"], 2_500_000)
+        self.assertTrue(result["prunedMessageAbsent"])
+        self.assertTrue(result["protectedMessagePreserved"])
+        self.assertTrue(result["recentMessagePreserved"])
+        self.assertTrue(result["restartStable"])
+
+    def test_moments_journey_requires_receiver_and_rollback_readback(
+        self,
+    ) -> None:
+        draft = {
+            "kind": "moment",
+            "targetId": "moment-compose-run",
+            "payloadSha256": "b" * 64,
+        }
+
+        class SenderSession:
+            publication_state = "PUBLISHED"
+
+            def call_action(
+                self,
+                action: str,
+                payload: object = None,
+            ) -> object:
+                if action == "moments.publish":
+                    if isinstance(payload, dict) and payload.get("audienceKind") == 1:
+                        return {"rejected": True, "code": "FEED_SIGNED_WRITE_REQUIRED"}
+                    if not isinstance(payload, dict) or payload.get("audience") != {
+                        "kind": "CUSTOM_ALLOW", "actorPtids": ["ptid:bob"],
+                    }:
+                        raise AssertionError(("private audience", payload))
+                    return {
+                        "postId": "post-1",
+                        "authorPtid": "ptid:alice",
+                        "text": "mobile-moment-run",
+                    }
+                if action == "moments.comment":
+                    return {"commentId": "reply-1"}
+                if action == "moments.private.publishText":
+                    return {"postId": "private-1", "state": self.publication_state}
+                if action == "reliability.draft.write":
+                    return draft
+                if action == "lifecycle.restart":
+                    return {"requested": True, "scope": "webview"}
+                if action == "reliability.draft.read":
+                    return [draft]
+                if action == "reliability.draft.action":
+                    return {"drafts": []}
+                raise AssertionError((action, payload))
+
+        class ReceiverSession:
+            comment_state = "COMMENT_POSTED"
+            duplicate_comments = False
+
+            def __init__(self) -> None:
+                self.mention_payloads: list[dict[str, object]] = []
+
+            def call_action(
+                self,
+                action: str,
+                payload: object = None,
+            ) -> object:
+                if action == "moments.feed.read":
+                    return {
+                        "posts": [{
+                            "postId": "post-1",
+                            "authorPtid": "ptid:alice",
+                            "text": "mobile-moment-run",
+                        }]
+                    }
+                if action == "moments.react":
+                    if isinstance(payload, dict) and payload.get("active"):
+                        return [{
+                            "kind": 1,
+                            "count": "1",
+                            "reactedByViewer": True,
+                        }]
+                    return []
+                if action == "moments.comment":
+                    return {"commentId": "comment-1"}
+                if action == "moments.comments.read":
+                    return [
+                        {"commentId": "comment-1"},
+                        {"commentId": "reply-1"},
+                    ]
+                if action == "moments.private.readText":
+                    return {"postId": "private-1", "state": "CONTENT_READY"}
+                if action == "moments.private.comment.submit":
+                    assert isinstance(payload, dict)
+                    self.mention_payloads.append(payload)
+                    return {
+                        "commentId": "mention-1" if self.duplicate_comments else payload["draftId"],
+                        "state": self.comment_state, "mentionCount": 1,
+                    }
+                raise AssertionError((action, payload))
+
+        sender = MessagingActor(
+            client_id="sim-ios",
+            role="alice",
+            station_url="https://primary.example",
+            station_peer_id="station-primary",
+            ptid="ptid:alice",
+            account_ref="station-account:alice@p.t",
+            federated_handle="@alice@primary",
+            federation_id="federation-1",
+        )
+        receiver = MessagingActor(
+            client_id="sim-ios-peer",
+            role="bob",
+            station_url="https://secondary.example",
+            station_peer_id="station-secondary",
+            ptid="ptid:bob",
+            account_ref="station-account:bob@p.t",
+            federated_handle="@bob@secondary",
+            federation_id="federation-1",
+        )
+
+        gate = SimulatorSocialGate("moments")
+        sender_session = SenderSession()
+        receiver_session = ReceiverSession()
+        notification_ui = {"read": {"unread": False}, "delete": {"ownerRowAbsent": True}}
+        with (
+            patch.object(gate, "_prepare_private_keys", return_value={
+                "endpointPrekeysAvailable": 16, "recoveryPrekeysAvailable": 4,
+            }) as prepare,
+            patch.object(gate, "_run_notification_ui", return_value=notification_ui) as notification,
+        ):
+            result = gate._run_moments_journey(
+                sender_session=sender_session, receiver_session=receiver_session,
+                sender=sender, receiver=receiver, journey_id="run",
+            )
+            self.assertEqual(prepare.call_count, 4)
+            self.assertTrue(result["publicWriteRejected"])
+            self.assertEqual(result["audience"], "CUSTOM_ALLOW")
+            notification.assert_called_once_with(
+                sender_session, comment_id="mention-run-30", post_id="private-1",
+                expected_comment_ids={f"mention-run-{index}" for index in range(31)},
+            )
+            self.assertEqual(result["notificationUi"], notification_ui)
+            self.assertEqual(len(receiver_session.mention_payloads), 31)
+            self.assertEqual(receiver_session.mention_payloads[0]["mentions"], [{
+                "actorPtid": sender.ptid, "offset": 0, "length": 6, "display": "Alice",
+            }])
+            for phase in ("publication", "comment", "duplicate"):
+                with self.subTest(phase=phase):
+                    sender_session.publication_state = "PUBLISH_FAILED" if phase == "publication" else "PUBLISHED"
+                    receiver_session.comment_state = "COMMENT_FAILED" if phase == "comment" else "COMMENT_POSTED"
+                    receiver_session.duplicate_comments = phase == "duplicate"
+                    with self.assertRaises(GateError):
+                        gate._run_moments_journey(
+                            sender_session=sender_session, receiver_session=receiver_session,
+                            sender=sender, receiver=receiver, journey_id="run",
+                        )
+
+        self.assertEqual(result["post"]["postId"], "post-1")
+        self.assertTrue(result["reactionCommitted"])
+        self.assertTrue(result["reactionRolledBack"])
+        self.assertTrue(result["draftRestartReadback"])
+
+
+if __name__ == "__main__":
+    unittest.main()
