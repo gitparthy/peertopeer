@@ -181,16 +181,10 @@ const SETTINGS_GROUP_ORDER: TabGroupDef[] = [
     sectionKeys: ['account', 'security', 'general'],
   },
   {
-    key: 'ai',
-    labelKey: 'settings.group.ai',
-    icon: Sparkles,
-    sectionKeys: ['models', 'discover', 'memory', 'skills', 'mcp', 'voice', 'cron'],
-  },
-  {
     key: 'channels',
     labelKey: 'settings.group.channels',
     icon: Send,
-    sectionKeys: ['channels', 'connections', 'bots'],
+    sectionKeys: ['channels', 'connections'],
   },
   {
     key: 'advanced',

@@ -26,11 +26,17 @@ export function isDesktopAppletAvailable(appletId: string): boolean {
 }
 
 export function resolveAvailablePage(page: Page): Page {
-  // Atelier is withheld until its product design is accepted. Old bookmarks
-  // and restored routes return to Chat without removing applet/user data.
-  if (page === 'agent-orchestration'
-    || (page.startsWith('applet:') && !isDesktopAppletAvailable(page.slice('applet:'.length)))) {
-    return 'agent';
+  // AI and Agent pages are disabled; redirect to Chat.
+  if (
+    page === 'agent' ||
+    page === 'agent-profile' ||
+    page === 'agent-orchestration' ||
+    page === 'agent-groups' ||
+    page === 'evaluation' ||
+    page === 'tasks' ||
+    (page.startsWith('applet:') && !isDesktopAppletAvailable(page.slice('applet:'.length)))
+  ) {
+    return 'chat';
   }
   return page;
 }
